@@ -509,16 +509,26 @@ The gate before any commit:
 npm run typecheck && npm run smoke && npm audit --omit=dev --audit-level=high && npm run build
 ```
 
-CI (`.github/workflows/`), all path-scoped to `labview/**`:
+CI lives in `.github/workflows/`:
 
-- **docker-image.yml** — typecheck + smoke, then build the image; push to Docker
-  Hub only on `main`/dispatch (PRs build with a local tag, since secrets may be
-  unavailable on forks and Dependabot PRs).
+- **docker-image.yml** — runs on every push to `main`. The `test` job runs
+  typecheck + smoke and the build `needs:` it, so a broken build or a reverted
+  fixture fix cannot reach Docker Hub. The build context is `./labview`, not the
+  repo root: the Dockerfile and every path it copies are context-relative, so a
+  root context finds none of them.
 - **security.yml** — `npm audit` at moderate (informational) and at high for
   production deps (**gating**), dependency-review at moderate on PRs, CodeQL
   `security-extended`, Trivy filesystem *and* image scans, TruffleHog
-  `--only-verified`. Also runs daily at 03:17 UTC.
-- **dependabot-auto-merge.yml** — patch/minor auto-merge after checks pass.
+  `--only-verified`. Path-scoped to `labview/**` plus its own file, and also runs
+  daily at 03:17 UTC regardless of the filter.
+
+Dependency updates are configured in **`.github/dependabot.yml`** — npm, the
+Dockerfile base image, and the Actions used by these workflows, weekly, with
+minor/patch bumps grouped into one PR per ecosystem and majors raised
+individually. That file is config for GitHub's hosted Dependabot service, **not**
+a workflow: it is read only from `.github/dependabot.yml`, and moving it into
+`workflows/` both breaks Actions (no `jobs:` key) and silently stops Dependabot.
+Merging its PRs is manual — there is no auto-merge workflow.
 
 ---
 

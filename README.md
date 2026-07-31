@@ -68,7 +68,9 @@ labview/              the application (see labview/README.md for full docs)
   scripts/smoke.ts    end-to-end pipeline assertions
   compose.yml         deployment example
   Dockerfile          two-stage node:22-alpine build, runs as non-root
-.github/workflows/    CI: security scanning, image build/push, dependabot auto-merge
+.github/
+  workflows/          CI: security scanning, test-gated image build/push
+  dependabot.yml      weekly dependency updates (npm, base image, Actions)
 truenas-apps/         local sample lab configuration (gitignored, not part of the app)
 IMPLEMENTATION.md     architecture, requirements and invariants — read before changing code
 LICENSE               MIT
@@ -235,9 +237,12 @@ CI runs on every push and PR touching `labview/**`, plus a daily scheduled sweep
 deps), GitHub dependency review (fails at `moderate`), CodeQL with
 `security-extended`, Trivy filesystem and image scans (vulns, Dockerfile
 misconfig, secrets) uploading SARIF to GitHub Security, and TruffleHog verified
-secret scanning. The image build is gated behind typecheck + smoke tests.
-Dependabot keeps dependencies current, with minor/patch updates grouped and
-auto-merged once checks pass; majors are raised individually for review.
+secret scanning. Separately, every push to `main` builds and pushes the image —
+gated behind typecheck + smoke tests, so a broken build or a reverted regression
+fix cannot reach Docker Hub. Dependabot keeps dependencies current — npm, the
+Dockerfile base image, and the Actions themselves — with minor/patch bumps
+grouped into one PR per ecosystem and majors raised individually; merging is
+manual.
 
 Found something? Please open an issue rather than a PR for anything
 security-sensitive.
