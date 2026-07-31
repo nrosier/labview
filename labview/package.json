@@ -28,7 +28,7 @@
     "@types/dockerode": "^3.3.31",
     "@types/node": "^22.10.1",
     "cytoscape": "^3.30.2",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.28.1",
     "mermaid": "^11.4.0",
     "preact": "^10.25.1",
     "tsx": "^4.19.2",
