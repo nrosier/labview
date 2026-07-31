@@ -9,9 +9,7 @@
 # stack. LabView only needs read endpoints (CONTAINERS/NETWORKS/VOLUMES/IMAGES/INFO/PING).
 services:
   labview:
-    build: .
-    # Or use a prebuilt image once you publish one:
-    # image: docker.io/YOUR_DOCKERHUB_USERNAME/labview:latest  # published by .github/workflows/docker-image.yml
+    image: niqck/labview:latest
     container_name: labview
     restart: unless-stopped
     environment:
