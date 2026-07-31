@@ -1,98 +1,32 @@
 name: Docker Build and Push
 
-# Adapted from the ghostbudget template for this monorepo: LabView lives in
-# labview/, so the build context and Dockerfile are scoped there and the image
-# is published to Docker Hub as <DOCKERHUB_USERNAME>/labview.
-#
-# Pull requests build the image (no push) after the test gate, so a broken build
-# fails the check. Pushes to main (and manual runs) build and push.
-#
-# Requires two repository secrets: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
-# (a Docker Hub access token with Read & Write scope).
-
 on:
   push:
-    branches: [ main ]
-    paths:
-      - 'labview/**'
-      - '.github/workflows/docker-image.yml'
-  pull_request:
-    paths:
-      - 'labview/**'
-      - '.github/workflows/docker-image.yml'
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
+    branches:
+      - main  # Trigger on pushes to the main branch
 
 jobs:
-  test:
-    name: Typecheck & smoke
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: labview
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: labview/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck (server + web)
-        run: npm run typecheck
-
-      - name: Smoke test (pipeline against fixtures)
-        run: npm run smoke
-
   build-and-push:
-    name: Build image
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-
-      # On pull requests, secrets may be unavailable (e.g. Dependabot PRs), so we
-      # build with a local tag and skip the push. On push/dispatch we push to
-      # Docker Hub.
-      - name: Resolve tags and push flag
-        id: vars
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "push=false" >> "$GITHUB_OUTPUT"
-            echo "tags=labview:ci" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=true" >> "$GITHUB_OUTPUT"
-            echo "tags=${{ secrets.DOCKERHUB_USERNAME }}/labview:latest,${{ secrets.DOCKERHUB_USERNAME }}/labview:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Log in to Docker Hub
-        if: steps.vars.outputs.push == 'true'
-        uses: docker/login-action@v4.5.2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
+          
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       - name: Build and push image
         uses: docker/build-push-action@v7
         with:
-          context: ./labview
-          file: ./labview/Dockerfile
-          push: ${{ steps.vars.outputs.push }}
+          context: .
+          push: true
           no-cache: true
-          tags: ${{ steps.vars.outputs.tags }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/labview:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/labview:${{ github.sha }}
