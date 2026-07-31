@@ -1,32 +1,46 @@
 /**
- * Smoke test: run the full pipeline (docker disabled) against two fixture roots
+ * Smoke test: run the full pipeline (docker disabled) against three fixture roots
  * and assert the analyzer produced the expected classifications. Exits non-zero
  * on any failure so it can gate CI / a pre-commit check.
  *
- *   ./fixtures/apps — a representative happy-path fleet.
- *   ./fixtures/edge — regression cases for previously-fixed defects.
+ *   ./fixtures/apps      — a representative happy-path fleet.
+ *   ./fixtures/edge      — regression cases for previously-fixed defects.
+ *   ./fixtures/authentik — the identity-provider API integration, driven through an
+ *                          injected HTTP layer so no network and no Authentik is
+ *                          needed. Canned responses: ./fixtures/authentik-api.json.
  *
  *   npx tsx scripts/smoke.ts
  */
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { Overview, Service } from "../src/model/types.js";
+import type { BuildDeps } from "../src/analyze/index.js";
+import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appsRoot = resolve(here, "..", "fixtures", "apps");
 const edgeRoot = resolve(here, "..", "fixtures", "edge");
+const authentikRoot = resolve(here, "..", "fixtures", "authentik");
 
 // Configure via env BEFORE importing config.
 process.env.LABVIEW_DOCKER_ENABLED = "false";
 process.env.LABVIEW_CONFIG = "___none___"; // force defaults
+// The Authentik integration is driven explicitly per run below. Clearing these
+// first means an operator's own credentials in the environment can neither make
+// this test reach the network nor change what it asserts.
+delete process.env.LABVIEW_AUTHENTIK_URL;
+delete process.env.LABVIEW_AUTHENTIK_TOKEN;
+delete process.env.LABVIEW_AUTHENTIK_TOKEN_FILE;
+delete process.env.LABVIEW_AUTHENTIK_ENABLED;
 
 const { loadConfig } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
-async function overviewFor(root: string): Promise<Overview> {
+async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
   process.env.LABVIEW_APPS_ROOT = root;
-  return buildOverview(loadConfig(), new Date("2024-01-01T00:00:00Z"));
+  return buildOverview(loadConfig(), new Date("2024-01-01T00:00:00Z"), deps);
 }
 
 let failures = 0;
@@ -50,6 +64,90 @@ function lookup(ov: Overview): (stackId: string, serviceName: string) => Service
 
 function envValue(s: Service, key: string): string | null | undefined {
   return s.env.find((e) => e.key === key)?.value;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Authentik API stub                                                         */
+/* -------------------------------------------------------------------------- */
+
+/** The one origin in the fixture fleet that actually serves the Authentik API. */
+const AK_ORIGIN = "http://authentik-server:9000";
+/** Not a credential: an arbitrary string the stub demands verbatim. */
+const AK_TOKEN = "smoke-fixture-token-0000000000";
+const AK_FIXTURE = JSON.parse(
+  readFileSync(resolve(here, "..", "fixtures", "authentik-api.json"), "utf8"),
+) as Record<string, unknown>;
+
+interface Recorded {
+  url: string;
+  /** Whether an Authorization header was sent — the leak check, not an auth check. */
+  sentToken: boolean;
+}
+
+/**
+ * Stand in for the fixture fleet's Authentik instance.
+ *
+ * It behaves like the real thing in the three ways that matter to the client:
+ * `/api/v3/root/config/` answers without credentials (it is `AllowAny` upstream),
+ * every other endpoint demands the exact bearer token, and any other origin — the
+ * outpost, the worker, a bare service name — is simply not an API and 404s.
+ *
+ * Every request is recorded, which is what lets the test assert the *absence* of a
+ * request: the token must never be sent to a candidate that failed the probe.
+ */
+function authentikStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
+  const calls: Recorded[] = [];
+  const reply = (status: number, body: unknown): HttpResponse => ({
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+  });
+
+  const fetchImpl: FetchLike = async (url, init) => {
+    const header = init?.headers?.Authorization;
+    calls.push({ url, sentToken: Boolean(header) });
+
+    const parsed = new URL(url);
+    if (parsed.origin !== AK_ORIGIN) return reply(404, { detail: "Not found." });
+
+    const endpoint = parsed.pathname.replace(/^\/api\/v3\//, "").replace(/\/$/, "");
+    if (endpoint === "root/config") return reply(200, AK_FIXTURE["root/config"]);
+    if (header !== `Bearer ${AK_TOKEN}`) {
+      return reply(403, { detail: "Authentication credentials were not provided." });
+    }
+
+    const pages = AK_FIXTURE[endpoint];
+    if (!Array.isArray(pages)) return reply(404, { detail: "Not found." });
+    const page = Number(parsed.searchParams.get("page") ?? "1");
+    const results: unknown[] = Array.isArray(pages[page - 1]) ? pages[page - 1] : [];
+    const count = pages.reduce((n: number, p: unknown) => n + (Array.isArray(p) ? p.length : 0), 0);
+
+    // Outposts answer in the DRF envelope, everything else in Authentik's own, so
+    // both branches of the pagination reader are exercised by one fixture.
+    if (endpoint === "outposts/instances") {
+      return reply(200, { count, next: null, previous: null, results });
+    }
+    return reply(200, {
+      pagination: {
+        next: page < pages.length ? page + 1 : 0,
+        previous: page > 1 ? page - 1 : 0,
+        count,
+        current: page,
+        total_pages: pages.length,
+      },
+      results,
+    });
+  };
+
+  return { fetchImpl, calls };
+}
+
+/** Point the config loader at the stub instance — or at nothing — for the next run. */
+function authentikEnv(opts: { url?: string; token?: string }): void {
+  if (opts.url) process.env.LABVIEW_AUTHENTIK_URL = opts.url;
+  else delete process.env.LABVIEW_AUTHENTIK_URL;
+  if (opts.token) process.env.LABVIEW_AUTHENTIK_TOKEN = opts.token;
+  else delete process.env.LABVIEW_AUTHENTIK_TOKEN;
 }
 
 console.log("LabView smoke test\n");
@@ -453,6 +551,347 @@ check(
   eSvc("hostport", "app").auth.method === "authentik-forward-auth",
   eSvc("hostport", "app").auth.method,
 );
+
+/* ========================================================================== */
+/* fixtures/authentik — the identity provider's own records                   */
+/* ========================================================================== */
+
+console.log("\n--- identity provider API (fixtures/authentik) ---");
+
+const discovered = authentikStub();
+authentikEnv({ token: AK_TOKEN });
+const ak = await overviewFor(authentikRoot, { fetchImpl: discovered.fetchImpl });
+const aSvc = lookup(ak);
+const akMeta = ak.meta.authentik!;
+
+console.log("\nendpoint discovery");
+check("found 9 stacks", ak.stats.stacks === 9, `got ${ak.stats.stacks}`);
+check(
+  "the endpoint is discovered from the fleet, not configured",
+  akMeta.endpointSource === "discovered" && akMeta.endpoint === AK_ORIGIN,
+  `${akMeta.endpointSource} ${akMeta.endpoint ?? ""}`,
+);
+// The published side of the mapping is 9443 and the public hostname is
+// sso.example.com; only the container name and the *target* port give AK_ORIGIN.
+check(
+  "...from the container name and the target port, not the host port",
+  discovered.calls.some((c) => c.url.startsWith(`${AK_ORIGIN}/api/v3/root/config/`)),
+  discovered.calls.map((c) => c.url).join(" "),
+);
+check("the API answered and the token was accepted", akMeta.reachable === true, akMeta.error ?? "");
+check("no partial-read error was reported", akMeta.error === undefined, akMeta.error ?? "");
+
+console.log("\nthe token goes nowhere it has not been earned");
+const rejected = discovered.calls.filter((c) => !c.url.startsWith(AK_ORIGIN));
+check(
+  "a non-API Authentik candidate was probed first",
+  rejected.some((c) => c.url.startsWith("http://authentik-outpost:9000")),
+  rejected.map((c) => c.url).join(" "),
+);
+// The revert-proof assertion for the probe-before-auth rule: send the token first
+// and every one of these carries it.
+check(
+  "...and no candidate that failed the probe was ever sent the token",
+  rejected.every((c) => !c.sentToken),
+  rejected.filter((c) => c.sentToken).map((c) => c.url).join(" "),
+);
+check(
+  "...nor asked for anything beyond the unauthenticated probe",
+  rejected.every((c) => c.url.includes("/api/v3/root/config/")),
+  rejected.map((c) => c.url).join(" "),
+);
+
+console.log("\nwhat was read");
+check(
+  "8 applications across 2 pages, 8 providers, 2 outposts",
+  akMeta.applications === 8 && akMeta.providers === 8 && akMeta.outposts === 2,
+  `${akMeta.applications}/${akMeta.providers}/${akMeta.outposts}`,
+);
+check(
+  "the second page of applications was requested",
+  discovered.calls.some((c) => c.url.includes("core/applications") && c.url.includes("page=2")),
+  discovered.calls.filter((c) => c.url.includes("core/applications")).map((c) => c.url).join(" "),
+);
+check("6 of 8 applications matched a service", akMeta.matchedServices === 6, String(akMeta.matchedServices));
+
+console.log("\nmatch 1: the provider names the service (internal host)");
+const akWiki = aSvc("wiki", "wiki");
+check(
+  "a proxy provider's internal host resolves to the service it forwards to",
+  akWiki.authentik?.applications[0]?.slug === "wiki-internal",
+  akWiki.authentik?.applications.map((a) => a.slug).join(",") ?? "no match",
+);
+// Revert-proof for rule 1 specifically: this application's slug matches nothing and
+// its launch URL is a per-user template, so no other rule can reach this service.
+check(
+  "...on that address, quoted as the reason",
+  akWiki.authentik?.evidence[0]?.includes("forwards authenticated traffic to http://wiki:3000") ??
+    false,
+  akWiki.authentik?.evidence.join(" | ") ?? "",
+);
+check(
+  "a per-user launch URL template is not matched on",
+  akWiki.authentik?.applications[0]?.launchUrl === undefined,
+  String(akWiki.authentik?.applications[0]?.launchUrl),
+);
+check(
+  "the API's account of the gate is the one reported",
+  akWiki.auth.method === "authentik-forward-auth" && akWiki.auth.confidence === "confirmed",
+  `${akWiki.auth.method}/${akWiki.auth.confidence}`,
+);
+check(
+  "...naming the provider, which no label could have supplied",
+  akWiki.auth.detail.includes("Team wiki proxy") && akWiki.auth.detail.includes("forward_single"),
+  akWiki.auth.detail,
+);
+check(
+  "...and the middleware's weaker account is kept as evidence",
+  akWiki.auth.evidence.some((e) => e.includes("middleware authentik@docker")),
+  akWiki.auth.evidence.join(" | "),
+);
+// Only visible by holding the API's records and the compose labels side by side.
+check(
+  "a tunnel origin that skips the enforcing outpost is called out",
+  akWiki.notes.some((n) => n.includes("never passes the outpost")),
+  akWiki.notes.join(" | "),
+);
+
+console.log("\nmatch 2: a hostname both sides name");
+const docs = aSvc("docs", "docs");
+check(
+  "an application's launch URL matches a hostname the service serves",
+  docs.authentik?.applications[0]?.slug === "documentation",
+  docs.authentik?.applications.map((a) => a.slug).join(",") ?? "no match",
+);
+// The hostname is declared for both the tunnel and the proxy. Count those as two
+// rival candidates and this match is discarded as ambiguous.
+check(
+  "...even though it is declared for both the tunnel and the proxy",
+  docs.authentik?.evidence[0]?.includes("its launch URL names docs.example.com") ?? false,
+  docs.authentik?.evidence.join(" | ") ?? "",
+);
+check(
+  "an OAuth2 provider is confirmed without any outpost",
+  docs.auth.method === "authentik-oauth" && docs.auth.confidence === "confirmed",
+  `${docs.auth.method}/${docs.auth.confidence}`,
+);
+check(
+  "...served by the Authentik server itself, and said so",
+  docs.auth.evidence.some((e) => e.includes("served by the Authentik server")),
+  docs.auth.evidence.join(" | "),
+);
+check(
+  "redirect URIs in the object-list form are read",
+  docs.authentik?.applications[0]?.providers[0]?.redirectUris?.includes(
+    "https://docs.example.com/auth/oidc/callback",
+  ) ?? false,
+  JSON.stringify(docs.authentik?.applications[0]?.providers[0]?.redirectUris),
+);
+check(
+  "a backchannel SCIM provider is reported as a provider",
+  docs.authentik?.applications[0]?.providers.some((p) => p.kind === "scim" && p.backchannel) ?? false,
+  docs.authentik?.applications[0]?.providers.map((p) => p.kind).join(",") ?? "",
+);
+// SCIM provisions outbound and gates nothing, so "no outpost serves it" would be a
+// finding about a provider that never wanted one.
+check(
+  "...but not as a gate missing its outpost",
+  docs.notes.every((n) => !n.includes("no outpost serving it")),
+  docs.notes.join(" | "),
+);
+
+const metrics = aSvc("metrics", "metrics");
+check(
+  "an application with no launch URL matches on a redirect URI",
+  metrics.authentik?.applications[0]?.slug === "metrics-dash",
+  metrics.authentik?.applications.map((a) => a.slug).join(",") ?? "no match",
+);
+check(
+  "...read from the newline-delimited string form",
+  metrics.authentik?.evidence[0]?.includes("a redirect URI") ?? false,
+  metrics.authentik?.evidence.join(" | ") ?? "",
+);
+
+console.log("\nmatch 3: the slug, when it points at exactly one service");
+const vault = aSvc("vault", "vault");
+check(
+  "a slug equal to the stack/service name matches",
+  vault.authentik?.applications[0]?.slug === "vault" &&
+    (vault.authentik?.evidence[0]?.includes('slug "vault"') ?? false),
+  vault.authentik?.evidence.join(" | ") ?? "no match",
+);
+// Read only the primary `provider` field and this service has no gate at all.
+check(
+  "a backchannel LDAP provider is found and its outpost with it",
+  vault.authentik?.applications[0]?.providers[0]?.kind === "ldap" &&
+    (vault.authentik?.applications[0]?.providers[0]?.outposts.includes("LDAP outpost") ?? false),
+  JSON.stringify(vault.authentik?.applications[0]?.providers),
+);
+check(
+  "...and it is the reported posture",
+  vault.auth.method === "authentik-ldap" && vault.auth.confidence === "confirmed",
+  `${vault.auth.method}/${vault.auth.confidence}`,
+);
+
+console.log("\nan ambiguous slug is discarded, not arbitrated");
+check(
+  "a slug naming a two-service stack matches neither",
+  aSvc("pair", "blue").authentik === undefined && aSvc("pair", "green").authentik === undefined,
+  JSON.stringify([aSvc("pair", "blue").authentik, aSvc("pair", "green").authentik]),
+);
+check(
+  "...and is reported as an application LabView could not place",
+  akMeta.unmatchedApplications.includes("pair"),
+  akMeta.unmatchedApplications.join(","),
+);
+
+console.log("\na shared authentication domain identifies no single service");
+// In forward_domain mode `external_host` is the domain every application in it
+// authenticates against — here the identity provider's own hostname, which exactly
+// one service serves. Match on it and this application is pinned to the Authentik
+// server, and with it a gate that has nothing to do with that service.
+check(
+  "a forward_domain external host is not read as an application hostname",
+  aSvc("idp", "server").authentik === undefined,
+  JSON.stringify(aSvc("idp", "server").authentik),
+);
+check(
+  "...leaving the application unplaced rather than misplaced",
+  akMeta.unmatchedApplications.includes("broad-app") &&
+    akMeta.unmatchedApplications.length === 2,
+  akMeta.unmatchedApplications.join(","),
+);
+
+console.log("\na provider no outpost serves enforces nothing");
+const orphan = aSvc("orphan", "orphan");
+check(
+  "the application still matches — the provider names the service",
+  orphan.authentik?.applications[0]?.slug === "orphan-ui",
+  orphan.authentik?.applications.map((a) => a.slug).join(",") ?? "no match",
+);
+// The whole point of reading the API: Authentik's own UI lists an application with
+// a proxy provider here, and a reader would call this service protected.
+check(
+  "...but an unserved proxy provider is not reported as protection",
+  orphan.auth.method === "none" && orphan.auth.exposedWithoutAuth === true,
+  `${orphan.auth.method} exposed=${orphan.auth.exposedWithoutAuth}`,
+);
+check(
+  "...with the reason stated on the service",
+  orphan.notes.some((n) => n.includes("no outpost serving it")),
+  orphan.notes.join(" | "),
+);
+check(
+  "...and no bypass claimed for a gate that was never standing anywhere",
+  orphan.notes.every((n) => !n.includes("never passes the outpost")),
+  orphan.notes.join(" | "),
+);
+check(
+  "the provider is still shown, marked as serving nothing",
+  orphan.auth.evidence.some((e) => e.includes("no outpost serves it, so it enforces nothing")),
+  orphan.auth.evidence.join(" | "),
+);
+
+console.log("\na confirmed gate with no method to report it as");
+const reports = aSvc("reports", "reports");
+check(
+  "a SAML application matches its service",
+  reports.authentik?.applications[0]?.providers[0]?.kind === "saml",
+  JSON.stringify(reports.authentik?.applications[0]?.providers),
+);
+// SAML has no AuthMethod (and no colour left in the palette), so the method stays
+// `none` — but calling the service unprotected would be a plain falsehood.
+check(
+  "...and is not counted as reachable without authentication",
+  reports.auth.method === "none" && reports.auth.exposedWithoutAuth === false,
+  `${reports.auth.method} exposed=${reports.auth.exposedWithoutAuth}`,
+);
+check(
+  "...with the provider stated verbatim instead",
+  reports.auth.evidence.some((e) => e.includes('SAML Provider "Reports SAML"')),
+  reports.auth.evidence.join(" | "),
+);
+
+console.log("\nendpoint from configuration");
+const configured = authentikStub();
+authentikEnv({ url: AK_ORIGIN, token: AK_TOKEN });
+const akCfg = await overviewFor(authentikRoot, { fetchImpl: configured.fetchImpl });
+check(
+  "a configured URL is used as given",
+  akCfg.meta.authentik?.endpointSource === "config" && akCfg.meta.authentik?.endpoint === AK_ORIGIN,
+  `${akCfg.meta.authentik?.endpointSource} ${akCfg.meta.authentik?.endpoint ?? ""}`,
+);
+check(
+  "...and nothing else in the fleet is probed",
+  configured.calls.every((c) => c.url.startsWith(AK_ORIGIN)),
+  configured.calls.filter((c) => !c.url.startsWith(AK_ORIGIN)).map((c) => c.url).join(" "),
+);
+check(
+  "...reaching the same conclusions",
+  akCfg.meta.authentik?.matchedServices === 6,
+  String(akCfg.meta.authentik?.matchedServices),
+);
+
+console.log("\nwithout a token the integration is inert");
+const untouched = authentikStub();
+authentikEnv({});
+const akOff = await overviewFor(authentikRoot, { fetchImpl: untouched.fetchImpl });
+const offSvc = lookup(akOff);
+check("no token means no request at all", untouched.calls.length === 0, String(untouched.calls.length));
+check(
+  "...and no error either — unconfigured is not broken",
+  akOff.meta.authentik?.configured === false && akOff.meta.authentik?.error === undefined,
+  akOff.meta.authentik?.error ?? "",
+);
+check(
+  "...so no service carries provider records",
+  akOff.stacks.every((s) => s.services.every((x) => x.authentik === undefined)),
+);
+
+// The pair of numbers that shows what the API actually changed. Both must move: the
+// first because two gates only the API can see stop counting as absent, the second
+// because a label-only read cannot see them at all.
+console.log("\nwhat the provider's records are worth");
+check(
+  "with the API read, 4 services are reachable without auth",
+  ak.stats.exposedWithoutAuth === 4,
+  String(ak.stats.exposedWithoutAuth),
+);
+check(
+  "...and 6 without it",
+  akOff.stats.exposedWithoutAuth === 6,
+  String(akOff.stats.exposedWithoutAuth),
+);
+check(
+  "a label-derived gate is still found on its own, just as `observed`",
+  offSvc("wiki", "wiki").auth.method === "authentik-forward-auth" &&
+    offSvc("wiki", "wiki").auth.confidence === "observed",
+  `${offSvc("wiki", "wiki").auth.method}/${offSvc("wiki", "wiki").auth.confidence}`,
+);
+
+console.log("\nan unreachable provider never blocks a scan");
+const failing: FetchLike = async () => {
+  throw new Error("ECONNREFUSED");
+};
+authentikEnv({ url: AK_ORIGIN, token: AK_TOKEN });
+const akDown = await overviewFor(authentikRoot, { fetchImpl: failing });
+check(
+  "the failure is reported rather than thrown",
+  akDown.meta.authentik?.configured === true && akDown.meta.authentik?.reachable === false,
+  JSON.stringify(akDown.meta.authentik),
+);
+check(
+  "...with the reason kept and no credential in it",
+  (akDown.meta.authentik?.error?.includes("no Authentik API endpoint answered") ?? false) &&
+    !akDown.meta.authentik!.error!.includes(AK_TOKEN),
+  akDown.meta.authentik?.error ?? "",
+);
+check(
+  "...and the whole fleet is still analyzed from its labels",
+  akDown.stats.stacks === 9 && akDown.stats.services === 13,
+  `${akDown.stats.stacks}/${akDown.stats.services}`,
+);
+authentikEnv({});
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

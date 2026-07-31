@@ -1,0 +1,25 @@
+# Matched by an OAuth2 redirect URI, and reached on the second page of results.
+#
+# The application has no launch URL at all — a perfectly ordinary configuration —
+# so the only hostname it names anywhere is inside its provider's redirect URIs.
+# Those have been both a newline-delimited string and a list of objects across
+# Authentik versions; this one is the string form, and `docs` covers the other.
+#
+# The application also sits on page 2 of `core/applications`. A client that read
+# only the first page would leave this service unmatched, and nothing else would
+# look wrong — so the pagination has an assertion of its own.
+services:
+  metrics:
+    image: example/metrics:1.8.0
+    container_name: metrics-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=metrics.example.com"
+      - "dockflare.service=http://metrics:9090"
+
+networks:
+  proxy:
+    external: true

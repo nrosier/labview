@@ -1,0 +1,307 @@
+{
+  "_comment": [
+    "Canned Authentik API responses for scripts/smoke.ts, driven through the",
+    "injectable HTTP layer so the smoke test needs no network and no Authentik.",
+    "",
+    "Each list endpoint holds an array of *pages*; the stub in smoke.ts wraps page N",
+    "in the appropriate envelope. `core/applications` has two pages on purpose, and",
+    "`outposts/instances` is wrapped in the DRF-style envelope while the others use",
+    "Authentik's own `{pagination:{next}}` shape — both are read, so both are tested.",
+    "",
+    "Field names and shapes follow Authentik's REST API: providers are referenced from",
+    "an application by pk and embedded as `provider_obj` / `backchannel_providers_obj`,",
+    "a proxy provider's `internal_host` lives on the provider endpoint rather than on",
+    "the application, and `redirect_uris` appears in both the object-list and the",
+    "newline-delimited-string form that different versions return.",
+    "",
+    "`mode` on a proxy provider changes what `external_host` means: in forward_single",
+    "and proxy mode it is the application's own hostname, but in forward_domain mode it",
+    "is the authentication domain shared by every application in that domain — pk 12 is",
+    "here to prove that one is not matched on."
+  ],
+
+  "root/config": {
+    "cache_timeout": 300,
+    "cache_timeout_flows": 0,
+    "cache_timeout_policies": 0,
+    "cache_timeout_reputation": 300,
+    "capabilities": ["can_save_media", "can_impersonate"],
+    "error_reporting": {
+      "enabled": false,
+      "environment": "custom",
+      "send_pii": false,
+      "traces_sample_rate": 0.0
+    }
+  },
+
+  "core/applications": [
+    [
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000001",
+        "name": "Team wiki",
+        "slug": "wiki-internal",
+        "group": "Documentation",
+        "provider": 10,
+        "provider_obj": {
+          "pk": 10,
+          "name": "Team wiki proxy",
+          "component": "ak-provider-proxy-form",
+          "verbose_name": "Proxy Provider",
+          "verbose_name_plural": "Proxy Providers",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "https://wiki.example.com/u/%(username)s",
+        "open_in_new_tab": false,
+        "meta_description": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000002",
+        "name": "Docs portal",
+        "slug": "documentation",
+        "group": "Documentation",
+        "provider": 20,
+        "provider_obj": {
+          "pk": 20,
+          "name": "Docs portal OIDC",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [50],
+        "backchannel_providers_obj": [
+          {
+            "pk": 50,
+            "name": "Docs portal SCIM",
+            "component": "ak-provider-scim-form",
+            "verbose_name": "SCIM Provider",
+            "verbose_name_plural": "SCIM Providers",
+            "meta_model_name": "authentik_providers_scim.scimprovider"
+          }
+        ],
+        "launch_url": "https://docs.example.com/",
+        "meta_launch_url": "",
+        "open_in_new_tab": true,
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000003",
+        "name": "Secrets vault",
+        "slug": "vault",
+        "group": "",
+        "provider": null,
+        "provider_obj": null,
+        "backchannel_providers": [30],
+        "backchannel_providers_obj": [
+          {
+            "pk": 30,
+            "name": "Directory LDAP",
+            "component": "ak-provider-ldap-form",
+            "verbose_name": "LDAP Provider",
+            "verbose_name_plural": "LDAP Providers",
+            "meta_model_name": "authentik_providers_ldap.ldapprovider"
+          }
+        ],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000004",
+        "name": "Orphaned app",
+        "slug": "orphan-ui",
+        "group": "",
+        "provider": 11,
+        "provider_obj": {
+          "pk": 11,
+          "name": "Orphaned proxy",
+          "component": "ak-provider-proxy-form",
+          "verbose_name": "Proxy Provider",
+          "verbose_name_plural": "Proxy Providers",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": "https://orphan.example.com/",
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000005",
+        "name": "Reports",
+        "slug": "reports",
+        "group": "Business",
+        "provider": 40,
+        "provider_obj": {
+          "pk": 40,
+          "name": "Reports SAML",
+          "component": "ak-provider-saml-form",
+          "verbose_name": "SAML Provider",
+          "verbose_name_plural": "SAML Providers",
+          "meta_model_name": "authentik_providers_saml.samlprovider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": "https://reports.example.com/sso/login",
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000006",
+        "name": "Paired app",
+        "slug": "pair",
+        "group": "",
+        "provider": null,
+        "provider_obj": null,
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000008",
+        "name": "Domain-wide app",
+        "slug": "broad-app",
+        "group": "",
+        "provider": 12,
+        "provider_obj": {
+          "pk": 12,
+          "name": "Domain-wide proxy",
+          "component": "ak-provider-proxy-form",
+          "verbose_name": "Proxy Provider",
+          "verbose_name_plural": "Proxy Providers",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      }
+    ],
+    [
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000007",
+        "name": "Metrics dashboard",
+        "slug": "metrics-dash",
+        "group": "Operations",
+        "provider": 21,
+        "provider_obj": {
+          "pk": 21,
+          "name": "Metrics OIDC",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      }
+    ]
+  ],
+
+  "providers/proxy": [
+    [
+      {
+        "pk": 10,
+        "name": "Team wiki proxy",
+        "component": "ak-provider-proxy-form",
+        "verbose_name": "Proxy Provider",
+        "verbose_name_plural": "Proxy Providers",
+        "meta_model_name": "authentik_providers_proxy.proxyprovider",
+        "external_host": "https://wiki-legacy.example.com",
+        "internal_host": "http://wiki:3000",
+        "internal_host_ssl_validation": true,
+        "mode": "forward_single",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      },
+      {
+        "pk": 11,
+        "name": "Orphaned proxy",
+        "component": "ak-provider-proxy-form",
+        "verbose_name": "Proxy Provider",
+        "verbose_name_plural": "Proxy Providers",
+        "meta_model_name": "authentik_providers_proxy.proxyprovider",
+        "external_host": "https://orphan.example.com",
+        "internal_host": "http://orphan:8080",
+        "internal_host_ssl_validation": true,
+        "mode": "proxy",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      },
+      {
+        "pk": 12,
+        "name": "Domain-wide proxy",
+        "component": "ak-provider-proxy-form",
+        "verbose_name": "Proxy Provider",
+        "verbose_name_plural": "Proxy Providers",
+        "meta_model_name": "authentik_providers_proxy.proxyprovider",
+        "external_host": "https://sso.example.com",
+        "internal_host": "http://legacy.example.internal:8080",
+        "internal_host_ssl_validation": true,
+        "mode": "forward_domain",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      }
+    ]
+  ],
+
+  "providers/oauth2": [
+    [
+      {
+        "pk": 20,
+        "name": "Docs portal OIDC",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "docs-portal",
+        "client_type": "confidential",
+        "redirect_uris": [
+          { "matching_mode": "strict", "url": "https://docs.example.com/auth/oidc/callback" }
+        ],
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 21,
+        "name": "Metrics OIDC",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "metrics-dash",
+        "client_type": "confidential",
+        "redirect_uris": "https://metrics.example.com/oauth2/callback\nhttps://metrics.example.com/logout",
+        "sub_mode": "hashed_user_id"
+      }
+    ]
+  ],
+
+  "outposts/instances": [
+    [
+      {
+        "pk": "3f7d1c50-0002-4000-8000-000000000001",
+        "name": "authentik Embedded Outpost",
+        "type": "proxy",
+        "providers": [10, 12],
+        "service_connection": null
+      },
+      {
+        "pk": "3f7d1c50-0002-4000-8000-000000000002",
+        "name": "LDAP outpost",
+        "type": "ldap",
+        "providers": [30],
+        "service_connection": "b0a1c2d3-0003-4000-8000-000000000001"
+      }
+    ]
+  ]
+}

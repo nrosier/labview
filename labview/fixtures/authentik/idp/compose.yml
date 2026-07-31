@@ -1,0 +1,90 @@
+# Authentik itself: the instance whose API this fixture root exercises.
+#
+# Endpoint discovery has to arrive at `http://authentik-server:9000` from nothing
+# but what is written here — the image identifies the software, `container_name`
+# gives the DNS name a sibling container would use, and the *target* side of the
+# port mapping is what that name answers on. The published host port and the public
+# hostname are deliberately different numbers/names from the internal address, so a
+# discovery that reached for either would not match the stub API's origin.
+#
+# The worker is a second Authentik-imaged service with no HTTP listener at all. It
+# is a candidate too, and it must simply not resolve to anything.
+services:
+  server:
+    image: ghcr.io/goauthentik/server:2024.10.1
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    depends_on:
+      - postgresql
+      - redis
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+    ports:
+      - "9443:9000"
+    networks:
+      - default
+      - proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.authentik.rule: "Host(`sso.example.com`)"
+      traefik.http.routers.authentik.entrypoints: "websecure"
+      traefik.http.routers.authentik.tls: "true"
+      traefik.http.services.authentik.loadbalancer.server.port: "9000"
+      # The forward-auth middleware other stacks reference as `authentik@docker`.
+      # It resolves to a definition, so a service referencing it is `observed` —
+      # which is what makes the API's `confirmed` account worth comparing against.
+      traefik.http.middlewares.authentik.forwardauth.address: "http://authentik-outpost:9000/outpost.goauthentik.io/auth/traefik"
+      traefik.http.middlewares.authentik.forwardauth.trustForwardHeader: "true"
+      dockflare.enable: "true"
+      dockflare.hostname: "sso.example.com"
+      dockflare.service: "http://authentik-server:9000"
+
+  worker:
+    image: ghcr.io/goauthentik/server:2024.10.1
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      - postgresql
+      - redis
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+    networks:
+      - default
+
+  postgresql:
+    image: postgres:16-alpine
+    container_name: authentik-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASS}
+      POSTGRES_DB: authentik
+    volumes:
+      - database:/var/lib/postgresql/data
+    networks:
+      - default
+
+  redis:
+    image: redis:7-alpine
+    container_name: authentik-redis
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+    networks:
+      - default
+
+volumes:
+  database:
+  redis:
+
+networks:
+  proxy:
+    external: true

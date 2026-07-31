@@ -38,7 +38,8 @@ It targets a specific, common TrueNAS Scale pattern:
   (routers, rules, entrypoints, TLS, middlewares).
 - **SSO** through **Authentik** — as a Traefik forward-auth middleware
   (`authentik@docker`), or via OAuth/OIDC or LDAP wired through a service's
-  environment.
+  environment. Optionally **read back from the Authentik API** with a read-only
+  token, which turns inference into the provider's own account of each gate.
 
 ---
 
@@ -51,8 +52,9 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
 | **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
 | **Ingress classification** | Every service resolves to `public`, `public+host-port`, `public+local`, `local`, `host-port`, or `internal`. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
-| **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `observed` in the config or only `inferred` from a name. |
-| **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. |
+| **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` by the provider's API, `observed` in the config, or only `inferred` from a name. |
+| **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts, matches each application to a service by the provider's internal host, a shared hostname or the slug, and reports what Authentik says. This finds gates configured only in Authentik — and, more usefully, the reverse: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
+| **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
 | **Light / dark** | Follows the OS, with a manual toggle. Colorblind-safe palette validated in both modes. |
 
@@ -62,9 +64,10 @@ It targets a specific, common TrueNAS Scale pattern:
 
 ```text
 labview/              the application (see labview/README.md for full docs)
-  src/                scanner, label parsers, analyzer, docker enrichment, server
+  src/                scanner, label parsers, analyzer, docker + authentik enrichment, server
   web/                preact UI
-  fixtures/           apps/ (happy path) + edge/ (regression cases)
+  fixtures/           apps/ (happy path), edge/ (regression cases),
+                      authentik/ + authentik-api.json (identity provider integration)
   scripts/smoke.ts    end-to-end pipeline assertions
   compose.yml         deployment example
   Dockerfile          two-stage node:22-alpine build, runs as non-root
@@ -153,11 +156,13 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
+| `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a **read-only** Authentik API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested |
+| `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Authentik base URL, e.g. `http://authentik-server:9000`. Only needed when Authentik is outside `appsRoot` |
 
 The full table — including `LABVIEW_HOST`, `LABVIEW_DOCKER_PORT`,
-`LABVIEW_DOCKER_MAX_CONCURRENCY` and `LABVIEW_CONFIG` — plus the secret patterns,
-label prefixes and Authentik hints, is documented in
-[labview/README.md](labview/README.md#configuration).
+`LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_CONFIG` and the rest of the
+`LABVIEW_AUTHENTIK_*` set — plus the secret patterns, label prefixes and Authentik
+hints, is documented in [labview/README.md](labview/README.md#configuration).
 
 ---
 
@@ -165,9 +170,10 @@ label prefixes and Authentik hints, is documented in
 
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
-      → build middleware registry → classify ingress → discover Authentik
-      → resolve tunnel origins → derive auth posture → build graph
-      → serve /api/overview
+      → build middleware registry → classify ingress → read the Authentik API
+      → discover Authentik hostnames → resolve tunnel origins
+      → match Authentik applications to services → derive auth posture
+      → build graph → serve /api/overview
 ```
 
 Compose parsing handles both label/env syntaxes (list `- k=v` and map `k: v`),
@@ -195,6 +201,17 @@ services declaring one port is broken by network membership — a candidate shar
 no network with the service it supposedly fronts cannot forward to it. When that
 proves a hop, the graph draws `tunnel → proxy → service`. When nothing proves one,
 the direct edge stays and the service says why the hop is unknown.
+
+There is one thing compose files genuinely cannot tell you: whether a gate defined
+in Authentik is actually standing in the request path. Give LabView a read-only
+Authentik token and it asks. Each application is matched to a service only on
+addressed evidence — a proxy provider's internal host resolving to that service, a
+launch or redirect URL naming a hostname the service serves, or a slug pointing at
+exactly one service — and anything ambiguous is reported as unmatched rather than
+guessed. Then the provider's account replaces the inference: `confirmed` instead of
+`observed`, the provider named, and a proxy or LDAP provider with no outpost
+assigned reported as protecting nothing, because nothing is in the path to enforce
+it. Without a token this stage does not run and no request is made.
 
 See [labview/README.md](labview/README.md#how-it-works) for the details, and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the design rules behind them.
@@ -237,6 +254,15 @@ output is sensitive.
   answers on the LAN regardless of what the Traefik labels say. When a proxy *is*
   in front, the service keeps its kind and gains a note that the published port
   bypasses the proxy and its SSO.
+- **The Authentik token is optional, read-only, and never speculatively sent.**
+  LabView issues GETs only, so the token needs `view_application`,
+  `view_provider` and `view_outpost` on a service account with no groups. When the
+  endpoint is discovered rather than configured, each candidate is first probed on
+  an endpoint that needs no authentication, and the token is sent only to one that
+  answers as an Authentik API — a guessed host never receives it. Prefer
+  `LABVIEW_AUTHENTIK_TOKEN_FILE` over the env var, which is readable by anyone who
+  can run `docker inspect`. There is no flag to skip TLS verification; use
+  `NODE_EXTRA_CA_CERTS` for a private CA.
 - **No built-in authentication.** LabView exposes your topology and (masked)
   config, so **do not publish it raw.** Put it behind your own edge — the compose
   example includes ready-to-adapt Traefik + Authentik forward-auth labels, and it

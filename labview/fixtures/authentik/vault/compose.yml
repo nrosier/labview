@@ -1,0 +1,33 @@
+# Matched by slug, and gated by a backchannel LDAP provider.
+#
+# The weakest of the three match rules and therefore the last one tried: an
+# operator-chosen slug on one side against an operator-chosen directory, service and
+# container name on the other. It is only accepted when it points at exactly one
+# service, which a single-service stack does.
+#
+# The provider matters as much as the match. LDAP providers are attached to an
+# application as *backchannel* providers, so a client that read only the primary
+# `provider` field would report this service as having no gate at all. The LDAP
+# outpost in the stub's outpost list is what makes it enforced.
+services:
+  vault:
+    image: example/vault:1.15.2
+    container_name: vault-app
+    restart: unless-stopped
+    environment:
+      # The env-derived LDAP signal. It resolves to Authentik because the outpost's
+      # container name was discovered from the fleet, and it agrees with the API's
+      # record — which must remain the account that is reported.
+      LDAP_HOST: ldap://authentik-outpost:389
+      LDAP_BIND_DN: cn=service,ou=users,dc=ldap,dc=goauthentik,dc=io
+      LDAP_BIND_PASSWORD: ${LDAP_PASSWORD}
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=vault.example.com"
+      - "dockflare.service=http://vault:8200"
+
+networks:
+  proxy:
+    external: true

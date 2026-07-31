@@ -1,0 +1,23 @@
+{
+  // scripts/ is run through tsx, which strips types without checking them — so a
+  // stale property name in a smoke assertion would read `undefined` at runtime
+  // instead of failing to build, and an assertion on `undefined` can pass while
+  // proving nothing. This config exists to typecheck the test harness itself.
+  //
+  // Separate from tsconfig.json because that one sets `rootDir: src` for emit;
+  // here nothing is emitted, so the two roots can sit side by side.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["scripts/**/*.ts", "src/**/*.ts"]
+}

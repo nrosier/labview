@@ -1,4 +1,4 @@
-import type { AppStack, OriginTarget, Service } from "../model";
+import type { AppStack, AuthentikProviderKind, OriginTarget, Service } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { buildServiceMermaid } from "../lib/mermaidDef";
 import { AuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
@@ -29,6 +29,16 @@ function originLabel(o: OriginTarget): string {
     default:
       return "hop unresolved";
   }
+}
+
+/**
+ * Whether an empty outpost list is worth flagging for this provider kind. OAuth2 and
+ * SAML are served by the Authentik server itself, and SCIM provisions outbound rather
+ * than gating anything, so "no outpost" is only a finding for the three kinds an
+ * outpost actually enforces.
+ */
+function needsOutpost(kind: AuthentikProviderKind): boolean {
+  return kind === "proxy" || kind === "ldap" || kind === "radius";
 }
 
 function originEvidence(svc: Service): string[] {
@@ -233,6 +243,14 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                     inferred from name
                   </span>
                 )}
+                {/* The other direction: the identity provider's own API reported this
+                    gate, so it states what will be enforced rather than what the
+                    labels asked for. */}
+                {svc.auth.confidence === "confirmed" && (
+                  <span class="pill" title="Reported by the Authentik API, not derived from labels">
+                    confirmed by provider
+                  </span>
+                )}
               </dd>
               <dt>Detail</dt>
               <dd>{svc.auth.detail}</dd>
@@ -245,6 +263,55 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               </ul>
             )}
           </Section>
+
+          {svc.authentik && svc.authentik.applications.length > 0 && (
+            <Section title="Identity provider — Authentik (from its API)">
+              {svc.authentik.applications.map((app) => (
+                <div style="margin-bottom:10px;">
+                  <div style="font-weight:600;">
+                    {app.name} <span class="mono masked">{app.slug}</span>
+                    {app.group && <span class="pill">{app.group}</span>}
+                  </div>
+                  <dl class="kv" style="grid-template-columns:120px 1fr;margin-top:4px;">
+                    {app.launchUrl && (
+                      <>
+                        <dt>Launch URL</dt>
+                        <dd class="mono">{app.launchUrl}</dd>
+                      </>
+                    )}
+                    {app.providers.map((p) => (
+                      <>
+                        <dt>{p.kind === "other" ? "Provider" : `${p.kind} provider`}</dt>
+                        <dd>
+                          {p.name}
+                          {p.mode && <span class="pill">{p.mode}</span>}
+                          {p.backchannel && <span class="pill">backchannel</span>}
+                          {/* An outpost is what puts a proxy, LDAP or RADIUS provider in
+                              the request path. None means the gate is configured but
+                              standing nowhere — which the notes above spell out. */}
+                          {p.outposts.length > 0 ? (
+                            p.outposts.map((o) => <span class="pill">outpost: {o}</span>)
+                          ) : needsOutpost(p.kind) ? (
+                            <span class="pill crit">no outpost</span>
+                          ) : null}
+                          {p.internalHost && <div class="mono masked">→ {p.internalHost}</div>}
+                        </dd>
+                      </>
+                    ))}
+                  </dl>
+                </div>
+              ))}
+              {/* Why each application was tied to this service, in the same voice as the
+                  auth and origin evidence: a match is a conclusion, not a given. */}
+              {svc.authentik.evidence.length > 0 && (
+                <ul class="evidence" style="margin-top:8px;">
+                  {svc.authentik.evidence.map((e) => (
+                    <li>{e}</li>
+                  ))}
+                </ul>
+              )}
+            </Section>
+          )}
 
           {svc.networks.length > 0 && (
             <Section title="Networks">

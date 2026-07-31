@@ -1,6 +1,6 @@
 import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import type { AppStack, IngressKind, Overview, Service } from "./model";
+import type { AppStack, AuthentikSummary, IngressKind, Overview, Service } from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
@@ -40,6 +40,25 @@ function flatten(ov: Overview): Flat[] {
   }
   out.sort((a, b) => a.stack.name.localeCompare(b.stack.name) || a.svc.name.localeCompare(b.svc.name));
   return out;
+}
+
+/**
+ * Tooltip for the Authentik status: the endpoint, how it was arrived at, and what was
+ * read. Applications the scan could not tie to a service are named because that gap
+ * is LabView's to explain — an unmatched application is a service it failed to
+ * identify, not a misconfiguration on the provider's side.
+ */
+function authentikTitle(ak: AuthentikSummary): string {
+  const bits = [
+    `${ak.endpoint ?? "unknown endpoint"} (${ak.endpointSource ?? "unknown"})`,
+    `${ak.applications} applications, ${ak.providers} providers, ${ak.outposts} outposts`,
+    `${ak.matchedServices} services matched`,
+  ];
+  if (ak.unmatchedApplications.length) {
+    bits.push(`not matched to any service: ${ak.unmatchedApplications.join(", ")}`);
+  }
+  if (ak.error) bits.push(ak.error);
+  return bits.join("\n");
 }
 
 function applyTheme(theme: Theme) {
@@ -218,6 +237,23 @@ function App() {
               <span title={ov.meta.dockerError ?? ""}>config-only</span>
             )}
           </span>
+          {/* Only shown once a token exists: an unconfigured optional integration is
+              not a status worth a permanent line in the header. */}
+          {ov.meta.authentik?.configured && (
+            <span>
+              authentik:{" "}
+              {ov.meta.authentik.reachable ? (
+                <span title={authentikTitle(ov.meta.authentik)}>
+                  {ov.meta.authentik.applications} app
+                  {ov.meta.authentik.applications === 1 ? "" : "s"}
+                  {ov.meta.authentik.matchedServices > 0 &&
+                    ` · ${ov.meta.authentik.matchedServices} matched`}
+                </span>
+              ) : (
+                <span title={ov.meta.authentik.error ?? ""}>unreachable</span>
+              )}
+            </span>
+          )}
         </div>
         <div class="spacer" />
         <button

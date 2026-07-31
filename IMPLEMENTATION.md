@@ -42,6 +42,7 @@ SSO provider. Each is listed with where it is satisfied.
 | **R3** | Read Cloudflare tunnel ingress configured by DockFlare labels | [dockflare.ts](labview/src/labels/dockflare.ts) — flat and indexed multi-route label forms, `enable` honoured |
 | **R4** | Read local ingress via Traefik labels, and cope with services that bypass it | [traefik.ts](labview/src/labels/traefik.ts) + `classifyIngress` in [analyze/index.ts](labview/src/analyze/index.ts) |
 | **R5** | Report SSO posture, whether wired as a reverse-proxy gate or as OAuth/OIDC/LDAP | [auth.ts](labview/src/labels/auth.ts) |
+| **R5b** | Optionally confirm that posture against the identity provider's own API, using a read-only credential the operator supplies | [enrich/authentik.ts](labview/src/enrich/authentik.ts) + [analyze/authentik.ts](labview/src/analyze/authentik.ts); §3.5 |
 | **R6** | Build the documentation dynamically, and use the Docker socket proxy for live state when available | [enrich/docker.ts](labview/src/enrich/docker.ts); every scan is fresh, nothing is persisted |
 | **R7** | Serve the documentation from a built-in webserver, itself exposable through the same tunnel/proxy/SSO chain | [server/server.ts](labview/src/server/server.ts), labelled example in `labview/compose.yml` |
 | **R8** | Be generic: the above is an *example* of a fleet, never a description of one | §4 I1–I3, enforced by the fixtures in §8 |
@@ -90,18 +91,23 @@ labview/
     analyze/
       middlewares.ts  cross-stack Traefik middleware registry
       origins.ts      cross-stack tunnel-origin resolution (what an origin points at)
+      authentik.ts    cross-stack matching of identity-provider applications to services
       networks.ts     real docker network names for a service (shared by graph + origins)
       index.ts        the pipeline; ingress classification; stats
       graph.ts        nodes/edges for the relationship graph
-    enrich/docker.ts  Docker Engine snapshot (never throws)
+    enrich/
+      docker.ts       Docker Engine snapshot (never throws)
+      authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
     server/server.ts  Fastify: /api/* + static UI, with a TTL cache
-  web/                Preact UI (see §3.7)
+  web/                Preact UI (see §3.8)
   scripts/
     build-web.mjs     esbuild bundle
     smoke.ts          pipeline assertions over the fixtures
   fixtures/
     apps/             a representative happy-path fleet
     edge/             one stack per previously-fixed defect
+    authentik/        a fleet with an identity provider in it
+    authentik-api.json  canned API responses driven through an injected fetch
 ```
 
 Repo root holds the README, LICENSE, CI workflows and this document. All code is
@@ -119,28 +125,42 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 3. Docker snapshot | `enrich/docker.ts` | `DockerSnapshot` keyed by `"project service"`, container name and short id |
 | 4. Middleware registry | `analyze/middlewares.ts` | every Traefik middleware *defined* anywhere, by bare name |
 | 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker`, `svc.ingress` |
-| 6. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
-| 7. Origin resolution | `analyze/origins.ts` | `route.origin` — what each tunnel origin points at, and notes where it could not be told |
-| 8. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
-| 9. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
-| 10. Stats | `computeStats` | `OverviewStats` for the dashboard header |
+| 6. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
+| 7. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
+| 8. Origin resolution | `analyze/origins.ts` | `route.origin` — what each tunnel origin points at, and notes where it could not be told |
+| 9. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
+| 10. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
+| 11. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
+| 12. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
-**Why two passes.** Steps 6–7 cannot run per-service inside step 5. Three
+**Why two passes.** Steps 6–9 cannot run per-service inside step 5. Four
 conclusions are only available once the *whole* fleet is parsed:
 
 1. A Traefik middleware referenced as `authentik@docker` is usually defined in a
    different stack than the service using it, so classifying the reference
    requires the global registry (step 4).
 2. Which hostnames represent the SSO provider is learned from whichever stack
-   *runs* the provider — so its routes must already be parsed (step 6 after 5).
+   *runs* the provider — so its routes must already be parsed (step 7 after 5).
 3. A tunnel origin routinely names a reverse proxy defined in a *different* stack,
    so resolving it needs a fleet-wide index of published host ports and DNS names
-   (step 7, after the routes exist and before the graph is drawn from them).
+   (step 8, after the routes exist and before the graph is drawn from them).
+4. An identity provider's application is matched against the fleet as a whole —
+   its provider's internal host, or a hostname declared by any service — so it
+   needs the same index (step 9, reusing step 8's).
 
-A change that needs fleet-wide knowledge belongs in a new pass or in step 4/6,
+A change that needs fleet-wide knowledge belongs in a new pass or in step 4/7,
 not in a per-service function reaching for global state.
 
-### 3.3 Provider discovery (step 6)
+**Where step 6 sits, and why.** A *configured* endpoint depends on nothing in the
+scan, so that request is started before the docker snapshot and awaited after,
+overlapping the two. A *discovered* endpoint cannot be found until pass 1 has
+parsed the routes, so it runs after. Either way the result is one value with the
+same shape, and an endpoint that answered the API becomes an input to step 7 —
+having answered as an Authentik API is stronger evidence of identity than any name
+match, and it is what attributes an OIDC issuer correctly when the provider runs
+outside the scanned root.
+
+### 3.3 Provider discovery (step 7)
 
 `discoverAuthentikHints` walks the parsed fleet for a service that is
 identifiably Authentik — its image mentions `authentik`, or one of its labels
@@ -159,7 +179,7 @@ Two properties matter and must be preserved:
   verbatim would make every `OIDC_ISSUER=https://server.example.com` look like
   Authentik.
 
-### 3.4 Tunnel origin resolution (step 7)
+### 3.4 Tunnel origin resolution (step 8)
 
 A tunnel rarely terminates at the container whose labels declare it. The origin
 (`dockflare.service`) normally names a reverse proxy, which forwards to the
@@ -195,7 +215,80 @@ Two rules keep this honest, and both have fixtures:
 No image, vendor or naming convention is consulted anywhere in the module — the
 proxy is identified structurally, by what it publishes and what it can reach.
 
-### 3.5 The data contract
+### 3.5 The identity provider API (steps 6 and 9)
+
+Compose files show a gate being *wired up*. They cannot show a gate that exists
+only in the identity provider, and — more importantly — they cannot distinguish an
+application that has a provider from one whose provider **nothing is serving**.
+Given a read-only token, LabView asks the provider directly.
+
+Two modules, deliberately split along the I/O boundary:
+
+- [enrich/authentik.ts](labview/src/enrich/authentik.ts) — all network access, no
+  knowledge of the fleet. Locates a candidate endpoint, authenticates, reads
+  `core/applications/`, `providers/proxy/`, `providers/oauth2/` and
+  `outposts/instances/`, and returns an `AuthentikSnapshot`. Mirrors
+  `enrich/docker.ts`: it never throws, and a failure becomes a reason string.
+- [analyze/authentik.ts](labview/src/analyze/authentik.ts) — no network access.
+  Matches applications onto services using the fleet index built for step 8.
+
+**Endpoint selection.** A configured `authentik.url` is used verbatim. Otherwise
+candidates are collected from services whose image identifies Authentik, ordered
+**internal addresses before public hostnames** so the exchange stays on the
+container network, and capped. Each is probed on `/api/v3/root/config/`, which
+upstream declares `AllowAny`; only a candidate that answers with a JSON object
+receives the token. This ordering is a security property, not an optimisation: a
+discovered endpoint is a guess, and a guess must never be handed a credential. On
+a candidate that *did* answer, a 401/403 is conclusive — the token is wrong, so
+later candidates are not tried and nothing further is sent.
+
+**Matching (step 9).** An application is tied to a service only by something
+addressed, in descending order of strength:
+
+1. A proxy provider's `internal_host` resolved through the same `lookupAddress`
+   used for tunnel origins — the provider naming its own target.
+2. A URL the application publishes (launch URL, or an OAuth2 redirect URI) whose
+   hostname is one the service declares in a DockFlare or Traefik label.
+3. The application slug, when it equals exactly one service's stack, compose or
+   container name.
+
+Each rule requires **exactly one** candidate; an ambiguous match is discarded and
+the application reported as unmatched. Three details are easy to get wrong and all
+have fixtures:
+
+- `meta_launch_url` may contain `%(username)s` and similar placeholders. A
+  per-user template is not a hostname anyone serves, so it is not matched on.
+- `external_host` is matched **except** in `forward_domain` mode, where it is the
+  authentication domain shared by every application in that domain — typically the
+  provider's own hostname. Matching it there attaches unrelated gates to whichever
+  service serves the SSO domain.
+- One service naming one hostname in both DockFlare *and* Traefik labels is the
+  normal case, not two rival candidates. The hostname index dedupes by service key;
+  without that, the commonest configuration in a fleet is unmatchable.
+
+**What a provider means.** Reading a provider is not the same as finding a gate:
+
+| Provider | Enforced by | Gate exists when |
+|---|---|---|
+| proxy, ldap, radius | an **outpost** in the request path | ≥ 1 outpost lists it |
+| oauth2, saml | the Authentik server itself | always |
+| scim | nothing — it provisions users outbound | never |
+
+A proxy provider assigned to no outpost is reported as protecting nothing, with
+that as the stated reason. This is the single most valuable output of the
+integration: in the admin UI such an application looks complete.
+
+LDAP and SCIM are **backchannel** providers, so `backchannel_providers_obj` must be
+read as well as `provider_obj` — reading only the latter misses every LDAP gate.
+
+**Where the results go.** `svc.authentik` carries the matched applications for the
+drawer. `labels/auth.ts` merges the API's account with the label-derived one by
+confidence rank (`confirmed` > `observed` > `inferred`), keeping the loser as
+evidence rather than discarding it. And `meta.authentik` reports the summary —
+endpoint, whether it came from config or discovery, counts, matched services,
+unmatched applications, and any error.
+
+### 3.6 The data contract
 
 [model/types.ts](labview/src/model/types.ts) is the single contract between
 backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
@@ -207,7 +300,7 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   change**: the palette in `web/lib/palette.ts` maps every member to a colour and
   a label, and an unmapped member silently renders grey. See §10.
 
-### 3.6 Serving
+### 3.7 Serving
 
 Fastify with three routes and a static mount:
 
@@ -223,7 +316,7 @@ traffic cannot start N scans. The cache is warmed in the background at startup s
 the first page load is instant. If `web/dist` is absent the server still runs and
 says how to build it — the API is the primary product, the UI is a view of it.
 
-### 3.7 Frontend
+### 3.8 Frontend
 
 Preact + esbuild, bundled to a single `web/dist/app.js` with mermaid and cytoscape
 inlined; `web/index.html` and `web/styles.css` are copied verbatim. There is no
@@ -293,6 +386,12 @@ So each family has a generic member alongside the attributed one:
 | OAuth / OIDC | `authentik-oauth` | `other-oauth` |
 | LDAP | `authentik-ldap` | `ldap` |
 
+The provider's own API is the one source that settles both questions at once, which
+is why an API-confirmed detection outranks every label-derived one. It does **not**
+license a new attributed method for every provider type Authentik has: a gate the
+model cannot name is reported as `none` *and* excluded from exposed-without-auth,
+with the provider quoted as evidence (see the SAML row in §12).
+
 Corollaries that are easy to break:
 
 - **The address outranks the name.** A middleware called `authentik` that points
@@ -319,6 +418,11 @@ object they belong to and the pipeline continues:
 - Docker unreachable → `snapshotDocker` returns `available: false` with the
   reason; it never throws, and the scan proceeds config-only.
 - A single container `inspect` failing → that container is skipped, not the scan.
+- Identity provider unreachable, token rejected, request timed out, response
+  malformed → `snapshotAuthentik` returns `reachable: false` with the reason in
+  `meta.authentik.error`; the scan proceeds on label-derived evidence. A *partial*
+  read keeps what arrived and records the rest as an error, so one failing endpoint
+  does not discard three good ones.
 
 ### I5 — Read-only, least privilege
 
@@ -329,6 +433,17 @@ endpoint, and needs no privileged access:
 - Docker access goes through a socket proxy with only read endpoints enabled
   (`CONTAINERS`, `NETWORKS`, `VOLUMES`, `IMAGES`, `INFO`, `PING`). Only `ping`,
   `listContainers` and `inspect` are ever called.
+- The identity provider API is read with `GET` only, so the documented token is a
+  groupless service account with `view_application`, `view_provider` and
+  `view_outpost`. A change that needs a write scope, or a scope beyond those three,
+  is a change to this invariant and needs the operator's consent, not a wider
+  token.
+- **A credential is never sent to an unverified endpoint.** A discovered endpoint
+  is probed on an unauthenticated route first and gets the token only if it
+  answered as the expected API. There is deliberately no TLS-verification bypass
+  flag: `NODE_EXTRA_CA_CERTS` covers a private CA without teaching the tool to
+  trust anything that answers. `tokenFile` exists so the value need not sit in the
+  environment where `docker inspect` reveals it.
 - The image runs as `USER node`.
 - Its own compose example publishes **no `ports:`** — see §7.
 
@@ -429,9 +544,33 @@ click target); the role only lets the UI colour it as infrastructure. Nothing el
 reads it, and no service is ever *declared* a proxy — the role is a consequence of
 having been resolved as a hop at least once.
 
-**AuthMethod / AuthConfidence** — see §4 I3. `confidence: "inferred"` means the
-method rests on a middleware *name* because no definition was found in any scanned
-stack; it also produces a service note saying so.
+**AuthMethod / AuthConfidence** — see §4 I3. Three levels, strongest first:
+`confirmed` means the identity provider's API reported the gate; `observed` means a
+value in the scanned config states it; `inferred` means the method rests on a
+middleware *name* because no definition was found in any scanned stack, and it also
+produces a service note saying so. When two accounts of one service disagree, the
+higher rank is reported and the lower is kept in `evidence`.
+
+**AuthentikMatch / AuthentikApplication / AuthentikProvider** — what the provider's
+API said about a service, attached as `svc.authentik` (§3.5). `evidence` records
+*why* the application was tied to this service, so a wrong match is visible rather
+than silent. A provider carries `kind` (normalized), `rawKind` (Authentik's own
+`verbose_name`, so an unmodelled provider type is still readable), `backchannel`,
+and `outposts` — the names of the outposts serving it, empty when none is.
+
+**Enforcement vs existence** — a provider existing is not a gate existing.
+`providerEnforces` decides: proxy/ldap/radius need at least one outpost, oauth2 and
+saml are served by the Authentik server, scim gates nothing at all. An application
+whose only provider enforces nothing leaves the service reported as unprotected,
+with the reason on the service. `hasEnforcedAuthentikGate` is the separate question
+of whether *any* enforced gate was confirmed, and it is what keeps a protected
+service out of `exposedWithoutAuth` even when its provider type has no
+`AuthMethod`.
+
+**Unmatched application** — an application the matcher could not tie to exactly one
+service. Reported in `meta.authentik.unmatchedApplications` by slug. Ambiguity is
+reported, never arbitrated: picking a candidate by iteration order would move a
+service between "protected" and "exposed" on a coin toss.
 
 **`detail` vs `evidence` vs `notes`** — `detail` is the prose summary of the
 primary detection plus any secondary ones; `evidence` is the flat list of raw
@@ -440,8 +579,9 @@ signals (`middleware x`, `env OIDC_ISSUER`, `forwardauth -> …`,
 warnings for a human (bypasses, refusals, unresolved references, inferences).
 
 **`exposedWithoutAuth`** — `ingress !== "internal"` and no auth detected (proxy
-gate, OIDC/LDAP, basic-auth, or a Cloudflare Access policy). Note this counts a
-`host-port`-only service as exposed, because it is.
+gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an API-confirmed
+enforced gate). Note this counts a `host-port`-only service as exposed, because it
+is.
 
 **Middleware registry** — every `traefik.http.middlewares.<name>.<type>` label
 found in *any* stack, keyed by bare name (references carry a `@docker` /`@file`
@@ -477,12 +617,22 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_MASK_SECRETS` | `secrets.maskValues` | leave on |
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
+| `LABVIEW_AUTHENTIK_TOKEN_FILE` | `authentik.tokenFile` | preferred over the token env var, which `docker inspect` exposes. Wins over `authentik.token` |
+| `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | with neither set, step 6 makes no request at all |
+| `LABVIEW_AUTHENTIK_URL` | `authentik.url` | skips discovery entirely; needed only when the provider is outside `appsRoot` |
+| `LABVIEW_AUTHENTIK_ENABLED` | `authentik.enabled` | `false` = never contact the provider |
+| `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `authentik.timeoutMs` | per request; `authentik.maxPages` bounds pagination and is file-only |
 
 **Docker endpoint resolution order:** explicit socket → configured/env TCP host →
 default socket path. The default is the conventional local socket, the one
 endpoint that requires no assumption about the operator's container names; a
 socket proxy is opted into. Neither the Dockerfile nor `config.ts` may ship a
 default TCP hostname (I2) — `compose.yml` sets it, as an example.
+
+**Authentik endpoint resolution order:** configured `url` → discovered internal
+container addresses → discovered public hostnames. `authentik.url` ships empty for
+the same reason: an address is a fact about the operator's fleet, so it is
+discovered or supplied, never defaulted.
 
 ---
 
@@ -509,17 +659,28 @@ exposure via key patterns and URI credentials (I6); privileged Docker access
 (socket proxy, read-only endpoints, `USER node`); denial by malformed input (I4);
 scan stampede (in-flight coalescing).
 
+**The one outbound call, and its rules.** Reading the identity provider's API is
+the only case where LabView initiates a connection with a credential, so it carries
+its own constraints (I5): `GET` only; a read-only groupless service account; a
+discovered endpoint probed unauthenticated before the token is sent; no
+TLS-verification bypass; `tokenFile` so the value need not sit in the environment.
+The whole stage is opt-in — with no token configured, no request is made.
+
 **Deliberate non-goals:** no authentication, authorization or rate limiting in
 LabView itself; no TLS termination (the proxy does it); no persistence, so
-nothing to leak at rest; no writes of any kind; no outbound network calls.
+nothing to leak at rest; no writes of any kind; no outbound network calls beyond
+the opt-in identity provider read above.
 
 ---
 
 ## 8. Testing contract
 
-`npm run smoke` runs the entire pipeline against two fixture roots with Docker
+`npm run smoke` runs the entire pipeline against three fixture roots with Docker
 disabled and asserts on the resulting `Overview`. It exits non-zero on any
-failure and gates CI.
+failure and gates CI. `npm run typecheck` covers `scripts/` too
+(`tsconfig.scripts.json`): `tsx` strips types without checking them, so an
+assertion reading a renamed field would silently read `undefined` — and an
+assertion on `undefined` can pass while proving nothing.
 
 **`fixtures/apps`** — a representative happy-path fleet: a tunnel + proxy service,
 a proxy-bypassing service, cross-stack middleware resolution, LDAP and OIDC
@@ -559,11 +720,40 @@ Two caveats worth knowing when writing these:
   *class* of bug returns (both reverted), which is the strongest true statement
   available.
 
-`fixtures/outside-root.env` sits outside both roots on purpose: it is the target
-of the `env_file` escape attempt that must be refused.
+**`fixtures/authentik`** — a fleet with an identity provider in it, driven against
+canned API responses in `fixtures/authentik-api.json` through `BuildDeps.fetchImpl`.
+No network, no Authentik, and the same revert-proof contract as `edge`. Each stack
+isolates one rule so an assertion cannot pass by accident through another path:
+
+| Stack | Pins |
+|---|---|
+| `idp` | the provider itself: discovery must use the **target** port of `9443:9000`, not the published one, since the stub answers only on 9000 |
+| `authentik-outpost` | a candidate that looks like Authentik by image but serves no API. Sorts before `idp`, so it is probed first and must be *skipped* — and must never receive the token |
+| `wiki` | rule 1 (provider `internal_host`), a per-user `meta_launch_url` that must not be matched on, `confirmed` outranking the label-derived `observed`, and the tunnel-bypasses-the-outpost note |
+| `docs` | rule 2 on a hostname declared in **both** DockFlare and Traefik labels (the dedupe); object-form `redirect_uris`; a backchannel SCIM provider listed but not treated as a gate |
+| `metrics` | rule 2 via a redirect URI in the newline-delimited-string form, from page 2 of the paginated response |
+| `vault` | rule 3 (slug), and a backchannel LDAP provider found with its outpost |
+| `pair` | a slug naming a two-service stack: unmatched, not arbitrated |
+| `orphan` | a proxy provider **no outpost serves** — matched, reported unprotected, reason on the service, and no bypass note for a gate that stands nowhere |
+| `reports` | a SAML gate: `method: "none"` yet **not** exposed-without-auth, provider quoted verbatim |
+| (api payload) | `broad-app`, whose only URL is a `forward_domain` `external_host` equal to the provider's own hostname — must stay unmatched rather than attach to `idp` |
+
+Four runs over that root assert the behaviours that are not about one stack:
+discovery + token; a configured URL (nothing else is probed); no token (zero
+requests, no error); and a throwing `fetchImpl` (reported, not raised, fleet still
+analyzed). The exposed-without-auth count is asserted **with and without** the API
+in the same run, so the integration's contribution is measured rather than assumed —
+that pair is what fails if any match rule regresses.
+
+`fixtures/outside-root.env` sits outside all three roots on purpose: it is the
+target of the `env_file` escape attempt that must be refused.
+`fixtures/authentik-api.json` sits beside the roots rather than inside one so the
+scanned tree stays purely compose stacks.
 
 Fixtures are also subject to I2 — they use `example.com` and RFC-1918 addresses,
-never anything from a real fleet.
+never anything from a real fleet. The stub's token is an arbitrary string it demands
+verbatim, and smoke deletes every `LABVIEW_AUTHENTIK_*` variable at startup so an
+operator's real credentials can neither reach the network nor change a result.
 
 ---
 
@@ -642,6 +832,23 @@ precedence and confidence stay in one place.
 **Change how auth is detected.** Re-read §4 I3 first, then add a fixture that
 fails before your change and passes after.
 
+**Read another endpoint from the identity provider API.** Add the fetch in
+`enrich/authentik.ts` — inside the existing `Promise.all`, and returning a soft
+error rather than throwing (I4). Extend the model in `enrich/authentik.ts`'s
+`buildApplications`, not at the call site, so `analyze/authentik.ts` stays free of
+API shapes. Add a page to `fixtures/authentik-api.json` and assert on it; if the new
+data can change whether a service counts as protected, assert the exposure count
+both with and without the API. Anything requiring a permission beyond
+`view_application` / `view_provider` / `view_outpost` is a change to I5 — say so
+explicitly and update the token guidance in `config.example.yml` and both READMEs.
+
+**Add a matching rule for applications.** Put it in `matchOne` in
+`analyze/authentik.ts`, in descending order of strength, and require **exactly one**
+candidate. Before adding one, ask what it would do to a fleet where two services
+plausibly satisfy it — if the answer is "pick one", the rule does not belong. Give
+it a fixture whose other rules cannot fire, so the assertion tests the new rule
+rather than an existing one.
+
 ---
 
 ## 11. Known limitations
@@ -661,7 +868,18 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
 - **`env_file` values are not interpolated**, matching Docker's own behaviour.
 - **Auth posture describes configuration, not enforcement.** A middleware
   reference proves it was configured; whether Traefik is actually running with
-  that config is outside what a file scan can know.
+  that config is outside what a file scan can know. The identity provider API
+  narrows this — an outpost assignment is enforcement rather than intent — but it
+  is still configuration, not an observed challenge.
+- **Only applications, providers and outposts are read from the identity
+  provider.** Policy bindings are not, so an application whose access policy denies
+  everyone reads as protected (it is), and a flow customization that weakens a gate
+  is invisible. Provider types beyond proxy/oauth2 are read from the application's
+  embedded `provider_obj` only, so their type-specific fields (a SAML ACS URL, for
+  instance) are not available for matching.
+- **An unmatchable application is reported, not resolved.** On a fleet whose
+  hostnames live only in the identity provider and never in a compose label, expect
+  several unmatched. The fix is a matching label or slug, not a looser rule.
 - **No history.** Every scan is a snapshot; nothing is persisted, so there is no
   drift detection or change log.
 - **The Docker snapshot lists all containers**, including ones with no compose
@@ -699,3 +917,14 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Single self-contained JS bundle, no CDN | An air-gapped or egress-filtered homelab must still render the UI. |
 | Stack cards that expand, with service-level filters | The stack is the unit an operator deploys and thinks in; a flat service grid scattered a stack's parts alphabetically. But exposure and auth are per-service, so the filter predicate stays per-service and the grouping is applied to its results. |
 | Fastify + `@fastify/static` over a hand-rolled server | Correct static handling, SPA fallback and structured logging without writing any of it. |
+| The identity provider API is opt-in and read-only | It answers the one question compose files cannot: whether a configured gate is actually being enforced. But it needs a credential, so it stays off until the operator supplies one, and it never needs more than three `view_*` permissions because it only ever issues `GET`s. |
+| A discovered endpoint is probed unauthenticated before the token is sent | A discovered address is a guess. `/api/v3/root/config/` is `AllowAny` upstream, so identity can be established without spending the credential — and a wrong guess (or a host that has taken over the name) never receives one. |
+| Internal container addresses are tried before public hostnames | The public hostname routes back out through the tunnel and the proxy, so it works but traverses the whole edge — and on a fleet where the provider fronts itself, that means authenticating to read the API. The container address is the same instance, one hop away. |
+| No flag to skip TLS verification | A bearer token sent to an unverified endpoint is a token given away, and such flags are set once "to get it working" and never unset. `NODE_EXTRA_CA_CERTS` covers a private CA; plain HTTP over the container network avoids the question. |
+| Provider→application is joined via the application's embedded `provider_obj` | `providers/proxy/` carries no `assigned_application` field, so walking from providers to applications would require guessing. The application already embeds its provider, so the join direction that exists in the data is the one used. |
+| An application matching two services matches neither | Arbitrating by iteration order would move a service between "protected" and "exposed" on a coin toss, and the result would look identical to a real finding. An unmatched application is a visible gap the operator can close with a label. |
+| A provider with no outpost protects nothing | Proxy, LDAP and RADIUS providers are enforced by an outpost in the request path. With none assigned, nothing is in any path. This is the integration's most valuable output precisely because the admin UI shows such an application as complete. |
+| SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. Revisit if the palette gains a colour. |
+| `forward_domain` external hosts are not matched on | In that mode `external_host` is the authentication domain shared by every application in it, usually the provider's own hostname. Matching it attaches unrelated gates to whichever service serves the SSO domain — which is the identity provider itself, so the error inflates the protected count. |
+| The hostname index dedupes by service key | A service fronted by both a tunnel and a reverse proxy declares the same hostname in both label sets. Those are two statements about one service; counting them as rival candidates makes the commonest configuration in a fleet unmatchable. |
+| `scripts/` is typechecked by its own tsconfig | `tsx` strips types without checking them, so a stale field name in an assertion becomes `undefined` at runtime instead of a build error — and an assertion on `undefined` can pass while proving nothing. `rootDir: src` in the emit config is why it needs a second file rather than a wider `include`. |

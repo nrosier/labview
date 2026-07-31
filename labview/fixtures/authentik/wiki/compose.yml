@@ -1,0 +1,41 @@
+# Matched by the strongest evidence there is: the provider names the service.
+#
+# The Authentik proxy provider backing application `wiki-internal` has
+# `internal_host: http://wiki:3000` — the address its outpost forwards
+# authenticated traffic to. That is the identity provider pointing straight at this
+# container, so no naming convention or slug guess is involved.
+#
+# The other two match rules are deliberately made unavailable, so this service can
+# only be found by rule 1:
+#
+#   * the slug is `wiki-internal`, which matches no stack, service or container name
+#   * `meta_launch_url` is a per-user template (`%(username)s`), so it names no host
+#   * the provider's `external_host` is a stale hostname nothing here serves
+#
+# Two further things are pinned here. The tunnel origin resolves to this service
+# itself, which means a request over the tunnel never passes the outpost that
+# enforces the proxy provider — a bypass only visible by holding the API's records
+# and the compose labels side by side. And the `authentik@docker` middleware gives a
+# second, weaker account of the same gate, so the reported posture must be the API's
+# `confirmed` one rather than the label's `observed` one.
+services:
+  wiki:
+    image: example/wiki:5.2.0
+    container_name: wiki-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.wiki.rule=Host(`wiki.example.com`)"
+      - "traefik.http.routers.wiki.entrypoints=websecure"
+      - "traefik.http.routers.wiki.middlewares=authentik@docker"
+      - "traefik.http.services.wiki.loadbalancer.server.port=3000"
+      - "dockflare.enable=true"
+      - "dockflare.hostname=wiki.example.com"
+      - "dockflare.service=http://wiki:3000"
+
+networks:
+  proxy:
+    external: true

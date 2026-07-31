@@ -33,6 +33,27 @@ export interface LabViewConfig {
       oauthEnvHints: string[];
     };
   };
+  /**
+   * Optional read-only Authentik API access. When a token is available, the
+   * identity provider's own records replace guesswork about which services it
+   * protects: applications, their providers, and the outposts serving them.
+   *
+   * Inert without a token — there is nothing useful to read anonymously — so the
+   * feature costs nothing when unconfigured.
+   */
+  authentik: {
+    enabled: boolean;
+    /** Base URL of the Authentik instance. Empty = discover it from the fleet. */
+    url: string;
+    /** API token. Prefer `tokenFile` so the value never sits in the environment. */
+    token: string;
+    /** Path to a file holding the token (docker secret, mounted file). Wins over `token`. */
+    tokenFile: string;
+    /** Per-request timeout. The whole exchange is a handful of GETs. */
+    timeoutMs: number;
+    /** Hard cap on paginated pages per endpoint, so a huge instance cannot stall a scan. */
+    maxPages: number;
+  };
   cacheTtlSeconds: number;
   server: { host: string; port: number };
 }
@@ -54,7 +75,10 @@ const DEFAULTS: LabViewConfig = {
   secrets: {
     maskValues: true,
     keyPatterns: ["PASS", "SECRET", "TOKEN", "KEY", "APIKEY", "CREDENTIAL", "PRIVATE", "SALT", "PEPPER", "DSN"],
-    keysAlways: [],
+    // LabView's own Authentik token is already caught by the TOKEN pattern, but it
+    // is named explicitly so that editing keyPatterns cannot expose it: a fleet
+    // that runs LabView from inside appsRoot scans its own stack.
+    keysAlways: ["LABVIEW_AUTHENTIK_TOKEN"],
     keysNever: ["PUBLIC_KEY_URL", "KEYCLOAK_REALM"],
     redactUriCredentials: true,
   },
@@ -73,6 +97,14 @@ const DEFAULTS: LabViewConfig = {
       ldapEnvHints: ["LDAP_HOST", "LDAP_URI", "LDAP_SERVER", "LDAP_URL"],
       oauthEnvHints: ["OIDC", "OAUTH", "OPENID", "ISSUER", "CLIENT_ID", "CLIENT_SECRET", "SSO"],
     },
+  },
+  authentik: {
+    enabled: true,
+    url: "",
+    token: "",
+    tokenFile: "",
+    timeoutMs: 5000,
+    maxPages: 20,
   },
   cacheTtlSeconds: 60,
   server: { host: "0.0.0.0", port: 8080 },
@@ -150,6 +182,14 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_DOCKER_MAX_CONCURRENCY) {
     const n = Number(env.LABVIEW_DOCKER_MAX_CONCURRENCY);
     if (Number.isFinite(n) && n >= 1) cfg.docker.maxConcurrency = Math.floor(n);
+  }
+  if (env.LABVIEW_AUTHENTIK_ENABLED) cfg.authentik.enabled = env.LABVIEW_AUTHENTIK_ENABLED !== "false";
+  if (env.LABVIEW_AUTHENTIK_URL) cfg.authentik.url = env.LABVIEW_AUTHENTIK_URL;
+  if (env.LABVIEW_AUTHENTIK_TOKEN) cfg.authentik.token = env.LABVIEW_AUTHENTIK_TOKEN;
+  if (env.LABVIEW_AUTHENTIK_TOKEN_FILE) cfg.authentik.tokenFile = env.LABVIEW_AUTHENTIK_TOKEN_FILE;
+  if (env.LABVIEW_AUTHENTIK_TIMEOUT) {
+    const n = Number(env.LABVIEW_AUTHENTIK_TIMEOUT);
+    if (Number.isFinite(n) && n > 0) cfg.authentik.timeoutMs = Math.floor(n);
   }
   if (env.LABVIEW_PORT) cfg.server.port = Number(env.LABVIEW_PORT);
   if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;

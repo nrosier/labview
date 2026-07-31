@@ -469,6 +469,13 @@ table.data tr:last-child td { border-bottom: none; }
   font-size: 12px;
 }
 .pill.ro::after { content: " ro"; color: var(--muted); }
+/* A pill stating something is missing rather than present — tinted like .note.crit
+   so the two read as the same severity. The wording carries the meaning; the colour
+   only reinforces it. */
+.pill.crit {
+  background: color-mix(in srgb, var(--critical) 12%, transparent);
+  border-color: color-mix(in srgb, var(--critical) 40%, transparent);
+}
 
 .evidence { margin: 0; padding-left: 18px; color: var(--ink-2); }
 .evidence li { margin: 2px 0; }

@@ -135,10 +135,107 @@ export type AuthMethod =
 
 /** How firmly a conclusion is grounded in the scanned configuration. */
 export type AuthConfidence =
+  /**
+   * The identity provider's own API states it. Stronger than `observed`: a compose
+   * label says what the operator intended to configure, whereas the provider's
+   * records say what it will actually enforce.
+   */
+  | "confirmed"
   /** A value in the config states it: a forwardauth address, an issuer, an LDAP host. */
   | "observed"
   /** Inferred from a name only — the referenced definition was never found. */
   | "inferred";
+
+/**
+ * What an Authentik provider does, normalized from the API's `component` /
+ * `meta_model_name` / `verbose_name` fields.
+ *
+ * `other` covers a provider type this version does not model rather than being
+ * dropped, so an unmodelled gate is still reported as existing.
+ */
+export type AuthentikProviderKind =
+  | "proxy"
+  | "oauth2"
+  | "ldap"
+  | "saml"
+  | "radius"
+  | "scim"
+  | "other";
+
+/** One provider backing an Authentik application. */
+export interface AuthentikProvider {
+  name: string;
+  kind: AuthentikProviderKind;
+  /** Verbatim provider type as the API reported it, for anything not modelled above. */
+  rawKind: string;
+  /** Proxy providers: `proxy`, `forward_single` or `forward_domain`. */
+  mode?: string;
+  /** Proxy providers: the address the outpost forwards authenticated traffic to. */
+  internalHost?: string;
+  /** Proxy providers: the public address the provider answers on. */
+  externalHost?: string;
+  /** OAuth2 providers: configured redirect URIs, a second source of the app's hostname. */
+  redirectUris?: string[];
+  /**
+   * Whether the provider is attached as a backchannel provider. LDAP and SCIM are
+   * always backchannel, so reading only the primary provider would miss them.
+   */
+  backchannel: boolean;
+  /**
+   * Names of the outposts serving this provider. Empty is meaningful: a proxy or
+   * LDAP provider that no outpost serves is configured but not deployed, so it
+   * enforces nothing.
+   */
+  outposts: string[];
+}
+
+/** One application as Authentik records it. */
+export interface AuthentikApplication {
+  name: string;
+  slug: string;
+  group?: string;
+  /** Resolved launch URL, when the API supplied a concrete one (not a template). */
+  launchUrl?: string;
+  providers: AuthentikProvider[];
+}
+
+/**
+ * The Authentik applications tied to one service, and how the tie was established.
+ *
+ * A match is only recorded when something addresses the same thing from both sides:
+ * a proxy provider's internal host resolving to this service, a URL whose hostname
+ * this service serves, or an application slug equal to its stack/service/container
+ * name. A candidate that could refer to more than one service is discarded rather
+ * than arbitrated, the same discipline `origins.ts` applies to a tunnel origin.
+ */
+export interface AuthentikMatch {
+  applications: AuthentikApplication[];
+  /** Why each application was tied to this service. */
+  evidence: string[];
+}
+
+/** Outcome of the Authentik API exchange, for the scan metadata. */
+export interface AuthentikSummary {
+  /** Whether the integration is switched on at all. */
+  enabled: boolean;
+  /** Whether an endpoint and a token were both available to try. */
+  configured: boolean;
+  /** Whether an endpoint answered as Authentik and accepted the token. */
+  reachable: boolean;
+  /** Endpoint used, origin only — never a path, query or credential. */
+  endpoint?: string;
+  /** Whether the endpoint was configured or discovered from the fleet. */
+  endpointSource?: "config" | "discovered";
+  /** Why the exchange did not complete, with no credential in the text. */
+  error?: string;
+  applications: number;
+  providers: number;
+  outposts: number;
+  /** Services that matched at least one application. */
+  matchedServices: number;
+  /** Application slugs no scanned service could be matched to. */
+  unmatchedApplications: string[];
+}
 
 /** Derived authentication posture for a service. */
 export interface AuthPosture {
@@ -195,6 +292,8 @@ export interface Service {
   ingress: IngressKind;
   auth: AuthPosture;
   docker?: DockerState;
+  /** Authentik applications this service was matched to, when the API was readable. */
+  authentik?: AuthentikMatch;
   /** Notes/warnings surfaced during analysis. */
   notes: string[];
 }
@@ -300,6 +399,8 @@ export interface ScanMeta {
   appsRoot: string;
   dockerAvailable: boolean;
   dockerError?: string;
+  /** Outcome of the optional Authentik API exchange. */
+  authentik?: AuthentikSummary;
   durationMs: number;
   warnings: string[];
   version: string;

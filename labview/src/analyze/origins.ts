@@ -102,6 +102,32 @@ export function resolveOrigins(stacks: AppStack[], index: FleetIndex): void {
   }
 }
 
+/**
+ * Which scanned services an address could be talking about, by the same evidence
+ * rules `resolveOrigin` applies — an IP literal addresses the host so its port is
+ * the evidence, a bare name addresses a container so the name is.
+ *
+ * Exposed because a tunnel origin is not the only address in a fleet that points at
+ * a service: an identity provider's proxy provider names its internal host the very
+ * same way. Callers get the candidate list rather than a verdict, so each can decide
+ * what to do with an ambiguous address in its own context.
+ */
+export function lookupAddress(address: string, index: FleetIndex): ServiceRef[] {
+  const parsed = parseOrigin(address.trim());
+  if (!parsed) return [];
+  const { host, port } = parsed;
+  if (isIpLiteral(host)) {
+    if (!port) return [];
+    return distinct((index.byPort.get(port) ?? []).filter((o) => bindReachableFrom(o, host)));
+  }
+  return distinct(index.byName.get(host.toLowerCase()) ?? []);
+}
+
+/** The `${stackId}/${serviceName}` key used for `hopKey`, matching `serviceKey()` in the UI. */
+export function serviceRefKey(ref: ServiceRef): string {
+  return refKey(ref);
+}
+
 function resolveOrigin(address: string, stack: AppStack, svc: Service, index: FleetIndex): OriginTarget {
   const parsed = parseOrigin(address);
   if (!parsed) {

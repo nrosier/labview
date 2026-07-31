@@ -1,0 +1,31 @@
+# A gate that is configured but standing nowhere.
+#
+# The application has a proxy provider pointing straight at this service, so the
+# match is certain — and the provider appears in no outpost's provider list. A proxy
+# provider is enforced by an outpost sitting in the request path; with no outpost
+# assigned there is nothing in any path, so the provider stops precisely nothing.
+#
+# Everything must follow from that. The service reports no auth method, it counts as
+# reachable without authentication, and the reason is stated as a note. This is the
+# false comfort the API integration exists to remove: the Authentik admin interface
+# lists an application with a provider, and a reader would reasonably conclude the
+# service is protected.
+#
+# The absence of a second note matters too. The bypass finding on `wiki` is about an
+# *enforced* proxy provider that the tunnel routes around; here there is no
+# enforcement to route around, so claiming a bypass would be doubly wrong.
+services:
+  orphan:
+    image: example/app:3.0.0
+    container_name: orphan-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=orphan.example.com"
+      - "dockflare.service=http://orphan:8080"
+
+networks:
+  proxy:
+    external: true

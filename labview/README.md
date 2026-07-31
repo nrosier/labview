@@ -42,8 +42,10 @@ live state from the Docker API, and never needs an agent inside each app.
 - **Detail drawer** — for each service: a **Mermaid diagram** of its connections,
   Cloudflare routes **with what each origin resolves to and why**, Traefik routers
   (rule, hosts, entrypoints, TLS, middlewares), the **derived auth posture with the
-  evidence that led to it**, networks, ports, volumes, environment (secrets
-  masked), and live container state.
+  evidence that led to it**, the matched **Authentik applications and providers**
+  when the API was read (including which outpost, if any, is actually serving each
+  one), networks, ports, volumes, environment (secrets masked), and live container
+  state.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
   and tunnel / proxy / SSO hub nodes, connected by network membership,
@@ -204,6 +206,11 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_CONFIG` | `config.yml` | Path to a config file |
+| `LABVIEW_AUTHENTIK_ENABLED` | `true` | Whether to read the Authentik API at all. With no token it does nothing either way |
+| `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a read-only API token (docker secret, mounted file). Wins over `LABVIEW_AUTHENTIK_TOKEN` |
+| `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | The token itself. Works, but is visible in `docker inspect` — prefer the file form |
+| `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://authentik-server:9000`. Needed only when Authentik is outside `appsRoot` or discovery picks the wrong endpoint |
+| `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `5000` | Per-request timeout. On timeout the scan continues without the API |
 
 The default Docker endpoint is the conventional local socket, since it is the one
 endpoint that needs no assumption about your container names; a socket proxy is
@@ -215,15 +222,52 @@ label prefixes, and the Authentik detection hints — see the comments in
 they are discovered from your fleet at scan time (see below), and adding a
 host-naming convention like `auth.` is how unrelated providers get mislabelled.
 
+### The Authentik API token
+
+Optional. Without it, auth posture is derived from labels and env vars alone;
+with it, LabView reports what Authentik itself says about each gate.
+
+Create a **service account** in Authentik (*Directory → Users → Create service
+account*), leave it out of every group, and grant only three global permissions:
+`view_application`, `view_provider`, `view_outpost`. Then issue a token for it and
+mount it:
+
+```yaml
+environment:
+  LABVIEW_AUTHENTIK_TOKEN_FILE: /run/secrets/authentik_token
+volumes:
+  - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
+```
+
+LabView only ever issues `GET`s, so anything beyond those three permissions is
+authority an attacker who reached this container would inherit for free.
+
+The endpoint is discovered when Authentik runs among the scanned stacks: LabView
+finds it by image, then tries its **container address first** and public hostnames
+only after, so the exchange stays on the container network. Discovery probes each
+candidate on `/api/v3/root/config/`, which needs no authentication, and sends the
+token only to a candidate that answers as an Authentik API — so a wrong guess
+never receives a credential. Set `LABVIEW_AUTHENTIK_URL` when Authentik lives
+outside `appsRoot`.
+
+If your instance serves HTTPS with a private CA, point `NODE_EXTRA_CA_CERTS` at
+the CA. There is deliberately no option to skip certificate verification: a bearer
+token sent to an unverified endpoint is a token handed over.
+
+Every failure here is soft. An unreachable host, a rejected token, a timeout or a
+malformed response leaves the scan running on label-derived evidence, with the
+reason reported in `meta.authentik.error` and in the UI.
+
 ---
 
 ## How it works
 
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
-      → build middleware registry → classify ingress → discover Authentik
-      → resolve tunnel origins → derive auth posture → build graph
-      → serve /api/overview
+      → build middleware registry → classify ingress → read the Authentik API
+      → discover Authentik hostnames → resolve tunnel origins
+      → match Authentik applications to services → derive auth posture
+      → build graph → serve /api/overview
 ```
 
 - **Compose parsing** understands both label/env syntaxes (list `- k=v` and map
@@ -248,6 +292,17 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   no Authentik in the fleet nothing is learned, and every issuer stays generic.
   Hints are matched at **token boundaries**, so `oauth.bigcorp.example.com` is not
   read as Authentik on the strength of four shared letters.
+- **Tunnel origins are resolved, not assumed.** A tunnel rarely terminates at the
+  container whose labels declare it — the origin normally names a reverse proxy,
+  which forwards on over a shared network. The origin address says which: an IP
+  literal addresses the *host*, so its port is a published host port and identifies
+  exactly one service; a bare name addresses a *container*, so the DNS name is the
+  evidence. A tie between two services declaring one port is broken by network
+  membership, since a candidate sharing no network with the service it supposedly
+  fronts cannot forward to it. Where that proves a hop, the diagrams draw
+  `tunnel → proxy → service`; where nothing proves one, the direct edge stays and
+  the service says why the hop is unknown. No image, vendor or naming convention is
+  consulted.
 - **Ingress** is classified `public` / `public+host-port` / `public+local` /
   `local` / `host-port` / `internal`. A `ports:` entry publishes on the host
   (unlike `expose:`), so the service answers at `<host-ip>:<port>` with no proxy
@@ -269,11 +324,40 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `forward-auth`, and an OpenLDAP or AD directory reads as plain `ldap`. The
   *address* also outranks the *name*: a middleware called `authentik` that points
   somewhere else is not Authentik.
-- **`observed` vs `inferred`.** Each posture carries a confidence. `observed`
+- **`confirmed` vs `observed` vs `inferred`.** Each posture carries a confidence.
+  `confirmed` means the identity provider's own API reported the gate. `observed`
   means a value in the config states it. `inferred` means the referenced
   middleware was defined nowhere in the scanned stacks — a Traefik file provider,
   say — so only its name was available; the UI labels it, and the service gets a
-  note saying the definition could not be found.
+  note saying the definition could not be found. When two accounts disagree the
+  stronger one is reported and the weaker is kept as evidence beneath it, so you
+  can see both.
+- **The Authentik API, when a token is given, is read as evidence like any other.**
+  Applications, providers and outposts are fetched, then each application is
+  matched to a service only on something addressed:
+  1. a proxy provider's `internal_host` resolving to exactly one service — the
+     provider naming its target outright, and the strongest evidence available;
+  2. a launch URL or OAuth2 redirect URI whose hostname is one the service is
+     configured to serve, per its DockFlare or Traefik labels;
+  3. the application slug, when it equals exactly one service's stack, compose or
+     container name — operator-chosen on both sides, so it is the last resort.
+
+  Anything that could name two services names neither, and is reported as an
+  unmatched application instead. `external_host` is used for matching except in
+  `forward_domain` mode, where it is the authentication domain shared by every
+  application in it and so identifies no single service.
+- **A provider only counts as protection if something is enforcing it.** Proxy,
+  LDAP and RADIUS providers are enforced by an **outpost** standing in the request
+  path; a provider assigned to no outpost stops nothing, however complete it looks
+  in the admin UI, and LabView reports the service as unprotected with that as the
+  reason. OAuth2 and SAML providers are served by the Authentik server itself, so
+  they need no outpost. SCIM provisions users outbound and gates nothing at all —
+  it is listed as a provider but never as a gate.
+- **A confirmed gate the model cannot name is still a gate.** SAML has no
+  `AuthMethod` of its own, so such a service reports `none` — but it is *not*
+  counted as exposed-without-auth, and the provider is shown verbatim in the
+  drawer. Reporting a protected service as reachable without authentication would
+  be the one error worth failing over.
 - **Exposed-without-auth**: a service reachable (public or local) with no detected
   *proxy/SSO* auth is flagged. Note this is honest about *proxy* auth only — apps
   with their own built-in login (Emby, Home Assistant, Authentik itself) will
@@ -299,6 +383,13 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   tile, and flagged exposed-without-auth — it answers on the LAN whatever your
   Traefik config says. When a proxy *is* in front, the service keeps its kind and
   gains an explicit note that the published port bypasses the proxy and its SSO.
+- The **Authentik API token is optional and read-only** (`view_application`,
+  `view_provider`, `view_outpost` on a groupless service account — LabView only
+  issues `GET`s). A discovered endpoint is probed unauthenticated first and the
+  token is sent only to a host that answered as an Authentik API, so a wrong guess
+  never receives it. Prefer `LABVIEW_AUTHENTIK_TOKEN_FILE`; a token in the
+  environment is readable via `docker inspect`. Certificate verification cannot be
+  disabled — use `NODE_EXTRA_CA_CERTS` for a private CA.
 - No built-in auth — put it behind your own edge (see above).
 
 ---
@@ -328,13 +419,15 @@ src/
   scan/       discover + compose/.env parsing
   labels/     dockflare, traefik, auth derivation
   analyze/    two-pass pipeline, middleware registry, graph, stats
-  enrich/     docker snapshot (dockerode)
+  enrich/     docker snapshot (dockerode) + authentik API client
   model/      types.ts — the shared backend⇄frontend contract
   server/     fastify server + static hosting
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
+  authentik/  a fleet with an identity provider in it
+  authentik-api.json   canned API responses for the above
 ```
 
 ```bash
@@ -343,14 +436,26 @@ npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
 ```
 
-`npm run smoke` runs the whole pipeline twice — once over `fixtures/apps` for the
-expected classifications, once over `fixtures/edge` for the regression cases: URL
-credential redaction, `env_file` containment, `dockflare.enable=false`, LDAP
-attribution, nested interpolation, host-port exposure (`ports:` vs `expose:`, the
-tunnel-straight-at-the-container pattern, and the bypass note on a proxied
-service), and provider attribution (a fleet whose SSO is *not* Authentik, where
-every mechanism is observable but nothing may be attributed to a vendor). Each
-edge fixture is written so that it fails if the corresponding fix is reverted.
+`npm run smoke` runs the whole pipeline against three fixture roots — `apps` for
+the expected classifications, `edge` for the regression cases (URL credential
+redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
+nested interpolation, host-port exposure — `ports:` vs `expose:`, the
+tunnel-straight-at-the-container pattern and the bypass note on a proxied service
+— and provider attribution in a fleet whose SSO is *not* Authentik, where every
+mechanism is observable but nothing may be attributed to a vendor), and
+`authentik` for the API integration.
+
+That last root drives canned responses (`fixtures/authentik-api.json`) through an
+injected HTTP layer, so the test needs no network and no Authentik: it pins each
+match rule in isolation, the rejection of an ambiguous match, the unserved-provider
+outcome, pagination, and the rule that a token is never sent to a host that has not
+answered the unauthenticated probe. It also runs the same fleet **without** a token
+and asserts the difference, so the API's contribution is measured rather than
+assumed.
+
+Every fixture is written so it fails if the corresponding logic is reverted — for
+the API integration that was checked by actually backing each rule out one at a
+time and confirming the expected assertions broke.
 
 The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 ~3 MB) so the dashboard works fully offline with no CDN dependency.
@@ -365,7 +470,17 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - Auth detection is label/env-driven and reports its evidence so you can verify
   each conclusion. It describes *configuration*, not enforcement: a middleware
   reference proves the gate was configured, not that Traefik is currently running
-  with that config.
+  with that config. Reading the Authentik API narrows this — an outpost assignment
+  is enforcement rather than intent — but it is still configuration, not a request
+  actually being challenged.
+- The Authentik integration reads applications, providers and outposts. Policy
+  bindings are not read, so an application whose access policy denies everyone
+  still reads as protected — which it is — and a flow customization that weakens a
+  gate is not visible.
+- An application LabView cannot tie to exactly one service is reported as unmatched
+  rather than guessed. In a fleet where hostnames live only in Authentik and never
+  in a compose label, expect several: the fix is a matching `dockflare.hostname` or
+  slug, not a looser rule.
 - Traefik middlewares defined in a dynamic config **file** rather than in labels
   are invisible to the scan — a reference to one resolves to nothing, which is why
   the name-based fallback and the `inferred` confidence exist.

@@ -1,0 +1,37 @@
+# An application whose slug identifies a stack, not a service.
+#
+# The stub's application `pair` has no provider, no launch URL and no redirect URI,
+# so the slug is the only thing left to match on — and it names this directory, which
+# holds two services. Either one could be the application's target and nothing
+# observable says which.
+#
+# The outcome must be no match at all, reported as an unmatched application. The
+# alternative — picking the first candidate — would move a service between
+# "protected" and "exposed" on the strength of a coin toss, which is the one error
+# this matcher is built to avoid.
+services:
+  blue:
+    image: example/app:3.0.0
+    container_name: pair-blue
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=blue.example.com"
+      - "dockflare.service=http://blue:8080"
+
+  green:
+    image: example/app:3.0.0
+    container_name: pair-green
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=green.example.com"
+      - "dockflare.service=http://green:8080"
+
+networks:
+  proxy:
+    external: true

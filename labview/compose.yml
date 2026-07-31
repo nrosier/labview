@@ -24,11 +24,29 @@ services:
       LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375
       LABVIEW_PORT: "8080"
       # LABVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
+      #
+      # --- Optional: read the Authentik API for confirmed auth posture ---
+      # Without a token, protection is inferred from compose labels and env vars.
+      # With one, LabView reads applications/providers/outposts and reports what
+      # Authentik itself says — including the case labels cannot show you: an
+      # application whose provider no outpost is serving, which protects nothing.
+      #
+      # Use a read-only service account (view_application / view_provider /
+      # view_outpost, no groups). Prefer the _FILE form: a token in the
+      # environment is visible to anyone who can run `docker inspect`.
+      # LABVIEW_AUTHENTIK_TOKEN_FILE: /run/secrets/authentik_token
+      #
+      # The host is discovered from the scanned stacks when Authentik runs among
+      # them, preferring its container address so the call stays on the container
+      # network. Set this only if it lives elsewhere or discovery guesses wrong:
+      # LABVIEW_AUTHENTIK_URL: http://authentik-server:9000
     volumes:
       # Your per-container stacks, read-only.
       - /mnt/apps:/data/apps:ro
       # Optional tuned config:
       # - /mnt/apps/labview/config.yml:/config/config.yml:ro
+      # Optional Authentik token, mounted as a file rather than passed as an env var:
+      # - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
     # No `ports:` on purpose. A published host port answers directly at
     # <host-ip>:<port>, bypassing the reverse proxy and therefore bypassing any
     # SSO middleware on it — for a dashboard that lists your whole topology that
@@ -39,6 +57,8 @@ services:
     networks:
       - default
       - proxy         # reach it through the reverse proxy / publish via DockFlare
+                      # (also how the Authentik API is reached by container name,
+                      #  if you enable that and Authentik is on this network)
       - dockerproxy   # reach the docker-socket-proxy for live state
 
     # --- Example: put LabView behind your own edge (Traefik + Authentik) ---

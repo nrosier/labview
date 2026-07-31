@@ -1,0 +1,31 @@
+# A standalone Authentik proxy outpost.
+#
+# It exists in this fixture for one reason: endpoint discovery must probe it and
+# then walk away. Its image identifies it as Authentik, so it is a candidate — but
+# an outpost serves `/outpost.goauthentik.io/...`, not the core REST API, so the
+# unauthenticated probe of `/api/v3/root/config/` 404s.
+#
+# Two things must follow. The candidate is skipped rather than failing the whole
+# lookup, and the API token is never sent to it: the probe comes first precisely so
+# that a wrong guess costs a 404 instead of a leaked credential.
+#
+# `expose:` rather than `ports:` — an outpost is reached over the docker network by
+# the reverse proxy in front of it, so discovery has no declared port to work from
+# and falls back to Authentik's documented listener.
+services:
+  outpost:
+    image: ghcr.io/goauthentik/proxy:2024.10.1
+    container_name: authentik-outpost
+    restart: unless-stopped
+    expose:
+      - "9000"
+    environment:
+      AUTHENTIK_HOST: http://authentik-server:9000
+      AUTHENTIK_INSECURE: "false"
+      AUTHENTIK_TOKEN: ${OUTPOST_TOKEN}
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

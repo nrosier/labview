@@ -95,6 +95,52 @@ labels:
       - CLIENT_SECRET
       - SSO
 
+# Read the Authentik API to confirm which services are actually protected.
+#
+# Without this, protection is inferred from compose labels and env vars: a
+# forward-auth middleware address, an OIDC issuer, an LDAP host. That finds gates
+# wired up in compose, but it cannot see a gate configured only in Authentik, and
+# it cannot tell an application that *has* a provider from one whose provider no
+# outpost is serving — which enforces nothing at all.
+#
+# With a token, LabView reads applications, providers and outposts, matches each
+# application to a service, and reports the provider's own account of the gate as
+# `confirmed`. Entirely optional: with no token nothing is requested, and a
+# credential is never sent to an endpoint that has not first been confirmed to be
+# an Authentik API.
+#
+# The token needs read access only. Create a service account with no groups, give
+# it view_application / view_provider / view_outpost, and nothing else — LabView
+# only ever issues GETs, and a token with more rights than that is a token an
+# attacker reaching this container would inherit.
+authentik:
+  enabled: true
+  # Base URL including scheme and port, e.g. http://authentik-server:9000. Leave
+  # empty to discover it: whichever scanned stack runs Authentik is located from
+  # its image, and its container address is tried before any public hostname, so
+  # the API call stays on the container network. Set this only when your Authentik
+  # lives outside appsRoot, or when discovery picks the wrong endpoint.
+  url: ""
+  # The API token. Prefer tokenFile — a value here ends up in the config file, and
+  # a value in LABVIEW_AUTHENTIK_TOKEN ends up in `docker inspect` output.
+  token: ""
+  # Path to a file holding the token, e.g. a docker secret or a mounted file.
+  # Takes precedence over `token`.
+  tokenFile: ""
+  # Per-request timeout in milliseconds. The whole exchange is a handful of GETs;
+  # if it times out the scan continues without the API and says so.
+  timeoutMs: 5000
+  # Hard cap on pages fetched per list endpoint, so a very large instance cannot
+  # stall a scan. 20 pages x 100 records is 2000 applications.
+  maxPages: 20
+  #
+  # If your Authentik serves HTTPS with a private CA, add the CA to Node's trust
+  # store rather than disabling verification — LabView has no flag to skip it,
+  # because a bearer token sent to an unverified endpoint is a token given away:
+  #   NODE_EXTRA_CA_CERTS=/etc/ssl/certs/internal-ca.pem
+  # Reaching the API over the container network as plain HTTP avoids the question
+  # entirely, and is what discovery prefers.
+
 # Rescan cache: how long (seconds) a scan result is served before a fresh scan is
 # triggered on the next request. The UI also has a manual "Rescan" button.
 cacheTtlSeconds: 60

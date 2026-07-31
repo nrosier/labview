@@ -1,0 +1,43 @@
+# Matched by a hostname both sides name independently.
+#
+# The application's launch URL is `https://docs.example.com/`, and this service is
+# configured to answer on `docs.example.com`. Neither side carries the other's
+# identifier; the agreement is about one hostname, which is an observation rather
+# than a guess.
+#
+# The hostname is declared twice — once for the tunnel, once for the reverse proxy —
+# which is the normal shape for a service fronted by both. Both declarations describe
+# *this* service, so they must collapse to one candidate: treating them as two rivals
+# would make the commonest configuration in a fleet unmatchable.
+#
+# Also here: a SCIM provider attached as a backchannel provider. SCIM provisions
+# accounts outbound and gates nothing, so it must be reported without being counted
+# as a gate and without the "no outpost serves it" finding that a proxy or LDAP
+# provider in the same position would earn.
+services:
+  docs:
+    image: example/docs:2.4.1
+    container_name: docs-app
+    restart: unless-stopped
+    environment:
+      # The env-derived OIDC signal, which resolves to Authentik because
+      # `sso.example.com` was discovered as one of its hostnames. It agrees with the
+      # API's record of the same gate, and must not outrank it.
+      OIDC_ISSUER: https://sso.example.com/application/o/documentation/
+      OIDC_CLIENT_ID: docs-portal
+      OIDC_CLIENT_SECRET: ${OIDC_SECRET}
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.docs.rule=Host(`docs.example.com`)"
+      - "traefik.http.routers.docs.entrypoints=websecure"
+      - "traefik.http.services.docs.loadbalancer.server.port=3000"
+      - "dockflare.enable=true"
+      - "dockflare.hostname=docs.example.com"
+      - "dockflare.service=http://docs:3000"
+
+networks:
+  proxy:
+    external: true

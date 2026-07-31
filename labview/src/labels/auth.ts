@@ -1,4 +1,11 @@
-import type { Service, AuthPosture, AuthMethod, AuthConfidence, EnvVar } from "../model/types.js";
+import type {
+  Service,
+  AuthPosture,
+  AuthMethod,
+  AuthConfidence,
+  AuthentikProvider,
+  EnvVar,
+} from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
 import type { MiddlewareRegistry } from "../analyze/middlewares.js";
 
@@ -23,6 +30,10 @@ interface Detection {
  * reported rather than the most likely vendor, and `confidence` records whether
  * the conclusion rests on a definition or only on a reference name.
  *
+ * When the identity provider's API was readable, its records outrank all of that
+ * and carry `confirmed` confidence: a label says what the operator meant to
+ * configure, whereas the provider's own records say what it will enforce.
+ *
  * `exposedWithoutAuth` is left false here and finalized by the analyzer once the
  * ingress classification is known.
  */
@@ -34,15 +45,31 @@ export function deriveAuth(
 ): AuthPosture {
   const a = cfg.labels.authentik;
   const detections: Detection[] = [];
+  /**
+   * Every provider the API reported gets an evidence line whether or not it gates
+   * anything. A configured-but-unserved gate is precisely the thing a reader needs
+   * told, and it produces no detection to carry the line for it.
+   */
+  const apiEvidence: string[] = [];
 
-  // 1. Traefik middlewares referenced by this service's routers.
+  // 1. The identity provider's own records, when its API answered. Only a provider
+  //    that something actually serves is treated as a gate — see providerEnforces.
+  for (const app of service.authentik?.applications ?? []) {
+    for (const provider of app.providers) {
+      apiEvidence.push(authentikEvidence(app.name, provider));
+      const d = classifyAuthentikProvider(app.name, provider);
+      if (d) detections.push(d);
+    }
+  }
+
+  // 2. Traefik middlewares referenced by this service's routers.
   const referenced = new Set(service.traefik.flatMap((r) => r.middlewares));
   for (const mw of referenced) {
     const d = classifyMiddleware(mw, registry, providerHints);
     if (d) detections.push(d);
   }
 
-  // 2. Cloudflare Access policy on a public route (an edge gate, stated in labels).
+  // 3. Cloudflare Access policy on a public route (an edge gate, stated in labels).
   for (const route of service.cloudflare) {
     if (route.access && (route.access.policy || route.access.group || route.access.emails?.length)) {
       const bits = [
@@ -59,7 +86,7 @@ export function deriveAuth(
     }
   }
 
-  // 3. Env-derived OIDC/OAuth. The keys prove the mechanism; only a value that
+  // 4. Env-derived OIDC/OAuth. The keys prove the mechanism; only a value that
   //    resolves to a discovered provider identity may name the provider.
   const oauth = detectEnv(service.env, a.oauthEnvHints);
   if (oauth.hit) {
@@ -74,7 +101,7 @@ export function deriveAuth(
     });
   }
 
-  // 4. Env-derived LDAP. An LDAP host matching a discovered provider identity is
+  // 5. Env-derived LDAP. An LDAP host matching a discovered provider identity is
   //    that provider's LDAP outpost; any other directory (OpenLDAP, AD, …) is one
   //    we cannot identify and must not be attributed to a vendor.
   const ldap = detectEnv(service.env, a.ldapEnvHints);
@@ -101,9 +128,15 @@ export function deriveAuth(
     "other-oauth",
     "basic-auth",
   ];
-  detections.sort((x, y) => order.indexOf(x.method) - order.indexOf(y.method));
+  // Mechanism first, then confidence: where a label and the provider's API report
+  // the same mechanism, the API's account is the one worth showing.
+  detections.sort(
+    (x, y) =>
+      order.indexOf(x.method) - order.indexOf(y.method) ||
+      CONFIDENCE_RANK[x.confidence] - CONFIDENCE_RANK[y.confidence],
+  );
   const primary = detections[0];
-  const evidence = [...new Set(detections.flatMap((d) => d.evidence))];
+  const evidence = [...new Set([...apiEvidence, ...detections.flatMap((d) => d.evidence)])];
 
   if (!primary) {
     return {
@@ -128,6 +161,81 @@ export function deriveAuth(
 
 /** Evidence marker for a mechanism seen without an identifiable provider. */
 const NO_PROVIDER = "provider not identified from the scanned config";
+
+/** Strongest evidence first, used only to break a tie between equal mechanisms. */
+const CONFIDENCE_RANK: Record<AuthConfidence, number> = { confirmed: 0, observed: 1, inferred: 2 };
+
+/**
+ * Whether a provider will actually stop a request.
+ *
+ * Being configured is not the same as being deployed. A proxy, LDAP or RADIUS
+ * provider is enforced by an **outpost**, so one with no outpost attached is a gate
+ * nothing is standing at — reporting it as protection would be exactly the kind of
+ * false comfort this project exists to remove. OAuth2 and SAML are served by
+ * Authentik's core server, so they need no outpost. SCIM provisions accounts
+ * outbound and gates nothing at all, and an unmodelled type is not claimed either
+ * way.
+ */
+export function providerEnforces(provider: AuthentikProvider): boolean {
+  switch (provider.kind) {
+    case "oauth2":
+    case "saml":
+      return true;
+    case "proxy":
+    case "ldap":
+    case "radius":
+      return provider.outposts.length > 0;
+    default:
+      return false;
+  }
+}
+
+/** Whether the provider's API confirmed at least one enforced gate on this service. */
+export function hasEnforcedAuthentikGate(service: Service): boolean {
+  return (service.authentik?.applications ?? []).some((app) => app.providers.some(providerEnforces));
+}
+
+/**
+ * Turn one API-reported provider into a detection.
+ *
+ * Only the three kinds with an `AuthMethod` produce one. A SAML, RADIUS or
+ * unmodelled provider is real protection but has no method to report it as, so it
+ * contributes evidence and counts toward the service being protected
+ * (`hasEnforcedAuthentikGate`) without being mislabelled as a mechanism it is not.
+ */
+function classifyAuthentikProvider(appName: string, provider: AuthentikProvider): Detection | undefined {
+  if (!providerEnforces(provider)) return undefined;
+
+  const method: AuthMethod | undefined =
+    provider.kind === "proxy"
+      ? "authentik-forward-auth"
+      : provider.kind === "oauth2"
+        ? "authentik-oauth"
+        : provider.kind === "ldap"
+          ? "authentik-ldap"
+          : undefined;
+  if (!method) return undefined;
+
+  const mode = provider.mode ? ` in \`${provider.mode}\` mode` : "";
+  return {
+    method,
+    detail: `Authentik ${provider.kind} provider "${provider.name}" for application "${appName}"${mode}, ${servedBy(provider)}`,
+    evidence: [authentikEvidence(appName, provider)],
+    confidence: "confirmed",
+  };
+}
+
+/** One line stating what the API reported, in the same voice as the other evidence. */
+function authentikEvidence(appName: string, provider: AuthentikProvider): string {
+  return `Authentik API: ${provider.rawKind} "${provider.name}" on application "${appName}" (${servedBy(provider)})`;
+}
+
+function servedBy(provider: AuthentikProvider): string {
+  if (provider.outposts.length) return `served by outpost ${provider.outposts.join(", ")}`;
+  return providerEnforces(provider)
+    ? "served by the Authentik server"
+    : "no outpost serves it, so it enforces nothing";
+}
 
 /**
  * Classify one referenced middleware.

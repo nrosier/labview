@@ -1,0 +1,30 @@
+# Real protection with no method to report it as.
+#
+# The application is gated by a SAML provider, which Authentik's own server serves —
+# no outpost is involved, and a request cannot reach the service without completing
+# the SAML flow. So this service is protected.
+#
+# LabView's `AuthMethod` list has no SAML member, and inventing one is not free: the
+# UI palette assigns a colour to every method, and the only colour left is the red
+# reserved for the exposed-without-auth warning. Colouring a protected service in the
+# warning colour would be worse than having no badge for it.
+#
+# The compromise this fixture pins: the method stays `none`, the provider is shown
+# verbatim in the drawer, and the service is *not* counted as exposed without auth.
+# A confirmed gate the model cannot name is still a confirmed gate — reporting it as
+# unprotected would be a plain falsehood, which is the one outcome worth failing over.
+services:
+  reports:
+    image: example/reports:2.0.0
+    container_name: reports-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=reports.example.com"
+      - "dockflare.service=http://reports:8000"
+
+networks:
+  proxy:
+    external: true
