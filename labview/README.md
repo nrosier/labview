@@ -59,6 +59,12 @@ live state from the Docker API, and never needs an agent inside each app.
   describes: where a route's origin resolves to another service, that service is
   drawn as the hop (`tunnel → proxy → service`) and highlighted as the
   infrastructure it was observed to be.
+- **Rescan** — re-reads every `compose.yml` and `.env` under the apps root and then
+  reports what moved, inline beside `scanned <time>`: `+1 stack, 2 services changed`,
+  with the stack and service names on hover. New stacks, deleted stacks, added
+  services and edited files all show up; live state changing on its own does not.
+  When your files are the same as last time it says so — `no config changes` —
+  rather than leaving you to guess whether it looked.
 - **Light / dark** theme (follows the OS, with a manual toggle).
 
 Colors follow a validated, colorblind-safe palette. The ingress and auth-method
@@ -207,7 +213,7 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_DOCKER_TIMEOUT` | `5000` | Per-request socket-inactivity timeout, ms. Reset whenever bytes arrive, so a large fleet's listing is unaffected; it exists to turn an endpoint that accepts the connection and then says nothing into a reported `timeout` |
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_HOST` | `0.0.0.0` | Bind address |
-| `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
+| `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh; Rescan ignores it |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_CONFIG` | `config.yml` | Path to a config file |
 | `LABVIEW_AUTHENTIK_ENABLED` | `true` | Whether to read the Authentik API at all. With no token it does nothing either way |
@@ -346,6 +352,17 @@ LabView connected to docker at tcp://dockerproxy:2375 (config) — 86 containers
 LabView could not connect to authentik at https://sso.example.com (config) — resolve: fetch failed (ENOTFOUND)
   No candidate hostname resolved. Set LABVIEW_AUTHENTIK_URL to the API's address — …
   · http://authentik-server:9000 (runs the Authentik image): resolve — fetch failed (ENOTFOUND)
+LabView read 56 stacks, 86 services from /data/apps
+```
+
+That last line closes the startup block with the number the root produced, so a
+mistyped `LABVIEW_APPS_ROOT` shows up as `read 0 stacks` rather than as an empty
+dashboard. Every later scan reports the difference from the one before it instead:
+
+```text
+LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service (57 stacks, 87 services)
+  · added: monitoring (1 service)
+  · changed: wiki — services added: search-sidecar
 ```
 
 The same lines print under `npm run scan -- --summary`, the same phase and reason
@@ -527,6 +544,22 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   *proxy/SSO* auth is flagged. Note this is honest about *proxy* auth only — apps
   with their own built-in login (Emby, Home Assistant, Authentik itself) will
   appear here; the note wording says exactly that.
+- **Rescan re-reads everything, and says what moved.** Nothing is remembered
+  between scans: every `compose.yml` and `.env` under the apps root is read again,
+  the directory is re-walked, and the whole pipeline runs from scratch — so a new
+  stack directory, a deleted one, an added service and an edited file are all picked
+  up. What the operator gets back is a comparison against the previous scan, beside
+  `scanned <time>` and in the log: `+1 stack, 2 services changed`, with the stack and
+  service names in the tooltip. Two things about that comparison are worth knowing.
+  It is over the **parsed configuration**, not file timestamps, so a comment-only
+  edit or a rewrite that produces the same document reports nothing, while an `.env`
+  change that alters what a compose file interpolates to reports as a changed
+  service. And it deliberately ignores everything that moves on its own — container
+  status, health, addresses, whether an API answered this time — because a container
+  restarting is not a configuration change, and a diff that fires on every rescan is
+  a diff nobody reads. When nothing in the files differs it says **`no config
+  changes`**, which is the answer most rescans have and the one the button used to
+  leave unsaid.
 
 ### Security
 
@@ -575,10 +608,18 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/overview` | GET | The full analyzed model (JSON) |
-| `/api/rescan` | POST | Force a fresh scan, returns the rebuilt overview |
+| `/api/rescan` | POST | Re-read the apps root and return the rebuilt overview |
 | `/api/healthz` | GET | Liveness probe |
 
 The web UI is a static SPA served from the same origin.
+
+`GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
+`POST /api/rescan` ignores the cache and is answered only by a scan that started
+**after** the request arrived — so a rescan issued a second after you save a file can
+never be handed a scan that read the old one, even when another scan was already
+running. Concurrent requests still coalesce into one sweep, so a double click does
+not double the load on the socket proxy, and a failed scan leaves the previous
+overview readable and is retried by the next caller.
 
 ---
 
@@ -598,7 +639,8 @@ src/
   enrich/     docker snapshot (dockerode) + authentik and traefik API clients
               over a shared http.ts (fetch, timeouts, injectable fetchImpl)
   model/      types.ts — the shared backend⇄frontend contract
-  server/     fastify server + static hosting
+              changes.ts — what moved between two scans, and its wording
+  server/     fastify server + static hosting, scan cache and force semantics
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
 fixtures/
   apps/       a representative happy-path fleet
@@ -689,3 +731,8 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - Traefik middlewares defined in a dynamic config **file** rather than in labels
   are invisible to the scan — a reference to one resolves to nothing, which is why
   the name-based fallback and the `inferred` confidence exist.
+- **No filesystem watcher.** A compose or `.env` edit is picked up by the next scan —
+  the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
+  stays an explicit action; nothing auto-refreshes the page.
+- LabView's own `config.yml` is read once at startup. Rescan re-reads the fleet, not
+  LabView's configuration: changing a token or an endpoint needs a restart.

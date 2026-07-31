@@ -58,6 +58,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts, matches each application to a service by the provider's internal host, a shared hostname or the slug, and reports what Authentik says. This finds gates configured only in Authentik — and, more usefully, the reverse: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
+| **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — and then says what moved, beside `scanned <time>`: `+1 stack, 2 services changed`, hover for the names. When nothing moved it says **`no config changes`**, so "LabView re-read everything and your files are the same" is never confused with "LabView didn't look". |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
 | **Light / dark** | Follows the OS, with a manual toggle. Colorblind-safe palette validated in both modes. |
 
@@ -159,7 +160,7 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_DOCKER_HOST` | *(unset)* | Docker API endpoint, `DOCKER_HOST` syntax (`tcp://host:2375`, `/path/to.sock`). The standard `DOCKER_HOST` is honoured too. Unset = the socket below |
 | `LABVIEW_DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path; always wins over a TCP host |
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
-| `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
+| `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh; Rescan ignores it |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a **read-only** Authentik API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Authentik base URL, e.g. `http://authentik-server:9000`. Only needed when Authentik is outside `appsRoot` |
@@ -183,6 +184,7 @@ LabView scanning /data/apps
 LabView connected to docker at tcp://dockerproxy:2375 (config) — 86 containers
 LabView could not connect to authentik at https://sso.example.com (config) — protocol: HTTP 200 but the body was not JSON — an HTML login page answers exactly like this
   Something answered that is not Authentik's API — most often its own login page…
+LabView read 56 stacks, 86 services from /data/apps
 ```
 
 The same phase and reason appear in a banner under the topbar, under
@@ -273,12 +275,25 @@ See [labview/README.md](labview/README.md#how-it-works) for the details, and
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/overview` | GET | The full analyzed model (JSON) |
-| `/api/rescan` | POST | Force a fresh scan, returns the rebuilt overview |
+| `/api/rescan` | POST | Re-read the apps root and return the rebuilt overview |
 | `/api/healthz` | GET | Liveness probe |
 
 The UI is a static SPA served from the same origin. The JSON contract is
 [labview/src/model/types.ts](labview/src/model/types.ts), imported directly by
 both backend and frontend.
+
+`GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
+`POST /api/rescan` ignores that cache and is guaranteed to be answered by a scan
+that started *after* the request arrived — so a rescan issued a second after you
+saved a file can never hand back a scan that read the old one. Concurrent requests
+still coalesce into a single sweep, so holding the button down does not multiply the
+load on the socket proxy. What the rescan found is logged too:
+
+```text
+LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service (57 stacks, 87 services)
+  · added: monitoring (1 service)
+  · changed: wiki — services added: search-sidecar
+```
 
 ---
 
@@ -412,6 +427,8 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   published schema — a mismatch degrades to "unreachable, with a reason" rather
   than breaking the scan. Traefik's static config file is not parsed.
 - Single-host. There is no aggregation across multiple Docker hosts.
+- No filesystem watcher. A change to a compose file is picked up on the next scan —
+  the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it.
 
 ---
 

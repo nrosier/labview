@@ -12,43 +12,29 @@ import {
   levelFor,
   rememberConnections,
 } from "../model/connections.js";
+import { diffStacks, formatScanDiff, formatScanTotals } from "../model/changes.js";
+import { createScanCache } from "./cache.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // dist/server -> project root -> web/dist
 const webRoot = join(here, "..", "..", "web", "dist");
 
-interface Cache {
-  overview: Overview | null;
-  builtAt: number;
-  inflight: Promise<Overview> | null;
-}
-
 export async function startServer(cfg: LabViewConfig): Promise<void> {
   const app = Fastify({ logger: { level: process.env.LABVIEW_LOG_LEVEL ?? "info" } });
-  const cache: Cache = { overview: null, builtAt: 0, inflight: null };
   // What each target's last logged outcome was. A long-running server rescans on a
   // timer and on demand, so repeating identical connection lines every time would bury
   // the one that changed — which is the only one worth a reader's attention.
   const lastConnections = new Map<string, string>();
 
-  async function getOverview(force: boolean): Promise<Overview> {
-    const ageMs = Date.now() - cache.builtAt;
-    const fresh = cache.overview && !force && ageMs < cfg.cacheTtlSeconds * 1000;
-    if (fresh) return cache.overview!;
-    if (cache.inflight) return cache.inflight;
-
-    cache.inflight = buildOverview(cfg, new Date())
-      .then((ov) => {
-        cache.overview = ov;
-        cache.builtAt = Date.now();
-        logConnections(app.log, lastConnections, ov.meta.connections);
-        return ov;
-      })
-      .finally(() => {
-        cache.inflight = null;
-      });
-    return cache.inflight;
-  }
+  const cache = createScanCache<Overview>({
+    build: () => buildOverview(cfg, new Date()),
+    ttlMs: cfg.cacheTtlSeconds * 1000,
+    onBuilt: (next, prev, { forced }) => {
+      logConnections(app.log, lastConnections, next.meta.connections);
+      logScan(app.log, cfg.appsRoot, next, prev, forced);
+    },
+  });
+  const getOverview = (force: boolean) => cache.get(force);
 
   app.get("/api/overview", async () => getOverview(false));
   app.post("/api/rescan", async () => getOverview(true));
@@ -105,4 +91,31 @@ function logConnections(
     }
   }
   rememberConnections(seen, reports);
+}
+
+/**
+ * Say what this scan read, so a rescan is never silent about its result.
+ *
+ * The first build states the baseline — how many stacks and services came out of the
+ * root — because a startup block that says only "scanning <root>" leaves the operator
+ * without the one number that proves the root was the right one.
+ *
+ * Afterwards the same cadence rule as the connection lines: a change always speaks, and
+ * a rescan somebody asked for answers even when the answer is "nothing moved". Only a
+ * timer rebuild that found nothing stays quiet — that one is LabView talking to itself.
+ */
+function logScan(
+  log: FastifyBaseLogger,
+  appsRoot: string,
+  next: Overview,
+  prev: Overview | undefined,
+  forced: boolean,
+): void {
+  if (!prev) {
+    log.info(formatScanTotals(appsRoot, next.stacks));
+    return;
+  }
+  const diff = diffStacks(prev.stacks, next.stacks);
+  if (diff.unchanged && !forced) return;
+  for (const line of formatScanDiff(appsRoot, diff)) log.info(line);
 }

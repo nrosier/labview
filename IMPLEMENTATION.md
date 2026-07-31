@@ -82,6 +82,7 @@ labview/
     secrets.ts        env masking + URI credential redaction
     model/types.ts    THE contract between backend and frontend
     model/connections.ts  connection-report wording, hints, log/banner rules (pure)
+    model/changes.ts  what changed between two scans, and its wording (pure)
     scan/
       discover.ts     appsRoot -> stack directories
       compose.ts      compose YAML -> normalized AppStack/Service
@@ -104,6 +105,7 @@ labview/
       docker.ts       Docker Engine snapshot (never throws)
       authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
       traefik.ts      Traefik runtime-API snapshot (never throws; all network I/O)
+    server/cache.ts   scan cache: TTL, coalescing, force semantics (§3.11)
     server/server.ts  Fastify: /api/* + static UI, with a TTL cache
   web/                Preact UI (see §3.9)
   scripts/
@@ -446,12 +448,14 @@ Fastify with three routes and a static mount:
 | Route | Behaviour |
 |---|---|
 | `GET /api/overview` | cached scan; rebuilds when older than `cacheTtlSeconds` |
-| `POST /api/rescan` | forces a rebuild, returns it |
+| `POST /api/rescan` | forces a rebuild that re-reads the apps root, and returns it (§3.11) |
 | `GET /api/healthz` | `{ok: true}`, no scan |
 | `GET /*` | the built UI from `web/dist`, SPA-style fallback to `index.html`; a 404 under `/api/` stays JSON |
 
 Concurrent requests during a rebuild share one in-flight promise, so a burst of
-traffic cannot start N scans. The cache is warmed in the background at startup so
+traffic cannot start N scans — **except** a forced one, which may only be answered
+by a build that started after it arrived, or it would return a scan taken before the
+edit that prompted it (§3.11). The cache is warmed in the background at startup so
 the first page load is instant. If `web/dist` is absent the server still runs and
 says how to build it — the API is the primary product, the UI is a view of it.
 
@@ -558,6 +562,70 @@ logs what `changedConnections` returns — `info` for a working target, `warn` f
 
 These are the rules that make the output trustworthy. A change that breaks one is
 a bug even if every test passes.
+
+### 3.11 Rescan and change detection
+
+A scan holds nothing between runs: `scanStacks` re-walks the apps root and re-reads
+every compose and `.env` file on every build, so a new stack directory, a new
+service and an edited file are picked up by construction. Two things were missing
+around that, and both made a working rescan look inert.
+
+**A forced request may only be answered by a build that started after it arrived.**
+A build reads the compose files once, at its start, so a build that began *before*
+an edit cannot contain it. Sharing one in-flight build with every caller — the
+right thing for a burst of page loads — therefore hands a rescan that arrived after
+the edit a scan of the pre-edit fleet. On a fleet of 86 containers with two API
+exchanges that window is seconds wide, and the UI opens one on mount. That rule
+lives in [server/cache.ts](labview/src/server/cache.ts), separated from
+`startServer` because the ordering *is* the behaviour and cannot be asserted
+through a listening socket: `build` and `now` are injected, and the consequences
+are each asserted —
+
+- two passive callers share one build (unchanged);
+- a forced caller behind a passive build waits for it and then builds fresh, rather
+  than sweeping the Engine twice to answer one question;
+- two simultaneous forced callers still coalesce into one build (the second's
+  `startedAt >= requestedAt`);
+- a failed build rejects its caller and leaves the previous value readable.
+
+**A rescan says what it found.** `onBuilt(next, prev, {forced})` fires once per
+build — not once per waiting caller — which is what lets the server report a diff
+without `buildOverview` keeping memory (§4 I7).
+[model/changes.ts](labview/src/model/changes.ts) does the comparison and the
+wording, pure and free of node imports so [web/model.ts](labview/web/model.ts) can
+re-export it: the log line and the note beside `scanned <time>` cannot disagree
+about the same rescan. Canonical JSON strings are compared directly rather than
+hashed — both payloads are already in memory, and an exact comparison needs no
+story about collisions.
+
+What is compared is the **parsed configuration**, not file mtimes and not raw
+bytes. That is the question an operator has (*did my edit take effect*), and it has
+two visible consequences: a comment-only edit reports nothing, and a rotated value
+that LabView masks is invisible, because masking happens before the payload exists
+(§4 I6). Both are asserted so neither can be mistaken for a miss.
+
+The canonical view omits the fields that move without anyone editing a file —
+`docker`, `authentik`, `traefikLive`, `ingress`, `auth`, `notes`, `cloudflare` —
+for the same reason `read` is kept out of `changedConnections`'s signature: a
+container that restarted is not a configuration change, and a diff that says
+otherwise reports everything on every rescan. `cloudflare` is in that list because
+each route's `origin` resolves against the fleet index, whose container-address
+table exists only when Docker is readable; the hostname edits it would have caught
+are caught anyway, in `labels`.
+
+It is a **deny-list, not an allow-list**, deliberately. Forgetting to exclude a new
+derived field produces a spurious "changed" line — loud, and fixed the first time
+anyone sees it. Forgetting to *include* a new field parsed out of the compose
+document produces an edit that is silently never reported, which is the failure
+this exists to prevent. See the §10 playbook line for adding a field.
+
+Emission follows the same cadence rule as the connection lines. The first build
+states the baseline (`LabView read 56 stacks, 86 services from /data/apps`); after
+that a change always speaks, a forced rescan answers even when nothing moved, and
+only a timer rebuild that found nothing stays quiet. The UI holds the outgoing
+payload across the request and renders `scanned 12:04:11 · +1 stack, +2 services`
+with the per-stack detail as the tooltip. No new API fields: both consumers already
+hold the two payloads a diff needs.
 
 ### I1 — Documentation rests on observable evidence
 
@@ -731,6 +799,12 @@ exactly as `meta.dockerError` has always worked. A logger threaded into the
 pipeline would make the same inputs produce different observable behaviour
 depending on who called it, and would put an I/O dependency inside a function whose
 value is that it has none.
+
+It is also why the rescan diff (§3.11) lives **outside** the pipeline. Answering
+"what changed" needs the previous scan, and a `buildOverview` that remembered its
+last result would no longer give the same output for the same inputs. The memory
+belongs to the caller: `createScanCache` holds it and hands it to `onBuilt`, and
+`diffStacks(prev, next)` is a pure function of two payloads.
 
 ### I8 — Containment for anything the config asks us to read
 
@@ -920,6 +994,20 @@ socket path and you meant to configure a proxy" is a real mistake, and only
 endpoints walked past are visible. `code` is a constant — a libuv code, a TLS code
 or an HTTP status — never an address (I2), and no `detail` may carry a credential
 (I6); both are asserted.
+
+**ScanDiff** — what one rescan found, relative to the scan before it. Not part of
+the API payload: it is derived locally by whoever holds both scans, in
+[model/changes.ts](labview/src/model/changes.ts) (§3.11). `added` and `removed`
+name each stack with how many services came or went with it, `changed` carries one
+`StackChange` per stack that moved, `stacks` and `services` are the totals after
+this scan — for the line that reports no change — and `unchanged` is the three
+being empty.
+
+**StackChange** — one stack that exists in both scans: `servicesAdded`,
+`servicesRemoved`, `servicesChanged` by name, and `stackChanged` for an edit to the
+stack itself (compose filename, project name, declared networks or volumes, parse
+warnings). Service tallies count only stacks present in both scans; the services of
+a stack that was just added are already accounted for by the stack.
 
 ---
 
@@ -1165,6 +1253,30 @@ merged away:
   checked against the stubs' token, password and session cookie, the same
   discipline as the leak check above.
 
+**The scan cache and the rescan diff** (§3.11) are asserted the same way, and for
+the same reason: the race *is* the behaviour, so it is driven through the injected
+clock and a build only the assertion can settle — no server, no timers, no sleeping
+on a real deadline. Four properties are pinned:
+
+- **A forced request is never answered by a build that started before it.** Two
+  concurrent passive gets coalesce into one build; a forced get arriving during a
+  passive build makes a second one and receives *its* value; two simultaneous forced
+  gets still coalesce into one. Backing the rule out makes the forced caller receive
+  the stale value, and one assertion fails on exactly that.
+- **Live state moving is not a configuration change.** Two builds over one unedited
+  fixture root, through `BuildDeps.createDocker` (§3.11) with an Engine reporting
+  different status, health, restart counts and addresses on the second pass, must
+  diff to `unchanged`. This is what makes the deny-list load-bearing rather than
+  decorative.
+- **An edit to anything parsed out of the compose document is reported.** Eight
+  fields are edited one at a time on a copied root, plus an `.env` value, plus a new
+  stack directory — each must appear in the diff. A comment-only edit and a
+  key-order change must not, and a rotated secret must not either, because masking
+  runs before the payload exists (**I6**).
+- **The wording says what moved, and says so when nothing did.** Singular and plural
+  forms, the no-change line, and the announced truncation past twelve stacks. No
+  formatted line may contain a fixture `.env` secret.
+
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
@@ -1240,6 +1352,21 @@ the start; the compiler will not catch the UI half.
    validated palette; do not invent a colour.
 7. `web/lib/mermaidDef.ts` if the static diagram labels it.
 8. A fixture and an assertion (§8).
+
+**Add a field to `Service` or `AppStack`.** The rescan diff (§3.11) compares
+whatever it finds, so ask one question about the new field: *does it come out of the
+compose document, or out of a live read?*
+
+- **Parsed out of the document** — nothing to do. It is compared by default, so an
+  edit to it is reported the day it is added. That default is the point.
+- **Derived from a live read** — put it on `VOLATILE_SERVICE_FIELDS` in
+  `model/changes.ts`, with a comment saying which read it depends on. Otherwise every
+  rescan reports that stack as changed whenever the read's answer moves, which is
+  noise the operator will learn to ignore — and an ignored diff is the same as no
+  diff.
+
+The failure modes are asymmetric on purpose: the first mistake is loud and gets
+fixed, the second is silent. When it is genuinely unclear, leave it compared.
 
 **Add a config knob.** `LabViewConfig` interface → `DEFAULTS` → an
 `applyEnvOverrides` line if it needs an env var → document it in
@@ -1442,3 +1569,8 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | `disabled` and `not-configured` log at `debug` and never banner | An optional integration nobody switched on is not a fault. Warning about it trains the operator to ignore the banner, which is the one place the real failures are stated. `not-found` and `credential` *are* faults for the same reason: the operator asked for the read and it cannot ever happen. |
 | Diagnostics are returned on `meta`, not logged where they happen | `buildOverview` has no logger and must not gain one (I4, I7): the same inputs would stop producing the same observable behaviour, and an I/O dependency would land inside the one function whose value is having none. `meta.dockerError` was already the precedent; `meta.connections` generalises it. |
 | Rejected candidates are kept on a *successful* report too | It is the same list that gets printed when none of them answers, which is what makes that case diagnosable at all — and on success it answers the question the log otherwise raises, namely why the endpoint in use is not the one the operator expected. |
+| A forced rescan may only be answered by a build that *started after it* | Joining any in-flight build is the one code path that can genuinely lose an edit: a scan takes seconds on a real fleet, and one that began before the operator saved the file read the old file. The operator sees a fresh `scanned` time and a payload that predates their edit — a wrong answer indistinguishable from a right one. Waiting for the in-flight build and then building again costs one extra sweep and cannot lose anything. |
+| Changes are compared over the parsed configuration, not file mtimes | The question is "did my edit take effect", not "did a file get written". An mtime moves for a `touch`, a `git checkout` that restores identical bytes, or a comment; it does not move for an `.env` edit that changes what a compose file interpolates to. Comparing what LabView actually parsed answers the operator's question and needs no filesystem access, which is what lets the same function run in the browser. |
+| The excluded fields are a deny-list, not an allow-list | The two mistakes are not equal. Forgetting to exclude a newly *derived* field produces a spurious "changed" line — loud, and fixed the first time anyone sees it. Forgetting to *include* a field parsed from the compose document produces an edit that is silently never reported, which is the failure the whole feature exists to prevent. So anything new is compared by default. |
+| The diff is derived by the caller, not carried in the payload | It needs memory of the previous scan, and `buildOverview` is required to have none (I7). Both consumers already hold two payloads, so `diffStacks(prev, next)` as a pure function of them adds no API surface, no server state, and nothing to keep consistent between the log line and the topbar. |
+| "No config changes" is stated rather than left implied | A rescan that reports nothing is indistinguishable from a rescan that never ran, and `scanned <time>` moves either way. The commonest true answer to pressing the button is "I re-read everything and nothing in it differs" — which is only reassuring if it is said out loud. |

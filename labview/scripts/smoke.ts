@@ -18,7 +18,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import type { DockerState, Overview, Service, TraefikLiveRouter } from "../src/model/types.js";
+import type { AppStack, DockerState, Overview, Service, TraefikLiveRouter } from "../src/model/types.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
@@ -2023,6 +2023,459 @@ check(
 );
 traefikEnv({ enabled: false });
 authentikEnv({});
+
+/* -------------------------------------------------------------------------- */
+/* Rescan: force semantics, and what a rescan found                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The two halves of a trustworthy rescan.
+ *
+ * First, that a forced request is never answered by a scan that began before it: a build
+ * reads the compose files once at its start, so an older build cannot contain an edit made
+ * after it started, and handing it to the operator who just pressed Rescan is
+ * indistinguishable from never re-reading the files at all. Driven through an injected
+ * clock and a build nobody can finish except this test, because the ordering is the
+ * behaviour and a live server cannot be asked for one ordering on demand.
+ *
+ * Second, that the diff reports configuration and only configuration. A container that
+ * restarted between two scans is not an edit, and a diff that says otherwise would report
+ * everything on every rescan — the same trap `read` is kept out of the connection
+ * signature for.
+ */
+const { createScanCache } = await import("../src/server/cache.js");
+const { diffStacks, scanDiffText, scanDiffDetails, formatScanDiff, formatScanTotals } = await import(
+  "../src/model/changes.js"
+);
+const { cpSync, mkdirSync } = await import("node:fs");
+
+console.log("\na forced rescan is never answered by a scan that started before it");
+
+const settle = () => new Promise<void>((r) => setTimeout(r, 0));
+
+/** A cache whose clock and whose builds only this test can move. */
+function harness() {
+  let clock = 1_000;
+  let started = 0;
+  const waiting: Array<{ ok: (v: string) => void; err: (e: unknown) => void }> = [];
+  const built: Array<{ next: string; prev: string | undefined; forced: boolean }> = [];
+  const cache = createScanCache<string>({
+    ttlMs: 5_000,
+    now: () => clock,
+    build: () =>
+      new Promise<string>((ok, err) => {
+        started++;
+        waiting.push({ ok, err });
+      }),
+    onBuilt: (next, prev, info) => built.push({ next, prev, forced: info.forced }),
+  });
+  return {
+    cache,
+    built,
+    get started() {
+      return started;
+    },
+    advance: (ms: number) => {
+      clock += ms;
+    },
+    finish: (value: string) => {
+      const w = waiting.shift();
+      if (!w) throw new Error("no build is waiting — the assertion would be vacuous");
+      w.ok(value);
+      return settle();
+    },
+    fail: (e: unknown) => {
+      const w = waiting.shift();
+      if (!w) throw new Error("no build is waiting — the assertion would be vacuous");
+      w.err(e);
+      return settle();
+    },
+  };
+}
+
+const h = harness();
+const firstCaller = h.cache.get(false);
+check("the first caller starts a scan", h.started === 1);
+const alongside = h.cache.get(false);
+check("a second caller waiting on it does not start another", h.started === 1);
+await h.finish("scan-1");
+check("...and both are answered by the one scan", (await firstCaller) === "scan-1" && (await alongside) === "scan-1");
+check(
+  "onBuilt fires once per scan, not once per caller, and the first has nothing to compare against",
+  h.built.length === 1 && h.built[0]?.prev === undefined && h.built[0]?.next === "scan-1",
+  JSON.stringify(h.built),
+);
+check("inside the TTL nothing is re-read", (await h.cache.get(false)) === "scan-1" && h.started === 1);
+h.advance(6_000);
+const afterTtl = h.cache.get(false);
+check("past the TTL a passive caller rebuilds", h.started === 2);
+await h.finish("scan-2");
+check(
+  "...and onBuilt is handed the scan it replaced, which is what lets a caller diff them",
+  (await afterTtl) === "scan-2" && h.built[1]?.prev === "scan-1" && h.built[1]?.forced === false,
+  JSON.stringify(h.built[1]),
+);
+
+// The defect this rule exists for. A passive scan is already running; the operator edits a
+// compose file and presses Rescan. That running scan read the files before the edit, so
+// answering the click with it returns the pre-edit fleet — which looks exactly like
+// "LabView did not re-read the files", and is invisible when it happens.
+h.advance(6_000);
+const running = h.cache.get(false);
+check("a passive scan is in flight", h.started === 3);
+h.advance(1);
+const clicked = h.cache.get(true);
+check(
+  "the click does not join it, and does not sweep the Engine alongside it either",
+  h.started === 3,
+  `${h.started} scans`,
+);
+await h.finish("pre-edit-scan");
+check("the in-flight scan answers the passive caller", (await running) === "pre-edit-scan");
+check("...and the click gets a scan of its own, started after it asked", h.started === 4);
+await h.finish("post-edit-scan");
+check("...whose result is what the click returns", (await clicked) === "post-edit-scan");
+check("two scans in total: the click waited its turn rather than doubling the load", h.started === 4);
+check("...and the forced build says so to onBuilt", h.built[3]?.forced === true, JSON.stringify(h.built[3]));
+
+h.advance(1);
+const clickA = h.cache.get(true);
+const clickB = h.cache.get(true);
+check("two clicks at once still coalesce into one scan", h.started === 5);
+await h.finish("scan-5");
+check("...and both are answered by it", (await clickA) === "scan-5" && (await clickB) === "scan-5");
+
+h.advance(6_000);
+const doomed = h.cache.get(false);
+let doomedRejected = false;
+// The handler goes on before the rejection, not after: a promise left bare for one turn
+// of the event loop is an unhandled rejection, and this run would die instead of asserting.
+const doomedSettled = doomed.catch(() => {
+  doomedRejected = true;
+});
+await h.fail(new Error("the Engine went away"));
+await doomedSettled;
+check("a scan that fails rejects its caller", doomedRejected);
+check("...and leaves the previous scan readable rather than poisoning the cache", h.cache.peek() === "scan-5");
+const retried = h.cache.get(false);
+check("...and the next caller tries again", h.started === 7);
+await h.finish("scan-7");
+check("...successfully", (await retried) === "scan-7");
+
+console.log("\nwhat a rescan found, compared over the parsed configuration");
+
+const baseScan = await overviewFor(appsRoot);
+const stacksA = baseScan.stacks;
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+check("a scan compared against itself reports nothing", diffStacks(stacksA, stacksA).unchanged);
+
+const firstStack = stacksA[0]!;
+const withoutFirst = stacksA.slice(1);
+const addedDiff = diffStacks(withoutFirst, stacksA);
+check(
+  "a stack that appeared is named, with how many services came with it",
+  addedDiff.added.length === 1 &&
+    addedDiff.added[0]?.id === firstStack.id &&
+    addedDiff.added[0]?.services === firstStack.services.length &&
+    addedDiff.removed.length === 0 &&
+    !addedDiff.unchanged,
+  JSON.stringify(addedDiff.added),
+);
+const removedDiff = diffStacks(stacksA, withoutFirst);
+check(
+  "a stack that disappeared likewise, and the totals are of the new scan",
+  removedDiff.removed.length === 1 &&
+    removedDiff.removed[0]?.id === firstStack.id &&
+    removedDiff.added.length === 0 &&
+    removedDiff.stacks === withoutFirst.length,
+  JSON.stringify({ removed: removedDiff.removed, stacks: removedDiff.stacks }),
+);
+
+const grown = clone(stacksA);
+const multiService = grown.find((s) => s.services.length > 1)!;
+const spare = clone(multiService.services[0]!);
+spare.name = "smoke-sidecar";
+spare.containerName = "smoke-sidecar";
+multiService.services.push(spare);
+const svcAdded = diffStacks(stacksA, grown);
+check(
+  "a service added to an existing stack is that stack, changed, naming the service",
+  svcAdded.changed.length === 1 &&
+    svcAdded.changed[0]?.id === multiService.id &&
+    svcAdded.changed[0]?.servicesAdded.join(",") === "smoke-sidecar" &&
+    svcAdded.changed[0]?.stackChanged === false,
+  JSON.stringify(svcAdded.changed),
+);
+check(
+  "...and taking it away again is the mirror image",
+  diffStacks(grown, stacksA).changed[0]?.servicesRemoved.join(",") === "smoke-sidecar",
+);
+
+// Every one of these comes straight out of the compose document, so every one of them is
+// an edit an operator made and expects to see reported.
+const edits: Array<[string, (s: Service) => void]> = [
+  ["image", (s) => void (s.image = "example.com/other:2")],
+  ["command", (s) => void (s.command = "sleep infinity")],
+  ["restart", (s) => void (s.restart = "no")],
+  ["labels", (s) => void (s.labels = { ...s.labels, "smoke.marker": "1" })],
+  ["ports", (s) => s.ports.push({ published: "19999", target: "80", protocol: "tcp", raw: "19999:80" })],
+  ["networks", (s) => s.networks.push("smoke-net")],
+  ["dependsOn", (s) => s.dependsOn.push("smoke-dep")],
+  ["mounts", (s) => s.mounts.push({ type: "bind", source: "/tmp/smoke", target: "/smoke", readOnly: true, raw: "/tmp/smoke:/smoke:ro" })],
+];
+for (const [field, mutate] of edits) {
+  const edited = clone(stacksA);
+  const svc = edited[0]!.services[0]!;
+  mutate(svc);
+  const d = diffStacks(stacksA, edited);
+  check(
+    `an edited ${field} is a changed service`,
+    d.changed.length === 1 && d.changed[0]?.servicesChanged.join(",") === svc.name && !d.unchanged,
+    JSON.stringify(d.changed),
+  );
+}
+
+const stackEdited = clone(stacksA);
+stackEdited[0]!.declaredNetworks.push({ name: "smoke-net", external: true });
+const stackDiff = diffStacks(stacksA, stackEdited);
+check(
+  "an edit to the stack itself is reported as the stack, not as a service",
+  stackDiff.changed.length === 1 &&
+    stackDiff.changed[0]?.stackChanged === true &&
+    stackDiff.changed[0]?.servicesChanged.length === 0,
+  JSON.stringify(stackDiff.changed),
+);
+
+// Key order is a property of how the object was built, not of the configuration. Without
+// the sorted-key comparison every rescan would report every stack.
+const reversedKeys = <T extends object>(o: T): T => Object.fromEntries(Object.entries(o).reverse()) as T;
+const reordered = stacksA.map((s) => reversedKeys({ ...s, services: s.services.map(reversedKeys) }));
+check("key order is not a change", diffStacks(stacksA, reordered).unchanged);
+
+// The load-bearing exclusion, at unit level: everything a scan learns from a live source
+// or derives for itself moves without anyone editing a file.
+const liveState: DockerState = {
+  id: "feedface0001",
+  name: "example",
+  image: "example.com/app:1",
+  state: "exited",
+  status: "Exited (137) 2 minutes ago",
+  health: "unhealthy",
+  running: false,
+  restartCount: 12,
+  networks: ["proxy"],
+  ipAddresses: { proxy: "172.30.9.9" },
+  publishedPorts: [],
+};
+const liveOnly = clone(stacksA);
+for (const s of liveOnly) {
+  for (const svc of s.services) {
+    svc.docker = liveState;
+    svc.traefikLive = [];
+    svc.notes = [...svc.notes, "a note this pass happened to add"];
+    svc.ingress = svc.ingress === "internal" ? "local" : "internal";
+  }
+}
+check(
+  "live state and derived conclusions are not configuration changes",
+  diffStacks(stacksA, liveOnly).unchanged,
+  JSON.stringify(diffStacks(stacksA, liveOnly).changed.slice(0, 2)),
+);
+
+console.log("\nthe same, through the whole pipeline, with an Engine that answers differently each time");
+// The assertion the `BuildDeps.createDocker` passthrough exists for. Two builds over one
+// unedited root, an Engine reporting a different state, a different address and a
+// different restart count each time — the rescan must still say nothing changed. The
+// container names are the fixture fleet's, so the live state actually merges onto services
+// instead of landing nowhere and making this vacuous.
+const fixtureContainers = ["authentik-server", "authentik-postgres", "authentik-redis", "jellyfin", "emby", "nextcloud", "nextcloud-db", "outline", "gateway"];
+const shiftingEngine = (pass: number): DockerLike => ({
+  ping: async () => ({}),
+  listContainers: async () =>
+    fixtureContainers.map((name, i) => ({
+      Id: `feedface${String(i).padStart(4, "0")}`,
+      Status: pass === 1 ? "Up 3 hours (healthy)" : "Up 12 seconds",
+    })) as never,
+  getContainer: (id: string) => ({
+    inspect: async () => {
+      const index = Number(id.replace("feedface", ""));
+      const name = fixtureContainers[index] ?? "unknown";
+      return {
+        Id: id,
+        Name: `/${name}`,
+        Created: "2024-01-01T00:00:00Z",
+        RestartCount: pass === 1 ? 0 : 7,
+        Image: "sha256:0000000000000000",
+        Config: { Image: "example.com/app:1", Labels: {} },
+        State: {
+          Status: pass === 1 ? "running" : "restarting",
+          Running: pass === 1,
+          StartedAt: pass === 1 ? "2024-01-01T00:00:00Z" : "2024-06-01T00:00:00Z",
+          Health: { Status: pass === 1 ? "healthy" : "starting" },
+        },
+        NetworkSettings: {
+          Networks: { proxy: { IPAddress: pass === 1 ? `172.30.0.${index + 2}` : `172.31.0.${index + 2}` } },
+          Ports: {},
+        },
+      } as never;
+    },
+  }),
+});
+process.env.LABVIEW_DOCKER_ENABLED = "true";
+process.env.LABVIEW_DOCKER_HOST = "tcp://127.0.0.1:2375";
+const livePass1 = await overviewFor(appsRoot, { createDocker: () => shiftingEngine(1) });
+const livePass2 = await overviewFor(appsRoot, { createDocker: () => shiftingEngine(2) });
+process.env.LABVIEW_DOCKER_ENABLED = "false";
+delete process.env.LABVIEW_DOCKER_HOST;
+const liveA = livePass1.stacks.flatMap((s) => s.services).filter((s) => s.docker);
+const liveB = livePass2.stacks.flatMap((s) => s.services).filter((s) => s.docker);
+check(
+  "the Engine really did reach the services, and really did report something else",
+  liveA.length > 0 &&
+    liveA.length === liveB.length &&
+    liveA[0]?.docker?.state !== liveB[0]?.docker?.state &&
+    liveA[0]?.docker?.ipAddresses.proxy !== liveB[0]?.docker?.ipAddresses.proxy,
+  JSON.stringify({ merged: liveA.length, a: liveA[0]?.docker?.state, b: liveB[0]?.docker?.state }),
+);
+const liveDiff = diffStacks(livePass1.stacks, livePass2.stacks);
+check(
+  "and the rescan still reports no configuration change",
+  liveDiff.unchanged,
+  JSON.stringify(liveDiff.changed.slice(0, 2)),
+);
+
+console.log("\na rescan of a root that really changed on disk");
+// Through the scanner rather than by editing parsed objects, because the question the
+// operator is asking is about files: a `.env` value that reaches a service's environment,
+// a whole new directory under the root.
+const tmpRoot = mkdtempSync(resolve(tmpdir(), "labview-rescan-"));
+cpSync(appsRoot, tmpRoot, { recursive: true });
+const envFile = resolve(tmpRoot, "authentik", ".env");
+const diskBefore = await overviewFor(tmpRoot);
+writeFileSync(envFile, readFileSync(envFile, "utf8").replace("PG_USER=authentik", "PG_USER=rescan-probe-user"));
+const diskAfterEnv = await overviewFor(tmpRoot);
+const envDiff = diffStacks(diskBefore.stacks, diskAfterEnv.stacks);
+check(
+  "an .env edit is caught wherever it was interpolated, because interpolation happens at parse time",
+  envDiff.changed.length === 1 &&
+    envDiff.changed[0]?.id === "authentik" &&
+    envDiff.changed[0]?.servicesChanged.length === 2,
+  JSON.stringify(envDiff.changed),
+);
+// The documented consequence of masking before the payload exists (I6): the diff compares
+// what LabView holds, and it does not hold rotated secrets.
+writeFileSync(envFile, readFileSync(envFile, "utf8").replace("PG_PASS=super-secret-value", "PG_PASS=rotated"));
+const diskAfterSecret = await overviewFor(tmpRoot);
+check(
+  "a rotated secret is invisible to the diff — it never reaches the payload (I6)",
+  diffStacks(diskAfterEnv.stacks, diskAfterSecret.stacks).unchanged,
+);
+mkdirSync(resolve(tmpRoot, "zz-smoke-stack"));
+writeFileSync(
+  resolve(tmpRoot, "zz-smoke-stack", "compose.yml"),
+  "services:\n  probe:\n    image: example.com/probe:1\n    ports:\n      - 19998:80\n",
+);
+const diskGrown = await overviewFor(tmpRoot);
+const grownDiff = diffStacks(diskAfterSecret.stacks, diskGrown.stacks);
+check(
+  "a directory that appeared under the root is a new stack, with its services counted",
+  grownDiff.added.length === 1 &&
+    grownDiff.added[0]?.id === "zz-smoke-stack" &&
+    grownDiff.added[0]?.services === 1,
+  JSON.stringify(grownDiff.added),
+);
+// Comparing the parsed configuration rather than the file has one visible consequence,
+// and this is it: a rescan after a comment-only edit reports nothing, because nothing
+// LabView documents moved. That is the intended answer, not a miss.
+const composeFile = resolve(tmpRoot, "zz-smoke-stack", "compose.yml");
+writeFileSync(composeFile, `# a comment nobody parses\n${readFileSync(composeFile, "utf8")}`);
+const diskCommented = await overviewFor(tmpRoot);
+check(
+  "a comment-only edit reports nothing — the parsed configuration is what is compared",
+  diffStacks(diskGrown.stacks, diskCommented.stacks).unchanged,
+);
+
+console.log("\nthe rescan line says what moved, and says so when nothing did");
+check(
+  "nothing moved has its own wording, so the button is never silent",
+  scanDiffText(diffStacks(stacksA, stacksA)) === "no config changes",
+  scanDiffText(diffStacks(stacksA, stacksA)),
+);
+check("one stack is singular", scanDiffText(addedDiff) === "+1 stack", scanDiffText(addedDiff));
+check(
+  "two are plural",
+  scanDiffText(diffStacks(stacksA.slice(2), stacksA)) === "+2 stacks",
+  scanDiffText(diffStacks(stacksA.slice(2), stacksA)),
+);
+check(
+  "a service is counted separately from the stack it is in",
+  scanDiffText(svcAdded) === "1 stack changed, +1 service",
+  scanDiffText(svcAdded),
+);
+check(
+  "a removal is signed, so it cannot be mistaken for an addition",
+  scanDiffText(removedDiff) === "-1 stack",
+  scanDiffText(removedDiff),
+);
+check(
+  "the detail line names the stack and the service that moved",
+  scanDiffDetails(svcAdded).join("|") === `· changed: ${multiService.id} — services added: smoke-sidecar`,
+  scanDiffDetails(svcAdded).join("|"),
+);
+check(
+  "an added stack's detail line carries its service count",
+  scanDiffDetails(addedDiff).join("|") === `· added: ${firstStack.id} (${firstStack.services.length} services)`,
+  scanDiffDetails(addedDiff).join("|"),
+);
+const logLines = formatScanDiff("/data/apps", svcAdded);
+check(
+  "the log line names the root, leads with the same summary, and carries the totals",
+  logLines[0] === `LabView rescanned /data/apps — 1 stack changed, +1 service (${svcAdded.stacks} stacks, ${svcAdded.services} services)` &&
+    logLines[1] === `  ${scanDiffDetails(svcAdded)[0]}`,
+  JSON.stringify(logLines),
+);
+check(
+  "the first scan states the baseline instead, since it has nothing to compare against",
+  formatScanTotals("/data/apps", stacksA) ===
+    `LabView read ${stacksA.length} stacks, ${stacksA.flatMap((s) => s.services).length} services from /data/apps`,
+  formatScanTotals("/data/apps", stacksA),
+);
+// A long list is truncated, but never silently: a rescan that reports 12 of 30 changed
+// stacks as though that were all of them is worse than one that reports nothing.
+const manyChanged: AppStack[] = Array.from({ length: 20 }, (_, i) => ({
+  ...clone(firstStack),
+  id: `stack-${String(i).padStart(2, "0")}`,
+}));
+const manyDetails = scanDiffDetails(diffStacks([], manyChanged));
+check(
+  "a long list of changes says how many it left out",
+  manyDetails.length === 13 && manyDetails[12] === "· … and 8 more stacks",
+  JSON.stringify(manyDetails.slice(-2)),
+);
+
+console.log("\nno rescan line carries a value out of the configuration");
+// Same discipline as the connection lines: these go to a log and to a tooltip, and the
+// diff is computed from a payload that has env values in it. It reports *that* a service
+// changed and never *to what*.
+const everyDiffLine = [
+  ...formatScanDiff(tmpRoot, envDiff),
+  ...formatScanDiff(tmpRoot, grownDiff),
+  ...scanDiffDetails(envDiff),
+].join("\n");
+check(
+  "not the new value, and not the old one either",
+  !everyDiffLine.includes("rescan-probe-user") && !everyDiffLine.includes("PG_USER"),
+  everyDiffLine,
+);
+check(
+  "and no fixture secret, from any of the three .env files",
+  !everyDiffLine.includes("super-secret-value") &&
+    !everyDiffLine.includes("another-secret") &&
+    !everyDiffLine.includes("ldap-bind-secret") &&
+    !everyDiffLine.includes("oidc-client-secret-value"),
+  everyDiffLine,
+);
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

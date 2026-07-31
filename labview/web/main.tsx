@@ -10,6 +10,7 @@ import type {
   TraefikSummary,
 } from "./model";
 import { phaseText, shouldBanner } from "./model";
+import { diffStacks, scanDiffDetails, scanDiffText, type ScanDiff } from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
@@ -166,6 +167,9 @@ function App() {
   const [ov, setOv] = useState<Overview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // What the last rescan found, held until the next one. The initial load has nothing to
+  // compare against, so it stays null and the note is absent rather than empty.
+  const [diff, setDiff] = useState<ScanDiff | null>(null);
   const [tab, setTab] = useState<"overview" | "graph">("overview");
   const [theme, setTheme] = useState<Theme>((localStorage.getItem(THEME_KEY) as Theme) || "auto");
 
@@ -198,8 +202,13 @@ function App() {
   async function doRescan() {
     setBusy(true);
     setError(null);
+    // Captured before the request: the payload on screen is the one the operator wants
+    // the new scan compared against, and it is about to be replaced.
+    const before = ov;
     try {
-      setOv(await rescan());
+      const next = await rescan();
+      setOv(next);
+      setDiff(before ? diffStacks(before.stacks, next.stacks) : null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -325,7 +334,25 @@ function App() {
         </div>
         <div class="meta">
           <span class="mono">{ov.meta.appsRoot}</span>
-          <span>scanned {fmtTime(ov.meta.scannedAt)}</span>
+          <span>
+            scanned {fmtTime(ov.meta.scannedAt)}
+            {/* The proof the click did something. "No config changes" is as much an
+                answer as a list of changes, and its absence is what made the button
+                feel inert — so it is shown too, only quieter. */}
+            {diff && (
+              <span
+                class={diff.unchanged ? "rescan-note" : "rescan-note moved"}
+                title={
+                  diff.unchanged
+                    ? `Re-read ${ov.meta.appsRoot}: nothing in the parsed configuration differs from the previous scan.`
+                    : scanDiffDetails(diff).join("\n")
+                }
+              >
+                {" · "}
+                {scanDiffText(diff)}
+              </span>
+            )}
+          </span>
           <span>
             docker:{" "}
             {ov.meta.dockerAvailable ? (

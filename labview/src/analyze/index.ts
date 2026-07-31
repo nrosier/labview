@@ -21,7 +21,7 @@ import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.
 import { buildFleetIndex, lookupContainerAddress, resolveOrigins, serviceRefKey } from "./origins.js";
 import { matchAuthentik } from "./authentik.js";
 import { matchTraefik, noteTraefikLive, type TraefikLiveContext } from "./traefik.js";
-import { snapshotDocker, composeKey, type DockerSnapshot } from "../enrich/docker.js";
+import { snapshotDocker, composeKey, type DockerDeps, type DockerSnapshot } from "../enrich/docker.js";
 import {
   discoverAuthentikEndpoints,
   isAuthentikService,
@@ -37,6 +37,16 @@ const VERSION = "0.1.0";
 export interface BuildDeps {
   /** HTTP layer for the Authentik and Traefik exchanges. Defaults to the global `fetch`. */
   fetchImpl?: FetchLike;
+  /**
+   * Engine client factory, passed through to `snapshotDocker`. Defaults to a real
+   * `dockerode`.
+   *
+   * Here so the live-merge path can be driven offline, which is what makes the rule
+   * behind change detection assertable: two builds over one unedited fixture root, an
+   * Engine reporting different container state each time, and a diff that still says
+   * nothing changed.
+   */
+  createDocker?: DockerDeps["createDocker"];
 }
 
 /** Full pipeline: scan -> enrich -> analyze -> Overview. `now` is injected for determinism. */
@@ -73,7 +83,7 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
       )
     : undefined;
 
-  const snapshot = await snapshotDocker(cfg);
+  const snapshot = await snapshotDocker(cfg, { createDocker: deps.createDocker });
   const registry = buildMiddlewareRegistry(stacks, cfg.labels.traefik.prefix);
 
   // Pass 1: parse routes, merge live docker state, classify ingress.

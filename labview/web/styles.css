@@ -187,6 +187,12 @@ code, .mono {
 .topbar h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
 .topbar .brand .dot { color: var(--c2); font-size: 22px; line-height: 0; }
 .topbar .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+/* What the last rescan found, beside the time it found it. Inherits the muted meta
+   colour when nothing changed — it is a confirmation, not news — and takes the ink
+   colour when something moved, which is the one case worth catching an eye. Both carry
+   the same tooltip contract, so `cursor: help` applies to both. */
+.topbar .meta .rescan-note { cursor: help; }
+.topbar .meta .rescan-note.moved { color: var(--ink); }
 .topbar .spacer { flex: 1; }
 
 .btn {

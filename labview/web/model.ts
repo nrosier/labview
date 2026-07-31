@@ -42,3 +42,11 @@ export type {
  * line about the same failure, and adding a phase updates both at once.
  */
 export { phaseText, shouldBanner } from "../src/model/connections";
+
+/**
+ * What a rescan found, compared and worded by the same module the server logs through —
+ * so the note beside `scanned <time>` and the line in the log can never disagree about
+ * the same rescan.
+ */
+export { diffStacks, scanDiffText, scanDiffDetails } from "../src/model/changes";
+export type { ScanDiff, StackChange } from "../src/model/changes";
