@@ -1,0 +1,40 @@
+# Deploy FleetView on TrueNAS Scale (Apps -> Custom App -> "Install via YAML",
+# or drop this in /mnt/apps/fleetview/compose.yml and run `docker compose up -d`).
+#
+# It mounts your stacks read-only and the docker socket read-only for live state.
+services:
+  fleetview:
+    build: .
+    # Or use a prebuilt image once you publish one:
+    # image: ghcr.io/you/fleetview:latest
+    container_name: fleetview
+    restart: unless-stopped
+    environment:
+      FLEETVIEW_APPS_ROOT: /data/apps
+      FLEETVIEW_DOCKER_SOCKET: /var/run/docker.sock
+      FLEETVIEW_PORT: "8080"
+      # FLEETVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
+    volumes:
+      # Your per-container stacks, read-only.
+      - /mnt/apps:/data/apps:ro
+      # Docker socket, read-only, for live enrichment. Remove to run config-only.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Optional tuned config:
+      # - /mnt/apps/fleetview/config.yml:/config/config.yml:ro
+    ports:
+      - "8080:8080"
+
+    # --- Example: put FleetView behind YOUR stack (Traefik + Authentik) ---
+    # Uncomment and adapt to expose it locally with SSO, matching your other apps.
+    # labels:
+    #   traefik.enable: "true"
+    #   traefik.http.routers.fleetview.rule: "Host(`fleet.example.com`)"
+    #   traefik.http.routers.fleetview.entrypoints: "websecure"
+    #   traefik.http.routers.fleetview.tls: "true"
+    #   traefik.http.routers.fleetview.middlewares: "authentik@docker"
+    #   traefik.http.services.fleetview.loadbalancer.server.port: "8080"
+    #   # And/or publish it through the Cloudflare tunnel via DockFlare:
+    #   dockflare.enable: "true"
+    #   dockflare.hostname: "fleet.example.com"
+    #   dockflare.service: "http://fleetview:8080"
+    #   dockflare.access.policy: "authenticate"

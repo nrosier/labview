@@ -1,0 +1,22 @@
+/** Re-export the shared backend model so the UI has a single import surface. */
+export type {
+  Overview,
+  OverviewStats,
+  ScanMeta,
+  AppStack,
+  Service,
+  EnvVar,
+  PortMapping,
+  MountSpec,
+  CloudflareRoute,
+  TraefikRoute,
+  AuthMethod,
+  AuthPosture,
+  DockerState,
+  NetworkDecl,
+  VolumeDecl,
+  Graph,
+  GraphNode,
+  GraphEdge,
+  IngressKind,
+} from "../src/model/types";

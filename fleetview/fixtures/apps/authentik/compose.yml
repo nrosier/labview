@@ -1,0 +1,60 @@
+services:
+  server:
+    image: ghcr.io/goauthentik/server:2024.10.1
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    depends_on:
+      - postgresql
+      - redis
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: ${PG_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+    ports:
+      - "9000:9000"
+    networks:
+      - default
+      - proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.authentik.rule: "Host(`sso.example.com`)"
+      traefik.http.routers.authentik.entrypoints: "websecure"
+      traefik.http.routers.authentik.tls: "true"
+      traefik.http.routers.authentik.tls.certresolver: "cloudflare"
+      traefik.http.services.authentik.loadbalancer.server.port: "9000"
+      # The forward-auth middleware other services reference as authentik@docker:
+      traefik.http.middlewares.authentik.forwardauth.address: "http://authentik-server:9000/outpost.goauthentik.io/auth/traefik"
+      traefik.http.middlewares.authentik.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.authentik.forwardauth.authResponseHeaders: "X-authentik-username,X-authentik-groups,X-authentik-email,X-authentik-name,X-authentik-uid"
+      dockflare.enable: "true"
+      dockflare.hostname: "sso.example.com"
+      dockflare.service: "http://authentik-server:9000"
+
+  postgresql:
+    image: postgres:16-alpine
+    container_name: authentik-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASS}
+      POSTGRES_DB: authentik
+    volumes:
+      - database:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: authentik-redis
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+
+volumes:
+  database:
+  redis:
+
+networks:
+  proxy:
+    external: true

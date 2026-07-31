@@ -1,0 +1,30 @@
+services:
+  outline:
+    image: outlinewiki/outline:latest
+    container_name: outline
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # OIDC SSO against Authentik (env-based).
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OIDC_AUTH_URI: https://sso.example.com/application/o/authorize/
+      OIDC_TOKEN_URI: https://sso.example.com/application/o/token/
+    ports:
+      - "3000:3000"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.outline.rule=Host(`docs.example.com`)"
+      - "traefik.http.routers.outline.entrypoints=websecure"
+      - "traefik.http.routers.outline.tls.certresolver=cloudflare"
+      - "traefik.http.services.outline.loadbalancer.server.port=3000"
+      - "dockflare.enable=true"
+      - "dockflare.hostname=docs.example.com"
+      - "dockflare.service=https://192.168.1.2"
+
+networks:
+  proxy:
+    external: true

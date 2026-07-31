@@ -1,0 +1,83 @@
+# FleetView configuration.
+# Copy to config.yml (or point FLEETVIEW_CONFIG at it) and tune to match your setup.
+# Every value here can also be overridden by an environment variable (see README).
+
+# Where your per-container stacks live. Each immediate subdirectory that contains
+# a compose file is treated as one "app stack".
+#   /mnt/apps/<container>/compose.yml  (+ optional .env)
+appsRoot: /data/apps
+
+# Compose file names to look for inside each stack directory, in priority order.
+composeFilenames:
+  - compose.yml
+  - compose.yaml
+  - docker-compose.yml
+  - docker-compose.yaml
+
+# Enrich compose config with live data from the Docker Engine when the socket is
+# reachable. Safe to leave on: if the socket is missing the scan degrades to
+# config-only automatically.
+docker:
+  enabled: true
+  socketPath: /var/run/docker.sock
+
+# Secret handling. Values of env keys matching these patterns are masked in the
+# API and UI (keys are always shown, values replaced with a placeholder).
+secrets:
+  maskValues: true
+  # Case-insensitive substrings. A key matching any of these is masked.
+  keyPatterns:
+    - PASS
+    - SECRET
+    - TOKEN
+    - KEY
+    - APIKEY
+    - CREDENTIAL
+    - PRIVATE
+    - SALT
+    - PEPPER
+    - DSN
+  # Extra explicit keys to always mask.
+  keysAlways: []
+  # Keys to never mask even if they match a pattern (e.g. PUBLIC_KEY_URL).
+  keysNever:
+    - PUBLIC_KEY_URL
+    - KEYCLOAK_REALM
+
+# Label matching. These are tolerant of both list ("- k=v") and map (k: v) syntax.
+labels:
+  dockflare:
+    prefix: dockflare
+  traefik:
+    prefix: traefik
+  authentik:
+    # Substrings that, when found in a Traefik forwardauth middleware address or
+    # in an env value, mark a service as protected by Authentik.
+    hostHints:
+      - authentik
+      - auth.
+      - outpost.goauthentik.io
+    # Env key substrings that indicate LDAP-based auth wired to Authentik.
+    ldapEnvHints:
+      - LDAP_HOST
+      - LDAP_URI
+      - LDAP_SERVER
+      - LDAP_URL
+    # Env key substrings that indicate OAuth/OIDC-based auth.
+    oauthEnvHints:
+      - OIDC
+      - OAUTH
+      - OPENID
+      - ISSUER
+      - CLIENT_ID
+      - CLIENT_SECRET
+      - SSO
+
+# Rescan cache: how long (seconds) a scan result is served before a fresh scan is
+# triggered on the next request. The UI also has a manual "Rescan" button.
+cacheTtlSeconds: 60
+
+# HTTP server.
+server:
+  host: 0.0.0.0
+  port: 8080

@@ -1,0 +1,28 @@
+services:
+  emby:
+    image: emby/embyserver:4.8.8.0
+    container_name: emby
+    restart: unless-stopped
+    # The Traefik exception: published via DockFlare (Cloudflare tunnel) but NOT
+    # behind Traefik/Authentik — Emby uses its own built-in login.
+    environment:
+      UID: "1000"
+      GID: "1000"
+    networks:
+      - default
+      - proxy
+    volumes:
+      - ./config:/config
+      - /mnt/media:/mnt/media:ro
+    ports:
+      - "8920:8096"
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=media.example.com"
+      - "dockflare.service=http://192.168.1.2:8096"
+      - "dockflare.http2_origin=true"
+      - "dockflare.match_sni_to_host=true"
+
+networks:
+  proxy:
+    external: true

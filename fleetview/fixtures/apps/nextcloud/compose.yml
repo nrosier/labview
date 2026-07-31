@@ -1,0 +1,39 @@
+services:
+  nextcloud:
+    image: nextcloud:30-apache
+    container_name: nextcloud
+    restart: unless-stopped
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      # LDAP wired to the Authentik LDAP outpost (env-based, not proxy).
+      LDAP_HOST: ldap://authentik-server:389
+      LDAP_BASE_DN: dc=bunbun,dc=be
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD}
+    networks:
+      - proxy
+      - default
+    volumes:
+      - ./data:/var/www/html/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.rule=Host(`cloud.example.com`)"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+      - "traefik.http.routers.nextcloud.tls.certresolver=cloudflare"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+
+  db:
+    image: postgres:16-alpine
+    container_name: nextcloud-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: nextcloud
+    networks:
+      - default
+
+networks:
+  proxy:
+    external: true
