@@ -1,0 +1,37 @@
+# Half of an ambiguous hostname — see also `twin-b`.
+#
+# `twin-blue@file` is a live router whose name happens to equal this service's
+# router name, and whose host rule matches both this service and `twin-b`. Neither
+# way in resolves it:
+#
+#   * the name match is only trustworthy for `@docker` routers, because Traefik
+#     derives those names from the labels of the very container it found them on. A
+#     `@file` router's name was typed by hand in a file this scan cannot read, so its
+#     resembling a label here is a coincidence with no evidentiary weight, and
+#   * the host matches two services, so the hostname index yields two candidates.
+#
+# Two candidates is not a match to arbitrate — it is a match not made. The router
+# ends up in `unmatchedRouters`, where it is reported as ingress LabView could not
+# attribute, and neither twin is credited with it.
+#
+# One thing it must NOT produce: a "declared but not live" note on this service. The
+# proxy *is* serving a router called `twin-blue`; LabView merely could not tie it to
+# anybody. Checking only the routers matched to this service would report a route
+# that demonstrably exists as missing — which is why that check runs against every
+# router in the snapshot instead. `twin-b`, whose `twin-green` really is absent, is
+# the other side of that assertion.
+services:
+  blue:
+    image: ghcr.io/example/twin:1
+    container_name: twin-blue
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.twin-blue.rule=Host(`twin.example.com`)"
+      - "traefik.http.routers.twin-blue.entrypoints=websecure"
+
+networks:
+  proxy:
+    external: true

@@ -25,7 +25,13 @@
  * so a missing match is by far the cheaper error.
  */
 import type { AppStack, AuthentikApplication, Service } from "../model/types.js";
-import { lookupAddress, serviceRefKey, type FleetIndex, type ServiceRef } from "./origins.js";
+import {
+  lookupAddress,
+  normalizeHost,
+  serviceRefKey,
+  type FleetIndex,
+  type ServiceRef,
+} from "./origins.js";
 
 export interface AuthentikMatchOutcome {
   /** Number of services matched to at least one application. */
@@ -51,12 +57,11 @@ export function matchAuthentik(
   for (const stack of stacks) {
     for (const svc of stack.services) services.set(`${stack.id}/${svc.name}`, { stack, svc });
   }
-  const byHostname = buildHostnameIndex(stacks);
   const bySlugCandidate = buildNameIndex(stacks);
 
   const unmatched: string[] = [];
   for (const app of applications) {
-    const hit = matchOne(app, index, byHostname, bySlugCandidate);
+    const hit = matchOne(app, index, index.byHostname, bySlugCandidate);
     if (!hit) {
       unmatched.push(app.slug);
       continue;
@@ -145,37 +150,6 @@ function describe(provider: { kind: string; name: string; backchannel: boolean }
 }
 
 /**
- * Hostnames a service is configured to answer on, from both ingress mechanisms.
- *
- * A hostname belongs to one service in a working fleet, but a half-migrated config
- * can name it twice; that resolves to two candidates and is discarded upstream
- * rather than silently resolved to the first one.
- *
- * The repeats that get collapsed are a single service naming one hostname more than
- * once, which is the normal case rather than the exception: a service fronted by both
- * a tunnel and a reverse proxy declares the same hostname in both label sets. Those
- * are two statements about one service, so counting them as rival candidates would
- * make the commonest configuration in a fleet unmatchable.
- */
-function buildHostnameIndex(stacks: AppStack[]): Map<string, ServiceRef[]> {
-  const out = new Map<string, ServiceRef[]>();
-  for (const stack of stacks) {
-    for (const svc of stack.services) {
-      const hosts = [
-        ...svc.cloudflare.map((r) => r.hostname),
-        ...svc.traefik.flatMap((r) => r.hosts),
-      ];
-      for (const raw of hosts) {
-        const host = normalizeHost(raw);
-        if (host) push(out, host, { stackId: stack.id, serviceName: svc.name });
-      }
-    }
-  }
-  for (const [key, refs] of out) out.set(key, dedupe(refs));
-  return out;
-}
-
-/**
  * Names a slug could plausibly equal: the stack directory, the compose service name
  * and the container name.
  *
@@ -226,11 +200,4 @@ function hostname(value: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** Lowercase, drop a trailing root dot, and reject a wildcard — it names no one host. */
-function normalizeHost(raw: string): string | undefined {
-  const host = raw.trim().toLowerCase().replace(/\.$/, "");
-  if (!host || host.includes("*")) return undefined;
-  return host;
 }

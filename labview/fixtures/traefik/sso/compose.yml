@@ -1,0 +1,26 @@
+# The outpost every forward-auth in this fleet delegates to.
+#
+# It publishes nothing and declares no router: internal, unreachable from outside,
+# which is what an embedded outpost sitting behind the proxy looks like. Its job in
+# this fixture is to be the far end of an address — `http://authentik-outpost:9000/…`
+# appears in two live middleware definitions, and resolving that address back to a
+# scanned service is what lets the evidence say *which* service authenticates, rather
+# than just quoting a URL.
+#
+# It is also the endpoint the Authentik API is served on in these runs, so the
+# forward-auth target and the identity provider are one service — the same
+# arrangement the embedded outpost has in a real deployment, and the reason the
+# three-way cross-check has something to be consistent about.
+services:
+  outpost:
+    image: ghcr.io/goauthentik/proxy:2024.6
+    container_name: authentik-outpost
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      AUTHENTIK_HOST: http://authentik-outpost:9000
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,20 @@
+# The other half of the ambiguous hostname — see `twin-a` for the reasoning.
+#
+# Same host rule, different service. Its own `twin-green@docker` router is not in the
+# live table either, so this service also carries the "declared but not live" note;
+# what matters here is that it does not get credited with `twin-blue@file`.
+services:
+  green:
+    image: ghcr.io/example/twin:1
+    container_name: twin-green
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.twin-green.rule=Host(`twin.example.com`)"
+      - "traefik.http.routers.twin-green.entrypoints=websecure"
+
+networks:
+  proxy:
+    external: true

@@ -34,19 +34,11 @@ import type {
   Service,
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
+import { getJson, isObject, safeOrigin, str, type FetchLike, type HttpResponse } from "./http.js";
 
-/** Minimal shape of a `fetch` response, so a test can supply a stub. */
-export interface HttpResponse {
-  ok: boolean;
-  status: number;
-  json(): Promise<unknown>;
-}
-
-/** The subset of `fetch` this module uses. The global `fetch` satisfies it. */
-export type FetchLike = (
-  url: string,
-  init?: { headers?: Record<string, string>; signal?: AbortSignal },
-) => Promise<HttpResponse>;
+// The HTTP plumbing is shared with the Traefik client. Re-exported so existing
+// importers of this module keep working and there is one `FetchLike` in the tree.
+export type { FetchLike, HttpResponse };
 
 /** An Authentik base URL worth trying, and where the idea came from. */
 export interface AuthentikEndpoint {
@@ -190,7 +182,9 @@ export async function snapshotAuthentik(
     const origin = safeOrigin(base);
 
     // Probe unauthenticated: confirm this is Authentik before the token goes out.
-    const probe = await getJson(doFetch, `${base}${API}/root/config/`, undefined, cfg);
+    const probe = await getJson(doFetch, `${base}${API}/root/config/`, {
+      timeoutMs: cfg.authentik.timeoutMs,
+    });
     if (!probe.ok || !isObject(probe.body)) {
       attempts.push(`${origin} (${candidate.why}): ${probe.error ?? "not an Authentik API root"}`);
       continue;
@@ -264,6 +258,13 @@ interface ListResult {
   error?: string;
 }
 
+/** What a rejected request most likely means, for the error text. No credential in it. */
+function tokenHint(status: number): string | undefined {
+  return status === 401 || status === 403
+    ? " (token rejected — check it is valid and its service account may view applications, providers and outposts)"
+    : undefined;
+}
+
 /**
  * Read every page of a list endpoint.
  *
@@ -283,7 +284,11 @@ async function getList(
   const items: Record<string, unknown>[] = [];
   for (let page = 1; page <= Math.max(1, cfg.authentik.maxPages); page++) {
     const url = `${base}${API}/${path}/?page=${page}&page_size=${PAGE_SIZE}`;
-    const res = await getJson(doFetch, url, headers, cfg);
+    const res = await getJson(doFetch, url, {
+      headers,
+      timeoutMs: cfg.authentik.timeoutMs,
+      hint: tokenHint,
+    });
     if (!res.ok || !isObject(res.body)) {
       // A later page failing still leaves the earlier ones usable.
       if (items.length) return { items, error: `${path} page ${page}: ${res.error ?? "bad response"}` };
@@ -301,44 +306,6 @@ async function getList(
     }
   }
   return { items };
-}
-
-interface JsonResult {
-  ok: boolean;
-  body?: unknown;
-  error?: string;
-}
-
-/**
- * One GET, with a timeout and no way to throw.
- *
- * Error text carries the status and the endpoint origin only. The token must never
- * reach a summary, a note or a log line, so nothing here interpolates the headers.
- */
-async function getJson(
-  doFetch: FetchLike,
-  url: string,
-  headers: Record<string, string> | undefined,
-  cfg: LabViewConfig,
-): Promise<JsonResult> {
-  try {
-    const res = await doFetch(url, {
-      headers: headers ?? { Accept: "application/json" },
-      signal: AbortSignal.timeout(cfg.authentik.timeoutMs),
-    });
-    if (!res.ok) {
-      const hint =
-        res.status === 401 || res.status === 403
-          ? " (token rejected — check it is valid and its service account may view applications, providers and outposts)"
-          : "";
-      return { ok: false, error: `HTTP ${res.status}${hint}` };
-    }
-    return { ok: true, body: await res.json() };
-  } catch (err) {
-    const e = err as Error;
-    const reason = e.name === "TimeoutError" || e.name === "AbortError" ? "timed out" : e.message;
-    return { ok: false, error: reason };
-  }
 }
 
 /**
@@ -480,21 +447,3 @@ function byPk(list: Record<string, unknown>[]): Map<string, Record<string, unkno
   return out;
 }
 
-/** Scheme + host + port of a base URL, with any embedded credentials dropped. */
-function safeOrigin(base: string): string {
-  try {
-    return new URL(base).origin;
-  } catch {
-    return base.replace(/\/\/[^@/]*@/, "//");
-  }
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function str(v: unknown): string | undefined {
-  if (typeof v === "string") return v;
-  if (typeof v === "number") return String(v);
-  return undefined;
-}

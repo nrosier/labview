@@ -5,6 +5,8 @@ import type {
   AuthConfidence,
   AuthentikProvider,
   EnvVar,
+  TraefikLiveMiddleware,
+  TraefikLiveRouter,
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
 import type { MiddlewareRegistry } from "../analyze/middlewares.js";
@@ -32,16 +34,26 @@ interface Detection {
  *
  * When the identity provider's API was readable, its records outrank all of that
  * and carry `confirmed` confidence: a label says what the operator meant to
- * configure, whereas the provider's own records say what it will enforce.
+ * configure, whereas the provider's own records say what it will enforce. The same
+ * applies to the reverse proxy's API — see `liveChainComplete`.
  *
  * `exposedWithoutAuth` is left false here and finalized by the analyzer once the
  * ingress classification is known.
+ *
+ * @param liveChainComplete Whether the proxy's live configuration was read *fully*
+ * (its runtime config **and** its entrypoints). Only then does a matched router's
+ * live chain **replace** that router's label list, which is what allows a label
+ * declaring a gate the proxy never attached to stop counting as protection. On a
+ * partial read the two are unioned instead: an entrypoint-level middleware is
+ * invisible without `/api/entrypoints`, and mistaking that for an absent gate would
+ * invert the finding.
  */
 export function deriveAuth(
   service: Service,
   cfg: LabViewConfig,
   registry: MiddlewareRegistry,
   providerHints: string[],
+  liveChainComplete = false,
 ): AuthPosture {
   const a = cfg.labels.authentik;
   const detections: Detection[] = [];
@@ -62,8 +74,32 @@ export function deriveAuth(
     }
   }
 
-  // 2. Traefik middlewares referenced by this service's routers.
-  const referenced = new Set(service.traefik.flatMap((r) => r.middlewares));
+  // 2. Traefik middlewares, per router.
+  //
+  // Per router rather than pooled across all of them: a live chain speaks for the
+  // one router it belongs to, and pooling would let a protected router's chain
+  // vouch for an unprotected one on the same service.
+  //
+  // Every live router the proxy is actually serving contributes its resolved chain
+  // — including routers no label declares, which is how a file-provider gate gets
+  // confirmed. A router the proxy reports as disabled or errored contributes
+  // nothing: it is not in any request path, so it protects nothing either.
+  const live = service.traefikLive ?? [];
+  for (const router of live) {
+    if (!routerIsServing(router)) continue;
+    for (const mw of router.middlewares) {
+      const d = classifyLiveMiddleware(router, mw, providerHints);
+      if (d) detections.push(d);
+    }
+  }
+
+  // Label middlewares stand for routers the live read did not account for. With no
+  // live read at all — API disabled, unreachable, or nothing matched — that is every
+  // router, which is exactly the label-only behaviour.
+  const liveNames = new Set(live.filter(routerIsServing).map((r) => r.router.toLowerCase()));
+  const superseded = (route: { router: string }) =>
+    liveChainComplete && liveNames.has(route.router.toLowerCase());
+  const referenced = new Set(service.traefik.filter((r) => !superseded(r)).flatMap((r) => r.middlewares));
   for (const mw of referenced) {
     const d = classifyMiddleware(mw, registry, providerHints);
     if (d) detections.push(d);
@@ -238,6 +274,83 @@ function servedBy(provider: AuthentikProvider): string {
 }
 
 /**
+ * Whether the proxy is actually serving a router.
+ *
+ * Traefik reports both a status and, separately, the errors that made it stop
+ * serving; either one is disqualifying. A router that is not serving is not in any
+ * request path, so it neither provides ingress nor enforces the middlewares it
+ * names — reporting its chain as protection would be a gate on a road nobody drives.
+ */
+export function routerIsServing(router: TraefikLiveRouter): boolean {
+  if (router.errors.length) return false;
+  return !router.status || router.status.toLowerCase() === "enabled";
+}
+
+/**
+ * Classify one entry of a live middleware chain.
+ *
+ * This is the same reasoning as `classifyMiddleware` with the guesswork removed. The
+ * type comes from the proxy's own runtime configuration rather than from a definition
+ * the scan had to find, so it is never `inferred` — which is precisely what retires
+ * the `inferred` posture for a middleware defined in a file provider, the largest
+ * known gap in label-only auth detection.
+ *
+ * A middleware the proxy reports an error for is skipped: Traefik does not apply a
+ * middleware it could not build, so it stops nothing.
+ */
+function classifyLiveMiddleware(
+  router: TraefikLiveRouter,
+  mw: TraefikLiveMiddleware,
+  providerHints: string[],
+): Detection | undefined {
+  if (mw.errors.length) return undefined;
+  const where = liveOrigin(router, mw);
+
+  if (mw.type === "basicauth" || mw.type === "digestauth") {
+    return {
+      method: "basic-auth",
+      detail: `HTTP ${mw.type === "digestauth" ? "digest" : "basic"} auth via \`${mw.name}\`, live in the proxy`,
+      evidence: [`Traefik API: ${mw.type} middleware \`${mw.name}\` ${where}`],
+      confidence: "confirmed",
+    };
+  }
+
+  if (mw.type === "forwardauth") {
+    // As with a label-derived forward-auth, the address is the only statement of who
+    // authenticates — and here it is the address the proxy will actually call.
+    const match = mw.address ? firstMatch([mw.address], providerHints) : undefined;
+    const evidence = [
+      `Traefik API: forwardauth middleware \`${mw.name}\` ${where}`,
+      ...(mw.address ? [`forwardauth -> ${mw.address}`] : []),
+    ];
+    if (match) {
+      return {
+        method: "authentik-forward-auth",
+        detail: `Authentik forward-auth via \`${mw.name}\`, live in the proxy's chain for router \`${router.router}\``,
+        evidence,
+        confidence: "confirmed",
+      };
+    }
+    return {
+      method: "forward-auth",
+      detail: `Forward-auth via \`${mw.name}\`, live in the proxy's chain for router \`${router.router}\`${mw.address ? ` -> ${mw.address}` : ""}`,
+      evidence: [...evidence, NO_PROVIDER],
+      confidence: "confirmed",
+    };
+  }
+  return undefined;
+}
+
+/** Where in the live configuration a chain entry was attached, for its evidence line. */
+function liveOrigin(router: TraefikLiveRouter, mw: TraefikLiveMiddleware): string {
+  const via = mw.viaChain ? ` via chain \`${mw.viaChain}\`` : "";
+  if (mw.viaEntrypoint) {
+    return `on entrypoint ${router.entryPoints.join(", ") || "(unnamed)"}${via}, which router \`${router.router}\` listens on`;
+  }
+  return `on router \`${router.router}\`${via}`;
+}
+
+/**
  * Classify one referenced middleware.
  *
  * The registry entry is the proof: its type says what the middleware does and its
@@ -300,6 +413,22 @@ function classifyMiddleware(
     evidence: [`middleware ${mw}`, "definition not found in any scanned stack", ...(named ? [] : [NO_PROVIDER])],
     confidence: "inferred",
   };
+}
+
+/**
+ * Whether a label-referenced middleware would count as an auth gate on its own.
+ *
+ * Exported so the live-configuration report asks the *same* question `deriveAuth`
+ * asks, rather than keeping a second opinion about what an auth middleware is: a
+ * discrepancy note is only worth printing for a middleware whose absence from the
+ * live chain would actually have changed the posture.
+ */
+export function isAuthMiddlewareRef(
+  mw: string,
+  registry: MiddlewareRegistry,
+  providerHints: string[],
+): boolean {
+  return classifyMiddleware(mw, registry, providerHints) !== undefined;
 }
 
 /**

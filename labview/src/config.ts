@@ -54,6 +54,36 @@ export interface LabViewConfig {
     /** Hard cap on paginated pages per endpoint, so a huge instance cannot stall a scan. */
     maxPages: number;
   };
+  /**
+   * Optional read-only Traefik API access. Labels state which routers and
+   * middlewares the operator *intended*; the API states what the proxy is
+   * actually serving — including middlewares defined outside the scanned stacks,
+   * which a compose scan can never see.
+   *
+   * Unlike Authentik's API, Traefik's is often reachable with no credential at
+   * all (`api.insecure` on its own entrypoint), so this stage can do useful work
+   * unconfigured. The credential fields exist only for an instance whose API is
+   * reachable exclusively through an authenticating edge.
+   */
+  traefik: {
+    enabled: boolean;
+    /** Base URL of the Traefik API. Empty = discover it from the fleet. */
+    url: string;
+    /**
+     * Username for HTTP Basic against a gated API. With an Authentik proxy
+     * provider this is an Authentik user (or the reserved `goauthentik.io/token`).
+     */
+    username: string;
+    /**
+     * Password for HTTP Basic. Behind Authentik this must be an *app password* or
+     * a token, not the account password. Prefer `passwordFile`.
+     */
+    password: string;
+    /** Path to a file holding the password (docker secret, mounted file). Wins over `password`. */
+    passwordFile: string;
+    /** Per-request timeout. The whole exchange is three GETs. */
+    timeoutMs: number;
+  };
   cacheTtlSeconds: number;
   server: { host: string; port: number };
 }
@@ -75,10 +105,10 @@ const DEFAULTS: LabViewConfig = {
   secrets: {
     maskValues: true,
     keyPatterns: ["PASS", "SECRET", "TOKEN", "KEY", "APIKEY", "CREDENTIAL", "PRIVATE", "SALT", "PEPPER", "DSN"],
-    // LabView's own Authentik token is already caught by the TOKEN pattern, but it
-    // is named explicitly so that editing keyPatterns cannot expose it: a fleet
-    // that runs LabView from inside appsRoot scans its own stack.
-    keysAlways: ["LABVIEW_AUTHENTIK_TOKEN"],
+    // LabView's own credentials are already caught by the TOKEN and PASS patterns,
+    // but they are named explicitly so that editing keyPatterns cannot expose
+    // them: a fleet that runs LabView from inside appsRoot scans its own stack.
+    keysAlways: ["LABVIEW_AUTHENTIK_TOKEN", "LABVIEW_TRAEFIK_PASSWORD"],
     keysNever: ["PUBLIC_KEY_URL", "KEYCLOAK_REALM"],
     redactUriCredentials: true,
   },
@@ -105,6 +135,14 @@ const DEFAULTS: LabViewConfig = {
     tokenFile: "",
     timeoutMs: 5000,
     maxPages: 20,
+  },
+  traefik: {
+    enabled: true,
+    url: "",
+    username: "",
+    password: "",
+    passwordFile: "",
+    timeoutMs: 5000,
   },
   cacheTtlSeconds: 60,
   server: { host: "0.0.0.0", port: 8080 },
@@ -190,6 +228,15 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_AUTHENTIK_TIMEOUT) {
     const n = Number(env.LABVIEW_AUTHENTIK_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.authentik.timeoutMs = Math.floor(n);
+  }
+  if (env.LABVIEW_TRAEFIK_ENABLED) cfg.traefik.enabled = env.LABVIEW_TRAEFIK_ENABLED !== "false";
+  if (env.LABVIEW_TRAEFIK_URL) cfg.traefik.url = env.LABVIEW_TRAEFIK_URL;
+  if (env.LABVIEW_TRAEFIK_USERNAME) cfg.traefik.username = env.LABVIEW_TRAEFIK_USERNAME;
+  if (env.LABVIEW_TRAEFIK_PASSWORD) cfg.traefik.password = env.LABVIEW_TRAEFIK_PASSWORD;
+  if (env.LABVIEW_TRAEFIK_PASSWORD_FILE) cfg.traefik.passwordFile = env.LABVIEW_TRAEFIK_PASSWORD_FILE;
+  if (env.LABVIEW_TRAEFIK_TIMEOUT) {
+    const n = Number(env.LABVIEW_TRAEFIK_TIMEOUT);
+    if (Number.isFinite(n) && n > 0) cfg.traefik.timeoutMs = Math.floor(n);
   }
   if (env.LABVIEW_PORT) cfg.server.port = Number(env.LABVIEW_PORT);
   if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;

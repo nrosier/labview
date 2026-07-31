@@ -40,6 +40,26 @@ services:
       # them, preferring its container address so the call stays on the container
       # network. Set this only if it lives elsewhere or discovery guesses wrong:
       # LABVIEW_AUTHENTIK_URL: http://authentik-server:9000
+      #
+      # --- Optional: read the reverse proxy's API to verify the labels ---
+      # On by default and needs no configuration: the proxy is located among the
+      # scanned stacks (a router of its own targeting `api@internal`, the hop a
+      # tunnel origin resolved to, or the Traefik image) and its container address
+      # is probed. If nothing answers, the scan continues from the labels alone.
+      #
+      # For it to answer, Traefik needs `api: {}` plus an entrypoint on the
+      # container network that is NOT published to the host — see the `traefik`
+      # block in config.example.yml. Then no credential is involved at all.
+      #
+      # Set the URL only when the proxy is not among the scanned stacks, or when
+      # discovery guesses wrong:
+      # LABVIEW_TRAEFIK_URL: http://traefik:8080
+      #
+      # Only needed if the API is reachable solely through a hostname Authentik
+      # gates: an Authentik user plus an **app password** — an API token will not
+      # work, see config.example.yml. Prefer the _FILE form.
+      # LABVIEW_TRAEFIK_USERNAME: labview
+      # LABVIEW_TRAEFIK_PASSWORD_FILE: /run/secrets/traefik_password
     volumes:
       # Your per-container stacks, read-only.
       - /mnt/apps:/data/apps:ro
@@ -47,6 +67,8 @@ services:
       # - /mnt/apps/labview/config.yml:/config/config.yml:ro
       # Optional Authentik token, mounted as a file rather than passed as an env var:
       # - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
+      # Optional Traefik app password, mounted the same way and for the same reason:
+      # - /mnt/apps/labview/traefik-password:/run/secrets/traefik_password:ro
     # No `ports:` on purpose. A published host port answers directly at
     # <host-ip>:<port>, bypassing the reverse proxy and therefore bypassing any
     # SSO middleware on it — for a dashboard that lists your whole topology that

@@ -1,0 +1,27 @@
+# A labelled router the proxy never picked up.
+#
+# There is no `blog@docker` in the live routing table at all — the container may have
+# started after the proxy lost the socket, the rule may be malformed in a way only
+# Traefik can tell, or `traefik.enable` may be off on the running container. The
+# scan cannot distinguish those, and does not try: what it can say is that a router
+# the labels declare is not among the ones the proxy is serving.
+#
+# The label posture stands (nothing superseded it — there is no live counterpart to
+# supersede it) but the note is the point. Without it, a route that does not exist
+# reads exactly like one that does.
+services:
+  blog:
+    image: ghcr.io/example/blog:5
+    container_name: blog-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.blog.rule=Host(`blog.example.com`)"
+      - "traefik.http.routers.blog.entrypoints=websecure"
+      - "traefik.http.routers.blog.middlewares=authentik@file"
+
+networks:
+  proxy:
+    external: true

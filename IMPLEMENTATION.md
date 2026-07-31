@@ -41,6 +41,7 @@ SSO provider. Each is listed with where it is satisfied.
 | **R2** | All configuration lives at `<apps-root>/<container>/compose.yml` (+ optional `.env`) | [discover.ts](labview/src/scan/discover.ts) — one stack per immediate subdirectory containing a compose file |
 | **R3** | Read Cloudflare tunnel ingress configured by DockFlare labels | [dockflare.ts](labview/src/labels/dockflare.ts) — flat and indexed multi-route label forms, `enable` honoured |
 | **R4** | Read local ingress via Traefik labels, and cope with services that bypass it | [traefik.ts](labview/src/labels/traefik.ts) + `classifyIngress` in [analyze/index.ts](labview/src/analyze/index.ts) |
+| **R4b** | Optionally verify that ingress against the reverse proxy's own runtime API, discovering the endpoint from the fleet | [enrich/traefik.ts](labview/src/enrich/traefik.ts) + [analyze/traefik.ts](labview/src/analyze/traefik.ts); §3.6 |
 | **R5** | Report SSO posture, whether wired as a reverse-proxy gate or as OAuth/OIDC/LDAP | [auth.ts](labview/src/labels/auth.ts) |
 | **R5b** | Optionally confirm that posture against the identity provider's own API, using a read-only credential the operator supplies | [enrich/authentik.ts](labview/src/enrich/authentik.ts) + [analyze/authentik.ts](labview/src/analyze/authentik.ts); §3.5 |
 | **R6** | Build the documentation dynamically, and use the Docker socket proxy for live state when available | [enrich/docker.ts](labview/src/enrich/docker.ts); every scan is fresh, nothing is persisted |
@@ -92,14 +93,17 @@ labview/
       middlewares.ts  cross-stack Traefik middleware registry
       origins.ts      cross-stack tunnel-origin resolution (what an origin points at)
       authentik.ts    cross-stack matching of identity-provider applications to services
+      traefik.ts      cross-stack matching of live proxy routers to services + its notes
       networks.ts     real docker network names for a service (shared by graph + origins)
       index.ts        the pipeline; ingress classification; stats
       graph.ts        nodes/edges for the relationship graph
     enrich/
+      http.ts         fetch wrapper: timeouts, JSON, injectable fetchImpl (no I/O policy)
       docker.ts       Docker Engine snapshot (never throws)
       authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
+      traefik.ts      Traefik runtime-API snapshot (never throws; all network I/O)
     server/server.ts  Fastify: /api/* + static UI, with a TTL cache
-  web/                Preact UI (see §3.8)
+  web/                Preact UI (see §3.9)
   scripts/
     build-web.mjs     esbuild bundle
     smoke.ts          pipeline assertions over the fixtures
@@ -108,6 +112,8 @@ labview/
     edge/             one stack per previously-fixed defect
     authentik/        a fleet with an identity provider in it
     authentik-api.json  canned API responses driven through an injected fetch
+    traefik/          a fleet whose labels and live proxy config disagree
+    traefik-api.json    canned proxy + identity responses, same injected fetch
 ```
 
 Repo root holds the README, LICENSE, CI workflows and this document. All code is
@@ -125,42 +131,53 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 3. Docker snapshot | `enrich/docker.ts` | `DockerSnapshot` keyed by `"project service"`, container name and short id |
 | 4. Middleware registry | `analyze/middlewares.ts` | every Traefik middleware *defined* anywhere, by bare name |
 | 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker`, `svc.ingress` |
-| 6. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
-| 7. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
-| 8. Origin resolution | `analyze/origins.ts` | `route.origin` — what each tunnel origin points at, and notes where it could not be told |
-| 9. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
-| 10. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
-| 11. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
-| 12. Stats | `computeStats` | `OverviewStats` for the dashboard header |
+| 6. Fleet index + origin resolution | `analyze/origins.ts` | `FleetIndex` (host ports, DNS names, container IPs, hostnames); `route.origin` — what each tunnel origin points at, and notes where it could not be told |
+| 7. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
+| 8. Reverse proxy API | `enrich/traefik.ts` | `TraefikSnapshot` — the routers the proxy is serving with their resolved middleware chains and backends, or a reason it is absent. Runs concurrently with step 7 |
+| 9. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
+| 10. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
+| 11. Live router matching | `analyze/traefik.ts` | `svc.traefikLive` — which live routers belong to which service, and which matched nothing |
+| 12. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
+| 13. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
+| 14. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
-**Why two passes.** Steps 6–9 cannot run per-service inside step 5. Four
+**Why two passes.** Steps 6–11 cannot run per-service inside step 5. Four
 conclusions are only available once the *whole* fleet is parsed:
 
 1. A Traefik middleware referenced as `authentik@docker` is usually defined in a
    different stack than the service using it, so classifying the reference
    requires the global registry (step 4).
 2. Which hostnames represent the SSO provider is learned from whichever stack
-   *runs* the provider — so its routes must already be parsed (step 7 after 5).
+   *runs* the provider — so its routes must already be parsed (step 9 after 5).
 3. A tunnel origin routinely names a reverse proxy defined in a *different* stack,
    so resolving it needs a fleet-wide index of published host ports and DNS names
-   (step 8, after the routes exist and before the graph is drawn from them).
+   (step 6, after the routes exist and before the graph is drawn from them).
 4. An identity provider's application is matched against the fleet as a whole —
    its provider's internal host, or a hostname declared by any service — so it
-   needs the same index (step 9, reusing step 8's).
+   needs the same index (step 10, reusing step 6's).
+5. A live proxy router names its backend by container address and its hosts by
+   rule, neither of which is scoped to a stack, so tying it to a service needs that
+   index too (step 11).
 
-A change that needs fleet-wide knowledge belongs in a new pass or in step 4/7,
+A change that needs fleet-wide knowledge belongs in a new pass or in step 4/9,
 not in a per-service function reaching for global state.
 
-**Where step 6 sits, and why.** A *configured* endpoint depends on nothing in the
-scan, so that request is started before the docker snapshot and awaited after,
-overlapping the two. A *discovered* endpoint cannot be found until pass 1 has
-parsed the routes, so it runs after. Either way the result is one value with the
-same shape, and an endpoint that answered the API becomes an input to step 7 —
-having answered as an Authentik API is stronger evidence of identity than any name
-match, and it is what attributes an OIDC issuer correctly when the provider runs
-outside the scanned root.
+**Where the two API reads sit, and why.** A *configured* endpoint depends on
+nothing in the scan, so that request is started before the docker snapshot and
+awaited after, overlapping the two. A *discovered* endpoint cannot be found until
+pass 1 has parsed the routes, so it runs after. Either way the result is one value
+with the same shape.
 
-### 3.3 Provider discovery (step 7)
+Origin resolution moved **ahead** of the discovered reads for two reasons. A
+resolved origin structurally identifies the service acting as reverse proxy, which
+is one of the three signals Traefik endpoint discovery rests on; and with the index
+already built, both discovered exchanges go out under one `Promise.all` — one round
+trip rather than two. An endpoint that answered the Authentik API then becomes an
+input to step 9: having answered as an Authentik API is stronger evidence of
+identity than any name match, and it is what attributes an OIDC issuer correctly
+when the provider runs outside the scanned root.
+
+### 3.3 Provider discovery (step 9)
 
 `discoverAuthentikHints` walks the parsed fleet for a service that is
 identifiably Authentik — its image mentions `authentik`, or one of its labels
@@ -179,7 +196,7 @@ Two properties matter and must be preserved:
   verbatim would make every `OIDC_ISSUER=https://server.example.com` look like
   Authentik.
 
-### 3.4 Tunnel origin resolution (step 8)
+### 3.4 Tunnel origin resolution (step 6)
 
 A tunnel rarely terminates at the container whose labels declare it. The origin
 (`dockflare.service`) normally names a reverse proxy, which forwards to the
@@ -215,7 +232,7 @@ Two rules keep this honest, and both have fixtures:
 No image, vendor or naming convention is consulted anywhere in the module — the
 proxy is identified structurally, by what it publishes and what it can reach.
 
-### 3.5 The identity provider API (steps 6 and 9)
+### 3.5 The identity provider API (steps 7 and 10)
 
 Compose files show a gate being *wired up*. They cannot show a gate that exists
 only in the identity provider, and — more importantly — they cannot distinguish an
@@ -230,7 +247,7 @@ Two modules, deliberately split along the I/O boundary:
   `outposts/instances/`, and returns an `AuthentikSnapshot`. Mirrors
   `enrich/docker.ts`: it never throws, and a failure becomes a reason string.
 - [analyze/authentik.ts](labview/src/analyze/authentik.ts) — no network access.
-  Matches applications onto services using the fleet index built for step 8.
+  Matches applications onto services using the fleet index built for step 6.
 
 **Endpoint selection.** A configured `authentik.url` is used verbatim. Otherwise
 candidates are collected from services whose image identifies Authentik, ordered
@@ -242,7 +259,7 @@ discovered endpoint is a guess, and a guess must never be handed a credential. O
 a candidate that *did* answer, a 401/403 is conclusive — the token is wrong, so
 later candidates are not tried and nothing further is sent.
 
-**Matching (step 9).** An application is tied to a service only by something
+**Matching (step 10).** An application is tied to a service only by something
 addressed, in descending order of strength:
 
 1. A proxy provider's `internal_host` resolved through the same `lookupAddress`
@@ -288,7 +305,126 @@ evidence rather than discarding it. And `meta.authentik` reports the summary —
 endpoint, whether it came from config or discovery, counts, matched services,
 unmatched applications, and any error.
 
-### 3.6 The data contract
+### 3.6 The reverse proxy API (steps 8 and 11)
+
+Labels are a request to the proxy; the runtime config is its answer. Three
+differences are invisible to a file scan, and each of them can only be resolved by
+asking the proxy:
+
+1. a **router the labels declare that Traefik is not serving** — a typo in a rule, a
+   missing entrypoint, a container it never picked up;
+2. a **middleware named in a label that is not in the chain the proxy built**, so a
+   service reads "protected" and answers without a login;
+3. a **middleware defined in a Traefik file provider**, which has no definition in
+   any scanned stack and is therefore only ever `inferred` (§11's first limitation —
+   this stage is what retires it).
+
+Same two-module split as §3.5:
+
+- [enrich/traefik.ts](labview/src/enrich/traefik.ts) — all network access, no
+  knowledge of the fleet beyond the candidate list handed to it. Reads
+  `/api/version`, `/api/rawdata` and `/api/entrypoints`; returns a
+  `TraefikSnapshot`; never throws.
+- [analyze/traefik.ts](labview/src/analyze/traefik.ts) — no network access. Matches
+  live routers onto services using step 6's index, and derives the notes.
+
+**Endpoint selection.** A configured `traefik.url` is used verbatim. Otherwise a
+scanned service becomes a candidate on one of three signals, and each candidate
+carries the `why` that produced it:
+
+| Signal | Why it is evidence |
+|---|---|
+| a router of its own whose service is `api@internal` | the operator's own label saying "this container serves the proxy API" — structural, vendor-neutral, and it also yields the exact public hostname |
+| another service's tunnel origin resolved to it (§3.4) | an observed reverse proxy, established without consulting any image or name |
+| it runs the Traefik image | last resort, same precedent as `isAuthentikService` |
+
+Per candidate the URLs are `http://<name|container_name>:<port>` for each declared
+`ports[].target` plus `8080` — the port the dedicated `traefik` entrypoint
+conventionally serves — followed by its Traefik/DockFlare hostnames. Internal before
+public, deduped, capped, exactly as `discoverAuthentikEndpoints`.
+
+**The credential rule**, which is the security core of this stage:
+
+- Every candidate is probed on `/api/version`, which needs no authentication. A
+  candidate that answers is used **with no credential at all**, and none is sent.
+- A credential is sent only to a candidate that is either configured by hand
+  (`mayAuthenticate` set at construction — the operator naming the API themselves)
+  or a hostname the scan proved belongs to the service whose own labels declare
+  `api@internal`. That is ownership evidence; a hostname that merely *looks* like a
+  proxy never receives one.
+- A 401/403 or a redirect on such a host is what triggers the authenticated retry.
+  Cookies set during that exchange are replayed on its remaining requests, because
+  the Authentik outpost expects its session cookie echoed.
+- **An Authentik API token is not a valid credential here** — see the decision log.
+
+**Matching (step 11).** Exactly one candidate or no match, same discipline as
+§3.5:
+
+1. **The backend address** — `loadBalancer.servers[].url` is the proxy naming its
+   own target. An IP-form URL resolves **only** through `FleetIndex.byContainerIp`;
+   a name-form URL through the name branch of `lookupAddress`.
+2. **The router name**, `@docker` routers only. Traefik derives those names from the
+   labels of the container it found them on, so an exact match against
+   `svc.traefik[].router` is that label round-tripping. A `@file` router's name was
+   typed by hand in a file this scan cannot read, so a resemblance there is a
+   coincidence with no evidentiary weight and this rule does not apply.
+3. **The host rule** — through the same hostname index the Authentik matcher uses.
+
+Unmatched routers are reported in `meta.traefik.unmatchedRouters`, the mirror of
+`unmatchedApplications`: it is how ingress LabView could not attribute — file
+provider routes especially — becomes visible instead of silently absent.
+
+**Why the backend address needs its own index.** A docker-provider backend is
+`http://<container-ip>:<container-port>`. `lookupAddress` reads an IP literal's port
+as a *published host port* (§3.4), which is the correct rule for a tunnel origin and
+the wrong table entirely for a container IP — it would match whichever unrelated
+service happens to publish that number. `byContainerIp` is built from
+`svc.docker.ipAddresses`, and an IP-form backend resolves through it and nothing
+else. With no Docker state the rule is skipped rather than guessed; rules 2 and 3
+still cover the docker provider.
+
+**What the live read is allowed to conclude** is decided once per scan, in
+`TraefikLiveContext`, because it is a property of the read and not of any service:
+
+- `reachable` — the API answered at all.
+- `chainComplete` — `reachable` **and** `entrypointsRead`. Only a complete read lets
+  a live chain supersede a label list, because a gate attached at an *entrypoint*
+  does not appear in a router's own middleware list. Mistaking that for an absent
+  gate would invert the finding, so a partial read notes the gap and changes no
+  posture.
+
+Where a router matched and `chainComplete` holds, the live chain **is** the chain: a
+resolved `forwardAuth` whose address resolves to a provider identity yields
+`authentik-forward-auth` at `confirmed`, `basicAuth`/`digestAuth` yields
+`basic-auth`, a `chain` middleware is resolved recursively (depth-capped, each entry
+recording `viaChain` so the evidence says how the gate was reached), and a label
+declaring an auth middleware the live chain does not contain is **downgraded** — the
+detection suppressed, the service free to land in `exposedWithoutAuth`, and a note
+naming the discrepancy. A router the proxy reports as `disabled`, or carrying
+`error[]`, counts as neither protection nor working ingress, with its errors quoted
+verbatim.
+
+The declared-but-absent check runs against **every router in the snapshot**, not
+only the ones matched to the service. A router the proxy is demonstrably serving but
+that LabView could not attribute must not be reported as missing.
+
+**Three-way cross-check.** When the live `forwardAuth` address resolves to the
+service the Authentik API answered on, and Authentik reports an outpost serving a
+provider for an application matched to *this* service, the note records labels,
+proxy and identity provider agreeing. Disagreement is the finding: a forward-auth
+address pointing at an instance with no matching application, or a matched provider
+whose `mode` means the request never reaches the outpost. A provider in `proxy` mode
+is exempt — there the outpost *is* the backend, so no forward-auth middleware exists
+and none should be expected.
+
+**Where the results go.** `svc.traefikLive` carries the matched routers for the
+drawer. `meta.traefik` reports the summary — endpoint, whether it came from config or
+discovery, whether a credential was used, whether the API answered unauthenticated,
+version, counts, matched services, unmatched routers, and any error. The proxy
+service itself gets `role: "proxy"` in the graph and every matched router is drawn
+from it, which is what retires the old "the responsible proxy is unknown" edge.
+
+### 3.7 The data contract
 
 [model/types.ts](labview/src/model/types.ts) is the single contract between
 backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
@@ -300,7 +436,7 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   change**: the palette in `web/lib/palette.ts` maps every member to a colour and
   a label, and an unmapped member silently renders grey. See §10.
 
-### 3.7 Serving
+### 3.8 Serving
 
 Fastify with three routes and a static mount:
 
@@ -316,7 +452,7 @@ traffic cannot start N scans. The cache is warmed in the background at startup s
 the first page load is instant. If `web/dist` is absent the server still runs and
 says how to build it — the API is the primary product, the UI is a view of it.
 
-### 3.8 Frontend
+### 3.9 Frontend
 
 Preact + esbuild, bundled to a single `web/dist/app.js` with mermaid and cytoscape
 inlined; `web/index.html` and `web/styles.css` are copied verbatim. There is no
@@ -423,6 +559,29 @@ object they belong to and the pipeline continues:
   `meta.authentik.error`; the scan proceeds on label-derived evidence. A *partial*
   read keeps what arrived and records the rest as an error, so one failing endpoint
   does not discard three good ones.
+- Reverse proxy unreachable, no candidate answering, credential rejected, timed
+  out, response shape unrecognised → `snapshotTraefik` returns `reachable: false`
+  with the reason in `meta.traefik.error` and **no** credential in that text; every
+  posture stays exactly as the labels described it. A partial read here is stricter
+  than Authentik's: keeping what arrived is fine for reporting, but a chain that
+  might be incomplete may not supersede a label, so `chainComplete` gates the
+  downgrade (§3.6).
+
+A soft failure is only worth anything if its reason names the fix, so `getJson` in
+[enrich/http.ts](labview/src/enrich/http.ts) resolves two reasons that arrive
+disguised:
+
+- **A transport failure keeps the code `fetch` hid.** Every transport problem —
+  a name that does not resolve, a port nothing listens on, a rejected certificate —
+  surfaces from `fetch` as the same `fetch failed`, with the real reason on
+  `error.cause`. Those call for opposite fixes, so the `cause.code` is appended:
+  `fetch failed (ENOTFOUND)`. The code is a constant, never an address.
+- **A 200 whose body is not JSON is an outcome, not a parser bug.** It is also the
+  likeliest way an endpoint behind an SSO gate answers, because the login page is
+  served with a success status. Reporting the `SyntaxError` verbatim reads as a fault
+  in LabView; the message says the body was not JSON and that an HTML login page
+  answers exactly like this. The endpoint is *not* treated as an API, so no credential
+  follows it.
 
 ### I5 — Read-only, least privilege
 
@@ -438,12 +597,19 @@ endpoint, and needs no privileged access:
   `view_outpost`. A change that needs a write scope, or a scope beyond those three,
   is a change to this invariant and needs the operator's consent, not a wider
   token.
+- The reverse proxy API is read with `GET` only, and only `/api/version`,
+  `/api/rawdata` and `/api/entrypoints`. Traefik's API has no read-only credential
+  to scope, which is another reason the recommended setup keeps it on an unpublished
+  container-network entrypoint and involves no credential at all.
 - **A credential is never sent to an unverified endpoint.** A discovered endpoint
   is probed on an unauthenticated route first and gets the token only if it
-  answered as the expected API. There is deliberately no TLS-verification bypass
-  flag: `NODE_EXTRA_CA_CERTS` covers a private CA without teaching the tool to
-  trust anything that answers. `tokenFile` exists so the value need not sit in the
-  environment where `docker inspect` reveals it.
+  answered as the expected API. For the proxy the bar is higher still: answering is
+  enough to be *used*, but not to be *authenticated to* — that needs a hand-written
+  URL or proven ownership of the hostname (§3.6). There is deliberately no
+  TLS-verification bypass flag: `NODE_EXTRA_CA_CERTS` covers a private CA without
+  teaching the tool to trust anything that answers. `tokenFile` and `passwordFile`
+  exist so neither value need sit in the environment where `docker inspect` reveals
+  it.
 - The image runs as `USER node`.
 - Its own compose example publishes **no `ports:`** — see §7.
 
@@ -539,10 +705,11 @@ claim about the path — an invented hop would be, and dropping the edge would h
 a route that exists. The note states which of the reasons applied.
 
 **Proxy role** — `GraphNode.role: "proxy"` is set on a service another service's
-origin resolved to. It stays an ordinary service node (same kind, same drawer, same
-click target); the role only lets the UI colour it as infrastructure. Nothing else
-reads it, and no service is ever *declared* a proxy — the role is a consequence of
-having been resolved as a hop at least once.
+origin resolved to, or on the service whose Traefik API answered. It stays an
+ordinary service node (same kind, same drawer, same click target); the role only lets
+the UI colour it as infrastructure. Nothing else reads it, and no service is ever
+*declared* a proxy — the role is a consequence of having been resolved as a hop at
+least once, or of having answered as the proxy's own API.
 
 **AuthMethod / AuthConfidence** — see §4 I3. Three levels, strongest first:
 `confirmed` means the identity provider's API reported the gate; `observed` means a
@@ -571,6 +738,45 @@ service out of `exposedWithoutAuth` even when its provider type has no
 service. Reported in `meta.authentik.unmatchedApplications` by slug. Ambiguity is
 reported, never arbitrated: picking a candidate by iteration order would move a
 service between "protected" and "exposed" on a coin toss.
+
+**TraefikRoute vs TraefikLiveRouter** — same subject, different source, and the
+distinction the whole of §3.6 rests on. `TraefikRoute` is what the compose labels
+asked the proxy for. `TraefikLiveRouter` is what the proxy built from them, plus
+whatever it built from providers the scan cannot read: `status` and `errors` as
+Traefik reports them, the `hosts` parsed out of its `rule`, its `entryPoints`, the
+**fully resolved** `middlewares` chain, the Traefik service it targets with that
+service's `servers`, and an `evidence` list saying how the router was tied to this
+service. Attached as `svc.traefikLive`; absent when the API was not read or nothing
+matched.
+
+**TraefikLiveMiddleware** — one entry of a resolved chain. `type` is the middleware
+type as Traefik keys it, taken from the definition Traefik *holds* — which is why a
+file-provider middleware is knowable at all, and why a type LabView has never
+modelled is still reported by name. `address` carries a forward-auth's delegate.
+`viaChain` names the `chain` middleware this entry was reached through; `viaEntrypoint`
+marks a middleware attached to the router's **entrypoint** rather than named by the
+router. That flag exists because such a gate appears in no router's own list, so it
+must be merged in before any conclusion about a *missing* gate can be drawn.
+
+**TraefikLiveServer** — one backend URL plus the `serverStatus` Traefik last observed
+for it, when it reported one. Absent status means "nothing known" and must not be
+read as healthy.
+
+**`chainComplete`** — `TraefikSummary.reachable && entrypointsRead`. The single gate
+on the downgrade (§3.6): only a read that got **both** `/api/rawdata` and
+`/api/entrypoints` may let a live chain supersede a label list. Anything less notes
+the gap and changes no posture.
+
+**`credential: "none" | "basic"`** — which credential the successful read needed.
+`none` means the API answered unauthenticated, which is direct evidence about how the
+proxy's API is exposed on that network and is reported as a note on the proxy service
+rather than inferred from config.
+
+**Unmatched router** — a live router no scanned service could be identified for.
+Reported in `meta.traefik.unmatchedRouters` as `name@provider`. Two candidates is not
+an ambiguity to arbitrate but a match not made, exactly as for an application; and
+because such a router demonstrably *exists*, it must never produce a
+"declared but not live" note on anybody.
 
 **`detail` vs `evidence` vs `notes`** — `detail` is the prose summary of the
 primary detection plus any secondary ones; `evidence` is the flat list of raw
@@ -618,10 +824,16 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
 | `LABVIEW_AUTHENTIK_TOKEN_FILE` | `authentik.tokenFile` | preferred over the token env var, which `docker inspect` exposes. Wins over `authentik.token` |
-| `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | with neither set, step 6 makes no request at all |
+| `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | with neither set, step 7 makes no request at all |
 | `LABVIEW_AUTHENTIK_URL` | `authentik.url` | skips discovery entirely; needed only when the provider is outside `appsRoot` |
 | `LABVIEW_AUTHENTIK_ENABLED` | `authentik.enabled` | `false` = never contact the provider |
 | `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `authentik.timeoutMs` | per request; `authentik.maxPages` bounds pagination and is file-only |
+| `LABVIEW_TRAEFIK_URL` | `traefik.url` | skips discovery, and is one of the two things that make an endpoint eligible for a credential (§3.6) |
+| `LABVIEW_TRAEFIK_USERNAME` | `traefik.username` | an Authentik user, or the reserved `goauthentik.io/token`. Only for an API behind a gate |
+| `LABVIEW_TRAEFIK_PASSWORD_FILE` | `traefik.passwordFile` | preferred over the password env var, which `docker inspect` exposes. Wins over `traefik.password` |
+| `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it |
+| `LABVIEW_TRAEFIK_ENABLED` | `traefik.enabled` | `false` = never contact the proxy. Unlike Authentik this stage is on by default, because it needs no credential |
+| `LABVIEW_TRAEFIK_TIMEOUT_MS` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
 
 **Docker endpoint resolution order:** explicit socket → configured/env TCP host →
 default socket path. The default is the conventional local socket, the one
@@ -633,6 +845,13 @@ default TCP hostname (I2) — `compose.yml` sets it, as an example.
 container addresses → discovered public hostnames. `authentik.url` ships empty for
 the same reason: an address is a fact about the operator's fleet, so it is
 discovered or supplied, never defaulted.
+
+**Traefik endpoint resolution order:** the same shape — configured `url` →
+discovered internal container addresses (declared target ports, plus `8080`) →
+discovered public hostnames — and `traefik.url` ships empty for the same reason.
+The one asymmetry is `enabled`: this stage defaults **on**, because the recommended
+setup needs no credential at all and an unreachable endpoint costs one failed
+connection and a reason string. `LABVIEW_TRAEFIK_ENABLED=false` opts out entirely.
 
 ---
 
@@ -659,23 +878,39 @@ exposure via key patterns and URI credentials (I6); privileged Docker access
 (socket proxy, read-only endpoints, `USER node`); denial by malformed input (I4);
 scan stampede (in-flight coalescing).
 
-**The one outbound call, and its rules.** Reading the identity provider's API is
-the only case where LabView initiates a connection with a credential, so it carries
-its own constraints (I5): `GET` only; a read-only groupless service account; a
-discovered endpoint probed unauthenticated before the token is sent; no
-TLS-verification bypass; `tokenFile` so the value need not sit in the environment.
-The whole stage is opt-in — with no token configured, no request is made.
+**The outbound calls, and their rules.** Two stages initiate a connection outside
+the Docker socket, and both carry the same constraints (I5): `GET` only; no
+TLS-verification bypass; the credential readable from a file so it need not sit in
+the environment; and a discovered endpoint probed on an unauthenticated path
+*before* any credential is sent, because a discovered address is a guess and a guess
+must never be handed a credential.
+
+- **The identity provider API** is entirely opt-in: with no token configured, no
+  request is made. It needs a read-only groupless service account with three
+  `view_*` permissions.
+- **The reverse proxy API** is on by default, because in the intended setup it needs
+  no credential: a `traefik` entrypoint on the container network, unpublished, with
+  `api: {}`. It sends a credential only to an endpoint the operator configured by
+  hand or to a hostname the scan proved belongs to the service whose own labels
+  declare `api@internal`. When the read succeeds unauthenticated, that fact is
+  reported as a note on the proxy service — LabView's own read is evidence about how
+  the API is exposed, and saying so is more useful than staying quiet about it.
+
+Neither credential can appear in output: `LABVIEW_AUTHENTIK_TOKEN` and
+`LABVIEW_TRAEFIK_PASSWORD` are both in `secrets.keysAlways`, so a fleet that includes
+LabView's own stack masks them like any other secret, and no error string in either
+client interpolates a credential.
 
 **Deliberate non-goals:** no authentication, authorization or rate limiting in
 LabView itself; no TLS termination (the proxy does it); no persistence, so
 nothing to leak at rest; no writes of any kind; no outbound network calls beyond
-the opt-in identity provider read above.
+the two reads above.
 
 ---
 
 ## 8. Testing contract
 
-`npm run smoke` runs the entire pipeline against three fixture roots with Docker
+`npm run smoke` runs the entire pipeline against four fixture roots with Docker
 disabled and asserts on the resulting `Overview`. It exits non-zero on any
 failure and gates CI. `npm run typecheck` covers `scripts/` too
 (`tsconfig.scripts.json`): `tsx` strips types without checking them, so an
@@ -745,15 +980,51 @@ analyzed). The exposed-without-auth count is asserted **with and without** the A
 in the same run, so the integration's contribution is measured rather than assumed —
 that pair is what fails if any match rule regresses.
 
-`fixtures/outside-root.env` sits outside all three roots on purpose: it is the
+**`fixtures/traefik`** — a fleet built so the labels and the live routing table
+disagree in every way that matters, driven against `fixtures/traefik-api.json`
+through the same `BuildDeps.fetchImpl`. That file carries the Authentik payload for
+these runs too, so the three-way cross-check has all three sources. Same
+revert-proof contract; one stack per rule:
+
+| Stack | Pins |
+|---|---|
+| `edge` | the proxy itself: `service=api@internal` is the only thing in the fleet saying where the API is, so it pins both halves of the discovery rule. Also the `basicAuth` on its own dashboard router, and the "answered with no credential" note |
+| `wiki` | the plain happy path (name-form backend, `forwardAuth` → `confirmed`) and the **container-IP trap**: its `3000:3000` is exactly what an IP-form backend on port 3000 would wrongly resolve to through the published-port index |
+| `docs` | a gate reachable only by expanding a `chain`, a file-provider middleware whose name does *not* read as auth (so label-only it is `none`), and a backend Traefik reports `DOWN` |
+| `dashboards` | **the downgrade** — label claims `authentik@file`, live chain empty, entrypoint carries nothing: method `none`, exposed, note names both sides |
+| `metrics` | the false-positive **guard** — structurally identical to `dashboards`, except the gate is on its entrypoint. No downgrade, `confirmed`, evidence says which entrypoint |
+| `legacy` | a router Traefik refused (`disabled` + `error[]`): its chain must count for nothing, and the errors are quoted |
+| `blog` | a labelled router absent from the live table entirely — note, no protection claimed, no invented reason |
+| `twin-a` / `twin-b` | one live `@file` router whose host rule matches two services: unmatched, not arbitrated. `twin-a` additionally pins that a router the proxy *is* serving never produces a "declared but not live" note, while `twin-b`'s genuinely absent router does |
+| `crm` | the three-way **disagreement** — labels declare nothing, the live chain is empty, and Authentik has a `forward_single` proxy provider with an outpost: somebody built a gate the request never reaches |
+| `shop` | the guard on that — identical but `mode: "proxy"`, where the outpost *is* the backend, so no forward-auth middleware should be expected and no finding is reported |
+| `sso` | the far end of the forward-auth address, so resolving it back to a service is what makes the delegate nameable |
+| (api payload) | PascalCase `/api/version`; a middleware type the model has never seen; `middlewares` and `serverStatus` *absent* rather than empty; a `mirroring` service with no backends; `api@internal` omitted from `services` entirely, as a real Traefik omits it |
+
+Seven runs over that root cover what is not about one stack: discovery and what was
+read; the leak check (a credential configured, the internal endpoint answering,
+nothing sent anywhere); the gated host (Basic sent only there, probe first
+unauthenticated, session cookie echoed on the rest); a configured URL (nothing else
+probed); a partial read (`/api/entrypoints` failing → no downgrade, `confirmed`
+falls back to `inferred`, no cross-check finding); a throwing `fetchImpl`
+(reported, not raised, fleet still fully analyzed, credential absent from the error);
+and the API switched off. That last run asserts the exposed-without-auth and
+protected counts **both ways** — `6`/`5` from labels alone, `4`/`7` with the live
+read — so the integration's contribution is measured in both directions rather than
+assumed. The container-IP trap is asserted directly against `buildFleetIndex`, since
+a container IP exists only in live Docker state and smoke runs without a socket.
+
+`fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
-`fixtures/authentik-api.json` sits beside the roots rather than inside one so the
-scanned tree stays purely compose stacks.
+`fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
+rather than inside one so the scanned trees stay purely compose stacks.
 
 Fixtures are also subject to I2 — they use `example.com` and RFC-1918 addresses,
-never anything from a real fleet. The stub's token is an arbitrary string it demands
-verbatim, and smoke deletes every `LABVIEW_AUTHENTIK_*` variable at startup so an
-operator's real credentials can neither reach the network nor change a result.
+never anything from a real fleet. The stubs' token and password are arbitrary strings
+they demand verbatim, and smoke deletes every `LABVIEW_AUTHENTIK_*` and
+`LABVIEW_TRAEFIK_*` variable at startup (and forces `LABVIEW_TRAEFIK_ENABLED=false`
+for the other three roots) so an operator's real credentials can neither reach the
+network nor change a result.
 
 ---
 
@@ -849,15 +1120,37 @@ plausibly satisfy it — if the answer is "pick one", the rule does not belong. 
 it a fixture whose other rules cannot fire, so the assertion tests the new rule
 rather than an existing one.
 
+**Read another endpoint from the reverse proxy API.** Add it to `snapshotTraefik`'s
+sequence in `enrich/traefik.ts`, tolerant of every field being absent, returning a
+soft error rather than throwing (I4), and record in `TraefikSummary` whether it was
+read — the way `entrypointsRead` does. If a *conclusion* depends on it having been
+read, gate that conclusion on the flag rather than on `reachable`: `chainComplete` is
+the precedent, and the reason it exists is that a missing read is not the same as a
+missing gate. Never send the credential on a probe, and never put it in an error
+string. Add the shape to `fixtures/traefik-api.json`, with its assumption written into
+that file's `_comment` — the fixture is the only documentation of Traefik's runtime
+shapes we have.
+
+**Add a matching rule for live routers.** Same discipline as applications: put it in
+`analyze/traefik.ts` in descending order of strength, require exactly one candidate,
+and be explicit about which *provider* the rule is valid for — the `@docker`-only
+restriction on the router-name rule is not an optimisation, it is the difference
+between evidence and coincidence. Ask what an address-shaped rule reads the port as
+before reusing an existing lookup (see the container-IP row in §12).
+
 ---
 
 ## 11. Known limitations
 
 Not bugs — bounded scope, stated so nobody assumes otherwise:
 
-- **Traefik dynamic-file config is invisible.** Only label-defined middlewares are
-  in the registry. A middleware from a file provider resolves to nothing, which is
-  why the name-based fallback and `confidence: "inferred"` exist.
+- **Traefik dynamic-file config is invisible to the scan.** Only label-defined
+  middlewares are in the registry. A middleware from a file provider resolves to
+  nothing, which is why the name-based fallback and `confidence: "inferred"` exist.
+  Reading the proxy's API (§3.6) is the only way out of this, and it removes the gap
+  rather than narrowing it — the proxy holds the definition. Without that read the
+  limitation stands unchanged, and the static config file is never parsed either:
+  nothing guarantees it lives under `appsRoot`, and the API supersedes it.
 - **Compose `extends`, `include` and profiles are not resolved.** The file is read
   as written.
 - **Only `<appsRoot>/<dir>/compose.yml` is discovered** — one level deep, no
@@ -868,9 +1161,21 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
 - **`env_file` values are not interpolated**, matching Docker's own behaviour.
 - **Auth posture describes configuration, not enforcement.** A middleware
   reference proves it was configured; whether Traefik is actually running with
-  that config is outside what a file scan can know. The identity provider API
-  narrows this — an outpost assignment is enforcement rather than intent — but it
-  is still configuration, not an observed challenge.
+  that config is outside what a *file* scan can know. Both APIs narrow this — an
+  outpost assignment is enforcement rather than intent, and a middleware in the
+  proxy's runtime chain is the config it is demonstrably running — but it is still
+  configuration. LabView never sends a request through a gate to see what happens.
+- **The proxy integration is Traefik-specific.** Another reverse proxy is still
+  classified from its labels and simply not verified; there is no second client.
+  Only `/api/rawdata` is used, with no fallback to the paginated granular endpoints,
+  and no write call of any kind exists. The response shapes come from Traefik v3's
+  runtime model rather than a published schema, so the parser is deliberately
+  tolerant and a mismatch degrades to `reachable: false` with a reason (I4).
+- **A live router is only as attributable as the fleet makes it.** With no Docker
+  state the backend-address rule is skipped entirely, and a `@file` router with a
+  host rule matching two services stays unmatched by design. Expect entries in
+  `unmatchedRouters` on a fleet whose routing lives mostly in file providers; the fix
+  is a label, not a looser rule.
 - **Only applications, providers and outposts are read from the identity
   provider.** Policy bindings are not, so an application whose access policy denies
   everyone reads as protected (it is), and a flow customization that weakens a gate
@@ -927,4 +1232,16 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. Revisit if the palette gains a colour. |
 | `forward_domain` external hosts are not matched on | In that mode `external_host` is the authentication domain shared by every application in it, usually the provider's own hostname. Matching it attaches unrelated gates to whichever service serves the SSO domain — which is the identity provider itself, so the error inflates the protected count. |
 | The hostname index dedupes by service key | A service fronted by both a tunnel and a reverse proxy declares the same hostname in both label sets. Those are two statements about one service; counting them as rival candidates makes the commonest configuration in a fleet unmatchable. |
+| The reverse proxy API is on by default, unlike the identity provider's | The Authentik read cannot happen without a credential the operator must create, so it stays off until they do. The Traefik read needs none in the intended setup — an unpublished container-network entrypoint — so requiring opt-in would mean most fleets never get the one check that catches a label claiming a gate the proxy is not applying. The cost of it being on and finding nothing is one failed connection and a reason string. |
+| An Authentik API token is not accepted as a proxy credential | It cannot work. A proxy provider validates HTTP Basic by driving the OAuth2 machine-to-machine flow with those credentials, which needs an **app password**; an API token authenticates to Authentik's own REST API and nothing else. The reserved username `goauthentik.io/token` (2023.2+) is the supported way to use a token, and it is a username choice, not a second mechanism. Accepting a token silently would produce a 401 the operator could only debug by reading this table. |
+| The credential is never sent to a discovered endpoint on the strength of its looking like a proxy | A discovered address is a guess (§3.5's rule, applied again). Two things earn a credential: the operator typing the URL, or the scan proving the hostname belongs to the service whose own labels declare `api@internal`. Everything else gets the unauthenticated probe and nothing more. |
+| The downgrade requires `/api/entrypoints`, not just `/api/rawdata` | A middleware attached to an entrypoint gates every router arriving on it and appears in no router's own list. Reading only `rawdata` therefore cannot distinguish "no gate" from "gate one level up", and the downgrade would invert the finding — reporting a protected service as reachable without auth, which is the single worst error this codebase can make. So the two reads together are the precondition, and a partial read notes the gap and changes nothing. |
+| A live chain supersedes the labels rather than merging with them | They are two accounts of one thing, and only one of them is what requests actually traverse. Merging would let a label add a gate the proxy is not applying, which is exactly the class of error the integration exists to find. The label list is kept as evidence and named in the note, so nothing is hidden. |
+| Backend container IPs need their own index | A docker-provider backend is `http://<container-ip>:<port>`, and `lookupAddress` reads an IP literal's port as a *published host port* — correct for a tunnel origin, wrong table entirely here. Reusing it would match whichever unrelated service publishes that number, and confidently: an IP-form URL looks like the strongest evidence available. `byContainerIp` keeps the two address spaces apart, and with no Docker state the rule is skipped rather than approximated. |
+| The router-name rule applies to `@docker` routers only | Traefik derives a docker router's name from the labels of the container it found it on, so an exact match against that service's own `router` value is the label round-tripping — evidence, not coincidence. A `@file` router's name was typed by hand in a file this scan cannot read, so the same match there is a coincidence with no evidentiary weight. `fixtures/traefik/twin-a` exists to pin that distinction. |
+| The declared-but-absent check runs over every router in the snapshot | Checking only the routers matched to a service would report a route the proxy is demonstrably serving as missing, whenever LabView could not attribute it. The absent-router note has to be about the whole live table or it is about nothing. |
+| A `proxy`-mode provider is exempt from the forward-auth cross-check | In `proxy` mode the outpost *is* the backend: the request goes to it and it forwards on. No forward-auth middleware exists anywhere in that topology, so "Authentik has a gate but the proxy forwards no auth" is not a finding, it is the mode working as designed. Only `forward_single` / `forward_domain` providers can disagree with the proxy this way. |
+| The unauthenticated-API outcome is reported, not silently used | An operator who does not know whether `api.insecure` is on gets a definite answer from the only party in a position to test it. It is a fact about their fleet that LabView established by observation, which is exactly what it exists to report — and it is not framed as a verdict, since an API on a container network with no host port is a reasonable configuration. |
+| A 200 with a non-JSON body is reported as that, not as a JSON parse error | It is the likeliest way a gated endpoint answers: an SSO login page is served with a success status, so the body is the only tell. Surfacing the `SyntaxError` blames LabView for the operator's missing credential and buries the one actionable fact. The endpoint is also not counted as an API, so nothing further — least of all a credential — follows it. |
+| `fetch`'s `cause.code` is kept in the failure reason | `fetch` collapses a name that does not resolve, a port nothing listens on and a rejected certificate into one `fetch failed`. Those have nothing in common as fixes, and the distinction is already in `error.cause` — discarding it makes the reason string worthless for exactly the setup step where it is read. The code is a constant like `ENOTFOUND`, so keeping it leaks no address and no credential. |
 | `scripts/` is typechecked by its own tsconfig | `tsx` strips types without checking them, so a stale field name in an assertion becomes `undefined` at runtime instead of a build error — and an assertion on `undefined` can pass while proving nothing. `rootDir: src` in the emit config is why it needs a second file rather than a wider `include`. |

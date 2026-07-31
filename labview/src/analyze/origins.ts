@@ -46,6 +46,33 @@ export interface FleetIndex {
   byPort: Map<string, ServiceRef[]>;
   /** Lowercased compose service name and container name -> the service(s) using it. */
   byName: Map<string, ServiceRef[]>;
+  /**
+   * Container IP as the Docker API reported it -> the service(s) holding it.
+   *
+   * A different table from `byPort` on purpose. A published host port and a
+   * container IP are both "an address with a port", but they identify a service by
+   * entirely different means, and reading one through the other's table produces a
+   * confident wrong answer — see `lookupContainerAddress`.
+   *
+   * Empty without live Docker state, since nothing in a compose file records the
+   * address the daemon will assign.
+   */
+  byContainerIp: Map<string, ServiceRef[]>;
+  /**
+   * Hostname a service is configured to answer on -> the service(s) declaring it,
+   * from both ingress mechanisms.
+   *
+   * A hostname belongs to one service in a working fleet, but a half-migrated config
+   * can name it twice; that yields two candidates, which every caller discards rather
+   * than silently resolving to the first.
+   *
+   * The repeats that get collapsed are a single service naming one hostname more than
+   * once, which is the normal case rather than the exception: a service fronted by both
+   * a tunnel and a reverse proxy declares the same hostname in both label sets. Those
+   * are two statements about one service, so counting them as rivals would make the
+   * commonest configuration in a fleet unmatchable.
+   */
+  byHostname: Map<string, ServiceRef[]>;
   /** `${stackId}/${serviceName}` -> the real docker networks it joins. */
   netsByKey: Map<string, string[]>;
 }
@@ -60,6 +87,8 @@ export interface FleetIndex {
 export function buildFleetIndex(stacks: AppStack[]): FleetIndex {
   const byPort = new Map<string, ServiceRef[]>();
   const byName = new Map<string, ServiceRef[]>();
+  const byContainerIp = new Map<string, ServiceRef[]>();
+  const byHostname = new Map<string, ServiceRef[]>();
   const netsByKey = new Map<string, string[]>();
   const push = (map: Map<string, ServiceRef[]>, key: string, ref: ServiceRef) => {
     const list = map.get(key);
@@ -77,10 +106,29 @@ export function buildFleetIndex(stacks: AppStack[]): FleetIndex {
       for (const name of [svc.name, svc.containerName]) {
         if (name) push(byName, name.toLowerCase(), { stackId: stack.id, serviceName: svc.name });
       }
+      for (const ip of Object.values(svc.docker?.ipAddresses ?? {})) {
+        if (ip) push(byContainerIp, ip, { stackId: stack.id, serviceName: svc.name });
+      }
+      const declared = [...svc.cloudflare.map((r) => r.hostname), ...svc.traefik.flatMap((r) => r.hosts)];
+      for (const raw of declared) {
+        const host = normalizeHost(raw);
+        if (host) push(byHostname, host, { stackId: stack.id, serviceName: svc.name });
+      }
       netsByKey.set(`${stack.id}/${svc.name}`, realNetworks(stack, svc));
     }
   }
-  return { byPort, byName, netsByKey };
+  for (const [key, refs] of byHostname) byHostname.set(key, distinct(refs));
+  return { byPort, byName, byContainerIp, byHostname, netsByKey };
+}
+
+/**
+ * Canonical form of a hostname for indexing: lowercased, without a trailing root
+ * dot, and rejecting a wildcard — `*.example.com` names no one host.
+ */
+export function normalizeHost(raw: string): string | undefined {
+  const host = raw.trim().toLowerCase().replace(/\.$/, "");
+  if (!host || host.includes("*")) return undefined;
+  return host;
 }
 
 /** Attach an `origin` to every declared tunnel route, and note the ones that resolved to nothing. */
@@ -120,6 +168,31 @@ export function lookupAddress(address: string, index: FleetIndex): ServiceRef[] 
     if (!port) return [];
     return distinct((index.byPort.get(port) ?? []).filter((o) => bindReachableFrom(o, host)));
   }
+  return distinct(index.byName.get(host.toLowerCase()) ?? []);
+}
+
+/**
+ * Which scanned services an address on a *container network* could be talking about.
+ *
+ * A reverse proxy's backend address is not the same kind of address as a tunnel
+ * origin, even when the two look identical. A tunnel enters from outside the docker
+ * networks, so an IP literal there is the host and its port is a published one. A
+ * proxy sharing a network with its backends addresses them from inside, so an IP
+ * literal is a *container* IP and its port is the container-internal port — which
+ * nothing publishes and which many containers use at once.
+ *
+ * Sending such an address through `lookupAddress` would look up a container port in
+ * the published-host-port table: `http://172.18.0.7:8080` would resolve to whichever
+ * unrelated service happens to publish host port 8080. That is worse than no answer,
+ * so an IP literal is resolved only against the container-IP index and the port is
+ * ignored entirely. A name-form address is the same evidence in either direction —
+ * compose publishes the name as a DNS alias — so it reuses the name branch.
+ */
+export function lookupContainerAddress(address: string, index: FleetIndex): ServiceRef[] {
+  const parsed = parseOrigin(address.trim());
+  if (!parsed) return [];
+  const { host } = parsed;
+  if (isIpLiteral(host)) return distinct(index.byContainerIp.get(host) ?? []);
   return distinct(index.byName.get(host.toLowerCase()) ?? []);
 }
 

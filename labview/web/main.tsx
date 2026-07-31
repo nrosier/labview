@@ -1,6 +1,13 @@
 import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
-import type { AppStack, AuthentikSummary, IngressKind, Overview, Service } from "./model";
+import type {
+  AppStack,
+  AuthentikSummary,
+  IngressKind,
+  Overview,
+  Service,
+  TraefikSummary,
+} from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
@@ -58,6 +65,32 @@ function authentikTitle(ak: AuthentikSummary): string {
     bits.push(`not matched to any service: ${ak.unmatchedApplications.join(", ")}`);
   }
   if (ak.error) bits.push(ak.error);
+  return bits.join("\n");
+}
+
+/**
+ * Tooltip for the proxy status: which endpoint answered, what it needed to let LabView
+ * in, and what was read. Routers no service could be identified for are named for the
+ * same reason unmatched applications are — ingress LabView could not attribute is its
+ * own reporting gap, and it is also the only place file-provider routes show up.
+ */
+function traefikTitle(tf: TraefikSummary): string {
+  const bits = [
+    `${tf.endpoint ?? "unknown endpoint"} (${tf.endpointSource ?? "unknown"})`,
+    tf.version ? `Traefik ${tf.version}` : "version not reported",
+    tf.credential === "none"
+      ? "answered without a credential — the API is open to anything that can reach it"
+      : "answered after HTTP Basic authentication",
+    `${tf.routers} routers, ${tf.middlewares} middlewares, ${tf.services} services`,
+    `${tf.matchedServices} services matched`,
+  ];
+  if (!tf.entrypointsRead) {
+    bits.push("entrypoint middlewares were not read, so a gate attached there is not accounted for");
+  }
+  if (tf.unmatchedRouters.length) {
+    bits.push(`not matched to any service: ${tf.unmatchedRouters.join(", ")}`);
+  }
+  if (tf.error) bits.push(tf.error);
   return bits.join("\n");
 }
 
@@ -251,6 +284,24 @@ function App() {
                 </span>
               ) : (
                 <span title={ov.meta.authentik.error ?? ""}>unreachable</span>
+              )}
+            </span>
+          )}
+          {/* Same rule for the proxy's API. Its credential state is part of the status
+              rather than a tooltip detail: a proxy API that answered unauthenticated is
+              readable by anything that can reach it, which is worth seeing at a glance. */}
+          {ov.meta.traefik?.configured && (
+            <span>
+              traefik:{" "}
+              {ov.meta.traefik.reachable ? (
+                <span title={traefikTitle(ov.meta.traefik)}>
+                  {ov.meta.traefik.routers} router
+                  {ov.meta.traefik.routers === 1 ? "" : "s"}
+                  {ov.meta.traefik.matchedServices > 0 && ` · ${ov.meta.traefik.matchedServices} matched`}
+                  {ov.meta.traefik.credential === "none" && " · no credential"}
+                </span>
+              ) : (
+                <span title={ov.meta.traefik.error ?? ""}>unreachable</span>
               )}
             </span>
           )}

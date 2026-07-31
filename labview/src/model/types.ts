@@ -109,6 +109,78 @@ export interface TraefikRoute {
   middlewares: string[];
   /** loadbalancer target port, if declared. */
   servicePort?: string;
+  /**
+   * The Traefik service this router targets, verbatim, when the label names one.
+   *
+   * Usually the container's own load balancer, but it can also be one of Traefik's
+   * built-ins — `api@internal` being the one that matters, since a router pointing at
+   * it is the operator stating that this container serves the Traefik API.
+   */
+  service?: string;
+}
+
+/**
+ * One entry of a router's middleware chain as Traefik itself resolved it.
+ *
+ * A label lists middleware *names*; only the proxy knows what those names resolve
+ * to. `type` therefore comes from the definition Traefik holds — including for a
+ * middleware declared in a file provider, which a compose scan cannot see at all.
+ */
+export interface TraefikLiveMiddleware {
+  /** Traefik's own qualified name, `name@provider`. */
+  name: string;
+  /** Lowercased middleware type as Traefik keys it (`forwardauth`, `basicauth`, `chain`, …). */
+  type: string;
+  /** For a forward-auth: the address the proxy delegates the decision to. */
+  address?: string;
+  /** Errors Traefik reported for this middleware. Non-empty means it is not usable. */
+  errors: string[];
+  /** Name of the `chain` middleware this entry was reached through, when nested. */
+  viaChain?: string;
+  /**
+   * True when the middleware is attached to the router's *entrypoint* rather than
+   * named by the router. Such a gate is invisible in a router's own middleware
+   * list, so it must be merged in before any conclusion about a missing gate.
+   */
+  viaEntrypoint?: boolean;
+}
+
+/** One backend Traefik forwards to, with the health it last observed for it. */
+export interface TraefikLiveServer {
+  url: string;
+  /** Traefik's `serverStatus` for this URL (`UP` / `DOWN`), when it reported one. */
+  status?: string;
+}
+
+/**
+ * A router as the proxy is actually serving it, matched to a scanned service.
+ *
+ * This is the live counterpart of `TraefikRoute`: same subject, different source.
+ * `TraefikRoute` is what the compose labels asked for; this is what Traefik built
+ * from them — plus whatever it built from providers the scan cannot read.
+ */
+export interface TraefikLiveRouter {
+  /** Router name without the provider suffix. */
+  router: string;
+  /** Provider Traefik loaded it from (`docker`, `file`, `kubernetes`, …). */
+  provider: string;
+  /** Traefik's own status, typically `enabled` or `disabled`. */
+  status?: string;
+  /** Errors Traefik reported for this router. Non-empty means it is not serving. */
+  errors: string[];
+  rule?: string;
+  /** Hostnames extracted from `rule`. */
+  hosts: string[];
+  entryPoints: string[];
+  /** The fully resolved chain: router middlewares, chains expanded, entrypoint ones merged. */
+  middlewares: TraefikLiveMiddleware[];
+  /** Traefik service name this router targets, `name@provider`. */
+  service?: string;
+  /** Backends of that service, when it is a load balancer. */
+  servers: TraefikLiveServer[];
+  tls: boolean;
+  /** How this router was tied to this service, in the spirit of `AuthPosture.evidence`. */
+  evidence: string[];
 }
 
 /**
@@ -237,6 +309,42 @@ export interface AuthentikSummary {
   unmatchedApplications: string[];
 }
 
+/** Outcome of the Traefik API exchange, for the scan metadata. */
+export interface TraefikSummary {
+  /** Whether the integration is switched on at all. */
+  enabled: boolean;
+  /** Whether there was at least one endpoint to try. */
+  configured: boolean;
+  /** Whether an endpoint answered as a Traefik API and its runtime config was read. */
+  reachable: boolean;
+  /** Endpoint used, origin only — never a path, query or credential. */
+  endpoint?: string;
+  /** Whether the endpoint was configured or discovered from the fleet. */
+  endpointSource?: "config" | "discovered";
+  /**
+   * Which credential the successful read needed. `none` means the API answered
+   * unauthenticated, which is the direct evidence that `api.insecure` is on.
+   */
+  credential: "none" | "basic";
+  /** Traefik's reported version, when it supplied one. */
+  version?: string;
+  /**
+   * Whether `/api/entrypoints` was read. An entrypoint can carry auth middlewares
+   * that no router lists, so without this a missing gate cannot be distinguished
+   * from a gate attached one level up — which is why the downgrade requires it.
+   */
+  entrypointsRead: boolean;
+  /** Why the exchange did not complete, with no credential in the text. */
+  error?: string;
+  routers: number;
+  middlewares: number;
+  services: number;
+  /** Services that matched at least one live router. */
+  matchedServices: number;
+  /** Live routers no scanned service could be identified for. */
+  unmatchedRouters: string[];
+}
+
 /** Derived authentication posture for a service. */
 export interface AuthPosture {
   method: AuthMethod;
@@ -294,6 +402,8 @@ export interface Service {
   docker?: DockerState;
   /** Authentik applications this service was matched to, when the API was readable. */
   authentik?: AuthentikMatch;
+  /** Live routers this service was matched to, when the Traefik API was readable. */
+  traefikLive?: TraefikLiveRouter[];
   /** Notes/warnings surfaced during analysis. */
   notes: string[];
 }
@@ -401,6 +511,8 @@ export interface ScanMeta {
   dockerError?: string;
   /** Outcome of the optional Authentik API exchange. */
   authentik?: AuthentikSummary;
+  /** Outcome of the optional Traefik API exchange. */
+  traefik?: TraefikSummary;
   durationMs: number;
   warnings: string[];
   version: string;

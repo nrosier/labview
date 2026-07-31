@@ -141,6 +141,67 @@ authentik:
   # Reaching the API over the container network as plain HTTP avoids the question
   # entirely, and is what discovery prefers.
 
+# Read the reverse proxy's own runtime configuration to verify the labels against
+# what it is actually serving.
+#
+# Compose labels state what the operator asked for. Only Traefik knows what it
+# built from them, and three differences matter:
+#
+#   * a router the labels declare that the proxy is not serving at all — a typo in
+#     a rule, a missing entrypoint, a container it never picked up;
+#   * a middleware named in a label that is not in the chain the proxy built, so
+#     the service reads "protected" here and answers without a login;
+#   * a middleware defined in a Traefik *file* provider, which a compose scan
+#     cannot see, and which is therefore only ever reported as `inferred`.
+#
+# Reading /api/rawdata and /api/entrypoints replaces all three with the proxy's own
+# account, at `confirmed` confidence. It also reports backend health, and lists the
+# routers no scanned service could be identified for.
+#
+# Enabling the API safely: give it its own entrypoint on the container network and
+# do NOT publish that port.
+#
+#   # traefik static config
+#   api: {}                       # not `api.insecure` on a published port
+#   entryPoints:
+#     traefik:
+#       address: ":8080"          # reachable only from the docker network
+#
+# Then nothing needs a credential and LabView sends none. If you instead front the
+# dashboard with a router and gate it with Authentik, see username/password below.
+traefik:
+  enabled: true
+  # Base URL including scheme and port, e.g. http://traefik:8080. Leave empty to
+  # discover it: a scanned service is taken to be the proxy when one of its own
+  # routers targets `api@internal`, when another service's tunnel origin resolved
+  # to it, or (last resort) when it runs the Traefik image. Container addresses are
+  # tried before any public hostname, so the call stays on the container network.
+  url: ""
+  #
+  # Credential for a gated API. Leave both empty unless the API is only reachable
+  # through a hostname that Authentik protects — an endpoint that answers
+  # unauthenticated is used with no credential at all, and a credential is only
+  # ever sent to an endpoint you configured by hand or to a hostname this scan
+  # proved belongs to the service whose own labels declare `api@internal`.
+  #
+  # An Authentik *API token* is not a valid credential here. A proxy provider
+  # accepts HTTP Basic with an Authentik user plus an **app password** — the
+  # credentials are used internally with the OAuth2 machine-to-machine flow, which
+  # an API token cannot drive — or the reserved username `goauthentik.io/token`
+  # with a token as the password. Either way the provider needs "Intercept header
+  # authentication" enabled, or it will answer the request itself instead of
+  # passing it through.
+  username: ""
+  # Prefer passwordFile. A value here ends up in the config file, and a value in
+  # LABVIEW_TRAEFIK_PASSWORD ends up in `docker inspect` output.
+  password: ""
+  # Path to a file holding the password (docker secret, mounted file). Takes
+  # precedence over `password`.
+  passwordFile: ""
+  # Per-request timeout in milliseconds. The whole exchange is three GETs; if it
+  # times out the scan continues from the labels alone and says so.
+  timeoutMs: 5000
+
 # Rescan cache: how long (seconds) a scan result is served before a fresh scan is
 # triggered on the next request. The UI also has a manual "Rescan" button.
 cacheTtlSeconds: 60

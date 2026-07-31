@@ -1,0 +1,29 @@
+# The guard against the downgrade firing wrongly.
+#
+# Structurally identical to `dashboards` — same label, same empty router chain —
+# with one difference: this router's entrypoint is `secure`, and that entrypoint
+# carries `authentik@file` for everything arriving on it. The gate is real; it just
+# is not in the router's own middleware list.
+#
+# So the downgrade must NOT fire here. A reader of `/api/rawdata` alone sees an
+# empty chain and would conclude this service is wide open — inverting the finding
+# on a service that is in fact protected. That is why `/api/entrypoints` is
+# required before a live chain may supersede a label, and why this fixture exists
+# next to `dashboards`: the two differ only in where the gate is attached, and the
+# conclusions must differ accordingly.
+services:
+  metrics:
+    image: ghcr.io/example/metrics:3
+    container_name: metrics-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.metrics.rule=Host(`metrics.example.com`)"
+      - "traefik.http.routers.metrics.entrypoints=secure"
+      - "traefik.http.routers.metrics.middlewares=authentik@file"
+
+networks:
+  proxy:
+    external: true

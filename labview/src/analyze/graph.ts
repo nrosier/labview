@@ -1,4 +1,5 @@
 import type { AppStack, Service, Graph, GraphNode, GraphEdge } from "../model/types.js";
+import { routerIsServing } from "../labels/auth.js";
 import { realNetworks } from "./networks.js";
 
 /**
@@ -17,8 +18,14 @@ import { realNetworks } from "./networks.js";
  * `tunnel -> proxy -> service`. Where the origin resolved to the service itself,
  * or to nothing this scan can see, the direct edge is kept — an unproven hop is
  * never invented.
+ *
+ * @param proxyKey `${stackId}/${serviceName}` of the proxy whose API was read, when
+ * one answered. It is the strongest possible statement about which proxy serves a
+ * route — the proxy itself said so — so a router it reported is drawn from that
+ * service rather than from the generic hub, in a fleet with no tunnel at all as
+ * readily as in one with several.
  */
-export function buildGraph(stacks: AppStack[]): Graph {
+export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const addNode = (n: GraphNode) => {
@@ -62,6 +69,9 @@ export function buildGraph(stacks: AppStack[]): Graph {
 
   /** Hostnames whose tunnel route terminates at a given hop, for one edge per hop. */
   const viaHop = new Map<string, Set<string>>();
+
+  /** Service nodes shown to be acting as a proxy, tunnel or no tunnel. */
+  const proxyRole = new Set<string>();
 
   for (const stack of stacks) {
     for (const svc of stack.services) {
@@ -145,13 +155,37 @@ export function buildGraph(stacks: AppStack[]): Graph {
           });
         }
       }
-      // Proxy routes start at the hop this service's own tunnel origin resolved to,
-      // since that service is an observed reverse proxy in front of it. Without
-      // such a hop the responsible proxy is unknown — a Traefik instance picks up
-      // routes from the docker socket, which no label records — so the generic hub
-      // stands in rather than attributing the route to a proxy found elsewhere.
+      // Routers the proxy's own API reported for this service. Drawn from that proxy
+      // because it is the proxy stating it serves them — no inference involved — and
+      // drawn for routers no label declares, which is how ingress configured outside
+      // the scanned stacks becomes visible at all. A router the proxy is not serving
+      // is left out: an edge is a request path, and that one carries no requests.
+      const proxyId = liveProxy(proxyKey, sid, netsById);
+      const serving = (svc.traefikLive ?? []).filter(routerIsServing);
+      if (proxyId && serving.length) {
+        proxyRole.add(proxyId);
+        for (const r of serving) {
+          addEdge({
+            id: `live->${sid}:${r.router}@${r.provider}`,
+            source: proxyId,
+            target: sid,
+            kind: "ingress",
+            label: r.hosts[0] ?? r.router,
+          });
+        }
+      }
+
+      // Proxy routes from labels. Those the live read already accounted for are drawn
+      // above from the proxy that confirmed them; the rest start at the hop this
+      // service's own tunnel origin resolved to, since that service is an observed
+      // reverse proxy in front of it. Without either, the responsible proxy is unknown
+      // — a Traefik instance picks up routes from the docker socket, which no label
+      // records — so the generic hub stands in rather than attributing the route to a
+      // proxy found elsewhere.
+      const confirmed = new Set(proxyId ? serving.map((r) => r.router.toLowerCase()) : []);
       const routerSource = hopId ?? "ext:traefik";
       for (const r of svc.traefik) {
+        if (confirmed.has(r.router.toLowerCase())) continue;
         if (!hopId) hub.traefik = true;
         addEdge({
           id: `tr->${sid}:${r.router}`,
@@ -203,6 +237,12 @@ export function buildGraph(stacks: AppStack[]): Graph {
     const node = nodes.get(hop);
     if (node) node.role = "proxy";
   }
+  // Same fact, established the other way round: a service whose API reported the
+  // routes for other services is a proxy whether or not any tunnel lands on it.
+  for (const id of proxyRole) {
+    const node = nodes.get(id);
+    if (node) node.role = "proxy";
+  }
 
   if (hub.cf) addNode({ id: "ext:cloudflare", label: "Cloudflare Tunnel", kind: "external" });
   if (hub.traefik) addNode({ id: "ext:traefik", label: "Traefik", kind: "external" });
@@ -232,6 +272,24 @@ function resolvedHop(
   const hop = `svc:${hopKey}`;
   if (hop === sid || !netsById.has(hop)) return undefined;
   return hop;
+}
+
+/**
+ * The graph node for the proxy whose API answered.
+ *
+ * Guards the two degenerate cases: no proxy was identified, and the proxy is the very
+ * service being drawn — a Traefik instance routinely serves a router for its own
+ * dashboard, and an edge from a node to itself states nothing.
+ */
+function liveProxy(
+  proxyKey: string | undefined,
+  sid: string,
+  netsById: Map<string, string[]>,
+): string | undefined {
+  if (!proxyKey) return undefined;
+  const id = `svc:${proxyKey}`;
+  if (id === sid || !netsById.has(id)) return undefined;
+  return id;
 }
 
 function normalizeBind(p: string): string {

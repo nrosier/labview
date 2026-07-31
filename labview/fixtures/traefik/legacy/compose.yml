@@ -1,0 +1,28 @@
+# A router Traefik refused, whose chain must therefore count for nothing.
+#
+# Live, `legacy@docker` comes back `status: "disabled"` with an error, and its chain
+# contains `authentik@file`. Both halves of that are traps:
+#
+#   * the chain is a gate on a router that is not in any request path, so it protects
+#     nothing and must not be read as protection, and
+#   * the router is not working ingress either, so it must not be drawn as a route
+#     nor counted as one.
+#
+# The labels here declare no auth at all, which keeps the two questions separate: if
+# a disabled router's chain were ever allowed to count, this service would gain a
+# protection it does not have, and the assertion would catch it.
+services:
+  legacy:
+    image: ghcr.io/example/legacy:0
+    container_name: legacy-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.legacy.rule=Host(`legacy.example.com`)"
+      - "traefik.http.routers.legacy.entrypoints=websecure"
+
+networks:
+  proxy:
+    external: true

@@ -35,7 +35,9 @@ It targets a specific, common TrueNAS Scale pattern:
 - **Public ingress** through a Cloudflare tunnel, configured with **DockFlare**
   labels (`dockflare.hostname`, `dockflare.service`, …).
 - **Local ingress** through **Traefik**, configured with `traefik.*` labels
-  (routers, rules, entrypoints, TLS, middlewares).
+  (routers, rules, entrypoints, TLS, middlewares). Optionally **verified against
+  Traefik's own API**, which is the only way to see what the proxy actually built
+  from those labels.
 - **SSO** through **Authentik** — as a Traefik forward-auth middleware
   (`authentik@docker`), or via OAuth/OIDC or LDAP wired through a service's
   environment. Optionally **read back from the Authentik API** with a read-only
@@ -54,6 +56,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Ingress classification** | Every service resolves to `public`, `public+host-port`, `public+local`, `local`, `host-port`, or `internal`. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` by the provider's API, `observed` in the config, or only `inferred` from a name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts, matches each application to a service by the provider's internal host, a shared hostname or the slug, and reports what Authentik says. This finds gates configured only in Authentik — and, more usefully, the reverse: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
+| **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
 | **Light / dark** | Follows the OS, with a manual toggle. Colorblind-safe palette validated in both modes. |
@@ -64,10 +67,12 @@ It targets a specific, common TrueNAS Scale pattern:
 
 ```text
 labview/              the application (see labview/README.md for full docs)
-  src/                scanner, label parsers, analyzer, docker + authentik enrichment, server
+  src/                scanner, label parsers, analyzer, docker + authentik +
+                      traefik enrichment, server
   web/                preact UI
   fixtures/           apps/ (happy path), edge/ (regression cases),
-                      authentik/ + authentik-api.json (identity provider integration)
+                      authentik/ + authentik-api.json (identity provider integration),
+                      traefik/ + traefik-api.json (reverse proxy integration)
   scripts/smoke.ts    end-to-end pipeline assertions
   compose.yml         deployment example
   Dockerfile          two-stage node:22-alpine build, runs as non-root
@@ -158,11 +163,15 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a **read-only** Authentik API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Authentik base URL, e.g. `http://authentik-server:9000`. Only needed when Authentik is outside `appsRoot` |
+| `LABVIEW_TRAEFIK_URL` | *(discovered)* | Traefik API base URL, e.g. `http://traefik:8080`. Only needed when the proxy is outside `appsRoot`, or when discovery picks the wrong endpoint |
+| `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through a hostname Authentik gates: an Authentik user, or the reserved `goauthentik.io/token`. An unauthenticated endpoint is used with no credential |
+| `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
 
 The full table — including `LABVIEW_HOST`, `LABVIEW_DOCKER_PORT`,
 `LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_CONFIG` and the rest of the
-`LABVIEW_AUTHENTIK_*` set — plus the secret patterns, label prefixes and Authentik
-hints, is documented in [labview/README.md](labview/README.md#configuration).
+`LABVIEW_AUTHENTIK_*` and `LABVIEW_TRAEFIK_*` sets — plus the secret patterns,
+label prefixes and Authentik hints, is documented in
+[labview/README.md](labview/README.md#configuration).
 
 ---
 
@@ -170,10 +179,11 @@ hints, is documented in [labview/README.md](labview/README.md#configuration).
 
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
-      → build middleware registry → classify ingress → read the Authentik API
-      → discover Authentik hostnames → resolve tunnel origins
-      → match Authentik applications to services → derive auth posture
-      → build graph → serve /api/overview
+      → build middleware registry → classify ingress → resolve tunnel origins
+      → read the Authentik API ∥ read the Traefik API   (concurrently)
+      → discover Authentik hostnames
+      → match Authentik applications ∥ match live routers to services
+      → derive auth posture → build graph → serve /api/overview
 ```
 
 Compose parsing handles both label/env syntaxes (list `- k=v` and map `k: v`),
@@ -202,8 +212,8 @@ no network with the service it supposedly fronts cannot forward to it. When that
 proves a hop, the graph draws `tunnel → proxy → service`. When nothing proves one,
 the direct edge stays and the service says why the hop is unknown.
 
-There is one thing compose files genuinely cannot tell you: whether a gate defined
-in Authentik is actually standing in the request path. Give LabView a read-only
+Two things compose files genuinely cannot tell you. The first is whether a gate
+defined in Authentik is actually standing in the request path. Give LabView a read-only
 Authentik token and it asks. Each application is matched to a service only on
 addressed evidence — a proxy provider's internal host resolving to that service, a
 launch or redirect URL naming a hostname the service serves, or a slug pointing at
@@ -212,6 +222,27 @@ guessed. Then the provider's account replaces the inference: `confirmed` instead
 `observed`, the provider named, and a proxy or LDAP provider with no outpost
 assigned reported as protecting nothing, because nothing is in the path to enforce
 it. Without a token this stage does not run and no request is made.
+
+The second is what the reverse proxy built from those labels. Labels are a request;
+the running config is the answer, and the two differ more often than is comfortable
+— a rule with a typo, a reference to a middleware that doesn't exist, a gate
+attached at the entrypoint rather than the router, a middleware defined in a file
+provider the scan can never see. So LabView locates the proxy among the scanned
+stacks — a service whose own labels route to `api@internal`, the hop a tunnel
+origin resolved to, or, last resort, the Traefik image — and reads `/api/rawdata`
+and `/api/entrypoints` from it, preferring its container address so the call stays
+on the container network. Live routers are matched to services on addressed
+evidence only: the backend URL the proxy itself names, a `@docker` router name
+round-tripping from that service's own labels, or a host rule resolving to exactly
+one service. Where a router matched, the chain Traefik built **is** the chain — a
+resolved `forwardAuth` becomes `confirmed`, retiring the `inferred` verdict that
+file-provider middlewares were stuck with, and a label claiming a gate the live
+chain does not contain is **downgraded** to `none`, which moves the service into
+exposed-without-auth with a note saying exactly what was and wasn't in the chain.
+That downgrade requires both reads to have succeeded, because a gate can sit on the
+entrypoint instead of the router; a partial read records the gap and changes no
+posture. This stage is on by default and needs no configuration — if nothing
+answers, the scan continues from the labels alone and reports what it tried.
 
 See [labview/README.md](labview/README.md#how-it-works) for the details, and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the design rules behind them.
@@ -263,6 +294,20 @@ output is sensitive.
   `LABVIEW_AUTHENTIK_TOKEN_FILE` over the env var, which is readable by anyone who
   can run `docker inspect`. There is no flag to skip TLS verification; use
   `NODE_EXTRA_CA_CERTS` for a private CA.
+- **The Traefik API is read without a credential wherever possible.** Discovered
+  endpoints are probed on `/api/version`, which needs no authentication, and an
+  endpoint that answers is used as-is with nothing sent. A credential is only ever
+  sent to an endpoint you configured by hand or to a hostname this scan proved
+  belongs to the service whose own labels declare `api@internal` — never to a
+  guessed host. The recommended setup involves no credential at all: give Traefik
+  `api: {}` plus a dedicated entrypoint on the container network that is **not**
+  published to the host. If the API is only reachable through an Authentik-gated
+  hostname, note that an Authentik *API token* is not a valid credential — a proxy
+  provider wants HTTP Basic with a user and an **app password**, or the reserved
+  username `goauthentik.io/token`, and needs "Intercept header authentication"
+  enabled. Prefer `LABVIEW_TRAEFIK_PASSWORD_FILE`; `LABVIEW_TRAEFIK_PASSWORD` is in
+  the always-masked key list, so LabView scanning its own stack will not print its
+  own credential, and no credential is ever interpolated into an error message.
 - **No built-in authentication.** LabView exposes your topology and (masked)
   config, so **do not publish it raw.** Put it behind your own edge — the compose
   example includes ready-to-adapt Traefik + Authentik forward-auth labels, and it
@@ -298,14 +343,21 @@ npm run smoke        # runs the full pipeline against fixtures/ and asserts resu
 npm run build        # web bundle + server compile
 ```
 
-`npm run smoke` runs the whole pipeline twice: once over `fixtures/apps` for the
-expected classifications, once over `fixtures/edge` for regression cases (URL
+`npm run smoke` runs the whole pipeline over four fixture fleets: `fixtures/apps`
+for the expected classifications, `fixtures/edge` for regression cases (URL
 credential redaction, `env_file` containment, `dockflare.enable=false`, LDAP
-attribution, nested interpolation, host-port exposure, provider attribution). Each
-edge fixture is written so that it fails if the corresponding fix is reverted.
+attribution, nested interpolation, host-port exposure, provider attribution),
+`fixtures/authentik` for the identity-provider integration, and
+`fixtures/traefik` for the reverse-proxy integration. The two API integrations are
+driven through an injected `fetchImpl` serving `fixtures/authentik-api.json` and
+`fixtures/traefik-api.json`, so no network or live service is involved — including
+a stub that demands Basic auth on the gated hostname and answers unauthenticated
+only on the internal one, which is how the credential rule is asserted on the
+recorded calls. Each edge fixture is written so that it fails if the corresponding
+fix is reverted.
 
-No Docker daemon is needed for either — set `LABVIEW_DOCKER_ENABLED=false` and the
-pipeline runs config-only.
+No Docker daemon is needed for any of them — set `LABVIEW_DOCKER_ENABLED=false`
+and the pipeline runs config-only.
 
 TypeScript is `strict` with `noUncheckedIndexedAccess`; there is no lint config,
 CodeQL covers static analysis in CI.
@@ -323,9 +375,15 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   Kubernetes manifests are out of scope.
 - Live state (status, health, IPs) requires access to the Docker API; without it
   the scan degrades cleanly to config-only.
-- Auth detection is heuristic and label/env-driven. It is honest about *proxy*
-  auth only: an app with its own built-in login (Emby, Home Assistant, Authentik
-  itself) will show up as exposed-without-auth, and the note says exactly that.
+- Auth detection is label/env-driven, and heuristic wherever neither API is
+  available to confirm it. It is honest about *edge* auth only: an app with its own
+  built-in login (Emby, Home Assistant, Authentik itself) will show up as
+  exposed-without-auth, and the note says exactly that.
+- The reverse-proxy integration reads Traefik's API. Another proxy (Caddy, nginx,
+  HAProxy) is still classified from its labels; only Traefik's runtime config is
+  read back. Its response shapes come from Traefik v3's runtime model, not a
+  published schema — a mismatch degrades to "unreachable, with a reason" rather
+  than breaking the scan. Traefik's static config file is not parsed.
 - Single-host. There is no aggregation across multiple Docker hosts.
 
 ---

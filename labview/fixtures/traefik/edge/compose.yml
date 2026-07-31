@@ -1,0 +1,39 @@
+# The proxy itself, and the only thing in this fleet that says where its API is.
+#
+# `service=api@internal` is Traefik's own name for its API, so this label is the
+# operator declaring "this container serves it" — which is what endpoint discovery
+# rests on. Both halves of the discovery rule are pinned here:
+#
+#   * the container name and port yield the internal candidates
+#     (`http://edge-proxy:8080` first — the port `api.insecure` serves on), and
+#   * the rule's hostname yields the one *public* candidate a credential may be sent
+#     to, because that hostname was proved to be the API's own address rather than
+#     just some address of this container.
+#
+# The dashboard's middleware is defined in a file provider, so the scan cannot read
+# its type: label-only, `dashboard-auth@file` is an auth gate `inferred` from its
+# name. The live chain reports it as `basicauth`, which is what the posture must
+# follow. Publishing 80/443 and nothing else also pins that 8080 is tried on the
+# strength of Traefik's default rather than of a declared port.
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: edge-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`edge.example.com`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.middlewares=dashboard-auth@file"
+
+networks:
+  proxy:
+    external: true

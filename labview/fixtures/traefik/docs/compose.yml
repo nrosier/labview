@@ -1,0 +1,29 @@
+# A gate reachable only through a chain, and a backend the proxy says is down.
+#
+# The label names `secured@file`, which is a `chain` middleware. Nothing in the
+# reference tells you that, and nothing in this fleet defines it: label-only, the
+# name does not read as auth (`secured` is not `auth`/`sso`/`authentik`), so the
+# scan concludes `none` and calls this service exposed. Live, the chain expands to
+# `compress@file` + `sso@file`, the second of which is a forwardAuth to the outpost
+# — so the posture becomes `authentik-forward-auth`, `confirmed`. Back out chain
+# resolution and this service silently goes back to reading as unprotected.
+#
+# Its live backend is `http://docs-site:8080`, matched by container name, and
+# Traefik reports that backend `DOWN`. Health of a backend is the one thing no
+# config file can state, so it gets its own note and its own assertion.
+services:
+  docs:
+    image: ghcr.io/example/docs:1
+    container_name: docs-site
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.docs.rule=Host(`docs.example.com`)"
+      - "traefik.http.routers.docs.entrypoints=websecure"
+      - "traefik.http.routers.docs.middlewares=secured@file"
+
+networks:
+  proxy:
+    external: true

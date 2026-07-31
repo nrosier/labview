@@ -1,0 +1,31 @@
+# The guard on the three-way disagreement — compare with `crm`.
+#
+# Identical shape to `crm`: no auth label, a live router the proxy is serving, an
+# empty chain, and an Authentik application with a proxy provider an outpost is
+# deployed for. One field differs — the provider's mode is `proxy` rather than
+# `forward_single`.
+#
+# That single field inverts the conclusion. In `proxy` mode the outpost terminates the
+# request and forwards upstream itself, so it is a backend, not a forward-auth callee:
+# there is no middleware for it to be, and an empty chain is exactly what a correct
+# deployment looks like. `crm`'s missing forward-auth is a finding; this one is not,
+# and reporting it would invent a bypass on a working setup.
+#
+# So this service must carry the Authentik-confirmed posture and NOT the
+# "never reaches the outpost" note, while `crm` carries both. Removing the mode test
+# makes this assertion fail.
+services:
+  shop:
+    image: ghcr.io/example/shop:7
+    container_name: shop-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.shop.rule=Host(`shop.example.com`)"
+      - "traefik.http.routers.shop.entrypoints=websecure"
+
+networks:
+  proxy:
+    external: true

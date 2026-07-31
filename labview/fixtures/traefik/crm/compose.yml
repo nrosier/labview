@@ -1,0 +1,28 @@
+# The three-way disagreement, and the only case where all three sources are needed
+# to see anything at all.
+#
+# The labels declare no middleware. The proxy is serving this router with an empty
+# chain. Authentik, meanwhile, has an application for this service with a proxy
+# provider and an outpost deployed to serve it — so somebody set up a gate and
+# believes it is in force.
+#
+# Each source alone is unremarkable: no label to check, an empty chain like any
+# other, a provider that looks correctly configured. Held together they say the
+# outpost is standing beside the request path rather than in it, because nothing in
+# the proxy forwards to it. That is the finding, and it is the reason the cross-check
+# reads all three rather than two.
+services:
+  crm:
+    image: ghcr.io/example/crm:4
+    container_name: crm-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.crm.rule=Host(`crm.example.com`)"
+      - "traefik.http.routers.crm.entrypoints=websecure"
+
+networks:
+  proxy:
+    external: true

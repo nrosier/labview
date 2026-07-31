@@ -11,7 +11,8 @@ It understands a specific, common TrueNAS Scale pattern:
 - **Public ingress via a Cloudflare tunnel**, configured with **DockFlare**
   labels (`dockflare.hostname`, `dockflare.service`, …).
 - **Local ingress via Traefik**, configured with `traefik.*` labels (routers,
-  rules, entrypoints, TLS, middlewares).
+  rules, entrypoints, TLS, middlewares) — and, when its API answers, checked
+  against the runtime config Traefik actually built from them.
 - **SSO via Authentik** — as a Traefik **forward-auth** middleware
   (`authentik@docker`), or via **OAuth/OIDC** or **LDAP** wired through a
   service's environment.
@@ -41,11 +42,13 @@ live state from the Docker API, and never needs an agent inside each app.
   — and a stack shows up whenever one of its services matches.
 - **Detail drawer** — for each service: a **Mermaid diagram** of its connections,
   Cloudflare routes **with what each origin resolves to and why**, Traefik routers
-  (rule, hosts, entrypoints, TLS, middlewares), the **derived auth posture with the
-  evidence that led to it**, the matched **Authentik applications and providers**
-  when the API was read (including which outpost, if any, is actually serving each
-  one), networks, ports, volumes, environment (secrets masked), and live container
-  state.
+  (rule, hosts, entrypoints, TLS, middlewares), the **live routers Traefik reports
+  serving it** when its API was read (status, entrypoints, the resolved middleware
+  chain, and each backend with the health Traefik itself reports for it), the
+  **derived auth posture with the evidence that led to it**, the matched
+  **Authentik applications and providers** when that API was read (including which
+  outpost, if any, is actually serving each one), networks, ports, volumes,
+  environment (secrets masked), and live container state.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
   and tunnel / proxy / SSO hub nodes, connected by network membership,
@@ -211,6 +214,12 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | The token itself. Works, but is visible in `docker inspect` — prefer the file form |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://authentik-server:9000`. Needed only when Authentik is outside `appsRoot` or discovery picks the wrong endpoint |
 | `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `5000` | Per-request timeout. On timeout the scan continues without the API |
+| `LABVIEW_TRAEFIK_ENABLED` | `true` | Whether to read the reverse proxy's API at all. Needs no credential and no configuration; if nothing answers the scan continues from the labels |
+| `LABVIEW_TRAEFIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://traefik:8080`. Needed only when the proxy is outside `appsRoot` or discovery picks the wrong endpoint |
+| `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
+| `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (docker secret, mounted file). Wins over `LABVIEW_TRAEFIK_PASSWORD` |
+| `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | The password itself. Works, but is visible in `docker inspect` — prefer the file form |
+| `LABVIEW_TRAEFIK_TIMEOUT_MS` | `5000` | Per-request timeout. On timeout the scan continues from the labels alone |
 
 The default Docker endpoint is the conventional local socket, since it is the one
 endpoint that needs no assumption about your container names; a socket proxy is
@@ -258,16 +267,82 @@ Every failure here is soft. An unreachable host, a rejected token, a timeout or 
 malformed response leaves the scan running on label-derived evidence, with the
 reason reported in `meta.authentik.error` and in the UI.
 
+### The Traefik API
+
+On by default, and in the recommended setup it needs no credential and no
+configuration at all. Labels say what you asked the proxy for; only the proxy knows
+what it built, and three differences are invisible to a compose scan:
+
+- a **router the labels declare that Traefik is not serving** — a typo in a rule, a
+  missing entrypoint, a container it never picked up;
+- a **middleware named in a label that is not in the chain the proxy built**, so the
+  service reads "protected" here and answers without a login;
+- a **middleware defined in a Traefik file provider**, which has no definition
+  anywhere in the scanned stacks and is therefore only ever `inferred`.
+
+LabView reads `/api/version`, `/api/rawdata` and `/api/entrypoints` — three GETs,
+no writes, no pagination — and replaces all three guesses with Traefik's own
+account at `confirmed` confidence.
+
+**Enabling it safely.** Give the API its own entrypoint on the container network and
+do **not** publish that port:
+
+```yaml
+# traefik static config
+api: {}                       # not `api.insecure` on a published port
+entryPoints:
+  traefik:
+    address: ":8080"          # reachable only from the docker network
+```
+
+Then no credential is involved: LabView reaches it by container address and sends
+nothing. When the read succeeds that way, the proxy service gets a note saying its
+API answered with no credential — so you also learn whether the API is open on that
+network, which is worth knowing either way.
+
+**Discovery.** A scanned service is taken to be the proxy when one of its own
+routers targets `api@internal` (the operator's own label saying "this container
+serves the proxy API", which also yields the exact public hostname), when another
+service's tunnel origin structurally resolved to it, or — last resort — when it runs
+the Traefik image. Candidate URLs are its container addresses on declared ports plus
+`8080`, tried before any public hostname. Set `LABVIEW_TRAEFIK_URL` when the proxy
+is outside `appsRoot` or discovery guesses wrong.
+
+**The credential rule.** Every candidate is probed on `/api/version`, which needs no
+authentication, and a candidate that answers is used as-is with nothing sent. A
+credential is only ever sent to an endpoint you configured by hand, or to a hostname
+this scan proved belongs to the service whose own labels declare `api@internal` —
+ownership evidence, not a guess. Cookies the gate sets during that exchange are
+echoed back on the remaining requests of the same exchange, which is what the
+Authentik outpost expects.
+
+**An Authentik API token is not a valid credential here.** A proxy provider accepts
+HTTP Basic with an Authentik user and an **app password** — per authentik's
+[header authentication docs](https://docs.goauthentik.io/add-secure-apps/providers/proxy/header_authentication/),
+the credentials are used internally with the OAuth2 machine-to-machine flow, which
+an API token cannot drive — or the reserved username `goauthentik.io/token` with a
+token as the password. Either way the provider needs **"Intercept header
+authentication"** enabled, or it answers the request itself instead of passing it
+through. Prefer `LABVIEW_TRAEFIK_PASSWORD_FILE`; `LABVIEW_TRAEFIK_PASSWORD` is
+always masked in LabView's own output, and no credential is ever interpolated into
+an error message.
+
+Every failure here is soft too: nothing answering, a rejected credential, a timeout
+or a shape the parser doesn't recognize leaves the posture exactly as the labels
+described it, with the reason in `meta.traefik.error`.
+
 ---
 
 ## How it works
 
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
-      → build middleware registry → classify ingress → read the Authentik API
-      → discover Authentik hostnames → resolve tunnel origins
-      → match Authentik applications to services → derive auth posture
-      → build graph → serve /api/overview
+      → build middleware registry → classify ingress
+      → build the fleet index → resolve tunnel origins
+      → read the Authentik API ∥ read the Traefik API   (one round trip, not two)
+      → discover Authentik hostnames
+      → match Authentik applications ∥ match live routers to services
+      → derive auth posture → build graph → serve /api/overview
 ```
 
 - **Compose parsing** understands both label/env syntaxes (list `- k=v` and map
@@ -329,9 +404,10 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   means a value in the config states it. `inferred` means the referenced
   middleware was defined nowhere in the scanned stacks — a Traefik file provider,
   say — so only its name was available; the UI labels it, and the service gets a
-  note saying the definition could not be found. When two accounts disagree the
-  stronger one is reported and the weaker is kept as evidence beneath it, so you
-  can see both.
+  note saying the definition could not be found. Reading the reverse proxy's API is
+  what retires that last case: the proxy has the definition, so the same middleware
+  comes back `confirmed`. When two accounts disagree the stronger one is reported
+  and the weaker is kept as evidence beneath it, so you can see both.
 - **The Authentik API, when a token is given, is read as evidence like any other.**
   Applications, providers and outposts are fetched, then each application is
   matched to a service only on something addressed:
@@ -358,6 +434,51 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   counted as exposed-without-auth, and the provider is shown verbatim in the
   drawer. Reporting a protected service as reachable without authentication would
   be the one error worth failing over.
+- **The reverse proxy's API is read the same way** — as evidence, matched only on
+  something addressed. A live router is tied to a service by the backend URL the
+  proxy itself names, by a `@docker` router name (Traefik derives those from the
+  labels of the very container it found them on, so an exact match is that label
+  round-tripping), or by a host rule resolving to exactly one service. Two
+  candidates is not an ambiguity to arbitrate but a match not made: the router lands
+  in `meta.traefik.unmatchedRouters`, reported as ingress LabView could not
+  attribute. A `@file` router's name was typed by hand in a file this scan cannot
+  read, so its resembling a label is a coincidence with no evidentiary weight and
+  the name rule does not apply to it.
+- **A backend address needs its own index.** A docker-provider backend is
+  `http://<container-ip>:<container-port>`, and the origin resolver reads an IP
+  literal's port as a *published host port* — the wrong table entirely, which would
+  produce confidently wrong matches. Container IPs get a separate index built from
+  live Docker state, and an IP-form backend resolves only through it. With no Docker
+  state that rule is skipped rather than guessed; the router-name and host-rule
+  rules still cover the docker provider.
+- **Where a router matched, the live chain is the chain.** A `forwardAuth` whose
+  address resolves to a discovered identity becomes `authentik-forward-auth` at
+  `confirmed`; one that resolves nowhere identifiable stays the mechanism,
+  `forward-auth`. `basicAuth`/`digestAuth` become `basic-auth`. A `chain` middleware
+  is resolved recursively (depth-capped), and the evidence line says how the gate was
+  reached — `via chain secured@file`. Middlewares attached at the **entrypoint** are
+  merged in, because a gate there protects the router without appearing in its own
+  list. A middleware type LabView has never heard of is still reported by name.
+- **A label that overstates the config is downgraded.** If the labels claim an auth
+  middleware and the chain Traefik built contains none, the detection is suppressed:
+  the service reports `none`, lands in exposed-without-auth, and carries a note
+  naming what was declared and what was actually built. This is the one conclusion
+  that can mislead in a dangerous direction, so it fires only when **both**
+  `/api/rawdata` and `/api/entrypoints` were read — a partial read notes the gap and
+  changes no posture — and a router the proxy reports as `disabled`, or carrying
+  `error[]`, is treated as neither protection nor working ingress with those errors
+  quoted verbatim.
+- **The declared-but-absent check runs against every router in the snapshot**, not
+  just the ones matched to the service. A router the proxy is demonstrably serving
+  but that LabView could not attribute to anybody must not be reported as missing.
+- **Three-way cross-check.** When the live `forwardAuth` address resolves to the
+  service the Authentik API answered on, and Authentik reports an outpost serving a
+  provider for an application matched to *this* service, the note records labels,
+  proxy and identity provider agreeing. When they disagree the disagreement is the
+  finding — a forward-auth address pointing at an instance with no matching
+  application, or a matched provider whose mode means the request never reaches the
+  outpost. A provider in `proxy` mode is exempt: there the outpost *is* the backend,
+  so no forward-auth middleware exists and none should be expected.
 - **Exposed-without-auth**: a service reachable (public or local) with no detected
   *proxy/SSO* auth is flagged. Note this is honest about *proxy* auth only — apps
   with their own built-in login (Emby, Home Assistant, Authentik itself) will
@@ -390,6 +511,17 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   never receives it. Prefer `LABVIEW_AUTHENTIK_TOKEN_FILE`; a token in the
   environment is readable via `docker inspect`. Certificate verification cannot be
   disabled — use `NODE_EXTRA_CA_CERTS` for a private CA.
+- **The reverse proxy's API is read with no credential wherever possible.** Every
+  discovered candidate is probed on `/api/version`, which needs no authentication,
+  and one that answers is used as-is with nothing sent. A credential goes only to an
+  endpoint configured by hand or to a hostname this scan proved belongs to the
+  service whose own labels declare `api@internal` — never to a guessed host. The
+  recommended setup (`api: {}` plus an unpublished container-network entrypoint)
+  involves no credential at all, and when the read succeeds that way the proxy
+  service is noted as having an API that answers unauthenticated on that network.
+  `LABVIEW_TRAEFIK_PASSWORD` is in the always-masked key list, so LabView scanning
+  its own stack cannot print its own credential, and no credential is interpolated
+  into any error string.
 - No built-in auth — put it behind your own edge (see above).
 
 ---
@@ -419,7 +551,8 @@ src/
   scan/       discover + compose/.env parsing
   labels/     dockflare, traefik, auth derivation
   analyze/    two-pass pipeline, middleware registry, graph, stats
-  enrich/     docker snapshot (dockerode) + authentik API client
+  enrich/     docker snapshot (dockerode) + authentik and traefik API clients
+              over a shared http.ts (fetch, timeouts, injectable fetchImpl)
   model/      types.ts — the shared backend⇄frontend contract
   server/     fastify server + static hosting
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
@@ -428,6 +561,8 @@ fixtures/
   edge/       regression cases for previously-fixed defects
   authentik/  a fleet with an identity provider in it
   authentik-api.json   canned API responses for the above
+  traefik/    a fleet whose labels and live proxy config disagree
+  traefik-api.json     canned proxy + identity responses for the above
 ```
 
 ```bash
@@ -436,25 +571,43 @@ npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
 ```
 
-`npm run smoke` runs the whole pipeline against three fixture roots — `apps` for
+`npm run smoke` runs the whole pipeline against four fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
 redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
 nested interpolation, host-port exposure — `ports:` vs `expose:`, the
 tunnel-straight-at-the-container pattern and the bypass note on a proxied service
 — and provider attribution in a fleet whose SSO is *not* Authentik, where every
-mechanism is observable but nothing may be attributed to a vendor), and
-`authentik` for the API integration.
+mechanism is observable but nothing may be attributed to a vendor), `authentik` for
+the identity-provider integration, and `traefik` for the reverse-proxy integration.
 
-That last root drives canned responses (`fixtures/authentik-api.json`) through an
-injected HTTP layer, so the test needs no network and no Authentik: it pins each
-match rule in isolation, the rejection of an ambiguous match, the unserved-provider
-outcome, pagination, and the rule that a token is never sent to a host that has not
-answered the unauthenticated probe. It also runs the same fleet **without** a token
-and asserts the difference, so the API's contribution is measured rather than
-assumed.
+Both API roots drive canned responses (`fixtures/authentik-api.json`,
+`fixtures/traefik-api.json`) through an injected HTTP layer, so the tests need no
+network, no Authentik and no proxy.
+
+The `authentik` root pins each match rule in isolation, the rejection of an
+ambiguous match, the unserved-provider outcome, pagination, and the rule that a
+token is never sent to a host that has not answered the unauthenticated probe.
+
+The `traefik` root is a fleet built so the labels and the live config disagree in
+every way that matters, and its stub demands Basic auth on the gated hostname while
+answering unauthenticated only on the internal one. Seven runs over it pin: which
+endpoint was chosen and why; a file-provider middleware reached through a `chain`
+coming back `confirmed`; the **downgrade** on a router whose declared middleware is
+absent from the built chain, and the false-positive guard where the same gate sits on
+the entrypoint instead; a declared router the proxy is not serving, versus a router
+the proxy *is* serving that no service could be attributed; a `disabled` router with
+its errors; all three sources agreeing, and the `mode` that makes them disagree;
+`serverStatus: DOWN`; the note that the API answered with no credential; that no
+credential is sent anywhere when the internal endpoint answers, even with one
+configured; that Basic goes only to the gated host and the session cookie is echoed;
+that a partial read changes no posture; that a `fetchImpl` which throws leaves the
+scan complete and the posture untouched; and the container-IP trap, asserted
+directly on the index because a container IP only exists in live Docker state.
+Each API root also runs its fleet **without** the API and asserts the difference in
+both directions, so the contribution is measured rather than assumed.
 
 Every fixture is written so it fails if the corresponding logic is reverted — for
-the API integration that was checked by actually backing each rule out one at a
+both API integrations that was checked by actually backing each rule out one at a
 time and confirming the expected assertions broke.
 
 The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
@@ -468,11 +621,19 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   socket proxy); without it the
   scan degrades cleanly to config-only.
 - Auth detection is label/env-driven and reports its evidence so you can verify
-  each conclusion. It describes *configuration*, not enforcement: a middleware
-  reference proves the gate was configured, not that Traefik is currently running
-  with that config. Reading the Authentik API narrows this — an outpost assignment
-  is enforcement rather than intent — but it is still configuration, not a request
-  actually being challenged.
+  each conclusion. It describes *configuration*, not enforcement. Reading the two
+  APIs narrows that considerably — an outpost assignment is enforcement rather than
+  intent, and a middleware in Traefik's runtime chain is the config the proxy is
+  actually running — but it is still configuration, not a request being challenged.
+  LabView never sends a request through a gate to see what happens.
+- The reverse-proxy integration is Traefik-specific: it reads Traefik's runtime API.
+  Another proxy (Caddy, nginx, HAProxy) is still classified from its labels, and its
+  routers are simply not verified. Traefik's static config file is not parsed —
+  nothing guarantees it lives under `appsRoot`, and the API supersedes it. Response
+  shapes come from Traefik v3's runtime model rather than a published schema, so a
+  mismatch degrades to `reachable: false` with a reason instead of breaking the scan.
+  Only `/api/rawdata` is used; there is no fallback to the paginated granular
+  endpoints, and no write call of any kind exists.
 - The Authentik integration reads applications, providers and outposts. Policy
   bindings are not read, so an application whose access policy denies everyone
   still reads as protected — which it is — and a flow customization that weakens a

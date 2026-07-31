@@ -48,6 +48,10 @@ export function parseTraefik(labels: Record<string, string>, prefix: string): Tr
       certResolver: bag["tls.certresolver"] ?? bag["tls.certResolver"],
       middlewares: splitList(bag["middlewares"]),
       servicePort,
+      // Kept verbatim rather than defaulted to the router name: only an explicitly
+      // named service can be one of Traefik's built-ins, and `api@internal` is how a
+      // container declares that it serves the proxy's own API.
+      service: bag["service"],
     });
   }
   out.sort((a, b) => a.router.localeCompare(b.router));

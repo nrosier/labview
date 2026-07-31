@@ -9,12 +9,18 @@ import type {
 import type { LabViewConfig } from "../config.js";
 import { parseDockflare } from "../labels/dockflare.js";
 import { parseTraefik } from "../labels/traefik.js";
-import { deriveAuth, hasEnforcedAuthentikGate, providerEnforces } from "../labels/auth.js";
+import {
+  deriveAuth,
+  hasEnforcedAuthentikGate,
+  isAuthMiddlewareRef,
+  providerEnforces,
+} from "../labels/auth.js";
 import { maskEnv } from "../secrets.js";
 import { buildGraph } from "./graph.js";
 import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.js";
-import { buildFleetIndex, resolveOrigins } from "./origins.js";
+import { buildFleetIndex, lookupContainerAddress, resolveOrigins, serviceRefKey } from "./origins.js";
 import { matchAuthentik } from "./authentik.js";
+import { matchTraefik, noteTraefikLive, type TraefikLiveContext } from "./traefik.js";
 import { snapshotDocker, composeKey, type DockerSnapshot } from "../enrich/docker.js";
 import {
   discoverAuthentikEndpoints,
@@ -22,13 +28,14 @@ import {
   snapshotAuthentik,
   type FetchLike,
 } from "../enrich/authentik.js";
+import { attributeEndpoint, discoverTraefikEndpoints, snapshotTraefik } from "../enrich/traefik.js";
 import { scanStacks } from "../scan/index.js";
 
 const VERSION = "0.1.0";
 
 /** Injectable side-effects, so the pipeline can be driven offline in tests. */
 export interface BuildDeps {
-  /** HTTP layer for the Authentik exchange. Defaults to the global `fetch`. */
+  /** HTTP layer for the Authentik and Traefik exchanges. Defaults to the global `fetch`. */
   fetchImpl?: FetchLike;
 }
 
@@ -37,14 +44,31 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   const started = Date.now();
   const { stacks, warnings } = scanStacks(cfg);
 
-  // A configured Authentik endpoint depends on nothing in the scan, so that
-  // exchange overlaps the docker snapshot instead of waiting behind it. A
-  // discovered one cannot start until pass 1 has parsed the routes.
+  // A configured endpoint depends on nothing in the scan, so those exchanges overlap
+  // the docker snapshot instead of waiting behind it. A discovered one cannot start
+  // until pass 1 has parsed the routes.
   const configuredUrl = cfg.authentik.url.trim();
   const configuredAk = configuredUrl
     ? snapshotAuthentik(
         cfg,
         [{ url: configuredUrl, source: "config", why: "endpoint from configuration" }],
+        deps.fetchImpl,
+      )
+    : undefined;
+  const configuredTraefikUrl = cfg.traefik.url.trim();
+  const configuredTf = configuredTraefikUrl
+    ? snapshotTraefik(
+        cfg,
+        [
+          {
+            url: configuredTraefikUrl,
+            source: "config",
+            why: "endpoint from configuration",
+            // A hand-written endpoint is the operator naming the API themselves, which
+            // is the ownership evidence a discovered hostname has to earn.
+            mayAuthenticate: true,
+          },
+        ],
         deps.fetchImpl,
       )
     : undefined;
@@ -59,9 +83,21 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     }
   }
 
-  const ak =
-    (await configuredAk) ??
-    (await snapshotAuthentik(cfg, discoverAuthentikEndpoints(stacks), deps.fetchImpl));
+  // Where each tunnel origin points. Cross-stack by nature — an origin routinely
+  // names a proxy defined in a different stack — so it runs over the whole fleet
+  // once, after the routes exist and before the graph is drawn from them.
+  //
+  // Ahead of the discovered exchanges rather than after them: a resolved origin
+  // identifies the service acting as reverse proxy, which is one of the three signals
+  // Traefik endpoint discovery rests on, and running it first also lets both discovered
+  // exchanges go out together instead of one round trip after the other.
+  const fleet = buildFleetIndex(stacks);
+  resolveOrigins(stacks, fleet);
+
+  const [ak, tf] = await Promise.all([
+    configuredAk ?? snapshotAuthentik(cfg, discoverAuthentikEndpoints(stacks), deps.fetchImpl),
+    configuredTf ?? snapshotTraefik(cfg, discoverTraefikEndpoints(stacks), deps.fetchImpl),
+  ]);
 
   // Authentik hostnames can only be discovered once routes are parsed. An endpoint
   // that answered the API is itself proof of identity, so it joins the hints — which
@@ -69,24 +105,38 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   // scanned root and its address had to be configured by hand.
   const authHints = discoverAuthentikHints(stacks, cfg, ak.summary.endpoint);
 
-  // Where each tunnel origin points. Cross-stack by nature — an origin routinely
-  // names a proxy defined in a different stack — so it runs over the whole fleet
-  // once, after the routes exist and before the graph is drawn from them.
-  const fleet = buildFleetIndex(stacks);
-  resolveOrigins(stacks, fleet);
-
   // The same index resolves an Authentik proxy provider's internal host, which is
   // the same kind of address as a tunnel origin and matched by the same rules.
   const matched = matchAuthentik(stacks, ak.applications, fleet);
+  const matchedRouters = matchTraefik(stacks, tf.routers, fleet);
+
+  // What the live read is allowed to conclude, decided once for the whole fleet
+  // because it is a property of the read and not of any one service.
+  const live: TraefikLiveContext = {
+    reachable: tf.summary.reachable,
+    chainComplete: tf.summary.reachable && tf.summary.entrypointsRead,
+    endpoint: tf.summary.endpoint,
+    credential: tf.summary.credential,
+    // A configured endpoint carries no service key of its own, but it usually names a
+    // container the scan knows, and the proxy has to be identified for its own notes
+    // and for the graph to draw live routes from it.
+    proxyKey: tf.proxyServiceKey ?? attributeEndpoint(tf.summary.endpoint, fleet),
+    liveRouterNames: new Set(tf.routers.map((r) => r.router.toLowerCase())),
+    isAuthMiddleware: (mw) => isAuthMiddlewareRef(mw, registry, authHints),
+    resolveDelegate: (address) => {
+      const refs = lookupContainerAddress(address, fleet);
+      return refs.length === 1 ? serviceRefKey(refs[0]!) : undefined;
+    },
+  };
 
   // Pass 2: derive auth posture, finalize exposure, mask secrets.
   for (const stack of stacks) {
     for (const svc of stack.services) {
-      finalizeAuth(svc, cfg, registry, authHints);
+      finalizeAuth(svc, `${stack.id}/${svc.name}`, cfg, registry, authHints, live);
     }
   }
 
-  const graph = buildGraph(stacks);
+  const graph = buildGraph(stacks, live.proxyKey);
   const stats = computeStats(stacks);
 
   const meta: ScanMeta = {
@@ -98,6 +148,11 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
       ...ak.summary,
       matchedServices: matched.matchedServices,
       unmatchedApplications: matched.unmatchedApplications,
+    },
+    traefik: {
+      ...tf.summary,
+      matchedServices: matchedRouters.matchedServices,
+      unmatchedRouters: matchedRouters.unmatchedRouters,
     },
     durationMs: Date.now() - started,
     warnings,
@@ -186,11 +241,13 @@ function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cf
 /** Pass 2: derive auth posture, finalize exposure, then mask secrets. */
 function finalizeAuth(
   svc: Service,
+  key: string,
   cfg: LabViewConfig,
   registry: MiddlewareRegistry,
   authHints: string[],
+  live: TraefikLiveContext,
 ): void {
-  svc.auth = deriveAuth(svc, cfg, registry, authHints);
+  svc.auth = deriveAuth(svc, cfg, registry, authHints, live.chainComplete);
 
   const hasCloudflareAccess = svc.cloudflare.some(
     (r) => r.access && (r.access.policy || r.access.group || r.access.emails?.length),
@@ -215,6 +272,7 @@ function finalizeAuth(
   }
   noteHostPortBypass(svc);
   noteAuthentikGaps(svc);
+  noteTraefikLive(svc, key, live);
   if (svc.cloudflare.some((r) => !r.hostname)) {
     svc.notes.push("DockFlare route present but hostname could not be resolved.");
   }

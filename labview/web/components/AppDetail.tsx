@@ -230,6 +230,127 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
             </Section>
           )}
 
+          {/* The live counterpart of the section above: same subject, different source.
+              Kept adjacent to it deliberately — the two accounts of one router are only
+              useful side by side, and any difference between them is what the notes at
+              the top of the drawer are about. */}
+          {svc.traefikLive && svc.traefikLive.length > 0 && (
+            <Section title="Local ingress — Traefik (live, from its API)">
+              {svc.traefikLive.map((r) => (
+                <div style="margin-bottom:10px;">
+                  <div style="font-weight:600;">
+                    {r.router}
+                    <span class="mono masked">@{r.provider}</span>
+                    {/* Traefik's own verdict on the router. Anything but a clean
+                        `enabled` means it is not in a request path at all. */}
+                    {r.status && r.status.toLowerCase() !== "enabled" ? (
+                      <span class="pill crit">{r.status}</span>
+                    ) : (
+                      <span class="pill">{r.status ?? "enabled"}</span>
+                    )}
+                  </div>
+                  <dl class="kv" style="grid-template-columns:120px 1fr;margin-top:4px;">
+                    {r.rule && (
+                      <>
+                        <dt>Rule</dt>
+                        <dd class="mono">{r.rule}</dd>
+                      </>
+                    )}
+                    {r.hosts.length > 0 && (
+                      <>
+                        <dt>Hosts</dt>
+                        <dd>
+                          {r.hosts.map((h) => (
+                            <a class="pill" href={`https://${h}`} target="_blank" rel="noreferrer">
+                              {h}
+                            </a>
+                          ))}
+                        </dd>
+                      </>
+                    )}
+                    {r.entryPoints.length > 0 && (
+                      <>
+                        <dt>Entrypoints</dt>
+                        <dd>{r.entryPoints.join(", ")}</dd>
+                      </>
+                    )}
+                    <>
+                      <dt>TLS</dt>
+                      <dd>{r.tls ? "yes" : "no"}</dd>
+                    </>
+                    <>
+                      {/* The chain as built, not as asked for: chains expanded,
+                          entrypoint middlewares merged in, each entry saying where it
+                          came from. An empty chain on a router whose labels name one is
+                          exactly the discrepancy worth seeing. */}
+                      <dt>Chain</dt>
+                      <dd>
+                        {r.middlewares.length === 0 ? (
+                          <span class="masked">none</span>
+                        ) : (
+                          r.middlewares.map((m) => (
+                            <div>
+                              <span class={`pill${m.errors.length ? " crit" : ""}`}>{m.name}</span>
+                              <span class="mono masked">{m.type}</span>
+                              {m.viaEntrypoint && <span class="pill">via entrypoint</span>}
+                              {m.viaChain && <span class="pill">via {m.viaChain}</span>}
+                              {m.address && <span class="mono masked">→ {m.address}</span>}
+                              {m.errors.map((e) => (
+                                <div class="mono">{e}</div>
+                              ))}
+                            </div>
+                          ))
+                        )}
+                      </dd>
+                    </>
+                    {r.service && (
+                      <>
+                        <dt>Service</dt>
+                        <dd class="mono">{r.service}</dd>
+                      </>
+                    )}
+                    {r.servers.length > 0 && (
+                      <>
+                        {/* Backend health as the proxy last observed it — the one part
+                            of this section no configuration file can state. */}
+                        <dt>Backends</dt>
+                        <dd>
+                          {r.servers.map((sv) => (
+                            <div>
+                              <span class="mono">{sv.url}</span>
+                              {sv.status && (
+                                <span
+                                  class={`pill${sv.status.toUpperCase() === "DOWN" ? " crit" : ""}`}
+                                >
+                                  {sv.status}
+                                </span>
+                              )}
+                            </div>
+                          ))}
+                        </dd>
+                      </>
+                    )}
+                    {r.errors.length > 0 && (
+                      <>
+                        <dt>Errors</dt>
+                        <dd class="mono">{r.errors.join("; ")}</dd>
+                      </>
+                    )}
+                  </dl>
+                  {/* Why this router was tied to this service. A match is a conclusion,
+                      in the same voice as the origin and Authentik evidence. */}
+                  {r.evidence.length > 0 && (
+                    <ul class="evidence" style="margin-top:4px;">
+                      {r.evidence.map((e) => (
+                        <li>{e}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </Section>
+          )}
+
           <Section title="Authentication">
             <dl class="kv">
               <dt>Method</dt>
@@ -243,12 +364,16 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                     inferred from name
                   </span>
                 )}
-                {/* The other direction: the identity provider's own API reported this
-                    gate, so it states what will be enforced rather than what the
-                    labels asked for. */}
+                {/* The other direction: a responsible system's own API reported this
+                    gate — the identity provider's records, or the chain the proxy
+                    actually built — so it states what will be enforced rather than what
+                    the labels asked for. */}
                 {svc.auth.confidence === "confirmed" && (
-                  <span class="pill" title="Reported by the Authentik API, not derived from labels">
-                    confirmed by provider
+                  <span
+                    class="pill"
+                    title="Reported by the Authentik API or the proxy's live configuration, not derived from labels"
+                  >
+                    confirmed by API
                   </span>
                 )}
               </dd>

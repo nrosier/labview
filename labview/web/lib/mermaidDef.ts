@@ -79,8 +79,18 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
   // Ingress: proxy routes (local). They start at the resolved hop when there is
   // one — that service was observed to front this one, so drawing a second,
   // synthetic proxy beside it would claim two hops where the config shows one.
-  const tHosts = [...new Set(svc.traefik.flatMap((r) => r.hosts))];
-  const hasTraefik = svc.traefik.length > 0;
+  //
+  // Routers the proxy's API reported count as routes here even when no label declares
+  // them: a file-provider route reaches this service exactly as a labelled one does,
+  // and leaving it out would draw a service the proxy is serving as unreachable. Only
+  // routers the proxy is actually serving are drawn, for the same reason.
+  const liveRouters = (svc.traefikLive ?? []).filter(
+    (r) => r.errors.length === 0 && (!r.status || r.status.toLowerCase() === "enabled"),
+  );
+  const tHosts = [
+    ...new Set([...svc.traefik.flatMap((r) => r.hosts), ...liveRouters.flatMap((r) => r.hosts)]),
+  ];
+  const hasTraefik = svc.traefik.length > 0 || liveRouters.length > 0;
   if (hasTraefik) {
     let tf = hopId;
     if (!tf) {

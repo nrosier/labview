@@ -1,0 +1,30 @@
+# The downgrade: a label that claims a gate the proxy is not applying.
+#
+# The label asks for `authentik@file`. The live router built an empty chain, and its
+# entrypoint carries no middlewares either — so the complete live read says, with
+# the proxy's own authority, that requests reach this service ungated. The posture
+# follows the live truth: method `none`, exposed, and a note naming the middleware
+# that was asked for and the chain that was built.
+#
+# This is the sharpest thing the integration does, and the only direction in which
+# it could mislead, so it is allowed only when both `/api/rawdata` and
+# `/api/entrypoints` were read. The partial-read half of that rule is pinned by the
+# run where `/api/entrypoints` fails: the same service must then keep its
+# label-derived posture and get a note that says the difference was reported rather
+# than acted on.
+services:
+  dashboards:
+    image: ghcr.io/example/dashboards:9
+    container_name: dashboards-app
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboards.rule=Host(`dashboards.example.com`)"
+      - "traefik.http.routers.dashboards.entrypoints=web"
+      - "traefik.http.routers.dashboards.middlewares=authentik@file"
+
+networks:
+  proxy:
+    external: true

@@ -1,5 +1,5 @@
 /**
- * Smoke test: run the full pipeline (docker disabled) against three fixture roots
+ * Smoke test: run the full pipeline (docker disabled) against four fixture roots
  * and assert the analyzer produced the expected classifications. Exits non-zero
  * on any failure so it can gate CI / a pre-commit check.
  *
@@ -8,13 +8,17 @@
  *   ./fixtures/authentik — the identity-provider API integration, driven through an
  *                          injected HTTP layer so no network and no Authentik is
  *                          needed. Canned responses: ./fixtures/authentik-api.json.
+ *   ./fixtures/traefik   — the reverse-proxy API integration, driven the same way.
+ *                          Canned responses: ./fixtures/traefik-api.json, which also
+ *                          carries the Authentik payload for those runs, since the
+ *                          cross-check reads all three sources at once.
  *
  *   npx tsx scripts/smoke.ts
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import type { Overview, Service } from "../src/model/types.js";
+import type { DockerState, Overview, Service, TraefikLiveRouter } from "../src/model/types.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
 
@@ -22,6 +26,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const appsRoot = resolve(here, "..", "fixtures", "apps");
 const edgeRoot = resolve(here, "..", "fixtures", "edge");
 const authentikRoot = resolve(here, "..", "fixtures", "authentik");
+const traefikRoot = resolve(here, "..", "fixtures", "traefik");
 
 // Configure via env BEFORE importing config.
 process.env.LABVIEW_DOCKER_ENABLED = "false";
@@ -33,9 +38,26 @@ delete process.env.LABVIEW_AUTHENTIK_URL;
 delete process.env.LABVIEW_AUTHENTIK_TOKEN;
 delete process.env.LABVIEW_AUTHENTIK_TOKEN_FILE;
 delete process.env.LABVIEW_AUTHENTIK_ENABLED;
+// The proxy integration needs one extra precaution the Authentik one does not. It is
+// enabled by default and needs no credential to do work, so a fixture fleet that
+// looks like it contains a proxy — `fixtures/apps` does, via its resolved tunnel hop
+// — would have the runs below issue real requests to a guessed container address
+// through the global `fetch`. Off by default here, enabled per run.
+process.env.LABVIEW_TRAEFIK_ENABLED = "false";
+delete process.env.LABVIEW_TRAEFIK_URL;
+delete process.env.LABVIEW_TRAEFIK_USERNAME;
+delete process.env.LABVIEW_TRAEFIK_PASSWORD;
+delete process.env.LABVIEW_TRAEFIK_PASSWORD_FILE;
 
 const { loadConfig } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
+// Used directly by the container-IP assertions: the trap is not reachable through the
+// pipeline, because a container IP only exists in live docker state and smoke runs
+// without a docker socket.
+const { buildFleetIndex, lookupAddress, lookupContainerAddress } = await import(
+  "../src/analyze/origins.js"
+);
+const { matchTraefik } = await import("../src/analyze/traefik.js");
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -82,61 +104,93 @@ interface Recorded {
   url: string;
   /** Whether an Authorization header was sent — the leak check, not an auth check. */
   sentToken: boolean;
+  /** Cookies echoed back, for the one exchange that depends on them. */
+  cookie?: string;
 }
 
 /**
- * Stand in for the fixture fleet's Authentik instance.
+ * One canned HTTP response. `setCookie` is served through the same optional
+ * `headers.get` shape the real `fetch` Response has, since that is what the client
+ * reads it from.
+ */
+function reply(status: number, body: unknown, setCookie?: string): HttpResponse {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    headers: { get: (name) => (/^set-cookie$/i.test(name) ? (setCookie ?? null) : null) },
+  };
+}
+
+/**
+ * Answer one Authentik API request from a fixture payload, or return undefined when
+ * the request is not for this origin.
+ *
+ * Shared by both stubs below: the Traefik runs need the same Authentik payload served
+ * for the three-way cross-check, and duplicating the pagination envelopes would mean
+ * two places for the assumed shape to drift apart.
  *
  * It behaves like the real thing in the three ways that matter to the client:
  * `/api/v3/root/config/` answers without credentials (it is `AllowAny` upstream),
  * every other endpoint demands the exact bearer token, and any other origin — the
- * outpost, the worker, a bare service name — is simply not an API and 404s.
+ * outpost, the worker, a bare service name — is simply not an API.
+ */
+function authentikResponse(
+  fixture: Record<string, unknown>,
+  origin: string,
+  token: string,
+  url: URL,
+  header: string | undefined,
+): HttpResponse | undefined {
+  if (url.origin !== origin) return undefined;
+
+  const endpoint = url.pathname.replace(/^\/api\/v3\//, "").replace(/\/$/, "");
+  if (endpoint === "root/config") return reply(200, fixture["root/config"]);
+  if (header !== `Bearer ${token}`) {
+    return reply(403, { detail: "Authentication credentials were not provided." });
+  }
+
+  const list = fixture[endpoint];
+  if (!Array.isArray(list)) return reply(404, { detail: "Not found." });
+  // A fixture states one page as a flat array and several as an array of arrays.
+  const pages: unknown[][] = Array.isArray(list[0]) ? (list as unknown[][]) : [list];
+  const page = Number(url.searchParams.get("page") ?? "1");
+  const results: unknown[] = pages[page - 1] ?? [];
+  const count = pages.reduce((n, p) => n + p.length, 0);
+
+  // Outposts answer in the DRF envelope, everything else in Authentik's own, so
+  // both branches of the pagination reader are exercised by one fixture.
+  if (endpoint === "outposts/instances") {
+    return reply(200, { count, next: null, previous: null, results });
+  }
+  return reply(200, {
+    pagination: {
+      next: page < pages.length ? page + 1 : 0,
+      previous: page > 1 ? page - 1 : 0,
+      count,
+      current: page,
+      total_pages: pages.length,
+    },
+    results,
+  });
+}
+
+/**
+ * Stand in for the fixture fleet's Authentik instance.
  *
  * Every request is recorded, which is what lets the test assert the *absence* of a
  * request: the token must never be sent to a candidate that failed the probe.
  */
 function authentikStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
   const calls: Recorded[] = [];
-  const reply = (status: number, body: unknown): HttpResponse => ({
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  });
 
   const fetchImpl: FetchLike = async (url, init) => {
     const header = init?.headers?.Authorization;
     calls.push({ url, sentToken: Boolean(header) });
-
-    const parsed = new URL(url);
-    if (parsed.origin !== AK_ORIGIN) return reply(404, { detail: "Not found." });
-
-    const endpoint = parsed.pathname.replace(/^\/api\/v3\//, "").replace(/\/$/, "");
-    if (endpoint === "root/config") return reply(200, AK_FIXTURE["root/config"]);
-    if (header !== `Bearer ${AK_TOKEN}`) {
-      return reply(403, { detail: "Authentication credentials were not provided." });
-    }
-
-    const pages = AK_FIXTURE[endpoint];
-    if (!Array.isArray(pages)) return reply(404, { detail: "Not found." });
-    const page = Number(parsed.searchParams.get("page") ?? "1");
-    const results: unknown[] = Array.isArray(pages[page - 1]) ? pages[page - 1] : [];
-    const count = pages.reduce((n: number, p: unknown) => n + (Array.isArray(p) ? p.length : 0), 0);
-
-    // Outposts answer in the DRF envelope, everything else in Authentik's own, so
-    // both branches of the pagination reader are exercised by one fixture.
-    if (endpoint === "outposts/instances") {
-      return reply(200, { count, next: null, previous: null, results });
-    }
-    return reply(200, {
-      pagination: {
-        next: page < pages.length ? page + 1 : 0,
-        previous: page > 1 ? page - 1 : 0,
-        count,
-        current: page,
-        total_pages: pages.length,
-      },
-      results,
-    });
+    return (
+      authentikResponse(AK_FIXTURE, AK_ORIGIN, AK_TOKEN, new URL(url), header) ??
+      reply(404, { detail: "Not found." })
+    );
   };
 
   return { fetchImpl, calls };
@@ -148,6 +202,96 @@ function authentikEnv(opts: { url?: string; token?: string }): void {
   else delete process.env.LABVIEW_AUTHENTIK_URL;
   if (opts.token) process.env.LABVIEW_AUTHENTIK_TOKEN = opts.token;
   else delete process.env.LABVIEW_AUTHENTIK_TOKEN;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Traefik API stub                                                           */
+/* -------------------------------------------------------------------------- */
+
+/** The container address endpoint discovery tries first, and the only one listening. */
+const TF_ORIGIN_INTERNAL = "http://edge-proxy:8080";
+/** The public hostname the proxy's own `api@internal` router serves. */
+const TF_ORIGIN_GATED = "https://edge.example.com";
+/** Where the Authentik API answers in this fleet — the outpost service. */
+const TF_AK_ORIGIN = "http://authentik-outpost:9000";
+/** Not credentials: arbitrary strings the stub demands verbatim. */
+const TF_USER = "labview";
+const TF_PASSWORD = "smoke-fixture-app-password-0000";
+const TF_BASIC = `Basic ${Buffer.from(`${TF_USER}:${TF_PASSWORD}`).toString("base64")}`;
+const TF_SESSION = "authentik_proxy_session=smoke-fixture-session";
+const TF_FIXTURE = JSON.parse(
+  readFileSync(resolve(here, "..", "fixtures", "traefik-api.json"), "utf8"),
+) as Record<string, unknown>;
+const TF_AK_FIXTURE = TF_FIXTURE.authentik as Record<string, unknown>;
+
+interface TraefikStubOptions {
+  /** Serve the API on the gated public hostname instead of the container address. */
+  gated?: boolean;
+  /** Fail `/api/entrypoints`, leaving the read partial. */
+  entrypointsFail?: boolean;
+}
+
+/**
+ * Stand in for the fixture fleet's proxy — and, on its own origin, for the Authentik
+ * instance, because the cross-check is only meaningful when all three sources answer
+ * in one run.
+ *
+ * Two behaviours are the point of it. Exactly one address serves the API, so every
+ * other candidate discovery generated 404s as a container port with nothing on it. And
+ * in `gated` mode the API sits behind the outpost: no credential, no answer, and the
+ * session cookie it sets on the way in must come back on the follow-up requests, which
+ * is what authentik's documentation says to expect.
+ *
+ * Every request is recorded with whether it carried a credential, which is what lets
+ * the test assert the *absence* of one — the rule that a guessed address is probed and
+ * never authenticated to cannot be checked any other way.
+ */
+function traefikStub(opts: TraefikStubOptions = {}): { fetchImpl: FetchLike; calls: Recorded[] } {
+  const calls: Recorded[] = [];
+  const origin = opts.gated ? TF_ORIGIN_GATED : TF_ORIGIN_INTERNAL;
+
+  const fetchImpl: FetchLike = async (url, init) => {
+    const auth = init?.headers?.Authorization;
+    const cookie = init?.headers?.Cookie;
+    calls.push({ url, sentToken: Boolean(auth), cookie });
+
+    const parsed = new URL(url);
+    const ak = authentikResponse(TF_AK_FIXTURE, TF_AK_ORIGIN, AK_TOKEN, parsed, auth);
+    if (ak) return ak;
+    if (parsed.origin !== origin) return reply(404, { detail: "no such host" });
+
+    const probing = parsed.pathname === "/api/version";
+    if (opts.gated) {
+      if (auth !== TF_BASIC) return reply(401, { detail: "authentication required" });
+      if (!probing && cookie !== TF_SESSION) return reply(401, { detail: "session not echoed" });
+    }
+
+    if (probing) return reply(200, TF_FIXTURE.version, opts.gated ? TF_SESSION : undefined);
+    if (parsed.pathname === "/api/rawdata") return reply(200, TF_FIXTURE.rawdata);
+    if (parsed.pathname === "/api/entrypoints") {
+      return opts.entrypointsFail
+        ? reply(500, { error: "internal server error" })
+        : reply(200, TF_FIXTURE.entrypoints);
+    }
+    return reply(404, { detail: "not found" });
+  };
+
+  return { fetchImpl, calls };
+}
+
+/** Point the config loader at the stub proxy — or at nothing — for the next run. */
+function traefikEnv(opts: { enabled?: boolean; url?: string; credential?: boolean }): void {
+  if (opts.enabled === false) process.env.LABVIEW_TRAEFIK_ENABLED = "false";
+  else delete process.env.LABVIEW_TRAEFIK_ENABLED;
+  if (opts.url) process.env.LABVIEW_TRAEFIK_URL = opts.url;
+  else delete process.env.LABVIEW_TRAEFIK_URL;
+  if (opts.credential) {
+    process.env.LABVIEW_TRAEFIK_USERNAME = TF_USER;
+    process.env.LABVIEW_TRAEFIK_PASSWORD = TF_PASSWORD;
+  } else {
+    delete process.env.LABVIEW_TRAEFIK_USERNAME;
+    delete process.env.LABVIEW_TRAEFIK_PASSWORD;
+  }
 }
 
 console.log("LabView smoke test\n");
@@ -891,6 +1035,515 @@ check(
   akDown.stats.stacks === 9 && akDown.stats.services === 13,
   `${akDown.stats.stacks}/${akDown.stats.services}`,
 );
+authentikEnv({});
+
+/* ========================================================================== */
+/* fixtures/traefik — the reverse proxy's own runtime configuration           */
+/* ========================================================================== */
+
+console.log("\n--- reverse proxy API (fixtures/traefik) ---");
+
+/** Requests that went to the proxy rather than to Authentik, which shares the stub. */
+const proxyCalls = (calls: Recorded[]) => calls.filter((c) => !c.url.includes("/api/v3/"));
+
+const internal = traefikStub();
+traefikEnv({});
+authentikEnv({ token: AK_TOKEN });
+const tf = await overviewFor(traefikRoot, { fetchImpl: internal.fetchImpl });
+const tSvc = lookup(tf);
+const tfMeta = tf.meta.traefik!;
+
+console.log("\nendpoint discovery");
+check("found 12 stacks, 12 services", tf.stats.stacks === 12 && tf.stats.services === 12, `${tf.stats.stacks}/${tf.stats.services}`);
+check(
+  "the endpoint is discovered from the fleet, not configured",
+  tfMeta.endpointSource === "discovered" && tfMeta.endpoint === TF_ORIGIN_INTERNAL,
+  `${tfMeta.endpointSource} ${tfMeta.endpoint ?? ""}`,
+);
+// Nothing in the fixture publishes 8080 and no label mentions it: the candidate exists
+// because a router on this container targets `api@internal`, and 8080 is the port the
+// dedicated `traefik` entrypoint serves the API on.
+check(
+  "...the container address on the API's own port is tried first",
+  proxyCalls(internal.calls)[0]?.url === `${TF_ORIGIN_INTERNAL}/api/version`,
+  proxyCalls(internal.calls)[0]?.url ?? "no request",
+);
+check(
+  "...and the public hostname is never reached, since an internal one answered",
+  proxyCalls(internal.calls).every((c) => !c.url.startsWith(TF_ORIGIN_GATED)),
+  proxyCalls(internal.calls).filter((c) => c.url.startsWith(TF_ORIGIN_GATED)).map((c) => c.url).join(" "),
+);
+check("the API answered", tfMeta.reachable === true, tfMeta.error ?? "");
+// PascalCase in the payload: read case-insensitively or this is undefined.
+check("...reporting its version", tfMeta.version === "3.1.2", String(tfMeta.version));
+check(
+  "...with no credential, which is the answer to whether the API is open",
+  tfMeta.credential === "none",
+  tfMeta.credential,
+);
+check("...and both reads completed", tfMeta.entrypointsRead === true && tfMeta.error === undefined, tfMeta.error ?? "");
+
+console.log("\nwhat was read");
+check(
+  "10 routers, 5 middlewares, 10 services",
+  tfMeta.routers === 10 && tfMeta.middlewares === 5 && tfMeta.services === 10,
+  `${tfMeta.routers}/${tfMeta.middlewares}/${tfMeta.services}`,
+);
+check("8 services matched a live router", tfMeta.matchedServices === 8, String(tfMeta.matchedServices));
+// The mirror of `unmatchedApplications`: ingress configured outside the scanned stacks.
+// `standalone@file` belongs to nothing scanned; `twin-blue@file` matches two services,
+// which is a match not made rather than a match to arbitrate.
+check(
+  "the two routers no single service could be identified for are listed",
+  JSON.stringify(tfMeta.unmatchedRouters) === JSON.stringify(["standalone@file", "twin-blue@file"]),
+  JSON.stringify(tfMeta.unmatchedRouters),
+);
+check(
+  "...and neither twin was credited with the hostname both claim",
+  tSvc("twin-a", "blue").traefikLive === undefined && tSvc("twin-b", "green").traefikLive === undefined,
+  `${tSvc("twin-a", "blue").traefikLive?.length ?? 0}/${tSvc("twin-b", "green").traefikLive?.length ?? 0}`,
+);
+
+console.log("\na file-provider middleware the scan cannot see");
+const tfDocs = tSvc("docs", "docs");
+// The gap this feature closes. `secured@file` is defined in a Traefik file provider,
+// so a label-only read has nothing but its name — which does not even look like auth.
+check(
+  "a chain wrapping a forward-auth is a confirmed Authentik gate",
+  tfDocs.auth.method === "authentik-forward-auth" && tfDocs.auth.confidence === "confirmed",
+  `${tfDocs.auth.method}/${tfDocs.auth.confidence}`,
+);
+check(
+  "...reached through the chain, which is stated as how it was found",
+  tfDocs.auth.evidence.some((e) => e.includes("`sso@file`") && e.includes("via chain `secured@file`")),
+  tfDocs.auth.evidence.join(" | "),
+);
+// Backend health is the proxy's own last observation, obtainable from nothing else.
+check(
+  "a backend the proxy cannot reach is reported DOWN",
+  tfDocs.notes.some((n) => n.includes("DOWN for router(s)") && n.includes("http://docs-site:8080")),
+  tfDocs.notes.join(" | "),
+);
+
+console.log("\nthe downgrade, and the guard on it");
+const tfDash = tSvc("dashboards", "dashboards");
+// The one finding that moves a service *towards* exposed. The label declares a gate;
+// the proxy built no chain for that router at all.
+check(
+  "a declared gate the proxy never attached stops counting as protection",
+  tfDash.auth.method === "none" && tfDash.auth.exposedWithoutAuth === true,
+  `${tfDash.auth.method} exposed=${tfDash.auth.exposedWithoutAuth}`,
+);
+check(
+  "...with both accounts named and the live one said to be the one that enforces",
+  tfDash.notes.some(
+    (n) =>
+      n.includes("declares auth middleware `authentik@file`") &&
+      n.includes("the chain Traefik built for it is empty") &&
+      n.includes("follows it and not the label"),
+  ),
+  tfDash.notes.join(" | "),
+);
+const tfMetrics = tSvc("metrics", "metrics");
+// Same label, same empty router chain — but its entrypoint carries the gate, which
+// appears in no router's middleware list. Drop the entrypoint merge and this service
+// is reported wide open while it is in fact protected.
+check(
+  "a gate attached to the entrypoint is not mistaken for an absent one",
+  tfMetrics.auth.method === "authentik-forward-auth" && tfMetrics.auth.confidence === "confirmed",
+  `${tfMetrics.auth.method}/${tfMetrics.auth.confidence}`,
+);
+check(
+  "...and is credited to the entrypoint it is attached to",
+  tfMetrics.auth.evidence.some((e) => e.includes("on entrypoint secure")),
+  tfMetrics.auth.evidence.join(" | "),
+);
+check(
+  "...with no discrepancy claimed",
+  !tfMetrics.notes.some((n) => n.includes("declares auth middleware")),
+  tfMetrics.notes.join(" | "),
+);
+
+console.log("\nrouters the labels and the proxy disagree about the existence of");
+const tfBlog = tSvc("blog", "blog");
+check(
+  "a label router the proxy serves no counterpart for is reported absent",
+  tfBlog.notes.some((n) => n.includes("`blog`") && n.includes("the proxy is serving no router by that name")),
+  tfBlog.notes.join(" | "),
+);
+// The absent check runs against every router in the snapshot, not just the matched
+// ones: `twin-blue` demonstrably exists, LabView merely could not attribute it.
+check(
+  "...while a router that exists but could not be attributed is not",
+  !tSvc("twin-a", "blue").notes.some((n) => n.includes("serving no router by that name")),
+  tSvc("twin-a", "blue").notes.join(" | "),
+);
+check(
+  "...and one that really is missing still is",
+  tSvc("twin-b", "green").notes.some((n) => n.includes("serving no router by that name")),
+  tSvc("twin-b", "green").notes.join(" | "),
+);
+const tfLegacy = tSvc("legacy", "legacy");
+// A router Traefik is holding but not serving. Its chain names an auth middleware, and
+// counting that as protection would be a gate on a road nobody drives.
+check(
+  "a disabled, errored router is quoted verbatim and protects nothing",
+  tfLegacy.notes.some((n) => n.includes("Traefik is not serving router `legacy@docker`")) &&
+    tfLegacy.notes.some((n) => n.includes('middleware "authentik@file" does not exist')) &&
+    tfLegacy.auth.method === "none",
+  `${tfLegacy.auth.method} | ${tfLegacy.notes.join(" | ")}`,
+);
+
+console.log("\nthree accounts of one gate");
+const tfWiki = tSvc("wiki", "wiki");
+check(
+  "labels, proxy and identity provider agreeing is stated as such",
+  tfWiki.notes.some(
+    (n) => n.includes("The labels, the proxy and Authentik agree") && n.includes('application "Wiki"'),
+  ),
+  tfWiki.notes.join(" | "),
+);
+// The forward-auth address is resolved back to a scanned service, so the note can say
+// *which* service authenticates rather than quoting a URL at the reader.
+check(
+  "...naming the service the proxy delegates the decision to",
+  tfWiki.notes.some((n) => n.includes("(which is sso/outpost)")),
+  tfWiki.notes.join(" | "),
+);
+const tfCrm = tSvc("crm", "crm");
+// Neither source reveals this alone: Authentik reports a healthy outpost either way,
+// and the proxy has no idea a provider was meant to be in the chain.
+check(
+  "a forward-auth provider with no forward-auth in the live chain is the finding",
+  tfCrm.notes.some((n) => n.includes("never reaches the outpost") && n.includes("`forward_single`")),
+  tfCrm.notes.join(" | "),
+);
+const tfShop = tSvc("shop", "shop");
+check(
+  "...but a `proxy`-mode provider is exempt: the outpost is the backend, not a callee",
+  !tfShop.notes.some((n) => n.includes("never reaches the outpost")) &&
+    tfShop.auth.method === "authentik-forward-auth",
+  `${tfShop.auth.method} | ${tfShop.notes.join(" | ")}`,
+);
+check(
+  "3 Authentik applications matched a service in this fleet",
+  tf.meta.authentik?.matchedServices === 3,
+  String(tf.meta.authentik?.matchedServices),
+);
+
+console.log("\nthe proxy itself");
+const tfEdge = tSvc("edge", "traefik");
+check(
+  "its own dashboard's basicAuth is confirmed from the live chain",
+  tfEdge.auth.method === "basic-auth" && tfEdge.auth.confidence === "confirmed",
+  `${tfEdge.auth.method}/${tfEdge.auth.confidence}`,
+);
+// The direct answer to "I don't know whether `api.insecure` is on" — reported because
+// the read succeeded without a credential, not because anything was configured.
+check(
+  "an API that answered unauthenticated is reported on the service that serves it",
+  tfEdge.notes.some((n) => n.includes(`answered at ${TF_ORIGIN_INTERNAL} with no credential`)),
+  tfEdge.notes.join(" | "),
+);
+check(
+  "a router the proxy confirmed is drawn from the proxy, not from the generic hub",
+  tf.graph.edges.find((e) => e.id === "live->svc:docs/docs:docs@docker")?.source === "svc:edge/traefik",
+  JSON.stringify(tf.graph.edges.find((e) => e.id === "live->svc:docs/docs:docs@docker")),
+);
+check(
+  "...and that service is marked as the proxy",
+  tf.graph.nodes.find((n) => n.id === "svc:edge/traefik")?.role === "proxy",
+);
+
+// A container IP and a published host port are addresses of entirely different kinds,
+// and reading one through the other's table gives a confident wrong answer. Asserted
+// directly: a container IP only exists in live docker state, which smoke runs without.
+console.log("\nthe container-IP trap");
+const trapState: DockerState = {
+  id: "0000000000000000000000000000000000000000000000000000000000000000",
+  name: "docs-site",
+  image: "ghcr.io/example/docs:1",
+  state: "running",
+  status: "Up 1 hour",
+  running: true,
+  networks: ["proxy"],
+  ipAddresses: { proxy: "172.31.0.7" },
+  publishedPorts: [],
+};
+tSvc("docs", "docs").docker = trapState;
+const trapIndex = buildFleetIndex(tf.stacks);
+const backend = "http://172.31.0.7:3000";
+check(
+  "a backend on a container IP resolves through the container-IP table",
+  lookupContainerAddress(backend, trapIndex).map((r) => `${r.stackId}/${r.serviceName}`).join(",") ===
+    "docs/docs",
+  lookupContainerAddress(backend, trapIndex).map((r) => `${r.stackId}/${r.serviceName}`).join(","),
+);
+// The reason it needs its own table: the published-port table answers, and is wrong.
+check(
+  "...where the published-port table would have named the wrong service entirely",
+  lookupAddress(backend, trapIndex).map((r) => `${r.stackId}/${r.serviceName}`).join(",") === "wiki/wiki",
+  lookupAddress(backend, trapIndex).map((r) => `${r.stackId}/${r.serviceName}`).join(","),
+);
+// And that the matcher reads the right one. Asserted on the matcher rather than on the
+// lookup, because the two checks above pass whichever table the call site uses; only
+// this one fails if it is swapped. The router is deliberately unmatchable by any other
+// rule: a `file` provider excludes the router-name rule, and no rule means no hostname.
+const trapRouter: TraefikLiveRouter = {
+  router: "ip-form-backend",
+  provider: "file",
+  errors: [],
+  hosts: [],
+  entryPoints: ["websecure"],
+  middlewares: [],
+  servers: [{ url: backend }],
+  tls: true,
+  evidence: [],
+};
+// Cleared first, because the pipeline run above already attached the routers it matched
+// and this asserts what *this* call does, not what is left over from that one.
+tSvc("docs", "docs").traefikLive = undefined;
+tSvc("wiki", "wiki").traefikLive = undefined;
+matchTraefik(tf.stacks, [trapRouter], trapIndex);
+const trapAttached = (stack: string, svc: string): string =>
+  (tSvc(stack, svc).traefikLive ?? []).map((r) => r.router).join(",");
+check(
+  "...and the matcher attributes such a backend to the container, not to the port's owner",
+  trapAttached("docs", "docs") === "ip-form-backend" && trapAttached("wiki", "wiki") === "",
+  `docs=[${trapAttached("docs", "docs")}] wiki=[${trapAttached("wiki", "wiki")}]`,
+);
+
+console.log("\na credential goes nowhere ownership was not established");
+const withCred = traefikStub();
+traefikEnv({ credential: true });
+authentikEnv({ token: AK_TOKEN });
+const tfCred = await overviewFor(traefikRoot, { fetchImpl: withCred.fetchImpl });
+check(
+  "an internal endpoint that answers is used with no credential at all",
+  tfCred.meta.traefik?.credential === "none" && tfCred.meta.traefik?.endpoint === TF_ORIGIN_INTERNAL,
+  `${tfCred.meta.traefik?.credential} ${tfCred.meta.traefik?.endpoint ?? ""}`,
+);
+// The revert-proof assertion for the probe-before-credential rule: authenticate the
+// probe and every one of these carries Basic.
+check(
+  "...so nothing sent to the proxy carried one",
+  proxyCalls(withCred.calls).every((c) => !c.sentToken),
+  proxyCalls(withCred.calls).filter((c) => c.sentToken).map((c) => c.url).join(" "),
+);
+check(
+  "...and the public hostname was never contacted",
+  withCred.calls.every((c) => !c.url.startsWith(TF_ORIGIN_GATED)),
+  withCred.calls.filter((c) => c.url.startsWith(TF_ORIGIN_GATED)).map((c) => c.url).join(" "),
+);
+
+console.log("\na gated API, reached with the credential it demands");
+const gated = traefikStub({ gated: true });
+traefikEnv({ credential: true });
+authentikEnv({ token: AK_TOKEN });
+const tfGated = await overviewFor(traefikRoot, { fetchImpl: gated.fetchImpl });
+const gatedMeta = tfGated.meta.traefik!;
+check(
+  "the one hostname the API's own router serves is used, with Basic",
+  gatedMeta.endpoint === TF_ORIGIN_GATED && gatedMeta.credential === "basic" && gatedMeta.reachable === true,
+  `${gatedMeta.endpoint ?? ""} ${gatedMeta.credential} ${gatedMeta.error ?? ""}`,
+);
+const gatedProbes = gated.calls.filter((c) => c.url === `${TF_ORIGIN_GATED}/api/version`);
+check(
+  "...probed unauthenticated first, then retried once with the credential",
+  gatedProbes.length === 2 && gatedProbes[0]?.sentToken === false && gatedProbes[1]?.sentToken === true,
+  gatedProbes.map((c) => `${c.sentToken}`).join(","),
+);
+// The outpost sets a session cookie and expects it echoed; without replaying it the
+// follow-up reads are rejected even though the credential is right.
+check(
+  "...with the session cookie the outpost set replayed on the reads that follow",
+  gated.calls
+    .filter((c) => c.url.startsWith(TF_ORIGIN_GATED) && !c.url.endsWith("/api/version"))
+    .every((c) => c.cookie === TF_SESSION),
+  gated.calls.filter((c) => c.url.startsWith(TF_ORIGIN_GATED)).map((c) => `${c.url} ${c.cookie ?? "-"}`).join(" | "),
+);
+check(
+  "...and the guessed container addresses were probed but never authenticated to",
+  proxyCalls(gated.calls)
+    .filter((c) => !c.url.startsWith(TF_ORIGIN_GATED))
+    .every((c) => !c.sentToken && c.url.endsWith("/api/version")),
+  proxyCalls(gated.calls).filter((c) => !c.url.startsWith(TF_ORIGIN_GATED)).map((c) => `${c.url} ${c.sentToken}`).join(" | "),
+);
+check(
+  "...reaching the same conclusions as the internal endpoint",
+  gatedMeta.matchedServices === 8 && tfGated.stats.exposedWithoutAuth === tf.stats.exposedWithoutAuth,
+  `${gatedMeta.matchedServices} ${tfGated.stats.exposedWithoutAuth}`,
+);
+// The unauthenticated-API note is evidence, not decoration: it must not appear when
+// the API in fact demanded a credential.
+check(
+  "...and the open-API note is absent, because the API was not open",
+  !lookup(tfGated)("edge", "traefik").notes.some((n) => n.includes("with no credential")),
+  lookup(tfGated)("edge", "traefik").notes.join(" | "),
+);
+
+console.log("\nendpoint from configuration");
+const cfgEndpoint = traefikStub();
+traefikEnv({ url: TF_ORIGIN_INTERNAL });
+authentikEnv({ token: AK_TOKEN });
+const tfCfg = await overviewFor(traefikRoot, { fetchImpl: cfgEndpoint.fetchImpl });
+check(
+  "a configured URL is used as given",
+  tfCfg.meta.traefik?.endpointSource === "config" && tfCfg.meta.traefik?.endpoint === TF_ORIGIN_INTERNAL,
+  `${tfCfg.meta.traefik?.endpointSource} ${tfCfg.meta.traefik?.endpoint ?? ""}`,
+);
+check(
+  "...and nothing else in the fleet is probed",
+  proxyCalls(cfgEndpoint.calls).every((c) => c.url.startsWith(TF_ORIGIN_INTERNAL)),
+  proxyCalls(cfgEndpoint.calls).filter((c) => !c.url.startsWith(TF_ORIGIN_INTERNAL)).map((c) => c.url).join(" "),
+);
+check("...reaching the same conclusions", tfCfg.meta.traefik?.matchedServices === 8, String(tfCfg.meta.traefik?.matchedServices));
+// A hand-written URL carries no service key, so the proxy has to be identified from
+// the address itself for its own notes and for the graph to draw live routes from it.
+check(
+  "...and the proxy is still identified from the address it names",
+  lookup(tfCfg)("edge", "traefik").notes.some((n) => n.includes("with no credential")),
+  lookup(tfCfg)("edge", "traefik").notes.join(" | "),
+);
+
+console.log("\na partial read concludes nothing about a missing gate");
+const partial = traefikStub({ entrypointsFail: true });
+traefikEnv({});
+authentikEnv({ token: AK_TOKEN });
+const tfPartial = await overviewFor(traefikRoot, { fetchImpl: partial.fetchImpl });
+const pSvc = lookup(tfPartial);
+check(
+  "the runtime config is still read, and the gap is reported",
+  tfPartial.meta.traefik?.reachable === true &&
+    tfPartial.meta.traefik?.entrypointsRead === false &&
+    (tfPartial.meta.traefik?.error?.includes("/api/entrypoints could not be read") ?? false),
+  tfPartial.meta.traefik?.error ?? "",
+);
+// Without the entrypoints an attached gate is invisible, so calling the label wrong
+// would invert the finding. The discrepancy is printed; the posture does not move.
+check(
+  "the declared gate is still counted, and the discrepancy reported rather than acted on",
+  pSvc("dashboards", "dashboards").auth.method === "authentik-forward-auth" &&
+    pSvc("dashboards", "dashboards").auth.exposedWithoutAuth === false &&
+    pSvc("dashboards", "dashboards").notes.some((n) => n.includes("reported rather than acted on")),
+  `${pSvc("dashboards", "dashboards").auth.method} | ${pSvc("dashboards", "dashboards").notes.join(" | ")}`,
+);
+check(
+  "...and a gate only the entrypoints could have confirmed falls back to the label",
+  pSvc("metrics", "metrics").auth.confidence === "inferred",
+  pSvc("metrics", "metrics").auth.confidence,
+);
+check(
+  "...and the Authentik cross-check makes no claim either",
+  !pSvc("crm", "crm").notes.some((n) => n.includes("never reaches the outpost")),
+  pSvc("crm", "crm").notes.join(" | "),
+);
+
+console.log("\nan unreachable proxy never blocks a scan");
+const throwing: FetchLike = async () => {
+  throw new Error("ECONNREFUSED");
+};
+traefikEnv({ url: TF_ORIGIN_INTERNAL, credential: true });
+authentikEnv({});
+const tfDown = await overviewFor(traefikRoot, { fetchImpl: throwing });
+check(
+  "the failure is reported rather than thrown",
+  tfDown.meta.traefik?.configured === true && tfDown.meta.traefik?.reachable === false,
+  JSON.stringify(tfDown.meta.traefik),
+);
+check(
+  "...with the reason kept and no credential in it",
+  (tfDown.meta.traefik?.error?.includes("no Traefik API endpoint answered") ?? false) &&
+    !tfDown.meta.traefik!.error!.includes(TF_PASSWORD) &&
+    !tfDown.meta.traefik!.error!.includes(TF_BASIC),
+  tfDown.meta.traefik?.error ?? "",
+);
+check(
+  "...and the whole fleet is still analyzed from its labels",
+  tfDown.stats.stacks === 12 &&
+    tfDown.stats.services === 12 &&
+    lookup(tfDown)("dashboards", "dashboards").auth.method === "authentik-forward-auth",
+  `${tfDown.stats.stacks}/${tfDown.stats.services}`,
+);
+
+// Both reasons below say what to *fix*, which is the whole value of a soft failure.
+// `fetch` reports a name that does not resolve and a service that is not listening with
+// the same opaque message, and those call for opposite fixes.
+const opaque: FetchLike = async () => {
+  throw Object.assign(new Error("fetch failed"), { cause: { code: "ENOTFOUND" } });
+};
+traefikEnv({ url: TF_ORIGIN_INTERNAL, credential: true });
+const tfDns = await overviewFor(traefikRoot, { fetchImpl: opaque });
+check(
+  "a transport failure keeps the reason `fetch` hid in `cause`",
+  tfDns.meta.traefik?.error?.includes("ENOTFOUND") === true,
+  tfDns.meta.traefik?.error ?? "",
+);
+// The likeliest real outcome of pointing this at a gated hostname: the login page is
+// served with a 200, so only the body gives it away.
+const loginPage: FetchLike = async () => ({
+  ok: true,
+  status: 200,
+  json: async () => {
+    throw new SyntaxError("Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON");
+  },
+});
+const tfHtml = await overviewFor(traefikRoot, { fetchImpl: loginPage });
+check(
+  "an HTML answer is reported as one, not as a JSON parser error",
+  tfHtml.meta.traefik?.error?.includes("the body was not JSON") === true &&
+    !tfHtml.meta.traefik!.error!.includes("Unexpected token"),
+  tfHtml.meta.traefik?.error ?? "",
+);
+check(
+  "...and it is not mistaken for a Traefik API, so no credential follows it",
+  tfHtml.meta.traefik?.reachable === false && tfHtml.meta.traefik?.credential === "none",
+  `${tfHtml.meta.traefik?.reachable} ${tfHtml.meta.traefik?.credential}`,
+);
+
+console.log("\nwithout the API the integration is inert");
+const idle = traefikStub();
+traefikEnv({ enabled: false });
+authentikEnv({});
+const tfOff = await overviewFor(traefikRoot, { fetchImpl: idle.fetchImpl });
+const oSvc = lookup(tfOff);
+check("disabled means no request at all", idle.calls.length === 0, String(idle.calls.length));
+check(
+  "...and no service carries live routers",
+  tfOff.stacks.every((s) => s.services.every((x) => x.traefikLive === undefined)),
+);
+check(
+  "...so a label router is drawn from the generic hub instead of a proxy",
+  tfOff.graph.edges.find((e) => e.id === "tr->svc:docs/docs:docs")?.source === "ext:traefik",
+  JSON.stringify(tfOff.graph.edges.find((e) => e.id === "tr->svc:docs/docs:docs")),
+);
+
+// The pair of numbers that shows what reading the proxy is worth, and that it moves in
+// both directions: gates only the proxy can see stop counting as absent, and gates the
+// labels claim that it never attached stop counting as present.
+console.log("\nwhat the proxy's runtime configuration is worth");
+check(
+  "with the API read, 4 services are reachable without auth and 7 are protected",
+  tf.stats.exposedWithoutAuth === 4 && tf.stats.authProtected === 7,
+  `${tf.stats.exposedWithoutAuth}/${tf.stats.authProtected}`,
+);
+check(
+  "...and from the labels alone, 6 and 5",
+  tfOff.stats.exposedWithoutAuth === 6 && tfOff.stats.authProtected === 5,
+  `${tfOff.stats.exposedWithoutAuth}/${tfOff.stats.authProtected}`,
+);
+check(
+  "a file-provider middleware is unclassifiable from its name alone",
+  oSvc("docs", "docs").auth.method === "none" && oSvc("docs", "docs").auth.exposedWithoutAuth === true,
+  `${oSvc("docs", "docs").auth.method} exposed=${oSvc("docs", "docs").auth.exposedWithoutAuth}`,
+);
+check(
+  "...and a label-named one is only ever `inferred`",
+  oSvc("metrics", "metrics").auth.method === "authentik-forward-auth" &&
+    oSvc("metrics", "metrics").auth.confidence === "inferred",
+  `${oSvc("metrics", "metrics").auth.method}/${oSvc("metrics", "metrics").auth.confidence}`,
+);
+traefikEnv({ enabled: false });
 authentikEnv({});
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);

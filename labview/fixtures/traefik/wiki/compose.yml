@@ -1,0 +1,33 @@
+# The container-IP trap, and the plain happy path.
+#
+# `3000:3000` is the trap: the live backend for this router is
+# `http://wiki-app:3000`, and a *name*-form backend is safe. But some other
+# service's docker-provider backend could be `http://<container-ip>:3000`, and
+# reading that port through the published-host-port index would land here — this
+# service publishes 3000 — with full confidence and the wrong answer. The
+# assertion that pins the separate container-IP table uses exactly this pair.
+#
+# Otherwise this is the straightforward case: a label naming an auth middleware,
+# a live router agreeing, and a chain that really does contain the forwardAuth.
+# Label-only the posture is `inferred` (nothing in this fleet defines
+# `authentik@file`); with the API read it becomes `confirmed`. Both directions
+# are asserted, so neither the fallback nor the upgrade can be removed quietly.
+services:
+  wiki:
+    image: ghcr.io/example/wiki:2
+    container_name: wiki-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wiki-web.rule=Host(`wiki.example.com`)"
+      - "traefik.http.routers.wiki-web.entrypoints=websecure"
+      - "traefik.http.routers.wiki-web.middlewares=authentik@file"
+      - "traefik.http.services.wiki-web.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true

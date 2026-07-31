@@ -1,0 +1,369 @@
+{
+  "_comment": [
+    "Canned Traefik API responses for the fixture fleet in fixtures/traefik/, plus the",
+    "Authentik payload the same runs are served, so the three-way cross-check has all",
+    "three sources. Consumed by scripts/smoke.ts through the injected fetchImpl; nothing",
+    "here is ever fetched over a network.",
+    "",
+    "Traefik's runtime model is not a published schema, so these shapes are LabView's",
+    "documented assumption about it rather than a contract. Written from Traefik v3's",
+    "own API surface, with the tolerances the parser is built for deliberately exercised:",
+    "",
+    "  * `/api/version` returns PascalCase (`Version`, `Codename`) — the probe and the",
+    "    version reader match the field case-insensitively, and this payload is the only",
+    "    thing pinning that.",
+    "  * `/api/rawdata` returns three maps keyed `name@provider`. A middleware's type is",
+    "    the name of its one non-meta key (`forwardAuth`, `basicAuth`, `chain`,",
+    "    `compress`), which is how a type LabView has never heard of still gets reported.",
+    "  * `routers.middlewares` is absent rather than empty on a router with no chain, and",
+    "    `serverStatus` is absent on one service — both mean 'nothing known', and neither",
+    "    may be read as a value.",
+    "  * `services` contains a non-load-balancer entry (`mirror@file`) that yields no",
+    "    backend evidence at all, and omits `api@internal` entirely, which a real Traefik",
+    "    also does — a router whose service has no entry must degrade, not throw.",
+    "  * `/api/entrypoints` is an array of `{name, address, http: {middlewares}}`. A map",
+    "    keyed by name parses too; the array is the documented form.",
+    "",
+    "The Authentik half mirrors fixtures/authentik-api.json — see its own comment for",
+    "those shapes. Three applications, all proxy providers with one outpost deployed for",
+    "them. Wiki is the case where all three sources agree; crm and shop differ only in",
+    "the provider's `mode`, and that field is the whole difference between crm's finding",
+    "and shop's non-finding."
+  ],
+
+  "version": {
+    "Version": "3.1.2",
+    "Codename": "mimolette",
+    "startDate": "2024-01-01T00:00:00Z"
+  },
+
+  "rawdata": {
+    "routers": {
+      "dashboard@docker": {
+        "entryPoints": ["websecure"],
+        "middlewares": ["dashboard-auth@file"],
+        "service": "api@internal",
+        "rule": "Host(`edge.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      },
+      "wiki-web@docker": {
+        "entryPoints": ["websecure"],
+        "middlewares": ["authentik@file"],
+        "service": "wiki-web@docker",
+        "rule": "Host(`wiki.example.com`)",
+        "status": "enabled",
+        "tls": { "certResolver": "le" },
+        "using": ["websecure"]
+      },
+      "docs@docker": {
+        "entryPoints": ["websecure"],
+        "middlewares": ["secured@file"],
+        "service": "docs@docker",
+        "rule": "Host(`docs.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      },
+      "dashboards@docker": {
+        "entryPoints": ["web"],
+        "service": "dashboards@docker",
+        "rule": "Host(`dashboards.example.com`)",
+        "status": "enabled",
+        "using": ["web"]
+      },
+      "metrics@docker": {
+        "entryPoints": ["secure"],
+        "service": "metrics@docker",
+        "rule": "Host(`metrics.example.com`)",
+        "status": "enabled",
+        "using": ["secure"]
+      },
+      "legacy@docker": {
+        "entryPoints": ["websecure"],
+        "middlewares": ["authentik@file"],
+        "service": "legacy@docker",
+        "rule": "Host(`legacy.example.com`)",
+        "status": "disabled",
+        "error": ["middleware \"authentik@file\" does not exist for entryPoint websecure"]
+      },
+      "crm@docker": {
+        "entryPoints": ["websecure"],
+        "service": "crm@docker",
+        "rule": "Host(`crm.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      },
+      "shop@docker": {
+        "entryPoints": ["websecure"],
+        "service": "shop@docker",
+        "rule": "Host(`shop.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      },
+      "standalone@file": {
+        "entryPoints": ["websecure"],
+        "service": "standalone@file",
+        "rule": "Host(`standalone.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      },
+      "twin-blue@file": {
+        "entryPoints": ["websecure"],
+        "service": "twin@file",
+        "rule": "Host(`twin.example.com`)",
+        "status": "enabled",
+        "using": ["websecure"]
+      }
+    },
+
+    "middlewares": {
+      "authentik@file": {
+        "forwardAuth": {
+          "address": "http://authentik-outpost:9000/outpost.goauthentik.io/auth/traefik",
+          "trustForwardHeader": true,
+          "authResponseHeaders": ["X-authentik-username", "X-authentik-groups"]
+        },
+        "status": "enabled",
+        "usedBy": ["wiki-web@docker", "legacy@docker"]
+      },
+      "sso@file": {
+        "forwardAuth": {
+          "address": "http://authentik-outpost:9000/outpost.goauthentik.io/auth/traefik",
+          "trustForwardHeader": true
+        },
+        "status": "enabled",
+        "usedBy": ["secured@file"]
+      },
+      "dashboard-auth@file": {
+        "basicAuth": {
+          "usersFile": "/etc/traefik/users.htpasswd",
+          "realm": "traefik",
+          "removeHeader": true
+        },
+        "status": "enabled",
+        "usedBy": ["dashboard@docker"]
+      },
+      "secured@file": {
+        "chain": {
+          "middlewares": ["compress@file", "sso@file"]
+        },
+        "status": "enabled",
+        "usedBy": ["docs@docker"]
+      },
+      "compress@file": {
+        "compress": {},
+        "status": "enabled",
+        "usedBy": ["secured@file"]
+      }
+    },
+
+    "services": {
+      "wiki-web@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://wiki-app:3000" }],
+          "passHostHeader": true
+        },
+        "status": "enabled",
+        "serverStatus": { "http://wiki-app:3000": "UP" },
+        "usedBy": ["wiki-web@docker"]
+      },
+      "docs@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://docs-site:8080" }],
+          "passHostHeader": true
+        },
+        "status": "enabled",
+        "serverStatus": { "http://docs-site:8080": "DOWN" },
+        "usedBy": ["docs@docker"]
+      },
+      "dashboards@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://dashboards-app:80" }]
+        },
+        "status": "enabled",
+        "usedBy": ["dashboards@docker"]
+      },
+      "metrics@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://metrics-app:9090" }],
+          "passHostHeader": true
+        },
+        "status": "enabled",
+        "serverStatus": { "http://metrics-app:9090": "UP" },
+        "usedBy": ["metrics@docker"]
+      },
+      "legacy@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://legacy-app:80" }]
+        },
+        "status": "enabled",
+        "serverStatus": { "http://legacy-app:80": "UP" },
+        "usedBy": ["legacy@docker"]
+      },
+      "crm@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://crm-app:8000" }],
+          "passHostHeader": true
+        },
+        "status": "enabled",
+        "serverStatus": { "http://crm-app:8000": "UP" },
+        "usedBy": ["crm@docker"]
+      },
+      "shop@docker": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://shop-app:80" }],
+          "passHostHeader": true
+        },
+        "status": "enabled",
+        "serverStatus": { "http://shop-app:80": "UP" },
+        "usedBy": ["shop@docker"]
+      },
+      "standalone@file": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://192.0.2.10:8443" }]
+        },
+        "status": "enabled",
+        "serverStatus": { "http://192.0.2.10:8443": "UP" },
+        "usedBy": ["standalone@file"]
+      },
+      "twin@file": {
+        "loadBalancer": {
+          "servers": [{ "url": "http://192.0.2.11:8080" }]
+        },
+        "status": "enabled",
+        "usedBy": ["twin-blue@file"]
+      },
+      "mirror@file": {
+        "mirroring": {
+          "service": "docs@docker",
+          "mirrors": [{ "name": "standalone@file", "percent": 10 }]
+        },
+        "status": "enabled"
+      }
+    }
+  },
+
+  "entrypoints": [
+    {
+      "name": "web",
+      "address": ":80",
+      "http": {
+        "redirections": { "entryPoint": { "to": "websecure", "scheme": "https" } }
+      }
+    },
+    {
+      "name": "websecure",
+      "address": ":443",
+      "http": { "tls": {} }
+    },
+    {
+      "name": "secure",
+      "address": ":8443",
+      "http": { "middlewares": ["authentik@file"] }
+    },
+    {
+      "name": "traefik",
+      "address": ":8080"
+    }
+  ],
+
+  "authentik": {
+    "root/config": {
+      "cache_timeout": 300,
+      "capabilities": ["can_save_media", "can_impersonate"],
+      "error_reporting": { "enabled": false }
+    },
+    "core/applications": [
+      {
+        "pk": "b7f1c4e2-0000-4000-8000-00000000c000",
+        "name": "Wiki",
+        "slug": "wiki",
+        "group": "Knowledge",
+        "provider": 40,
+        "provider_obj": {
+          "pk": 40,
+          "name": "wiki-proxy",
+          "component": "ak-provider-proxy-form",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "launch_url": "https://wiki.example.com",
+        "meta_launch_url": "https://wiki.example.com"
+      },
+      {
+        "pk": "b7f1c4e2-0000-4000-8000-00000000c001",
+        "name": "CRM",
+        "slug": "crm",
+        "group": "Business",
+        "provider": 41,
+        "provider_obj": {
+          "pk": 41,
+          "name": "crm-proxy",
+          "component": "ak-provider-proxy-form",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "launch_url": "https://crm.example.com",
+        "meta_launch_url": "https://crm.example.com"
+      },
+      {
+        "pk": "b7f1c4e2-0000-4000-8000-00000000c002",
+        "name": "Shop",
+        "slug": "shop",
+        "group": "Business",
+        "provider": 42,
+        "provider_obj": {
+          "pk": 42,
+          "name": "shop-proxy",
+          "component": "ak-provider-proxy-form",
+          "meta_model_name": "authentik_providers_proxy.proxyprovider"
+        },
+        "backchannel_providers": [],
+        "launch_url": "https://shop.example.com",
+        "meta_launch_url": "https://shop.example.com"
+      }
+    ],
+    "providers/proxy": [
+      {
+        "pk": 40,
+        "name": "wiki-proxy",
+        "component": "ak-provider-proxy-form",
+        "external_host": "https://wiki.example.com",
+        "internal_host": "http://wiki-app:3000",
+        "mode": "forward_single",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      },
+      {
+        "pk": 41,
+        "name": "crm-proxy",
+        "component": "ak-provider-proxy-form",
+        "external_host": "https://crm.example.com",
+        "internal_host": "http://crm-app:8000",
+        "mode": "forward_single",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      },
+      {
+        "pk": 42,
+        "name": "shop-proxy",
+        "component": "ak-provider-proxy-form",
+        "external_host": "https://shop.example.com",
+        "internal_host": "http://shop-app:80",
+        "mode": "proxy",
+        "basic_auth_enabled": false,
+        "skip_path_regex": ""
+      }
+    ],
+    "providers/oauth2": [],
+    "outposts/instances": [
+      {
+        "pk": "d3e5a7b9-0000-4000-8000-00000000e001",
+        "name": "embedded-outpost",
+        "type": "proxy",
+        "providers": [40, 41, 42],
+        "service_connection": null
+      }
+    ]
+  }
+}
