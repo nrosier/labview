@@ -1,5 +1,5 @@
-# FleetView configuration.
-# Copy to config.yml (or point FLEETVIEW_CONFIG at it) and tune to match your setup.
+# LabView configuration.
+# Copy to config.yml (or point LABVIEW_CONFIG at it) and tune to match your setup.
 # Every value here can also be overridden by an environment variable (see README).
 
 # Where your per-container stacks live. Each immediate subdirectory that contains
@@ -14,11 +14,16 @@ composeFilenames:
   - docker-compose.yml
   - docker-compose.yaml
 
-# Enrich compose config with live data from the Docker Engine when the socket is
-# reachable. Safe to leave on: if the socket is missing the scan degrades to
+# Enrich compose config with live data from the Docker Engine when it is
+# reachable. Safe to leave on: if Docker is unreachable the scan degrades to
 # config-only automatically.
 docker:
   enabled: true
+  # Connect via the docker-socket-proxy over TCP (recommended; matches compose.yml).
+  host: dockerproxy
+  port: 2375
+  # To talk to a mounted unix socket directly instead, set host to "" (empty)
+  # and point socketPath at the socket:
   socketPath: /var/run/docker.sock
 
 # Secret handling. Values of env keys matching these patterns are masked in the

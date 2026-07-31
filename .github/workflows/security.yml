@@ -1,0 +1,172 @@
+name: Security Checks
+
+# Adapted from the ghostbudget template for this monorepo (all code lives in
+# labview/). Changes from the original:
+#   * npm steps run in ./labview and use --omit=dev (the modern --production);
+#   * the ESLint "lint-security" job is replaced by CodeQL static analysis —
+#     this project has no ESLint config, and CodeQL provides deeper JS/TS
+#     security scanning;
+#   * a Trivy filesystem scan is added (dependency vulns + Dockerfile misconfig
+#     + secrets), alongside the existing Trivy image scan;
+#   * the Docker image is built from ./labview.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'labview/**'
+      - '.github/workflows/security.yml'
+  pull_request:
+    paths:
+      - 'labview/**'
+      - '.github/workflows/security.yml'
+  schedule:
+    # Daily full scan (runs regardless of the path filters above).
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labview
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: labview/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: npm audit (all deps, informational)
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+      - name: npm audit (production deps, gating)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Check for outdated packages
+        run: npm outdated || true
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"
+
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy (vuln, misconfig, secrets)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'labview'
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs.sarif'
+          category: 'trivy-fs'
+
+  docker-security:
+    name: Docker Image Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t labview:test ./labview
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'labview:test'
+          format: 'sarif'
+          output: 'trivy-image.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Upload results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-image.sarif'
+          category: 'trivy-image'
+
+  secret-scanning:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ''
+          head: HEAD
+          extra_args: --only-verified
+        continue-on-error: true

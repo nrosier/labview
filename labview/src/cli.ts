@@ -1,6 +1,6 @@
 /**
  * CLI: scan once and print the Overview as JSON.
- *   FLEETVIEW_APPS_ROOT=./fixtures/apps npm run scan
+ *   LABVIEW_APPS_ROOT=./fixtures/apps npm run scan
  *   npm run scan -- --summary
  */
 import { loadConfig } from "./config.js";
@@ -13,7 +13,7 @@ const overview = await buildOverview(cfg, new Date());
 
 if (summary) {
   const { stats, meta } = overview;
-  console.log(`FleetView scan @ ${meta.scannedAt} (${meta.durationMs}ms)`);
+  console.log(`LabView scan @ ${meta.scannedAt} (${meta.durationMs}ms)`);
   console.log(`  apps root:        ${meta.appsRoot}`);
   console.log(`  docker:           ${meta.dockerAvailable ? "available" : `unavailable (${meta.dockerError})`}`);
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);

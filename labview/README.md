@@ -1,4 +1,4 @@
-# FleetView
+# LabView
 
 A self-hosted overview of a Docker-Compose homelab. Point it at the directory
 where your per-container stacks live (`/mnt/apps/<container>/compose.yml`, with
@@ -16,8 +16,9 @@ It is built for a specific, common TrueNAS Scale pattern:
   (`authentik@docker`), or via **OAuth/OIDC** or **LDAP** wired through a
   service's environment.
 
-FleetView reads all of that from your compose files, optionally enriches it with
-live state from the Docker socket, and never needs an agent inside each app.
+LabView reads all of that from your compose files, optionally enriches it with
+live state from the Docker API (via the socket proxy), and never needs an agent
+inside each app.
 
 ---
 
@@ -51,17 +52,24 @@ ship with an icon and label, never color alone.
 ## Quick start (local)
 
 ```bash
-cd fleetview
+cd labview
 npm install
 npm run build            # bundles the web UI + compiles the server
-FLEETVIEW_APPS_ROOT=/path/to/your/apps npm start
+LABVIEW_APPS_ROOT=/path/to/your/apps npm start
 # open http://localhost:8080
+```
+
+Running locally (no socket proxy), point LabView at your own Docker socket for
+live state — otherwise it degrades cleanly to config-only:
+
+```bash
+LABVIEW_APPS_ROOT=/path/to/your/apps LABVIEW_DOCKER_SOCKET=/var/run/docker.sock npm start
 ```
 
 Just want a one-shot report on the terminal (no server)?
 
 ```bash
-FLEETVIEW_APPS_ROOT=/path/to/your/apps npm run scan -- --summary
+LABVIEW_APPS_ROOT=/path/to/your/apps npm run scan -- --summary
 ```
 
 Live-reloading development:
@@ -74,51 +82,72 @@ npm run dev              # esbuild --watch for the UI + tsx server with reload
 
 ## Deploy on TrueNAS Scale
 
-FleetView runs as one more container next to the apps it inspects. It mounts your
-stacks **read-only** and (optionally) the Docker socket **read-only** for live
-state — it never writes to either.
+LabView runs as one more container next to the apps it inspects. It mounts your
+stacks **read-only** and reads live Docker state through the shared
+**docker-socket-proxy** (over TCP) — it never touches the raw socket and never
+writes anything.
 
-1. Copy this `fleetview/` directory to your box, e.g. to
-   `/mnt/apps/fleetview/`.
+**Prerequisites** (already present in this homelab): the external `proxy` and
+`dockerproxy` networks and the `dockerproxy` (tecnativa/docker-socket-proxy)
+stack. LabView only needs the proxy's read endpoints
+(`CONTAINERS`, `NETWORKS`, `VOLUMES`, `IMAGES`, `INFO`, `PING`).
+
+1. Copy this `labview/` directory to your box, e.g. to
+   `/mnt/apps/labview/`.
 2. Review [`compose.yml`](compose.yml) — the defaults mount `/mnt/apps` →
-   `/data/apps:ro` and the docker socket read-only, and publish port `8080`.
+   `/data/apps:ro`, reach Docker via `tcp://dockerproxy:2375`, join the `proxy`
+   and `dockerproxy` networks, and publish port `8459` (8080 is too common on a
+   homelab).
 3. Deploy it one of two ways:
    - **Apps → Custom App → Install via YAML**, pasting the compose file, or
-   - drop it at `/mnt/apps/fleetview/compose.yml` and run
+   - drop it at `/mnt/apps/labview/compose.yml` and run
      `docker compose up -d` (it builds the image locally).
 
 ```yaml
 services:
-  fleetview:
+  labview:
     build: .
-    container_name: fleetview
+    container_name: labview
     restart: unless-stopped
     environment:
-      FLEETVIEW_APPS_ROOT: /data/apps
-      FLEETVIEW_DOCKER_SOCKET: /var/run/docker.sock
-      FLEETVIEW_PORT: "8080"
+      LABVIEW_APPS_ROOT: /data/apps
+      LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375   # via the socket proxy
+      LABVIEW_PORT: "8080"
     volumes:
       - /mnt/apps:/data/apps:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro   # remove to run config-only
     ports:
-      - "8080:8080"
+      - "8459:8080"
+    networks:
+      - default
+      - proxy
+      - dockerproxy
+
+networks:
+  proxy:
+    external: true
+  dockerproxy:
+    external: true
 ```
+
+To run **config-only** (no live state), set `LABVIEW_DOCKER_ENABLED: "false"`
+and drop the `dockerproxy` network.
 
 ### Put it behind your own edge (recommended)
 
-FleetView has **no built-in authentication** — it exposes your topology and
+LabView has **no built-in authentication** — it exposes your topology and
 (masked) config, so don't publish it raw. Expose it the same way as your other
 apps by adding labels; [`compose.yml`](compose.yml) has a ready-to-adapt example
 for **Traefik + Authentik forward-auth** and/or **DockFlare**:
 
 ```yaml
     labels:
-      traefik.enable: "true"
-      traefik.http.routers.fleetview.rule: "Host(`fleet.example.com`)"
-      traefik.http.routers.fleetview.entrypoints: "websecure"
-      traefik.http.routers.fleetview.tls: "true"
-      traefik.http.routers.fleetview.middlewares: "authentik@docker"
-      traefik.http.services.fleetview.loadbalancer.server.port: "8080"
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.labview.rule=Host(`labview.example.com`)"
+      - "traefik.http.routers.labview.entrypoints=websecure"
+      - "traefik.http.routers.labview.tls.certresolver=cloudflare"
+      - "traefik.http.routers.labview.middlewares=authentik@docker"
+      - "traefik.http.services.labview.loadbalancer.server.port=8080"
 ```
 
 ---
@@ -127,18 +156,20 @@ for **Traefik + Authentik forward-auth** and/or **DockFlare**:
 
 Everything works out of the box. To tune, copy
 [`config.example.yml`](config.example.yml) to `config.yml` (or point
-`FLEETVIEW_CONFIG` at it). Environment variables override the file:
+`LABVIEW_CONFIG` at it). Environment variables override the file:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FLEETVIEW_APPS_ROOT` | `/data/apps` | Root directory of your stacks |
-| `FLEETVIEW_DOCKER_ENABLED` | `true` | Enrich with live Docker state |
-| `FLEETVIEW_DOCKER_SOCKET` | `/var/run/docker.sock` | Docker socket path |
-| `FLEETVIEW_PORT` | `8080` | HTTP port |
-| `FLEETVIEW_HOST` | `0.0.0.0` | Bind address |
-| `FLEETVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
-| `FLEETVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
-| `FLEETVIEW_CONFIG` | `config.yml` | Path to a config file |
+| `LABVIEW_APPS_ROOT` | `/data/apps` | Root directory of your stacks |
+| `LABVIEW_DOCKER_ENABLED` | `true` | Enrich with live Docker state |
+| `LABVIEW_DOCKER_HOST` | `tcp://dockerproxy:2375` | Docker API endpoint (socket proxy). Accepts `tcp://host:port`, `host:port`, or a `unix://`/absolute socket path |
+| `LABVIEW_DOCKER_PORT` | `2375` | Proxy port (when host has no port) |
+| `LABVIEW_DOCKER_SOCKET` | *(unset)* | Use a mounted socket directly instead of the proxy |
+| `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
+| `LABVIEW_HOST` | `0.0.0.0` | Bind address |
+| `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
+| `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
+| `LABVIEW_CONFIG` | `config.yml` | Path to a config file |
 
 The config file also controls the secret key-patterns, the DockFlare/Traefik
 label prefixes, and the Authentik detection hints — see the comments in
@@ -179,7 +210,8 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 
 ### Security
 
-- Stacks and the Docker socket are mounted **read-only**; FleetView only reads.
+- Stacks are mounted **read-only** and Docker is reached through the
+  **socket-proxy** with read-only endpoints only; LabView never writes.
 - Secret-looking env values (`*PASS*`, `*SECRET*`, `*TOKEN*`, `*KEY*`, …) are
   **masked** in both the API and UI by default. Keys stay visible; values are
   replaced with a placeholder.
@@ -206,7 +238,7 @@ src/
   scan/       discover + compose/.env parsing
   labels/     dockflare, traefik, authentik derivation
   analyze/    two-pass pipeline, middleware registry, graph, stats
-  enrich/     docker socket snapshot (dockerode)
+  enrich/     docker snapshot via the socket-proxy (dockerode)
   model/      types.ts — the shared backend⇄frontend contract
   server/     fastify server + static hosting
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
@@ -226,7 +258,8 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 
 - Reads Compose stacks laid out as `appsRoot/<stack>/compose.yml`. Swarm and
   Kubernetes manifests are out of scope.
-- Live state (status, health, IPs) requires the Docker socket; without it the
+- Live state (status, health, IPs) requires access to the Docker API (via the
+  socket proxy); without it the
   scan degrades cleanly to config-only.
 - Auth detection is heuristic and label/env-driven; it reports the evidence so
   you can verify each conclusion.

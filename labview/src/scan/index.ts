@@ -1,10 +1,10 @@
-import type { FleetViewConfig } from "../config.js";
+import type { LabViewConfig } from "../config.js";
 import type { AppStack } from "../model/types.js";
 import { discoverStacks } from "./discover.js";
 import { parseStack } from "./compose.js";
 
 /** Discover and parse every stack under the configured apps root. */
-export function scanStacks(cfg: FleetViewConfig): { stacks: AppStack[]; warnings: string[] } {
+export function scanStacks(cfg: LabViewConfig): { stacks: AppStack[]; warnings: string[] } {
   const warnings: string[] = [];
   const discovered = discoverStacks(cfg);
   if (discovered.length === 0) {

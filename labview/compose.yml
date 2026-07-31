@@ -1,40 +1,56 @@
-# Deploy FleetView on TrueNAS Scale (Apps -> Custom App -> "Install via YAML",
-# or drop this in /mnt/apps/fleetview/compose.yml and run `docker compose up -d`).
+# Deploy LabView on TrueNAS Scale (Apps -> Custom App -> "Install via YAML",
+# or drop this in /mnt/apps/labview/compose.yml and run `docker compose up -d`).
 #
-# It mounts your stacks read-only and the docker socket read-only for live state.
+# Live Docker state is read through the shared docker-socket-proxy (tcp://dockerproxy:2375)
+# — LabView never touches the raw socket. Your app stacks are mounted read-only.
+#
+# Prerequisites (already present in this homelab): the external `proxy` and
+# `dockerproxy` networks, and the `dockerproxy` (tecnativa/docker-socket-proxy)
+# stack. LabView only needs read endpoints (CONTAINERS/NETWORKS/VOLUMES/IMAGES/INFO/PING).
 services:
-  fleetview:
+  labview:
     build: .
     # Or use a prebuilt image once you publish one:
-    # image: ghcr.io/you/fleetview:latest
-    container_name: fleetview
+    # image: docker.io/YOUR_DOCKERHUB_USERNAME/labview:latest  # published by .github/workflows/docker-image.yml
+    container_name: labview
     restart: unless-stopped
     environment:
-      FLEETVIEW_APPS_ROOT: /data/apps
-      FLEETVIEW_DOCKER_SOCKET: /var/run/docker.sock
-      FLEETVIEW_PORT: "8080"
-      # FLEETVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
+      LABVIEW_APPS_ROOT: /data/apps
+      # Talk to the Docker API via the socket proxy instead of mounting the socket.
+      LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375
+      LABVIEW_PORT: "8080"
+      # LABVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
     volumes:
       # Your per-container stacks, read-only.
       - /mnt/apps:/data/apps:ro
-      # Docker socket, read-only, for live enrichment. Remove to run config-only.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       # Optional tuned config:
-      # - /mnt/apps/fleetview/config.yml:/config/config.yml:ro
+      # - /mnt/apps/labview/config.yml:/config/config.yml:ro
     ports:
-      - "8080:8080"
+      # 8080 is very common on a homelab; publish LabView on an uncommon port.
+      # (Not needed at all if you only reach it through Traefik below.)
+      - "8459:8080"
+    networks:
+      - default
+      - proxy         # reach it through Traefik / expose via DockFlare
+      - dockerproxy   # reach the docker-socket-proxy for live state
 
-    # --- Example: put FleetView behind YOUR stack (Traefik + Authentik) ---
+    # --- Example: put LabView behind YOUR stack (Traefik + Authentik) ---
     # Uncomment and adapt to expose it locally with SSO, matching your other apps.
     # labels:
-    #   traefik.enable: "true"
-    #   traefik.http.routers.fleetview.rule: "Host(`fleet.example.com`)"
-    #   traefik.http.routers.fleetview.entrypoints: "websecure"
-    #   traefik.http.routers.fleetview.tls: "true"
-    #   traefik.http.routers.fleetview.middlewares: "authentik@docker"
-    #   traefik.http.services.fleetview.loadbalancer.server.port: "8080"
+    #   - "traefik.enable=true"
+    #   - "traefik.docker.network=proxy"
+    #   - "traefik.http.routers.labview.rule=Host(`labview.bunbun.be`)"
+    #   - "traefik.http.routers.labview.entrypoints=websecure"
+    #   - "traefik.http.routers.labview.tls.certresolver=cloudflare"
+    #   - "traefik.http.routers.labview.middlewares=authentik@docker"
+    #   - "traefik.http.services.labview.loadbalancer.server.port=8080"
     #   # And/or publish it through the Cloudflare tunnel via DockFlare:
-    #   dockflare.enable: "true"
-    #   dockflare.hostname: "fleet.example.com"
-    #   dockflare.service: "http://fleetview:8080"
-    #   dockflare.access.policy: "authenticate"
+    #   - "dockflare.enable=true"
+    #   - "dockflare.hostname=labview.bunbun.be"
+    #   - "dockflare.service=http://labview:8080"
+
+networks:
+  proxy:
+    external: true
+  dockerproxy:
+    external: true

@@ -27,14 +27,15 @@ COPY --from=build /app/web/dist ./web/dist
 COPY package.json ./
 COPY config.example.yml ./
 
-# The web root and apps root are configurable; these are the container defaults.
-ENV FLEETVIEW_APPS_ROOT=/data/apps \
-    FLEETVIEW_DOCKER_SOCKET=/var/run/docker.sock \
-    FLEETVIEW_PORT=8080
+# Container defaults. Live Docker state is read via the docker-socket-proxy over
+# TCP by default (see compose.yml); set LABVIEW_DOCKER_SOCKET to use a socket.
+ENV LABVIEW_APPS_ROOT=/data/apps \
+    LABVIEW_DOCKER_HOST=tcp://dockerproxy:2375 \
+    LABVIEW_PORT=8080
 
 EXPOSE 8080
-# Run as an unprivileged user; mount the docker socket group-readable if you
-# want live enrichment (see README for the gid trick on TrueNAS).
+# Run as an unprivileged user. No socket mount is needed — the socket proxy
+# handles Docker access on its own network.
 USER node
 
 CMD ["node", "dist/index.js"]

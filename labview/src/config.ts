@@ -1,11 +1,16 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
-export interface FleetViewConfig {
+export interface LabViewConfig {
   appsRoot: string;
   composeFilenames: string[];
   docker: {
     enabled: boolean;
+    /** When set, connect over TCP (the docker-socket-proxy). Takes precedence
+     *  over socketPath. Empty string means "use the socket". */
+    host: string;
+    port: number;
+    /** Local unix socket, used only when host is empty. */
     socketPath: string;
   };
   secrets: {
@@ -27,10 +32,12 @@ export interface FleetViewConfig {
   server: { host: string; port: number };
 }
 
-const DEFAULTS: FleetViewConfig = {
+const DEFAULTS: LabViewConfig = {
   appsRoot: "/data/apps",
   composeFilenames: ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"],
-  docker: { enabled: true, socketPath: "/var/run/docker.sock" },
+  // Default to the tecnativa docker-socket-proxy (see compose.yml). Set host to
+  // "" (or LABVIEW_DOCKER_SOCKET) to talk to a mounted socket directly instead.
+  docker: { enabled: true, host: "dockerproxy", port: 2375, socketPath: "/var/run/docker.sock" },
   secrets: {
     maskValues: true,
     keyPatterns: ["PASS", "SECRET", "TOKEN", "KEY", "APIKEY", "CREDENTIAL", "PRIVATE", "SALT", "PEPPER", "DSN"],
@@ -62,21 +69,54 @@ function merge<T>(base: T, over: unknown): T {
   return out as T;
 }
 
-function applyEnvOverrides(cfg: FleetViewConfig): FleetViewConfig {
+/**
+ * Parse a Docker endpoint given in `DOCKER_HOST` style. Accepts
+ * `tcp://host:port`, `http://host:port`, `host:port`, a bare `host`,
+ * `unix:///path` or an absolute `/path`. TCP forms set host/port; socket forms
+ * set socketPath.
+ */
+function parseDockerTarget(value: string): { host?: string; port?: number; socketPath?: string } {
+  const v = value.trim();
+  if (!v) return {};
+  if (v.startsWith("unix://")) return { socketPath: v.slice("unix://".length) };
+  if (v.startsWith("/")) return { socketPath: v };
+  const stripped = v.replace(/^tcp:\/\//i, "").replace(/^https?:\/\//i, "");
+  const [host, port] = stripped.split(":");
+  return { host, port: port ? Number(port) : 2375 };
+}
+
+function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   const env = process.env;
-  if (env.FLEETVIEW_APPS_ROOT) cfg.appsRoot = env.FLEETVIEW_APPS_ROOT;
-  if (env.FLEETVIEW_DOCKER_SOCKET) cfg.docker.socketPath = env.FLEETVIEW_DOCKER_SOCKET;
-  if (env.FLEETVIEW_DOCKER_ENABLED) cfg.docker.enabled = env.FLEETVIEW_DOCKER_ENABLED !== "false";
-  if (env.FLEETVIEW_PORT) cfg.server.port = Number(env.FLEETVIEW_PORT);
-  if (env.FLEETVIEW_HOST) cfg.server.host = env.FLEETVIEW_HOST;
-  if (env.FLEETVIEW_CACHE_TTL) cfg.cacheTtlSeconds = Number(env.FLEETVIEW_CACHE_TTL);
-  if (env.FLEETVIEW_MASK_SECRETS) cfg.secrets.maskValues = env.FLEETVIEW_MASK_SECRETS !== "false";
+  if (env.LABVIEW_APPS_ROOT) cfg.appsRoot = env.LABVIEW_APPS_ROOT;
+  // LABVIEW_DOCKER_HOST (DOCKER_HOST style) selects the TCP proxy; a socket-style
+  // value clears host so socketPath is used instead.
+  if (env.LABVIEW_DOCKER_HOST) {
+    const t = parseDockerTarget(env.LABVIEW_DOCKER_HOST);
+    if (t.socketPath) {
+      cfg.docker.socketPath = t.socketPath;
+      cfg.docker.host = "";
+    } else {
+      if (t.host) cfg.docker.host = t.host;
+      if (t.port) cfg.docker.port = t.port;
+    }
+  }
+  if (env.LABVIEW_DOCKER_PORT) cfg.docker.port = Number(env.LABVIEW_DOCKER_PORT);
+  // An explicit socket path always wins and disables the TCP host.
+  if (env.LABVIEW_DOCKER_SOCKET) {
+    cfg.docker.socketPath = env.LABVIEW_DOCKER_SOCKET;
+    cfg.docker.host = "";
+  }
+  if (env.LABVIEW_DOCKER_ENABLED) cfg.docker.enabled = env.LABVIEW_DOCKER_ENABLED !== "false";
+  if (env.LABVIEW_PORT) cfg.server.port = Number(env.LABVIEW_PORT);
+  if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;
+  if (env.LABVIEW_CACHE_TTL) cfg.cacheTtlSeconds = Number(env.LABVIEW_CACHE_TTL);
+  if (env.LABVIEW_MASK_SECRETS) cfg.secrets.maskValues = env.LABVIEW_MASK_SECRETS !== "false";
   return cfg;
 }
 
-export function loadConfig(): FleetViewConfig {
-  const path = process.env.FLEETVIEW_CONFIG ?? "config.yml";
-  let cfg = merge(DEFAULTS, {}) as FleetViewConfig;
+export function loadConfig(): LabViewConfig {
+  const path = process.env.LABVIEW_CONFIG ?? "config.yml";
+  let cfg = merge(DEFAULTS, {}) as LabViewConfig;
   if (existsSync(path)) {
     try {
       const raw = parseYaml(readFileSync(path, "utf8")) ?? {};

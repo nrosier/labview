@@ -6,7 +6,7 @@ import type {
   IngressKind,
   ScanMeta,
 } from "../model/types.js";
-import type { FleetViewConfig } from "../config.js";
+import type { LabViewConfig } from "../config.js";
 import { parseDockflare } from "../labels/dockflare.js";
 import { parseTraefik } from "../labels/traefik.js";
 import { deriveAuth } from "../labels/authentik.js";
@@ -19,7 +19,7 @@ import { scanStacks } from "../scan/index.js";
 const VERSION = "0.1.0";
 
 /** Full pipeline: scan -> enrich -> analyze -> Overview. `now` is injected for determinism. */
-export async function buildOverview(cfg: FleetViewConfig, now: Date): Promise<Overview> {
+export async function buildOverview(cfg: LabViewConfig, now: Date): Promise<Overview> {
   const started = Date.now();
   const { stacks, warnings } = scanStacks(cfg);
   const snapshot = await snapshotDocker(cfg);
@@ -64,7 +64,7 @@ export async function buildOverview(cfg: FleetViewConfig, now: Date): Promise<Ov
  * Authentik even though the string "authentik" never appears. Learns from any
  * service running the goauthentik image or defining the outpost forward-auth.
  */
-function discoverAuthentikHints(stacks: AppStack[], cfg: FleetViewConfig): string[] {
+function discoverAuthentikHints(stacks: AppStack[], cfg: LabViewConfig): string[] {
   const hints = new Set(cfg.labels.authentik.hostHints.map((h) => h.toLowerCase()));
   for (const stack of stacks) {
     for (const svc of stack.services) {
@@ -84,7 +84,7 @@ function discoverAuthentikHints(stacks: AppStack[], cfg: FleetViewConfig): strin
 }
 
 /** Pass 1: parse DockFlare/Traefik labels, merge docker state, classify ingress. */
-function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cfg: FleetViewConfig): void {
+function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cfg: LabViewConfig): void {
   svc.cloudflare = parseDockflare(svc.labels, cfg.labels.dockflare.prefix);
   svc.traefik = parseTraefik(svc.labels, cfg.labels.traefik.prefix);
 
@@ -100,7 +100,7 @@ function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cf
 /** Pass 2: derive auth posture, finalize exposure, then mask secrets. */
 function finalizeAuth(
   svc: Service,
-  cfg: FleetViewConfig,
+  cfg: LabViewConfig,
   registry: MiddlewareRegistry,
   authHints: string[],
 ): void {

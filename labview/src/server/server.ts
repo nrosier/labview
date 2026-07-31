@@ -3,7 +3,7 @@ import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
-import type { FleetViewConfig } from "../config.js";
+import type { LabViewConfig } from "../config.js";
 import type { Overview } from "../model/types.js";
 import { buildOverview } from "../analyze/index.js";
 
@@ -17,8 +17,8 @@ interface Cache {
   inflight: Promise<Overview> | null;
 }
 
-export async function startServer(cfg: FleetViewConfig): Promise<void> {
-  const app = Fastify({ logger: { level: process.env.FLEETVIEW_LOG_LEVEL ?? "info" } });
+export async function startServer(cfg: LabViewConfig): Promise<void> {
+  const app = Fastify({ logger: { level: process.env.LABVIEW_LOG_LEVEL ?? "info" } });
   const cache: Cache = { overview: null, builtAt: 0, inflight: null };
 
   async function getOverview(force: boolean): Promise<Overview> {
@@ -56,7 +56,7 @@ export async function startServer(cfg: FleetViewConfig): Promise<void> {
   } else {
     app.get("/", async (_req, reply) => {
       reply.type("text/html").send(
-        "<h1>FleetView</h1><p>Web UI not built. Run <code>npm run build:web</code>. API is at <code>/api/overview</code>.</p>",
+        "<h1>LabView</h1><p>Web UI not built. Run <code>npm run build:web</code>. API is at <code>/api/overview</code>.</p>",
       );
     });
   }
@@ -65,5 +65,5 @@ export async function startServer(cfg: FleetViewConfig): Promise<void> {
   getOverview(true).catch((err) => app.log.error(err, "initial scan failed"));
 
   await app.listen({ host: cfg.server.host, port: cfg.server.port });
-  app.log.info(`FleetView scanning ${cfg.appsRoot}`);
+  app.log.info(`LabView scanning ${cfg.appsRoot}`);
 }

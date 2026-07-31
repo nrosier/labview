@@ -1,5 +1,5 @@
 {
-  "name": "fleetview",
+  "name": "labview",
   "version": "0.1.0",
   "private": true,
   "description": "Scans homelab docker compose stacks (DockFlare / Traefik / Authentik) and serves a structured overview website.",

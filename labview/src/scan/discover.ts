@@ -1,6 +1,6 @@
 import { readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { FleetViewConfig } from "../config.js";
+import type { LabViewConfig } from "../config.js";
 
 export interface DiscoveredStack {
   id: string;
@@ -13,7 +13,7 @@ export interface DiscoveredStack {
  * Find every immediate subdirectory of `appsRoot` that contains a compose file.
  * Layout expected: `<appsRoot>/<container>/compose.yml` (+ optional `.env`).
  */
-export function discoverStacks(cfg: FleetViewConfig): DiscoveredStack[] {
+export function discoverStacks(cfg: LabViewConfig): DiscoveredStack[] {
   const root = cfg.appsRoot;
   if (!existsSync(root)) return [];
 

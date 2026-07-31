@@ -1,0 +1,101 @@
+name: Dependabot Auto-merge
+
+# Auto-approves and enables auto-merge for Dependabot patch & minor updates once
+# required status checks pass. Major updates are left for manual review.
+#
+# Adapted from the ghostbudget template with two fixes for this repo:
+#   * the scheduled sweep no longer requires an "automerge" label (this repo's
+#     dependabot.yml does not apply one) and detects major bumps by comparing the
+#     version in the PR title instead of grepping for the word "major" (Dependabot
+#     titles never contain it, so the old check skipped nothing);
+#   * merges use --squash for a single tidy commit per update.
+#
+# Requires "Allow auto-merge" enabled in the repo settings, and branch protection
+# on main with the Docker/security checks marked as required (see repo notes).
+
+on:
+  pull_request_target:
+  workflow_dispatch:
+  schedule:
+    # Daily sweep for any Dependabot PRs opened before this workflow existed.
+    - cron: '23 9 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Approve & enable auto-merge
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request_target' && github.actor == 'dependabot[bot]' }}
+    steps:
+      # No checkout: we only call the API, never execute PR code, so running with
+      # write permissions on pull_request_target is safe here.
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve patch & minor updates
+        if: ${{ steps.meta.outputs.update-type != 'version-update:semver-major' }}
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch & minor updates
+        if: ${{ steps.meta.outputs.update-type != 'version-update:semver-major' }}
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Leave a note on major updates
+        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-major' }}
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "🚧 Major version update (\`${{ steps.meta.outputs.dependency-names }}\` → ${{ steps.meta.outputs.new-version }}). Auto-merge is **not** enabled — please review and merge manually." \
+            || true
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sweep:
+    name: Sweep pending Dependabot PRs
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Enable auto-merge on pending non-major PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$REPO" --author "app/dependabot" --state open \
+            --json number,title --limit 100 > prs.json
+          echo "Found $(jq 'length' prs.json) open Dependabot PR(s)."
+          jq -c '.[]' prs.json | while read -r pr; do
+            num=$(jq -r '.number' <<<"$pr")
+            title=$(jq -r '.title' <<<"$pr")
+            # Grouped PRs only contain minor/patch updates by config, so they are safe.
+            if echo "$title" | grep -qiE '\bgroup\b'; then
+              major=false
+            else
+              from_major=$(echo "$title" | grep -oiE 'from v?[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+              to_major=$(echo "$title" | grep -oiE 'to v?[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+              if [ -n "$from_major" ] && [ -n "$to_major" ] && [ "$from_major" != "$to_major" ]; then
+                major=true
+              else
+                major=false
+              fi
+            fi
+            if [ "$major" = "true" ]; then
+              echo "PR #$num: major update — skipping (manual review)."
+              continue
+            fi
+            echo "PR #$num: enabling auto-merge."
+            gh pr merge "$num" --repo "$REPO" --auto --squash \
+              || echo "  (auto-merge already enabled, or not yet mergeable)"
+          done

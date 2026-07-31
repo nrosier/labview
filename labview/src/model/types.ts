@@ -1,5 +1,5 @@
 /**
- * FleetView normalized model.
+ * LabView normalized model.
  *
  * These types are the single contract between the scanner/analyzer (backend) and
  * the web UI (frontend). The frontend imports this file directly, so keep it free

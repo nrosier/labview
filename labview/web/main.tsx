@@ -10,7 +10,7 @@ import { AppDetail } from "./components/AppDetail";
 import { GraphView } from "./components/GraphView";
 
 type Theme = "light" | "dark" | "auto";
-const THEME_KEY = "fleetview-theme";
+const THEME_KEY = "labview-theme";
 
 interface Flat {
   stack: AppStack;
@@ -159,7 +159,7 @@ function App() {
       <header class="topbar">
         <div class="brand">
           <span class="dot">●</span>
-          <h1>FleetView</h1>
+          <h1>LabView</h1>
         </div>
         <div class="meta">
           <span class="mono">{ov.meta.appsRoot}</span>

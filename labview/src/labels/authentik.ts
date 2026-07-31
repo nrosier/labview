@@ -1,5 +1,5 @@
 import type { Service, AuthPosture, AuthMethod, EnvVar } from "../model/types.js";
-import type { FleetViewConfig } from "../config.js";
+import type { LabViewConfig } from "../config.js";
 import type { MiddlewareRegistry } from "../analyze/middlewares.js";
 
 interface Detection {
@@ -18,7 +18,7 @@ interface Detection {
  */
 export function deriveAuth(
   service: Service,
-  cfg: FleetViewConfig,
+  cfg: LabViewConfig,
   registry: MiddlewareRegistry,
   hostHints: string[],
 ): AuthPosture {

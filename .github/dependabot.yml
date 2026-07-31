@@ -1,0 +1,50 @@
+# Dependabot keeps LabView's npm deps, its Docker base image, and the GitHub
+# Actions used by these workflows up to date. Minor/patch bumps are grouped to
+# cut PR noise and are auto-merged by dependabot-auto-merge.yml once CI passes;
+# major bumps come as individual PRs for manual review.
+version: 2
+updates:
+  # --- LabView Node dependencies -----------------------------------------
+  - package-ecosystem: npm
+    directory: /labview
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:30"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      # One PR for all non-major updates.
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # --- Dockerfile base image (node:22-alpine) ------------------------------
+  - package-ecosystem: docker
+    directory: /labview
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:45"
+    labels:
+      - dependencies
+      - docker
+
+  # --- The GitHub Actions used by these workflows --------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-all:
+        update-types:
+          - minor
+          - patch

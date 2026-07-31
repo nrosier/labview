@@ -12,9 +12,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fixturesRoot = resolve(here, "..", "fixtures", "apps");
 
 // Configure via env BEFORE importing config.
-process.env.FLEETVIEW_APPS_ROOT = fixturesRoot;
-process.env.FLEETVIEW_DOCKER_ENABLED = "false";
-process.env.FLEETVIEW_CONFIG = "___none___"; // force defaults
+process.env.LABVIEW_APPS_ROOT = fixturesRoot;
+process.env.LABVIEW_DOCKER_ENABLED = "false";
+process.env.LABVIEW_CONFIG = "___none___"; // force defaults
 
 const { loadConfig } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
@@ -38,7 +38,7 @@ function svc(stackId: string, serviceName: string) {
   return s;
 }
 
-console.log("FleetView smoke test\n");
+console.log("LabView smoke test\n");
 
 console.log("discovery");
 check("found 5 stacks", ov.stats.stacks === 5, `got ${ov.stats.stacks}`);
