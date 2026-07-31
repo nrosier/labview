@@ -54,8 +54,8 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
 | **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
 | **Ingress classification** | Every service resolves to `public`, `public+host-port`, `public+local`, `local`, `host-port`, or `internal`. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
-| **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` by the provider's API, `observed` in the config, or only `inferred` from a name. |
-| **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts, matches each application to a service by the provider's internal host, a shared hostname or the slug, and reports what Authentik says. This finds gates configured only in Authentik — and, more usefully, the reverse: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
+| **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
+| **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — and then says what moved, beside `scanned <time>`: `+1 stack, 2 services changed`, hover for the names. When nothing moved it says **`no config changes`**, so "LabView re-read everything and your files are the same" is never confused with "LabView didn't look". |
@@ -236,13 +236,22 @@ proves a hop, the graph draws `tunnel → proxy → service`. When nothing prove
 the direct edge stays and the service says why the hop is unknown.
 
 Two things compose files genuinely cannot tell you. The first is whether a gate
-defined in Authentik is actually standing in the request path. Give LabView a read-only
-Authentik token and it asks. Each application is matched to a service only on
-addressed evidence — a proxy provider's internal host resolving to that service, a
-launch or redirect URL naming a hostname the service serves, or a slug pointing at
-exactly one service — and anything ambiguous is reported as unmatched rather than
-guessed. Then the provider's account replaces the inference: `confirmed` instead of
-`observed`, the provider named, and a proxy or LDAP provider with no outpost
+defined in Authentik is actually standing in the request path — and for OIDC, whether
+there is a gate at all: an OAuth2 application leaves no trace in the compose file, so
+the identity provider is the only place it can be seen. Give LabView a read-only
+Authentik token and it asks. Each application is tied to a service by one of four
+things: a proxy provider's internal host resolving to that service; a bare-name host
+inside a URL the provider hands out, such as a redirect URI `http://app:3000/callback`
+naming the container itself — the rule that reaches a service with no public hostname
+at all; a hostname both the application's URLs and the service's labels declare; or,
+last, a name — the slug, the application name or a provider name — when it identifies
+exactly one service, compared with separators removed and with the words naming the
+mechanism dropped, so `Provider for ledger` finds `ledger` and `Home Assistant` finds
+`home-assistant`. Anything that could name two services names neither and is reported
+as unmatched rather than guessed. A match made by name alone reports `observed` rather
+than `confirmed` and says so in the detail, because a posture resting on a name should
+not read like one resting on a resolved address. Then the provider's account replaces
+the inference: the provider named, and a proxy or LDAP provider with no outpost
 assigned reported as protecting nothing, because nothing is in the path to enforce
 it. Without a token this stage does not run and no request is made.
 

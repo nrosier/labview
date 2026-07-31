@@ -1,0 +1,20 @@
+# The service a too-short name must not be allowed to claim.
+#
+# Two-character names are everywhere in a fleet and identify nothing: `db`, `ui`, `ha`.
+# An Authentik provider named "DB Provider" leaves exactly `db` once the mechanism
+# word is dropped, and if a residue that short were allowed to match, this database
+# would be reported as protected by an OIDC provider belonging to some unrelated
+# application — the kind of false comfort the whole matcher exists to avoid.
+#
+# So this stack must stay unmatched, and the application (`s01`, "OAuth Application")
+# must stay in `unmatchedApplications`: its name is nothing but mechanism words, which
+# leaves no residue at all.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    networks:
+      - default

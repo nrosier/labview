@@ -1,0 +1,24 @@
+# Matched by the *provider's* name, once the mechanism words are dropped.
+#
+# Authentik's own wizard names a provider after what it is rather than what it
+# protects — "Provider for ledger" here — so the words that survive that pattern are
+# the only part naming a service. Dropping the mechanism vocabulary (`provider`,
+# `for`, `oidc`, …) leaves `ledger`, which is this stack and this service.
+#
+# Nothing else reaches it: the slug is `fin-01`, the application name is "Finance
+# app" (whose only generic word is `app`, leaving `finance`), and the provider has no
+# redirect URI, no launch URL and no hostname.
+#
+# The published port is the point of the case. The scan sees a container answering on
+# a host port with no gate declared anywhere, which reads as exposed; the API's record
+# is what says otherwise. Because the tie is a name, it is reported at `observed` and
+# the detail says so — the reader can then decide whether they believe the name.
+services:
+  ledger:
+    image: example/ledger:3.4.1
+    container_name: ledger
+    restart: unless-stopped
+    ports:
+      - "8642:8080"
+    networks:
+      - default

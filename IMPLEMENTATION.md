@@ -264,15 +264,54 @@ discovered endpoint is a guess, and a guess must never be handed a credential. O
 a candidate that *did* answer, a 401/403 is conclusive — the token is wrong, so
 later candidates are not tried and nothing further is sent.
 
-**Matching (step 10).** An application is tied to a service only by something
-addressed, in descending order of strength:
+**Matching (step 10).** Neither side carries the other's identifier, so a match must
+come from something both sides name independently. Four such things exist, tried in
+descending order of strength:
 
-1. A proxy provider's `internal_host` resolved through the same `lookupAddress`
+1. **A proxy provider's `internal_host`**, resolved through the same `lookupAddress`
    used for tunnel origins — the provider naming its own target.
-2. A URL the application publishes (launch URL, or an OAuth2 redirect URI) whose
-   hostname is one the service declares in a DockFlare or Traefik label.
-3. The application slug, when it equals exactly one service's stack, compose or
-   container name.
+2. **A bare-name host inside a URL the provider hands out** — a launch URL, an
+   `external_host`, or an OAuth2 redirect URI — resolved through the fleet index.
+   `http://app:3000/oauth/callback` is not a coincidence of wording; it is a pointer,
+   and compose publishes that name as the container's network alias. This is the rule
+   that reaches a service with no public hostname, which for OIDC is the common case.
+3. **A hostname** named by one of those same URLs and declared by the service in a
+   DockFlare or Traefik label — one hostname, observed on both sides.
+4. **A name** — the application slug, the application name, or any of its providers'
+   names — when it identifies exactly one service's stack, compose or container name.
+
+Rules 1–3 are *addressed*: the provider points at the service. Rule 4 is only that the
+operator chose similar words on each side. That difference is recorded per match in
+`AuthentikMatch.strength` (`"address" | "hostname" | "name"`) and is what makes a
+name-only tie report at `observed` rather than `confirmed` — see **Confidence** below.
+
+Rule 2 resolves **only** a name host. An IP literal in a redirect URI addresses the
+*host*, and on a host running a reverse proxy the standard ports belong to the proxy,
+so reading it through the published-port table would attach the application to
+whatever answers on 443 — worse than no answer, and the same reason
+`lookupContainerAddress` refuses to read a container IP as a published port.
+
+Rule 4 compares three forms, narrowing only when the wider one found nobody: the name
+as written, the name with separators removed, and the name with the words naming the
+*mechanism* removed as well (`GENERIC_NAME_TOKENS` — protocol and English words only,
+nothing fleet-specific, and `authentik` deliberately absent). Authentik's own wizard
+names providers `Provider for X`, and an operator writing `Home Assistant` means the
+`home-assistant` stack. Three constraints keep this from inventing matches:
+
+- **Separate raw and tight indexes.** Adding the looser forms must never take away a
+  match the exact form already had; merged into one map, a stack `foo-bar` and a
+  service `foobar` would collide into a contested key and both be discarded.
+- **The first form with any entry decides**, and a contested entry decides *against* a
+  match. Falling through from a contested key to a looser one would be arbitrating
+  ambiguity, and could not help anyway — every looser form pools at least the same
+  services.
+- **`MIN_DERIVED_KEY = 3`.** A one- or two-character residue carries no information; a
+  provider named `DB` would otherwise pin an application to whichever service happens
+  to be short.
+
+Generic-token stripping is applied to the **Authentik side only**. A service literally
+named `authentik-proxy` means that, and stripping `proxy` from it would invent a
+collision with the identity provider's own stack.
 
 Each rule requires **exactly one** candidate; an ambiguous match is discarded and
 the application reported as unmatched. Three details are easy to get wrong and all
@@ -302,6 +341,28 @@ integration: in the admin UI such an application looks complete.
 
 LDAP and SCIM are **backchannel** providers, so `backchannel_providers_obj` must be
 read as well as `provider_obj` — reading only the latter misses every LDAP gate.
+
+A provider Authentik records is taken as **being in use** by the service it matched.
+For OAuth2 that is the whole of the available evidence: no outpost is involved, and the
+application's own client configuration lives in the application, not in the compose
+file, so there is nothing in the scan to corroborate it with. The identity provider's
+own record is the authority on its own configuration. On a fleet where no service
+declares an OIDC environment key at all, this is the only way an OIDC gate can be seen.
+
+**Confidence follows the match, not the provider.** What the provider's record cannot
+establish is *which* service it belongs to, so `AuthentikMatch.strength` sets the
+confidence of the derived posture:
+
+| Strength | How the tie was made | Confidence |
+|---|---|---|
+| `address` | rules 1–2 — the provider points at this service | `confirmed` |
+| `hostname` | rule 3 — one hostname both sides declare | `confirmed` |
+| `name` | rule 4 — similar words on each side | `observed`, and the detail says `— tied to this service by name alone` |
+
+This is deliberately visible in the UI and the payload, and it changes **no** posture
+roll-up: `AuthMethod` precedence sorts by mechanism before confidence, and
+`hasEdgeAuth`/`exposedWithoutAuth` do not read confidence at all (§3.7). A weaker tie
+therefore reads as weaker without moving a service between "protected" and "exposed".
 
 **Where the results go.** `svc.authentik` carries the matched applications for the
 drawer. `labels/auth.ts` merges the API's account with the label-derived one by
@@ -638,6 +699,16 @@ truthful one — plus a note saying what was missing. `AuthPosture.evidence` exi
 so a reader can check the derivation, and `AuthPosture.confidence` exists so they
 can tell a fact from a guess without re-deriving it.
 
+The identity provider's API is itself an observation, and the one place where a
+*name* is allowed to establish anything: Authentik's records carry no compose
+identifier, so for a service whose gate leaves no trace in any file — an OIDC
+application is the standard case — a name is the only bridge that exists (§3.5,
+rule 4). Two things keep this inside the invariant rather than outside it. An
+ambiguous name resolves to nothing, so no service is ever *assigned* a gate on a
+guess. And a tie made by name is reported at `observed` with the wording naming
+the weakness, so the reader can tell it from an addressed match without re-deriving
+it — which is exactly what `confidence` is for.
+
 ### I2 — No fleet-specific identifiers in shipped artifacts
 
 Defaults, doc comments, example configs, UI copy and fixtures use
@@ -647,6 +718,11 @@ Defaults, doc comments, example configs, UI copy and fixtures use
 This includes UI copy: a stat tile may say "tunnel route", not "Cloudflare" — the
 routes' own labels say which tunnel, and a fleet using none should not be told
 otherwise by a hard-coded caption.
+
+It also bounds the one word list in the analyzer, `GENERIC_NAME_TOKENS` (§3.5): protocol
+names and English connectives only. No application name, vendor or image belongs in it —
+that would be recognising a fleet rather than reading it. `authentik` is absent for the
+same reason in reverse: a stack named after the identity provider means that service.
 
 ### I3 — Mechanism and provider are separate conclusions
 
@@ -879,18 +955,30 @@ the UI colour it as infrastructure. Nothing else reads it, and no service is eve
 least once, or of having answered as the proxy's own API.
 
 **AuthMethod / AuthConfidence** — see §4 I3. Three levels, strongest first:
-`confirmed` means the identity provider's API reported the gate; `observed` means a
-value in the scanned config states it; `inferred` means the method rests on a
-middleware *name* because no definition was found in any scanned stack, and it also
-produces a service note saying so. When two accounts of one service disagree, the
-higher rank is reported and the lower is kept in `evidence`.
+`confirmed` means the identity provider's API reported the gate *and* named the service
+it belongs to; `observed` means a value in the scanned config states it, or the API
+reported the gate but could only tie it to the service by name
+(`AuthentikMatchStrength`); `inferred` means the method rests on a middleware *name*
+because no definition was found in any scanned stack, and it also produces a service
+note saying so. When two accounts of one service disagree, the higher rank is reported
+and the lower is kept in `evidence`.
 
 **AuthentikMatch / AuthentikApplication / AuthentikProvider** — what the provider's
-API said about a service, attached as `svc.authentik` (§3.5). `evidence` records
-*why* the application was tied to this service, so a wrong match is visible rather
-than silent. A provider carries `kind` (normalized), `rawKind` (Authentik's own
-`verbose_name`, so an unmodelled provider type is still readable), `backchannel`,
-and `outposts` — the names of the outposts serving it, empty when none is.
+API said about a service, attached as `svc.authentik` (§3.5). Its three arrays are
+parallel — index `i` of `applications`, `evidence` and `strength` describes the same
+match. `evidence` records *why* the application was tied to this service, so a wrong
+match is visible rather than silent. A provider carries `kind` (normalized), `rawKind`
+(Authentik's own `verbose_name`, so an unmodelled provider type is still readable),
+`backchannel`, and `outposts` — the names of the outposts serving it, empty when none
+is.
+
+**AuthentikMatchStrength** — `"address" | "hostname" | "name"`: what kind of thing
+established the tie, per match. An *address* is the provider pointing at the service; a
+*hostname* is one name both sides declare independently; a *name* is only that the
+operator chose similar words on each side. Load-bearing rather than cosmetic — it sets
+the reported confidence (§3.5), because a posture resting on a name should not read the
+same as one resting on a resolved address. Absent is treated as `name`, the weakest
+reading, never the strongest.
 
 **Enforcement vs existence** — a provider existing is not a gate existing.
 `providerEnforces` decides: proxy/ldap/radius need at least one outpost, oauth2 and
@@ -1179,20 +1267,26 @@ isolates one rule so an assertion cannot pass by accident through another path:
 | `idp` | the provider itself: discovery must use the **target** port of `9443:9000`, not the published one, since the stub answers only on 9000 |
 | `authentik-outpost` | a candidate that looks like Authentik by image but serves no API. Sorts before `idp`, so it is probed first and must be *skipped* — and must never receive the token |
 | `wiki` | rule 1 (provider `internal_host`), a per-user `meta_launch_url` that must not be matched on, `confirmed` outranking the label-derived `observed`, and the tunnel-bypasses-the-outpost note |
-| `docs` | rule 2 on a hostname declared in **both** DockFlare and Traefik labels (the dedupe); object-form `redirect_uris`; a backchannel SCIM provider listed but not treated as a gate |
-| `metrics` | rule 2 via a redirect URI in the newline-delimited-string form, from page 2 of the paginated response |
-| `vault` | rule 3 (slug), and a backchannel LDAP provider found with its outpost |
-| `pair` | a slug naming a two-service stack: unmatched, not arbitrated |
+| `docs` | rule 3 on a hostname declared in **both** DockFlare and Traefik labels (the dedupe); object-form `redirect_uris`; a backchannel SCIM provider listed but not treated as a gate |
+| `metrics` | rule 3 via a redirect URI in the newline-delimited-string form, from page 2 of the paginated response |
+| `notebook` | rule 2: no labels, no hostname, reachable **only** by a redirect URI naming the container (`http://notebook:8888/…`) — an OIDC gate that appears in no label and no env key |
+| `vault` | rule 4 (slug), a backchannel LDAP provider found with its outpost, and the posture reported one step down (`observed`) for resting on a name |
+| `home-assistant` | rule 4 by the *application name*, across differing separators: `Home Assistant` → the `home-assistant` stack |
+| `ledger` | rule 4 by a *provider* name, once the mechanism words are dropped: `Provider for ledger` → `ledger`. Reported `observed` with `— tied to this service by name alone` |
+| `db` | the `MIN_DERIVED_KEY` guard: a provider named `DB Provider` reduces to a two-character residue and must claim nothing, leaving the service `method: "none"` |
+| `pair` | a slug **and** a provider name each naming a two-service stack: unmatched, not arbitrated. The provider is an OIDC one so an arbitrated match would visibly claim a gate on the winner |
 | `orphan` | a proxy provider **no outpost serves** — matched, reported unprotected, reason on the service, and no bypass note for a gate that stands nowhere |
 | `reports` | a SAML gate: `method: "none"` yet **not** exposed-without-auth, provider quoted verbatim |
-| (api payload) | `broad-app`, whose only URL is a `forward_domain` `external_host` equal to the provider's own hostname — must stay unmatched rather than attach to `idp` |
+| (api payload) | `broad-app`, whose only URL is a `forward_domain` `external_host` equal to the provider's own hostname — must stay unmatched rather than attach to `idp`. `ext-01`, whose redirect URI is an **IP literal** on a port `idp` publishes — must not be resolved through the published-port table (rule 2's guard) |
 
 Four runs over that root assert the behaviours that are not about one stack:
 discovery + token; a configured URL (nothing else is probed); no token (zero
 requests, no error); and a throwing `fetchImpl` (reported, not raised, fleet still
 analyzed). The exposed-without-auth count is asserted **with and without** the API
 in the same run, so the integration's contribution is measured rather than assumed —
-that pair is what fails if any match rule regresses.
+that pair is what fails if any match rule regresses. Two of the gates in that gap are
+OIDC ones that appear in no label and no environment key, so the difference is the whole
+of what reading the provider buys.
 
 **`fixtures/traefik`** — a fleet built so the labels and the live routing table
 disagree in every way that matters, driven against `fixtures/traefik-api.json`
@@ -1396,7 +1490,21 @@ explicitly and update the token guidance in `config.example.yml` and both README
 candidate. Before adding one, ask what it would do to a fleet where two services
 plausibly satisfy it — if the answer is "pick one", the rule does not belong. Give
 it a fixture whose other rules cannot fire, so the assertion tests the new rule
-rather than an existing one.
+rather than an existing one. Three further obligations:
+
+- **Return a `strength`.** Ask what the rule actually proves: that the provider points
+  at this service (`address`), that both sides name one hostname (`hostname`), or that
+  the words resemble each other (`name`). Getting this wrong misreports confidence,
+  which is the one thing a reader uses to tell a fact from a guess.
+- **Resolve addresses in the right space.** Host addresses go through `lookupAddress`,
+  container addresses through `lookupContainerAddress`, and the two must not be crossed
+  (§3.4). A rule reading a URL must decide which space the host is in *before*
+  resolving; on a host running a reverse proxy, port 443 belongs to the proxy.
+- **Widen the name forms, not the token list.** If a naming convention is unmatched,
+  prefer another *normalization* (a form comparable on both sides) over another word in
+  `GENERIC_NAME_TOKENS`, which is bounded by I2. And add a fixture for the guard, not
+  just the rule: a fixture proving the rule fires is half the contract, one proving it
+  *declines* on an ambiguous or degenerate name is the other half.
 
 **Read another endpoint from the reverse proxy API.** Add it to `snapshotTraefik`'s
 sequence in `enrich/traefik.ts`, tolerant of every field being absent, returning a
@@ -1490,9 +1598,20 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   is invisible. Provider types beyond proxy/oauth2 are read from the application's
   embedded `provider_obj` only, so their type-specific fields (a SAML ACS URL, for
   instance) are not available for matching.
-- **An unmatchable application is reported, not resolved.** On a fleet whose
-  hostnames live only in the identity provider and never in a compose label, expect
-  several unmatched. The fix is a matching label or slug, not a looser rule.
+- **An unmatchable application is reported, not resolved.** Four rules (§3.5) is not
+  every naming convention an operator might use, and an application whose slug, name,
+  provider names and URLs all resemble two services equally is discarded on purpose. So
+  expect some unmatched, and read `meta.authentik.unmatchedApplications` as the list of
+  gates LabView can see but cannot place. The fix is a name or a redirect URI that
+  agrees with the compose file, not a looser rule: every loosening trades a visible gap
+  for an invisible wrong answer.
+- **A name match cannot be verified, only reported.** Rule 4 rests on the operator
+  having named things consistently. Two independently-named services could satisfy it
+  the same way and only one be right — the matcher can tell that *two* candidates exist
+  and decline, but not that a single candidate is the wrong one. That is what the
+  `observed` confidence and the "by name alone" wording are for; a fleet where it
+  matters should give the application a redirect URI naming the container, which moves
+  the same match up to rule 2.
 - **A connection phase describes the answer, not the network.** It is derived from
   one error object or one response, so it can name the stage that failed and the
   likely fix, but it cannot tell a firewall from a stopped container, and dockerode's
@@ -1548,6 +1667,12 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. Revisit if the palette gains a colour. |
 | `forward_domain` external hosts are not matched on | In that mode `external_host` is the authentication domain shared by every application in it, usually the provider's own hostname. Matching it attaches unrelated gates to whichever service serves the SSO domain — which is the identity provider itself, so the error inflates the protected count. |
 | The hostname index dedupes by service key | A service fronted by both a tunnel and a reverse proxy declares the same hostname in both label sets. Those are two statements about one service; counting them as rival candidates makes the commonest configuration in a fleet unmatchable. |
+| A redirect URI's bare-name host is resolved as an address; an IP literal is not | `http://app:3000/oauth/callback` is the provider pointing at a container, and compose publishes that name as the container's network alias — a pointer, not a resemblance. An IP literal in the same field addresses the *host*, where port 443 belongs to the reverse proxy, so resolving it through the published-port table would attach the application to whatever answers there. Confidently wrong beats unmatched here, which is why the guard is not an optimisation. |
+| A name may establish a match, but the posture is reported one step down | On a fleet where no service declares an OIDC environment key, a name is the only bridge between an OAuth2 application and the service it gates — refusing names means never reporting OIDC at all. But a name is the operator having chosen similar words twice, not an address, and the reader needs to see which of the two they are looking at. `observed` plus "tied to this service by name alone" says it without weakening the finding into uselessness, and no roll-up reads confidence, so nothing moves between "protected" and "exposed". |
+| Mechanism words are stripped from the Authentik side only | Authentik's wizard names providers `Provider for X`, so those words have to be removable for a name to be comparable at all. On the fleet side they are meaningful: a service named `authentik-proxy` *is* that, and stripping `proxy` would invent a collision with the identity provider's own stack. The list is protocol and English words only (I2). |
+| Two name indexes — as declared, and with separators removed | One merged map makes a stack `foo-bar` and a service `foobar` collide into a contested key, so both are discarded and the *exact* match is lost to the existence of the looser one. Kept apart, adding a looser form can only ever add reach. The first form with any entry decides, and a contested one decides against a match: falling through would be arbitrating, and cannot help anyway, since every looser form pools at least the same services. |
+| A three-character floor on a derived name | `DB Provider` reduces to `db`, which would pin an application to whichever service happens to be short. A two-character residue is not a name, it is a coincidence with a small search space. |
+| An OAuth2 provider Authentik records is taken as being in use | No outpost is involved, and the client configuration lives in the application rather than in any compose file, so there is nothing in the scan to corroborate it with — the identity provider's own record is the whole of the available evidence, and it is authoritative about its own configuration. Requiring a second source would mean an OIDC gate is never reportable, which is the gap this integration exists to close. |
 | The reverse proxy API is on by default, unlike the identity provider's | The Authentik read cannot happen without a credential the operator must create, so it stays off until they do. The Traefik read needs none in the intended setup — an unpublished container-network entrypoint — so requiring opt-in would mean most fleets never get the one check that catches a label claiming a gate the proxy is not applying. The cost of it being on and finding nothing is one failed connection and a reason string. |
 | An Authentik API token is not accepted as a proxy credential | It cannot work. A proxy provider validates HTTP Basic by driving the OAuth2 machine-to-machine flow with those credentials, which needs an **app password**; an API token authenticates to Authentik's own REST API and nothing else. The reserved username `goauthentik.io/token` (2023.2+) is the supported way to use a token, and it is a username choice, not a second mechanism. Accepting a token silently would produce a 401 the operator could only debug by reading this table. |
 | The credential is never sent to a discovered endpoint on the strength of its looking like a proxy | A discovered address is a guess (§3.5's rule, applied again). Two things earn a credential: the operator typing the URL, or the scan proving the hostname belongs to the service whose own labels declare `api@internal`. Everything else gets the unauthenticated probe and nothing more. |

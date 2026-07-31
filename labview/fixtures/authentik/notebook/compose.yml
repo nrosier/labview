@@ -1,0 +1,24 @@
+# Matched by the address inside an OIDC redirect URI, and by nothing else.
+#
+# This is the case the compose file cannot report on its own. An OIDC gate lives in
+# the application's own client configuration, not in a label and not in an env key
+# this service declares, so the scan sees a container published straight onto a host
+# port with no gate anywhere — `exposedWithoutAuth`. The identity provider's record
+# is the only place the gate exists, and the only thing tying that record to *this*
+# container is the host inside the redirect URI: `http://notebook:8888/...` is the
+# provider addressing a container by the DNS alias compose gives it.
+#
+# Deliberately unreachable by every other rule, so the match proves that one:
+# no proxy provider and so no internal host, no launch URL, no hostname declared for
+# either the tunnel or the proxy, a slug (`nb-app`) that collapses to two characters
+# once the mechanism word is dropped, an application name ("Lab notebook") matching
+# no stack or service, and a provider name ("Research OIDC") matching none either.
+services:
+  notebook:
+    image: example/notebook:7.2.0
+    container_name: notebook
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    networks:
+      - default

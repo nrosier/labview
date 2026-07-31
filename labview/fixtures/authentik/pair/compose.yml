@@ -1,14 +1,16 @@
-# An application whose slug identifies a stack, not a service.
+# An application whose names identify a stack, not a service.
 #
-# The stub's application `pair` has no provider, no launch URL and no redirect URI,
-# so the slug is the only thing left to match on — and it names this directory, which
-# holds two services. Either one could be the application's target and nothing
-# observable says which.
+# The stub's application `pair` has no launch URL and no redirect URI, so names are
+# all that is left to match on — and both the slug and its provider ("Provider for
+# pair", which reduces to `pair` once the mechanism words are dropped) name this
+# directory, which holds two services. Either one could be the application's target
+# and nothing observable says which.
 #
 # The outcome must be no match at all, reported as an unmatched application. The
 # alternative — picking the first candidate — would move a service between
 # "protected" and "exposed" on the strength of a coin toss, which is the one error
-# this matcher is built to avoid.
+# this matcher is built to avoid. The provider is an OIDC one precisely so that a
+# match arbitrated between the two would visibly claim a gate on the winner.
 services:
   blue:
     image: example/app:3.0.0

@@ -17,7 +17,17 @@
     "`mode` on a proxy provider changes what `external_host` means: in forward_single",
     "and proxy mode it is the application's own hostname, but in forward_domain mode it",
     "is the authentication domain shared by every application in that domain — pk 12 is",
-    "here to prove that one is not matched on."
+    "here to prove that one is not matched on.",
+    "",
+    "The OIDC applications on page 2 each exercise exactly one matching rule and are",
+    "unreachable by the others, so a reverted rule leaves a service unmatched rather",
+    "than merely matched for a different reason: `nb-app` only by the container name",
+    "inside a redirect URI, `ha-portal` only by the application name once separators",
+    "are normalized, `fin-01` only by its provider name once the mechanism words are",
+    "dropped. `s01` (provider \"DB Provider\", a two-character residue) and `ext-01` (a",
+    "redirect URI on an IP literal, whose port the identity provider publishes) must",
+    "match nothing, and pk 22 gives the ambiguous `pair` application a provider so a",
+    "match arbitrated between its two services would visibly claim a gate."
   ],
 
   "root/config": {
@@ -155,8 +165,15 @@
         "name": "Paired app",
         "slug": "pair",
         "group": "",
-        "provider": null,
-        "provider_obj": null,
+        "provider": 22,
+        "provider_obj": {
+          "pk": 22,
+          "name": "Provider for pair",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
         "backchannel_providers": [],
         "backchannel_providers_obj": [],
         "launch_url": null,
@@ -194,6 +211,106 @@
         "provider_obj": {
           "pk": 21,
           "name": "Metrics OIDC",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-000000000009",
+        "name": "Lab notebook",
+        "slug": "nb-app",
+        "group": "Operations",
+        "provider": 23,
+        "provider_obj": {
+          "pk": 23,
+          "name": "Research OIDC",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-00000000000a",
+        "name": "Home Assistant",
+        "slug": "ha-portal",
+        "group": "",
+        "provider": 24,
+        "provider_obj": {
+          "pk": 24,
+          "name": "Household OIDC",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-00000000000b",
+        "name": "Finance app",
+        "slug": "fin-01",
+        "group": "Business",
+        "provider": 25,
+        "provider_obj": {
+          "pk": 25,
+          "name": "Provider for ledger",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-00000000000c",
+        "name": "OAuth Application",
+        "slug": "s01",
+        "group": "",
+        "provider": 26,
+        "provider_obj": {
+          "pk": 26,
+          "name": "DB Provider",
+          "component": "ak-provider-oauth2-form",
+          "verbose_name": "OAuth2/OpenID Provider",
+          "verbose_name_plural": "OAuth2/OpenID Providers",
+          "meta_model_name": "authentik_providers_oauth2.oauth2provider"
+        },
+        "backchannel_providers": [],
+        "backchannel_providers_obj": [],
+        "launch_url": null,
+        "meta_launch_url": "",
+        "policy_engine_mode": "any"
+      },
+      {
+        "pk": "b21c0a1e-0001-4000-8000-00000000000d",
+        "name": "External IdP client",
+        "slug": "ext-01",
+        "group": "",
+        "provider": 27,
+        "provider_obj": {
+          "pk": 27,
+          "name": "Edge OIDC",
           "component": "ak-provider-oauth2-form",
           "verbose_name": "OAuth2/OpenID Provider",
           "verbose_name_plural": "OAuth2/OpenID Providers",
@@ -281,6 +398,80 @@
         "client_id": "metrics-dash",
         "client_type": "confidential",
         "redirect_uris": "https://metrics.example.com/oauth2/callback\nhttps://metrics.example.com/logout",
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 22,
+        "name": "Provider for pair",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "pair-client",
+        "client_type": "confidential",
+        "redirect_uris": [],
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 23,
+        "name": "Research OIDC",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "nb-client",
+        "client_type": "confidential",
+        "redirect_uris": "http://notebook:8888/oauth/callback",
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 24,
+        "name": "Household OIDC",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "ha-client",
+        "client_type": "confidential",
+        "redirect_uris": [],
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 25,
+        "name": "Provider for ledger",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "ledger-client",
+        "client_type": "confidential",
+        "redirect_uris": [],
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 26,
+        "name": "DB Provider",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "s01-client",
+        "client_type": "confidential",
+        "redirect_uris": [],
+        "sub_mode": "hashed_user_id"
+      },
+      {
+        "pk": 27,
+        "name": "Edge OIDC",
+        "component": "ak-provider-oauth2-form",
+        "verbose_name": "OAuth2/OpenID Provider",
+        "verbose_name_plural": "OAuth2/OpenID Providers",
+        "meta_model_name": "authentik_providers_oauth2.oauth2provider",
+        "client_id": "ext-client",
+        "client_type": "confidential",
+        "redirect_uris": [
+          { "matching_mode": "strict", "url": "http://198.51.100.10:9443/oauth/callback" }
+        ],
         "sub_mode": "hashed_user_id"
       }
     ]

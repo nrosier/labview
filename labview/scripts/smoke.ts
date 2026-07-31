@@ -710,7 +710,7 @@ const aSvc = lookup(ak);
 const akMeta = ak.meta.authentik!;
 
 console.log("\nendpoint discovery");
-check("found 9 stacks", ak.stats.stacks === 9, `got ${ak.stats.stacks}`);
+check("found 13 stacks", ak.stats.stacks === 13, `got ${ak.stats.stacks}`);
 check(
   "the endpoint is discovered from the fleet, not configured",
   akMeta.endpointSource === "discovered" && akMeta.endpoint === AK_ORIGIN,
@@ -748,8 +748,8 @@ check(
 
 console.log("\nwhat was read");
 check(
-  "8 applications across 2 pages, 8 providers, 2 outposts",
-  akMeta.applications === 8 && akMeta.providers === 8 && akMeta.outposts === 2,
+  "13 applications across 2 pages, 14 providers, 2 outposts",
+  akMeta.applications === 13 && akMeta.providers === 14 && akMeta.outposts === 2,
   `${akMeta.applications}/${akMeta.providers}/${akMeta.outposts}`,
 );
 check(
@@ -757,7 +757,7 @@ check(
   discovered.calls.some((c) => c.url.includes("core/applications") && c.url.includes("page=2")),
   discovered.calls.filter((c) => c.url.includes("core/applications")).map((c) => c.url).join(" "),
 );
-check("6 of 8 applications matched a service", akMeta.matchedServices === 6, String(akMeta.matchedServices));
+check("9 of 13 applications were placed, on 9 distinct services", akMeta.matchedServices === 9, String(akMeta.matchedServices));
 
 console.log("\nmatch 1: the provider names the service (internal host)");
 const akWiki = aSvc("wiki", "wiki");
@@ -801,7 +801,44 @@ check(
   akWiki.notes.join(" | "),
 );
 
-console.log("\nmatch 2: a hostname both sides name");
+console.log("\nmatch 2: an address inside a URL the provider hands out");
+const notebook = aSvc("notebook", "notebook");
+check(
+  "a redirect URI naming a container matches the container it names",
+  notebook.authentik?.applications[0]?.slug === "nb-app",
+  notebook.authentik?.applications.map((a) => a.slug).join(",") ?? "no match",
+);
+check(
+  "...on the address, not on a resemblance between two names",
+  notebook.authentik?.evidence[0]?.includes("points at notebook") ?? false,
+  notebook.authentik?.evidence.join(" | ") ?? "",
+);
+// The whole case for reading the API. This service declares no hostname for either the
+// tunnel or the proxy, references no middleware and carries no OIDC env key — the gate
+// exists only in the identity provider's records, and the container answers on a host
+// port, so without them it reads as reachable by anyone.
+check(
+  "an OIDC gate no file mentions is what stops a published port reading as exposed",
+  notebook.ingress === "host-port" &&
+    notebook.auth.method === "authentik-oauth" &&
+    notebook.auth.exposedWithoutAuth === false,
+  `${notebook.ingress}/${notebook.auth.method} exposed=${notebook.auth.exposedWithoutAuth}`,
+);
+check(
+  "...and an addressed tie is reported as confirmed",
+  notebook.auth.confidence === "confirmed",
+  notebook.auth.confidence,
+);
+// An IP literal in a redirect URI addresses the *host*, so resolving it through the
+// published-port table pins the application to whatever publishes that port — here the
+// identity provider itself, on 9443. Declining the form is the only safe reading.
+check(
+  "a redirect URI on an IP literal is not resolved through the published-port table",
+  akMeta.unmatchedApplications.includes("ext-01") && aSvc("idp", "server").authentik === undefined,
+  `${akMeta.unmatchedApplications.join(",")} ${JSON.stringify(aSvc("idp", "server").authentik)}`,
+);
+
+console.log("\nmatch 3: a hostname both sides name");
 const docs = aSvc("docs", "docs");
 check(
   "an application's launch URL matches a hostname the service serves",
@@ -857,7 +894,7 @@ check(
   metrics.authentik?.evidence.join(" | ") ?? "",
 );
 
-console.log("\nmatch 3: the slug, when it points at exactly one service");
+console.log("\nmatch 4: a name, when it points at exactly one service");
 const vault = aSvc("vault", "vault");
 check(
   "a slug equal to the stack/service name matches",
@@ -873,12 +910,66 @@ check(
   JSON.stringify(vault.authentik?.applications[0]?.providers),
 );
 check(
-  "...and it is the reported posture",
-  vault.auth.method === "authentik-ldap" && vault.auth.confidence === "confirmed",
+  "...and it is the reported posture, one step down for resting on a name",
+  vault.auth.method === "authentik-ldap" && vault.auth.confidence === "observed",
   `${vault.auth.method}/${vault.auth.confidence}`,
 );
 
-console.log("\nan ambiguous slug is discarded, not arbitrated");
+// Separators are the difference between the two names an operator would give the same
+// product: "Home Assistant" in the identity provider, `home-assistant` on disk. The
+// service and container are named something else again, so the stack directory is the
+// only thing this can reach, and the application's own name is the only candidate that
+// reaches it — the slug is `ha-portal` and the provider is "Household OIDC".
+const hass = aSvc("home-assistant", "hass");
+check(
+  "an application's name matches a stack whose separators differ",
+  hass.authentik?.applications[0]?.slug === "ha-portal" &&
+    (hass.authentik?.evidence[0]?.includes('its name "Home Assistant"') ?? false),
+  hass.authentik?.evidence.join(" | ") ?? "no match",
+);
+
+// Authentik's own wizard names providers after the mechanism, so the words that survive
+// that pattern are the only part naming a service.
+const ledger = aSvc("ledger", "ledger");
+check(
+  "a provider's name matches once the words naming the mechanism are dropped",
+  ledger.authentik?.applications[0]?.slug === "fin-01" &&
+    (ledger.authentik?.evidence[0]?.includes('the name of its oauth2 provider "Provider for ledger"') ??
+      false),
+  ledger.authentik?.evidence.join(" | ") ?? "no match",
+);
+// Why the strength is carried at all: this posture rests on two people having chosen the
+// same word, and it says so instead of reading like a resolved address.
+check(
+  "a gate found only by name is reported one step down and labelled as such",
+  ledger.auth.method === "authentik-oauth" &&
+    ledger.auth.confidence === "observed" &&
+    ledger.auth.detail.includes("by name alone"),
+  `${ledger.auth.method}/${ledger.auth.confidence} — ${ledger.auth.detail}`,
+);
+check(
+  "...while still counting as a gate, so its published port does not read as exposed",
+  ledger.ingress === "host-port" && ledger.auth.exposedWithoutAuth === false,
+  `${ledger.ingress} exposed=${ledger.auth.exposedWithoutAuth}`,
+);
+
+console.log("\na name too generic to identify anything matches nothing");
+// Two-character names are everywhere in a fleet and identify nobody. "DB Provider"
+// reduces to `db`; allow a residue that short and this database is reported as gated by
+// an OIDC provider belonging to an unrelated application.
+const shortName = aSvc("db", "db");
+check(
+  "a two-character residue does not claim the service it happens to equal",
+  shortName.authentik === undefined && shortName.auth.method === "none",
+  JSON.stringify(shortName.authentik),
+);
+check(
+  "...and a name that is nothing but mechanism words leaves the application unplaced",
+  akMeta.unmatchedApplications.includes("s01"),
+  akMeta.unmatchedApplications.join(","),
+);
+
+console.log("\nan ambiguous name is discarded, not arbitrated");
 check(
   "a slug naming a two-service stack matches neither",
   aSvc("pair", "blue").authentik === undefined && aSvc("pair", "green").authentik === undefined,
@@ -888,6 +979,13 @@ check(
   "...and is reported as an application LabView could not place",
   akMeta.unmatchedApplications.includes("pair"),
   akMeta.unmatchedApplications.join(","),
+);
+// Its provider reduces to the same contested name, and it is an OIDC one — so a match
+// arbitrated between the two services would visibly hand the winner a gate.
+check(
+  "...nor does its provider's name arbitrate between them",
+  aSvc("pair", "blue").auth.method === "none" && aSvc("pair", "green").auth.method === "none",
+  `${aSvc("pair", "blue").auth.method}/${aSvc("pair", "green").auth.method}`,
 );
 
 console.log("\na shared authentication domain identifies no single service");
@@ -902,8 +1000,15 @@ check(
 );
 check(
   "...leaving the application unplaced rather than misplaced",
-  akMeta.unmatchedApplications.includes("broad-app") &&
-    akMeta.unmatchedApplications.length === 2,
+  akMeta.unmatchedApplications.includes("broad-app"),
+  akMeta.unmatchedApplications.join(","),
+);
+// The four that must stay unplaced, and no fifth: every other application in the stub
+// is reachable by exactly one rule, so a rule that started matching too freely would
+// show up here as a shorter list.
+check(
+  "four applications in all, each for a stated reason",
+  akMeta.unmatchedApplications.slice().sort().join(",") === "broad-app,ext-01,pair,s01",
   akMeta.unmatchedApplications.join(","),
 );
 
@@ -973,7 +1078,7 @@ check(
 );
 check(
   "...reaching the same conclusions",
-  akCfg.meta.authentik?.matchedServices === 6,
+  akCfg.meta.authentik?.matchedServices === 9,
   String(akCfg.meta.authentik?.matchedServices),
 );
 
@@ -994,8 +1099,10 @@ check(
 );
 
 // The pair of numbers that shows what the API actually changed. Both must move: the
-// first because two gates only the API can see stop counting as absent, the second
-// because a label-only read cannot see them at all.
+// first because four gates only the API can see stop counting as absent, the second
+// because a label-only read cannot see them at all. Two of those four are OIDC gates
+// that appear in no label and no env key, so the gap is the whole of what reading the
+// provider buys.
 console.log("\nwhat the provider's records are worth");
 check(
   "with the API read, 4 services are reachable without auth",
@@ -1003,8 +1110,8 @@ check(
   String(ak.stats.exposedWithoutAuth),
 );
 check(
-  "...and 6 without it",
-  akOff.stats.exposedWithoutAuth === 6,
+  "...and 8 without it",
+  akOff.stats.exposedWithoutAuth === 8,
   String(akOff.stats.exposedWithoutAuth),
 );
 check(
@@ -1033,7 +1140,7 @@ check(
 );
 check(
   "...and the whole fleet is still analyzed from its labels",
-  akDown.stats.stacks === 9 && akDown.stats.services === 13,
+  akDown.stats.stacks === 13 && akDown.stats.services === 17,
   `${akDown.stats.stacks}/${akDown.stats.services}`,
 );
 authentikEnv({});

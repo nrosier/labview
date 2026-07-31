@@ -272,18 +272,35 @@ export interface AuthentikApplication {
 }
 
 /**
+ * How firmly an Authentik application was tied to a service.
+ *
+ * The distinction is load-bearing rather than cosmetic. An **address** is the
+ * provider pointing at the service — a proxy provider's internal host, or the host
+ * inside a URL the provider sends a browser or a token to. A **hostname** is one
+ * name both sides declare independently. A **name** is only that the operator chose
+ * similar words on each side, which is a good guess and nothing more. The reported
+ * confidence follows this, because a posture resting on a name should not read the
+ * same as one resting on a resolved address.
+ */
+export type AuthentikMatchStrength = "address" | "hostname" | "name";
+
+/**
  * The Authentik applications tied to one service, and how the tie was established.
  *
- * A match is only recorded when something addresses the same thing from both sides:
- * a proxy provider's internal host resolving to this service, a URL whose hostname
- * this service serves, or an application slug equal to its stack/service/container
- * name. A candidate that could refer to more than one service is discarded rather
- * than arbitrated, the same discipline `origins.ts` applies to a tunnel origin.
+ * A match is only recorded when something identifies the same thing from both sides:
+ * an address resolving to this service, a hostname this service is configured to
+ * serve, or a name equal to its stack/service/container name. A candidate that could
+ * refer to more than one service is discarded rather than arbitrated, the same
+ * discipline `origins.ts` applies to a tunnel origin.
+ *
+ * The three arrays are parallel — index `i` of each describes the same match.
  */
 export interface AuthentikMatch {
   applications: AuthentikApplication[];
   /** Why each application was tied to this service. */
   evidence: string[];
+  /** What kind of thing established each tie. */
+  strength: AuthentikMatchStrength[];
 }
 
 /**

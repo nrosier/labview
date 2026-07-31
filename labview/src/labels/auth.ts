@@ -3,6 +3,7 @@ import type {
   AuthPosture,
   AuthMethod,
   AuthConfidence,
+  AuthentikMatchStrength,
   AuthentikProvider,
   EnvVar,
   TraefikLiveMiddleware,
@@ -66,10 +67,13 @@ export function deriveAuth(
 
   // 1. The identity provider's own records, when its API answered. Only a provider
   //    that something actually serves is treated as a gate — see providerEnforces.
-  for (const app of service.authentik?.applications ?? []) {
+  for (const [i, app] of (service.authentik?.applications ?? []).entries()) {
+    // Parallel arrays, so the tie that placed this application is at the same index.
+    // Absent means the weakest reading, never the strongest.
+    const strength = service.authentik?.strength[i] ?? "name";
     for (const provider of app.providers) {
       apiEvidence.push(authentikEvidence(app.name, provider));
-      const d = classifyAuthentikProvider(app.name, provider);
+      const d = classifyAuthentikProvider(app.name, provider, strength);
       if (d) detections.push(d);
     }
   }
@@ -238,8 +242,19 @@ export function hasEnforcedAuthentikGate(service: Service): boolean {
  * unmodelled provider is real protection but has no method to report it as, so it
  * contributes evidence and counts toward the service being protected
  * (`hasEnforcedAuthentikGate`) without being mislabelled as a mechanism it is not.
+ *
+ * A provider Authentik records is taken as being in use — an OAuth2 provider needs no
+ * outpost and the application's own client configuration is not in the compose file to
+ * corroborate, so the identity provider's record is the whole of the evidence. What
+ * the record cannot establish is *which* service it belongs to, and `strength` is that:
+ * an addressed or hostname tie is `confirmed`, a tie resting only on similar names is
+ * `observed`, and the reason is spelled out so the reader can weigh it.
  */
-function classifyAuthentikProvider(appName: string, provider: AuthentikProvider): Detection | undefined {
+function classifyAuthentikProvider(
+  appName: string,
+  provider: AuthentikProvider,
+  strength: AuthentikMatchStrength,
+): Detection | undefined {
   if (!providerEnforces(provider)) return undefined;
 
   const method: AuthMethod | undefined =
@@ -253,11 +268,12 @@ function classifyAuthentikProvider(appName: string, provider: AuthentikProvider)
   if (!method) return undefined;
 
   const mode = provider.mode ? ` in \`${provider.mode}\` mode` : "";
+  const tie = strength === "name" ? " — tied to this service by name alone" : "";
   return {
     method,
-    detail: `Authentik ${provider.kind} provider "${provider.name}" for application "${appName}"${mode}, ${servedBy(provider)}`,
+    detail: `Authentik ${provider.kind} provider "${provider.name}" for application "${appName}"${mode}, ${servedBy(provider)}${tie}`,
     evidence: [authentikEvidence(appName, provider)],
-    confidence: "confirmed",
+    confidence: strength === "name" ? "observed" : "confirmed",
   };
 }
 

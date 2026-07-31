@@ -1,0 +1,21 @@
+# Matched by the application's *name*, once separators stop mattering.
+#
+# Operators name an application in Authentik after the product — "Home Assistant" —
+# and name the directory after the same product with a separator — `home-assistant`.
+# Neither string equals the other, and the slug here (`ha-portal`) equals nothing at
+# all, so before separators were normalized away this application had no service.
+#
+# The service name and container name are deliberately something else again (`hass`),
+# so the match can only come from the stack directory, and the application's name is
+# the only candidate that reaches it: the slug misses, the provider name ("Household
+# OIDC") misses, and there is no URL of any kind to resolve or compare.
+#
+# Being a name match, the posture it produces is reported at `observed` rather than
+# `confirmed` — similar wording on both sides is a good guess, not an address.
+services:
+  hass:
+    image: example/home-assistant:2024.10
+    container_name: hass
+    restart: unless-stopped
+    networks:
+      - default

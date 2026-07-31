@@ -470,19 +470,45 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   comes back `confirmed`. When two accounts disagree the stronger one is reported
   and the weaker is kept as evidence beneath it, so you can see both.
 - **The Authentik API, when a token is given, is read as evidence like any other.**
-  Applications, providers and outposts are fetched, then each application is
-  matched to a service only on something addressed:
+  Applications, providers and outposts are fetched, then each application is tied to
+  a service by one of four things, strongest first:
   1. a proxy provider's `internal_host` resolving to exactly one service — the
      provider naming its target outright, and the strongest evidence available;
-  2. a launch URL or OAuth2 redirect URI whose hostname is one the service is
-     configured to serve, per its DockFlare or Traefik labels;
-  3. the application slug, when it equals exactly one service's stack, compose or
-     container name — operator-chosen on both sides, so it is the last resort.
+  2. a **bare-name host inside a URL the provider hands out** — a launch URL, an
+     external host, or an OAuth2 redirect URI — resolving to exactly one service.
+     `http://app:3000/oauth/callback` is the provider addressing a container, and
+     compose publishes that name as the container's network alias. This is what
+     reaches a service with **no public hostname at all**, which for OIDC is the
+     normal case: an OIDC gate leaves no trace in the compose file, so the API is
+     the only place it can be seen;
+  3. a **hostname** named by one of those URLs *and* declared by the service in its
+     DockFlare or Traefik labels — one hostname, observed on both sides;
+  4. a **name** — the slug, the application name, or any of its providers' names —
+     when it identifies exactly one service's stack, compose or container name.
+     Compared with separators removed and with the words naming the mechanism
+     dropped, because Authentik's own wizard produces `Provider for X` and someone
+     writing `Home Assistant` means the `home-assistant` stack.
 
   Anything that could name two services names neither, and is reported as an
   unmatched application instead. `external_host` is used for matching except in
   `forward_domain` mode, where it is the authentication domain shared by every
-  application in it and so identifies no single service.
+  application in it and so identifies no single service. An **IP literal** in a
+  redirect URI is deliberately not resolved: it addresses the host, where port 443
+  belongs to the reverse proxy, so reading it as a published port would attach the
+  application to whatever answers there.
+- **How firmly the match was made is part of the answer.** Rules 1–3 are addressed —
+  the provider points at the service — and report `confirmed`. Rule 4 is only that the
+  operator chose similar words on each side, so it reports **`observed`** and the
+  detail ends `— tied to this service by name alone`. The gate itself is not in doubt;
+  which service owns it is, and the confidence says which of the two you are reading.
+  Give the application a redirect URI naming the container and the same match moves up
+  to rule 2. No exposure count reads confidence, so this never moves a service between
+  "protected" and "exposed".
+- **A provider Authentik records is taken as being in use.** An OAuth2 provider needs
+  no outpost, and the client configuration lives in the application rather than in any
+  compose file, so the identity provider's own record is the whole of the available
+  evidence — and it is authoritative about its own configuration. Requiring a second
+  source would mean an OIDC gate could never be reported at all.
 - **A provider only counts as protection if something is enforcing it.** Proxy,
   LDAP and RADIUS providers are enforced by an **outpost** standing in the request
   path; a provider assigned to no outpost stops nothing, however complete it looks
@@ -725,9 +751,14 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   still reads as protected — which it is — and a flow customization that weakens a
   gate is not visible.
 - An application LabView cannot tie to exactly one service is reported as unmatched
-  rather than guessed. In a fleet where hostnames live only in Authentik and never
-  in a compose label, expect several: the fix is a matching `dockflare.hostname` or
-  slug, not a looser rule.
+  rather than guessed, in `meta.authentik.unmatchedApplications` — the gates it can see
+  but cannot place. Four rules are not every naming convention, and an application whose
+  names and URLs fit two services equally is discarded on purpose, so expect some. The
+  fix is a name or a redirect URI that agrees with the compose file, not a looser rule:
+  every loosening trades a visible gap for an invisible wrong answer.
+- A name match cannot be verified, only reported. LabView can tell that *two*
+  candidates exist and decline; it cannot tell that a single candidate is the wrong
+  service. That is what `observed` and "by name alone" are for.
 - Traefik middlewares defined in a dynamic config **file** rather than in labels
   are invisible to the scan — a reference to one resolves to nothing, which is why
   the name-based fallback and the `inferred` confidence exist.
