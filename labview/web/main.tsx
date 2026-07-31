@@ -13,10 +13,11 @@ import { phaseText, shouldBanner } from "./model";
 import { diffStacks, scanDiffDetails, scanDiffText, type ScanDiff } from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
-import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
+import { fmtTime, ingressSummary, qualifyRouter, serviceKey } from "./lib/format";
 import { StatTile, DistributionBar, type DistSegment } from "./components/stats";
 import { StackCard } from "./components/StackCard";
 import { AppDetail } from "./components/AppDetail";
+import { AuthentikDetail, TraefikDetail } from "./components/ApiDetail";
 import { GraphView } from "./components/GraphView";
 
 type Theme = "light" | "dark" | "auto";
@@ -65,8 +66,13 @@ function authentikTitle(ak: AuthentikSummary): string {
     `${ak.matchedServices} services matched`,
   ];
   if (ak.unmatchedApplications.length) {
-    bits.push(`not matched to any service: ${ak.unmatchedApplications.join(", ")}`);
+    bits.push(
+      `not matched to any service: ${ak.unmatchedApplications
+        .map((u) => u.application.slug)
+        .join(", ")}`,
+    );
   }
+  bits.push("click for the matched and unmatched detail");
   if (ak.error) bits.push(ak.error);
   return bits.join("\n");
 }
@@ -91,8 +97,11 @@ function traefikTitle(tf: TraefikSummary): string {
     bits.push("entrypoint middlewares were not read, so a gate attached there is not accounted for");
   }
   if (tf.unmatchedRouters.length) {
-    bits.push(`not matched to any service: ${tf.unmatchedRouters.join(", ")}`);
+    bits.push(
+      `not matched to any service: ${tf.unmatchedRouters.map((u) => qualifyRouter(u.router)).join(", ")}`,
+    );
   }
+  bits.push("click for the matched and unmatched detail");
   if (tf.error) bits.push(tf.error);
   return bits.join("\n");
 }
@@ -180,6 +189,14 @@ function App() {
   const [exposedOnly, setExposedOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  /**
+   * Which integration's detail panel is open, if any.
+   *
+   * Separate from `selected` rather than folded into one "what is in the drawer" state:
+   * the two are opened from different places and closed in a defined order, and a single
+   * union would have to be unpacked at every use to say which of the two it is.
+   */
+  const [apiPanel, setApiPanel] = useState<"authentik" | "traefik" | null>(null);
 
   useEffect(() => {
     applyTheme(theme);
@@ -193,11 +210,17 @@ function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSelected(null);
+      if (e.key !== "Escape") return;
+      // One layer at a time, topmost first. Opening a service from a panel closes the
+      // panel, so the two are not normally both open — but the order is defined here
+      // rather than relying on that, since the cost of being wrong is a key that looks
+      // dead because it dismissed something behind what the reader was looking at.
+      if (apiPanel) setApiPanel(null);
+      else setSelected(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [apiPanel]);
 
   async function doRescan() {
     setBusy(true);
@@ -284,6 +307,10 @@ function App() {
 
   function openService(stackId: string, serviceName: string) {
     setSelected(serviceKey(stackId, serviceName));
+    // A service can be reached from inside an integration panel. Two stacked drawers
+    // would leave the reader closing one to find another underneath, so the panel that
+    // sent them here gets out of the way.
+    setApiPanel(null);
   }
 
   function toggleStack(stackId: string) {
@@ -366,8 +393,14 @@ function App() {
           {ov.meta.authentik?.configured && (
             <span>
               authentik:{" "}
+              {/* The count is the way in to the detail behind it: which application was
+                  tied to which service and on what evidence, and why the rest were not.
+                  The tooltip keeps the summary — hover for the gist, click for the case. */}
               {ov.meta.authentik.reachable ? (
-                <span
+                <button
+                  class="linkbtn"
+                  aria-expanded={apiPanel === "authentik"}
+                  onClick={() => setApiPanel("authentik")}
                   title={[authentikTitle(ov.meta.authentik), conn("authentik")?.hint]
                     .filter(Boolean)
                     .join("\n")}
@@ -376,11 +409,19 @@ function App() {
                   {ov.meta.authentik.applications === 1 ? "" : "s"}
                   {ov.meta.authentik.matchedServices > 0 &&
                     ` · ${ov.meta.authentik.matchedServices} matched`}
-                </span>
+                </button>
               ) : (
-                <span title={connTitle(conn("authentik"), ov.meta.authentik.error)}>
+                /* Clickable in this state too: the pill shows a phase instead of a count,
+                   and the stage that failed with every candidate tried is worth more than
+                   one word of it. */
+                <button
+                  class="linkbtn"
+                  aria-expanded={apiPanel === "authentik"}
+                  onClick={() => setApiPanel("authentik")}
+                  title={connTitle(conn("authentik"), ov.meta.authentik.error)}
+                >
                   {conn("authentik")?.phase ?? "unreachable"}
-                </span>
+                </button>
               )}
             </span>
           )}
@@ -391,7 +432,10 @@ function App() {
             <span>
               traefik:{" "}
               {ov.meta.traefik.reachable ? (
-                <span
+                <button
+                  class="linkbtn"
+                  aria-expanded={apiPanel === "traefik"}
+                  onClick={() => setApiPanel("traefik")}
                   title={[traefikTitle(ov.meta.traefik), conn("traefik")?.hint]
                     .filter(Boolean)
                     .join("\n")}
@@ -400,11 +444,16 @@ function App() {
                   {ov.meta.traefik.routers === 1 ? "" : "s"}
                   {ov.meta.traefik.matchedServices > 0 && ` · ${ov.meta.traefik.matchedServices} matched`}
                   {ov.meta.traefik.credential === "none" && " · no credential"}
-                </span>
+                </button>
               ) : (
-                <span title={connTitle(conn("traefik"), ov.meta.traefik.error)}>
+                <button
+                  class="linkbtn"
+                  aria-expanded={apiPanel === "traefik"}
+                  onClick={() => setApiPanel("traefik")}
+                  title={connTitle(conn("traefik"), ov.meta.traefik.error)}
+                >
                   {conn("traefik")?.phase ?? "unreachable"}
-                </span>
+                </button>
               )}
             </span>
           )}
@@ -558,6 +607,28 @@ function App() {
 
       {selectedFlat && (
         <AppDetail stack={selectedFlat.stack} svc={selectedFlat.svc} onClose={() => setSelected(null)} />
+      )}
+
+      {/* The integration panels read the payload already in memory — `ov.stacks` for the
+          matched pairs, the summary for the unplaced ones — so opening one costs no
+          request and can never disagree with the drawer behind it. */}
+      {apiPanel === "authentik" && ov.meta.authentik && (
+        <AuthentikDetail
+          summary={ov.meta.authentik}
+          stacks={ov.stacks}
+          conn={conn("authentik")}
+          onClose={() => setApiPanel(null)}
+          onOpenService={openService}
+        />
+      )}
+      {apiPanel === "traefik" && ov.meta.traefik && (
+        <TraefikDetail
+          summary={ov.meta.traefik}
+          stacks={ov.stacks}
+          conn={conn("traefik")}
+          onClose={() => setApiPanel(null)}
+          onOpenService={openService}
+        />
       )}
     </div>
   );

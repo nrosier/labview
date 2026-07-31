@@ -401,6 +401,33 @@ export interface ConnectionReport {
   attempts: ConnectionAttempt[];
 }
 
+/**
+ * Why an application or router could not be tied to exactly one service.
+ *
+ * The distinction is the point. `ambiguous` means the evidence pointed at more than
+ * one service and was discarded rather than arbitrated — the operator can fix that by
+ * making one name distinct. `no-candidate` means nothing pointed anywhere, which is
+ * usually LabView's to explain. Reporting both as "unmatched" hides the actionable one.
+ * `internal` is defensive: a matcher named a service key the scan does not hold.
+ */
+export type UnmatchedReason = "ambiguous" | "no-candidate" | "internal";
+
+/** One Authentik application no scanned service could be matched to, and why. */
+export interface UnmatchedApplication {
+  /** The application itself, so the UI can show what was on offer. */
+  application: AuthentikApplication;
+  reason: UnmatchedReason;
+  /** One line naming what stopped the match. */
+  detail: string;
+  /**
+   * One line per matching rule tried and what it produced, in the order tried — the
+   * same evidence discipline as `AuthPosture.evidence`, for the case that failed.
+   * Carries only what the payload already holds: slugs, provider and service names,
+   * hostnames. Never an env value.
+   */
+  considered: string[];
+}
+
 /** Outcome of the Authentik API exchange, for the scan metadata. */
 export interface AuthentikSummary {
   /** Whether the integration is switched on at all. */
@@ -420,8 +447,19 @@ export interface AuthentikSummary {
   outposts: number;
   /** Services that matched at least one application. */
   matchedServices: number;
-  /** Application slugs no scanned service could be matched to. */
-  unmatchedApplications: string[];
+  /** Applications no scanned service could be matched to, each with its reason. */
+  unmatchedApplications: UnmatchedApplication[];
+}
+
+/** One live router no scanned service could be identified for, and why. */
+export interface UnmatchedRouter {
+  /** The router itself: rule, hosts, entrypoints, chain, backends, status. */
+  router: TraefikLiveRouter;
+  reason: UnmatchedReason;
+  /** One line naming what stopped the match. */
+  detail: string;
+  /** One line per matching rule tried, as on {@link UnmatchedApplication}. */
+  considered: string[];
 }
 
 /** Outcome of the Traefik API exchange, for the scan metadata. */
@@ -456,8 +494,8 @@ export interface TraefikSummary {
   services: number;
   /** Services that matched at least one live router. */
   matchedServices: number;
-  /** Live routers no scanned service could be identified for. */
-  unmatchedRouters: string[];
+  /** Live routers no scanned service could be identified for, each with its reason. */
+  unmatchedRouters: UnmatchedRouter[];
 }
 
 /** Derived authentication posture for a service. */

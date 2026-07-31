@@ -39,6 +39,8 @@ import type {
   AuthentikApplication,
   AuthentikMatchStrength,
   Service,
+  UnmatchedApplication,
+  UnmatchedReason,
 } from "../model/types.js";
 import {
   lookupAddress,
@@ -51,8 +53,15 @@ import {
 export interface AuthentikMatchOutcome {
   /** Number of services matched to at least one application. */
   matchedServices: number;
-  /** Slugs of applications no single service could be identified for. */
-  unmatchedApplications: string[];
+  /**
+   * Applications no single service could be identified for, each carrying why.
+   *
+   * The reason is part of the answer, not decoration. "Two services answer to this
+   * name" is the operator's to fix by making one name distinct; "nothing named or
+   * addressed anything" usually is not. Reporting both as a bare slug — which is all
+   * this used to carry — hides the actionable one behind the inert one.
+   */
+  unmatchedApplications: UnmatchedApplication[];
 }
 
 /**
@@ -74,22 +83,30 @@ export function matchAuthentik(
   }
   const names = buildNameIndex(stacks);
 
-  const unmatched: string[] = [];
+  const unmatched: UnmatchedApplication[] = [];
   for (const app of applications) {
-    const hit = matchOne(app, index, index.byHostname, names);
-    if (!hit) {
-      unmatched.push(app.slug);
+    const outcome = matchOne(app, index, index.byHostname, names);
+    if (!("key" in outcome)) {
+      unmatched.push({ application: app, ...outcome });
       continue;
     }
-    const target = services.get(hit.key);
+    const target = services.get(outcome.key);
     if (!target) {
-      unmatched.push(app.slug);
+      // Defensive only: every key a rule can produce comes from an index built from
+      // these same stacks. Report it rather than dropping the application silently,
+      // so a future index that outlives its stacks is visible instead of invisible.
+      unmatched.push({
+        application: app,
+        reason: "internal",
+        detail: `matched ${outcome.key}, which this scan does not hold`,
+        considered: [outcome.evidence],
+      });
       continue;
     }
     const match = (target.svc.authentik ??= { applications: [], evidence: [], strength: [] });
     match.applications.push(app);
-    match.evidence.push(hit.evidence);
-    match.strength.push(hit.strength);
+    match.evidence.push(outcome.evidence);
+    match.strength.push(outcome.strength);
   }
 
   let matchedServices = 0;
@@ -104,30 +121,65 @@ interface Hit {
   strength: AuthentikMatchStrength;
 }
 
+/** No rule placed the application, and why — everything but the application itself. */
+type Unplaced = Omit<UnmatchedApplication, "application">;
+
 function matchOne(
   app: AuthentikApplication,
   index: FleetIndex,
   byHostname: Map<string, ServiceRef[]>,
   names: NameIndex,
-): Hit | undefined {
+): Hit | Unplaced {
+  // Every rule that does not fire says so. Two of those outcomes are worth telling
+  // apart from a plain miss, because they are the ones an operator can act on or would
+  // otherwise report as a bug:
+  //
+  //  * **contested** — the rule pointed at more than one service and was discarded
+  //    rather than arbitrated. Actionable: make one of the names distinct.
+  //  * **blocked** — there was evidence, and LabView deliberately declined to resolve
+  //    it (an address literal, a residue too short to mean anything, a host shared by
+  //    every application in a domain). Without saying so, refusing looks like failing.
+  //
+  // The strongest rule runs first, so the first of each is the one worth leading with.
+  const considered: string[] = [];
+  let contested: string | undefined;
+  let blocked: string | undefined;
+  const note = (line: string, kind?: "contested" | "blocked"): void => {
+    if (!considered.includes(line)) considered.push(line);
+    if (kind === "contested") contested ??= line;
+    if (kind === "blocked") blocked ??= line;
+  };
+
   // 1. A proxy provider's internal host is the provider naming the service outright.
+  let addressed = false;
   for (const provider of app.providers) {
     if (!provider.internalHost) continue;
+    addressed = true;
     const refs = lookupAddress(provider.internalHost, index);
-    if (refs.length !== 1) continue;
-    return {
-      key: serviceRefKey(refs[0]!),
-      strength: "address",
-      evidence: `Authentik application "${app.name}" (${app.slug}): its ${describe(provider)} forwards authenticated traffic to ${provider.internalHost}, which is this service.`,
-    };
+    if (refs.length === 1) {
+      return {
+        key: serviceRefKey(refs[0]!),
+        strength: "address",
+        evidence: `Authentik application "${app.name}" (${app.slug}): its ${describe(provider)} forwards authenticated traffic to ${provider.internalHost}, which is this service.`,
+      };
+    }
+    note(
+      `its ${describe(provider)} forwards authenticated traffic to ${provider.internalHost}, which resolves to ${tally(refs)}.`,
+      refs.length > 1 ? "contested" : undefined,
+    );
   }
+  if (!addressed) note("no proxy provider, so there is no forwarded address to resolve.");
 
   // The URLs the provider hands out serve rules 2 and 3, read two different ways: as
   // an address of a container, then as a public hostname. In `forward_domain` mode
   // the external host is the Authentik domain shared by every application in that
   // domain, so it identifies no single service and is excluded from both — the launch
   // URL is what distinguishes them.
-  const urls = urlEvidence(app);
+  const { urls, excluded } = urlEvidence(app);
+  for (const line of excluded) note(line, "blocked");
+  if (!urls.length && !excluded.length) {
+    note("no launch URL, external host or redirect URI, so there is no URL to read.");
+  }
 
   // 2. A bare-name host inside one of those URLs. Only a name form is resolved: an IP
   //    literal in a redirect URI addresses the *host*, and on a host running a reverse
@@ -137,14 +189,29 @@ function matchOne(
   //    `lookupContainerAddress` refuses to read a container IP as a published port.
   for (const [url, why] of urls) {
     const host = hostname(url);
-    if (!host || !isNameHost(host)) continue;
+    if (!host) {
+      note(`${why} is ${JSON.stringify(url)}, which no host can be read from.`);
+      continue;
+    }
+    if (!isNameHost(host)) {
+      note(
+        `${why} points at ${host}, an address literal rather than a name: it addresses the host, whose standard ports belong to whatever reverse proxy answers on them, so it is not resolved through the published-port table.`,
+        "blocked",
+      );
+      continue;
+    }
     const refs = lookupAddress(url, index);
-    if (refs.length !== 1) continue;
-    return {
-      key: serviceRefKey(refs[0]!),
-      strength: "address",
-      evidence: `Authentik application "${app.name}" (${app.slug}): ${why} points at ${host}, this service's compose or container name.`,
-    };
+    if (refs.length === 1) {
+      return {
+        key: serviceRefKey(refs[0]!),
+        strength: "address",
+        evidence: `Authentik application "${app.name}" (${app.slug}): ${why} points at ${host}, this service's compose or container name.`,
+      };
+    }
+    note(
+      `${why} points at ${host}, which resolves to ${tally(refs)}.`,
+      refs.length > 1 ? "contested" : undefined,
+    );
   }
 
   // 3. A hostname both sides name.
@@ -152,42 +219,110 @@ function matchOne(
     const host = hostname(url);
     if (!host) continue;
     const refs = byHostname.get(host);
-    if (refs?.length !== 1) continue;
-    return {
-      key: serviceRefKey(refs[0]!),
-      strength: "hostname",
-      evidence: `Authentik application "${app.name}" (${app.slug}): ${why} names ${host}, a hostname this service is configured to serve.`,
-    };
+    if (refs?.length === 1) {
+      return {
+        key: serviceRefKey(refs[0]!),
+        strength: "hostname",
+        evidence: `Authentik application "${app.name}" (${app.slug}): ${why} names ${host}, a hostname this service is configured to serve.`,
+      };
+    }
+    // An address literal was already reported by rule 2; repeating it here would pad
+    // the trace with the same fact worded differently.
+    if (isNameHost(host)) {
+      note(
+        refs?.length
+          ? `${why} names the hostname ${host}, declared by ${tally(refs)}.`
+          : `${why} names the hostname ${host}, which no scanned service declares.`,
+        refs && refs.length > 1 ? "contested" : undefined,
+      );
+    }
   }
 
   // 4. A name — the slug first, then the application's own name, then its providers'.
   //    Operator-chosen on both sides, so equality is suggestive rather than addressed:
   //    last resort, and only when it points at exactly one service.
   for (const [value, why] of nameCandidates(app)) {
-    const ref = resolveName(value, names);
-    if (!ref) continue;
-    return {
-      key: serviceRefKey(ref),
-      strength: "name",
-      evidence: `Authentik application "${app.name}": ${why} matches this service's stack, compose or container name.`,
-    };
+    const found = resolveName(value, names);
+    if (found.ref) {
+      return {
+        key: serviceRefKey(found.ref),
+        strength: "name",
+        evidence: `Authentik application "${app.name}": ${why} matches this service's stack, compose or container name.`,
+      };
+    }
+    note(
+      nameNote(why, found),
+      found.contested ? "contested" : found.tooShort.length ? "blocked" : undefined,
+    );
   }
-  return undefined;
+
+  const reason: UnmatchedReason = contested ? "ambiguous" : "no-candidate";
+  return {
+    reason,
+    detail:
+      contested ??
+      blocked ??
+      "no address, hostname or name in this application identifies a scanned service.",
+    considered,
+  };
 }
 
-/** URLs worth matching on, each with the wording for the evidence line. */
-function urlEvidence(app: AuthentikApplication): [string, string][] {
+/** How a candidate list reads in a `considered` line. Only ever 0 or ≥ 2 — one is a match. */
+function tally(refs: ServiceRef[]): string {
+  if (!refs.length) return "no scanned service";
+  const keys = refs.map(serviceRefKey).sort().join(", ");
+  return `${refs.length} scanned services — ${keys} — so it identifies none of them`;
+}
+
+/** One `considered` line for a name candidate that did not place the application. */
+function nameNote(why: string, found: NameResolution): string {
+  const parts: string[] = [];
+  if (found.contested) {
+    parts.push(`${why} matches ${tally(found.contested)}`);
+  } else if (found.tried.length) {
+    parts.push(
+      `no stack, compose or container name equals ${found.tried.map((k) => JSON.stringify(k)).join(" or ")}, tried for ${why}`,
+    );
+  } else {
+    parts.push(`${why} is empty`);
+  }
+  if (found.tooShort.length) {
+    parts.push(
+      `the residue ${found.tooShort
+        .map((k) => JSON.stringify(k))
+        .join(", ")} left after dropping the words that name the mechanism is under ${MIN_DERIVED_KEY} characters, too short to identify a service`,
+    );
+  }
+  return `${parts.join("; ")}.`;
+}
+
+/**
+ * URLs worth matching on, each with the wording for the evidence line — and the ones
+ * deliberately left out, worded for the report, so an exclusion is visible as a
+ * decision rather than as an absence.
+ */
+function urlEvidence(app: AuthentikApplication): {
+  urls: [string, string][];
+  excluded: string[];
+} {
   const out: [string, string][] = [];
+  const excluded: string[] = [];
   if (app.launchUrl) out.push([app.launchUrl, "its launch URL"]);
   for (const provider of app.providers) {
-    if (provider.externalHost && provider.mode !== "forward_domain") {
-      out.push([provider.externalHost, `the external host of its ${describe(provider)}`]);
+    if (provider.externalHost) {
+      if (provider.mode === "forward_domain") {
+        excluded.push(
+          `the external host of its ${describe(provider)} is ${provider.externalHost}, the Authentik domain shared by every application in \`forward_domain\` mode, so it names no single service and is not matched on.`,
+        );
+      } else {
+        out.push([provider.externalHost, `the external host of its ${describe(provider)}`]);
+      }
     }
     for (const uri of provider.redirectUris ?? []) {
       out.push([uri, `a redirect URI of its ${describe(provider)}`]);
     }
   }
-  return out;
+  return { urls: out, excluded };
 }
 
 function describe(provider: { kind: string; name: string; backchannel: boolean }): string {
@@ -219,24 +354,44 @@ function nameCandidates(app: AuthentikApplication): [string, string][] {
  * be arbitrating ambiguity, and could not help anyway: every looser form pools at
  * least the same services.
  */
-function resolveName(value: string, names: NameIndex): ServiceRef | undefined {
+function resolveName(value: string, names: NameIndex): NameResolution {
   const raw = value.trim().toLowerCase();
-  if (!raw) return undefined;
+  if (!raw) return { tried: [], tooShort: [] };
   const attempts: [Map<string, ServiceRef[]>, string][] = [[names.raw, raw]];
+  const tooShort: string[] = [];
   for (const derived of [tighten(value), withoutGenericTokens(value)]) {
     // A one- or two-character residue carries no information: a provider named "DB"
     // would otherwise pin an application to whichever service happens to be short.
     if (derived.length >= MIN_DERIVED_KEY) attempts.push([names.tight, derived]);
+    // A residue that came out empty is not a refusal — the name consisted only of
+    // words describing the mechanism, so there was never anything to compare.
+    else if (derived) tooShort.push(derived);
   }
-  const tried = new Set<string>();
+  const seen = new Set<string>();
+  const tried: string[] = [];
   for (const [map, key] of attempts) {
-    if (tried.has(key)) continue;
-    tried.add(key);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tried.push(key);
     const refs = map.get(key);
     if (!refs) continue;
-    return refs.length === 1 ? refs[0] : undefined;
+    return refs.length === 1
+      ? { ref: refs[0], tried, tooShort }
+      : { contested: refs, tried, tooShort };
   }
-  return undefined;
+  return { tried, tooShort };
+}
+
+/** What a name lookup found, including the two ways it can find nothing usable. */
+interface NameResolution {
+  /** The one service the name identifies, when exactly one does. */
+  ref?: ServiceRef;
+  /** The services a key matched when more than one did — discarded, not arbitrated. */
+  contested?: ServiceRef[];
+  /** Keys looked up, in order, up to and including the one that decided. */
+  tried: string[];
+  /** Keys not looked up because the residue was too short to be conclusive. */
+  tooShort: string[];
 }
 
 /**

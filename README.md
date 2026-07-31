@@ -57,6 +57,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
+| **Integration panel** | The `authentik: 13 apps · 9 matched` and `traefik: 10 routers · 8 matched` counts in the topbar are buttons. Click one and you get the whole join: every matched pair with the evidence behind it and how strongly it was established, and every application or router LabView could **not** place — with the reason (`ambiguous` where two services claim it, `no-candidate` where nothing did), plus the rule-by-rule trace of what was tried. Clicking a matched row jumps to that service's drawer. When an integration is unreachable the same panel shows the failure instead: the stage that failed, the address, every candidate that was tried, and the suggested fix. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — and then says what moved, beside `scanned <time>`: `+1 stack, 2 services changed`, hover for the names. When nothing moved it says **`no config changes`**, so "LabView re-read everything and your files are the same" is never confused with "LabView didn't look". |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
@@ -290,6 +291,15 @@ See [labview/README.md](labview/README.md#how-it-works) for the details, and
 The UI is a static SPA served from the same origin. The JSON contract is
 [labview/src/model/types.ts](labview/src/model/types.ts), imported directly by
 both backend and frontend.
+
+One shape is worth calling out if you consume that JSON yourself:
+`meta.authentik.unmatchedApplications` and `meta.traefik.unmatchedRouters` are
+**objects, not names**. Each carries the whole application or live router, a
+`reason` (`ambiguous`, `no-candidate` or `internal`), a one-line `detail`, and
+`considered` — one line per matching rule that ran. They were `string[]` before,
+so this is a **breaking change** for any external consumer. It was made rather
+than adding a second, parallel list so that why a match did not happen has exactly
+one home instead of a name in one place and an explanation in another.
 
 `GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
 `POST /api/rescan` ignores that cache and is guaranteed to be answered by a scan

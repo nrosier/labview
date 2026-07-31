@@ -1,4 +1,4 @@
-import type { DockerState, Service } from "../model";
+import type { DockerState, Service, TraefikLiveRouter } from "../model";
 
 /** Short "image:tag" without a long registry prefix, for compact display. */
 export function shortImage(image: string | undefined): string {
@@ -10,6 +10,17 @@ export function shortImage(image: string | undefined): string {
 /** A stable per-service key: `${stackId}/${serviceName}`. */
 export function serviceKey(stackId: string, serviceName: string): string {
   return `${stackId}/${serviceName}`;
+}
+
+/**
+ * A live router as Traefik itself names it, `name@provider`.
+ *
+ * The provider half is not decoration: it is what says whether the route came from a
+ * container label or from operator-written file configuration, which is the difference
+ * between a route LabView can attribute to a service and one it cannot.
+ */
+export function qualifyRouter(r: TraefikLiveRouter): string {
+  return r.provider ? `${r.router}@${r.provider}` : r.router;
 }
 
 export interface StatusView {

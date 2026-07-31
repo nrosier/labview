@@ -314,8 +314,34 @@ named `authentik-proxy` means that, and stripping `proxy` from it would invent a
 collision with the identity provider's own stack.
 
 Each rule requires **exactly one** candidate; an ambiguous match is discarded and
-the application reported as unmatched. Three details are easy to get wrong and all
-have fixtures:
+the application reported as unmatched.
+
+**Why it was not matched is part of the answer.** "Unmatched" alone hides the one case
+the operator can act on. An application whose slug names *two* services is a naming
+collision they can resolve; an application nothing pointed at is usually LabView's gap
+to explain. So `matchOne` returns `Hit | Unplaced`, and every unplaced application
+carries an `UnmatchedReason` (`ambiguous` | `no-candidate` | `internal`), a one-line
+`detail`, and a `considered` trace with one line per rule tried, in the order tried
+(§5). Three properties make the trace trustworthy:
+
+- **The headline is the most actionable line, not the last one.** A rule that found
+  more than one service sets `contested`; a rule that found usable evidence and
+  deliberately declined to resolve it — an IP literal, a `forward_domain` external host
+  — sets `blocked`. `detail` is the first of `contested`, `blocked`, then the generic
+  fallback, and `reason` is `ambiguous` exactly when something was contested.
+- **A rule that could not run says so.** "No proxy provider, so there is no forwarded
+  address to resolve" is a different statement from "the address resolved to nothing",
+  and a trace that silently omitted the first would read as if rule 1 had been tried.
+- **The trace carries only what the payload already holds** — slugs, provider names,
+  service keys, hostnames. Never an env value (**I2**, **I6**), which smoke asserts
+  over every `detail` and `considered` string.
+
+The four fixture applications in `fixtures/authentik` exist to produce four
+distinguishable answers: a contested slug (`ambiguous`), an excluded `forward_domain`
+host, a name residue under the 3-character floor, and an IP-literal redirect URI. If a
+future rule stops reporting, those assertions fail — see §10.
+
+Three details are easy to get wrong and all have fixtures:
 
 - `meta_launch_url` may contain `%(username)s` and similar placeholders. A
   per-user template is not a hostname anyone serves, so it is not matched on.
@@ -369,7 +395,9 @@ drawer. `labels/auth.ts` merges the API's account with the label-derived one by
 confidence rank (`confirmed` > `observed` > `inferred`), keeping the loser as
 evidence rather than discarding it. And `meta.authentik` reports the summary —
 endpoint, whether it came from config or discovery, counts, matched services,
-unmatched applications, and any error.
+unmatched applications with their reason and trace, and any error. The two sides meet
+in the UI in the integration panel (§3.9), which reads the matches back off the
+services rather than from a second copy in the metadata.
 
 ### 3.6 The reverse proxy API (steps 8 and 11)
 
@@ -437,8 +465,18 @@ public, deduped, capped, exactly as `discoverAuthentikEndpoints`.
 3. **The host rule** — through the same hostname index the Authentik matcher uses.
 
 Unmatched routers are reported in `meta.traefik.unmatchedRouters`, the mirror of
-`unmatchedApplications`: it is how ingress LabView could not attribute — file
-provider routes especially — becomes visible instead of silently absent.
+`unmatchedApplications` in every respect including the reason model above: each entry
+carries the whole `TraefikLiveRouter` — rule, hosts, entrypoints, resolved chain,
+backends, status — plus its `reason`, `detail` and `considered` trace. It is how
+ingress LabView could not attribute — file provider routes especially — becomes
+diagnosable instead of silently absent: a backend address that resolves to nothing
+scanned is exactly what rule 1 was looking for and did not find, and the trace says so.
+
+One deliberate asymmetry with §3.5: this matcher tracks `contested` but not `blocked`.
+The skip in rule 2 applies to *every* non-docker router, so promoting it to the
+headline would make "its name proves nothing about which container it refers to" the
+stated reason for each one — displacing the answer a reader needs. It stays a trace
+line, and `detail` falls through to what was actually looked at.
 
 **Why the backend address needs its own index.** A docker-provider backend is
 `http://<container-ip>:<container-port>`. `lookupAddress` reads an IP literal's port
@@ -546,6 +584,36 @@ drawer. Two rules hold it together:
 palette in `styles.css`. DOM nodes use `var(--…)` directly; canvas-based views
 (cytoscape, mermaid) call `resolveVar()` so both follow the light/dark toggle from
 one definition.
+
+**Integration panels.** The topbar states each API integration as a count —
+`authentik: 13 apps · 9 matched` — which is an outcome with two questions behind it:
+which application was tied to which service and on what evidence, and why the rest
+were not. Both counts are buttons (`.linkbtn`) opening a side drawer
+(`web/components/ApiDetail.tsx`) that answers both, and the tooltips stay as the
+summary: hover for the gist, click for the case.
+
+Three rules shape it:
+
+- **The matched side is derived, not duplicated.** The rows are built with `useMemo`
+  by walking `ov.stacks` for `svc.authentik` / `svc.traefikLive` — the same fields the
+  service drawer reads. Copying the pairs into `ScanMeta` would put the same fact in
+  two places, and the two would eventually disagree about the same match. A matched
+  row's service key is a button that opens that service's own drawer, and opening it
+  closes the panel so two drawers are never stacked.
+- **The unmatched side leads with the reason, not the name.** Each entry shows its
+  `UnmatchedReason` as a pill, the one-line `detail`, and the whole `considered` trace
+  as an evidence list — one line per matching rule tried, in the order tried, so a
+  reader can see which rule came closest instead of taking "unmatched" on trust.
+- **`--critical` is not used here.** An unplaced entry is a gap in what LabView can
+  say; the critical tint means one thing only — a service reachable from the internet
+  with no gate (§12). `ambiguous`, an unauthenticated proxy API and a failed
+  connection phase use `--warning`, the same register as `.note` and `.banner`.
+
+When an integration is unreachable the pill shows a phase instead of a count, and it
+is clickable in that state too: the same drawer becomes the failure body — the stage
+that failed, the address and where it came from, the code, the detail, the fix, and
+one row per candidate tried with its own phase — read from the `ConnectionReport` in
+`meta.connections` (§3.10) rather than from a second source.
 
 ### 3.10 Connection diagnostics
 
@@ -989,10 +1057,28 @@ of whether *any* enforced gate was confirmed, and it is what keeps a protected
 service out of `exposedWithoutAuth` even when its provider type has no
 `AuthMethod`.
 
-**Unmatched application** — an application the matcher could not tie to exactly one
-service. Reported in `meta.authentik.unmatchedApplications` by slug. Ambiguity is
-reported, never arbitrated: picking a candidate by iteration order would move a
-service between "protected" and "exposed" on a coin toss.
+**UnmatchedApplication** — an application the matcher could not tie to exactly one
+service, in `meta.authentik.unmatchedApplications`. Carries the whole
+`AuthentikApplication`, an `UnmatchedReason`, a one-line `detail`, and a `considered`
+trace. Ambiguity is reported, never arbitrated: picking a candidate by iteration order
+would move a service between "protected" and "exposed" on a coin toss.
+
+**UnmatchedRouter** — the same for a live router, in `meta.traefik.unmatchedRouters`,
+carrying the whole `TraefikLiveRouter`. Because such a router demonstrably *exists*, it
+must never produce a "declared but not live" note on anybody.
+
+**UnmatchedReason** — `"ambiguous" | "no-candidate" | "internal"`. Not a severity but a
+statement about who can act: `ambiguous` means the evidence pointed at more than one
+service and was discarded, which one distinct name fixes; `no-candidate` means nothing
+pointed anywhere, usually LabView's gap to explain; `internal` is defensive only — a
+matcher named a service key the scan does not hold. Reporting all three as "unmatched"
+hides the actionable one, which is the whole reason the field exists.
+
+**`considered`** — one line per matching rule tried and what it produced, in the order
+tried: the same evidence discipline as `AuthPosture.evidence`, applied to the case that
+failed. A rule that could not run says why rather than being omitted. Constrained to
+what the payload already carries — slugs, provider and service names, hostnames — and
+never an env value, which smoke asserts.
 
 **TraefikRoute vs TraefikLiveRouter** — same subject, different source, and the
 distinction the whole of §3.6 rests on. `TraefikRoute` is what the compose labels
@@ -1027,11 +1113,10 @@ the gap and changes no posture.
 proxy's API is exposed on that network and is reported as a note on the proxy service
 rather than inferred from config.
 
-**Unmatched router** — a live router no scanned service could be identified for.
-Reported in `meta.traefik.unmatchedRouters` as `name@provider`. Two candidates is not
-an ambiguity to arbitrate but a match not made, exactly as for an application; and
-because such a router demonstrably *exists*, it must never produce a
-"declared but not live" note on anybody.
+**`name@provider`** — how Traefik itself names a router, and how LabView reports one
+(`qualifyRouter`). The provider half is not decoration: it says whether the route came
+from a container label or from operator-written file configuration, which is what
+decides whether the router-name matching rule may be applied to it at all (§3.6).
 
 **`detail` vs `evidence` vs `notes`** — `detail` is the prose summary of the
 primary detection plus any secondary ones; `evidence` is the flat list of raw
@@ -1322,6 +1407,32 @@ read — so the integration's contribution is measured in both directions rather
 assumed. The container-IP trap is asserted directly against `buildFleetIndex`, since
 a container IP exists only in live Docker state and smoke runs without a socket.
 
+**Why a match did not happen** (§3.5, §3.6) is asserted across both API fixture roots,
+because a reason nothing checks decays back into a shrug. Three properties:
+
+- **The four unplaced applications give four distinguishable answers.** `pair` is
+  `ambiguous`, with both `pair/blue` and `pair/green` named in its trace; `broad-app`,
+  `s01` and `ext-01` are each `no-candidate` with their own cause quoted — the
+  `forward_domain` mode, the three-character floor, an address literal. Exactly one of
+  the four is `ambiguous`, so a matcher that stopped telling contested from absent fails
+  on the count as well as on the wording. Traefik pins the same pair: `twin-blue@file`
+  contested between both twins, `standalone@file` belonging to nothing scanned.
+- **Every unmatched entry carries its subject and a non-empty trace** — the application
+  with its providers, or the router with its rule and entrypoints — plus one
+  `considered` line per rule tried. A rule that stops appending leaves a *short* trace
+  rather than a wrong one, so the assertion is on the length, not on the text.
+  `standalone@file` additionally pins that a rule which was **skipped** says so, instead
+  of reading like a rule that looked and found nothing.
+- **No trace line carries a value out of the configuration.** Every `detail` and every
+  `considered` string from both roots is checked against all three fixture `.env`
+  secrets and the stub token — the same discipline as the connection diagnostics below,
+  and for the same reason: these are new prose built from scanned input and served to a
+  browser (**I2**, **I6**).
+
+No posture number moves with them. `matchedServices` on both roots and the
+exposed-without-auth pair asserted with and without the API are unchanged by the reason
+model, which adds reporting and nothing else.
+
 **The connection taxonomy** (§3.10) is asserted the same way, but without a fixture
 root: the classifiers are pure, so each is driven directly. Every transport code,
 every HTTP status and every socket-file state is mapped to its phase, the reports
@@ -1490,8 +1601,16 @@ explicitly and update the token guidance in `config.example.yml` and both README
 candidate. Before adding one, ask what it would do to a fleet where two services
 plausibly satisfy it — if the answer is "pick one", the rule does not belong. Give
 it a fixture whose other rules cannot fire, so the assertion tests the new rule
-rather than an existing one. Three further obligations:
+rather than an existing one. Four further obligations:
 
+- **Append to `considered`, on every path.** A rule that finds nothing, finds too many,
+  or declines to run must still say so in one line, because that trace is the whole
+  answer an operator gets for an unmatched application (§3.5) and a silent rule leaves a
+  hole in it that reads as if the rule never existed. Set `contested` when the rule
+  produced more than one candidate and `blocked` when it declined on evidence it could
+  see — those are what promote the entry to `ambiguous` and what headline the `detail`.
+  The line may name only what the payload already carries: service keys, slugs,
+  hostnames, provider names, never an env value (**I2**, **I6**).
 - **Return a `strength`.** Ask what the rule actually proves: that the provider points
   at this service (`address`), that both sides name one hostname (`hostname`), or that
   the words resemble each other (`name`). Getting this wrong misreports confidence,
@@ -1522,7 +1641,10 @@ shapes we have.
 and be explicit about which *provider* the rule is valid for — the `@docker`-only
 restriction on the router-name rule is not an optimisation, it is the difference
 between evidence and coincidence. Ask what an address-shaped rule reads the port as
-before reusing an existing lookup (see the container-IP row in §12).
+before reusing an existing lookup (see the container-IP row in §12). The `considered`
+obligation above applies here too, with one difference: this matcher tracks `contested`
+but deliberately not `blocked` (§3.6), so a rule that is inapplicable for a provider
+records the skip in the trace without promoting the router to `ambiguous`.
 
 **Add a new outbound connection.** The diagnostics are shared, so most of this is
 already done for you — the work is to route through them rather than invent a
@@ -1601,10 +1723,11 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
 - **An unmatchable application is reported, not resolved.** Four rules (§3.5) is not
   every naming convention an operator might use, and an application whose slug, name,
   provider names and URLs all resemble two services equally is discarded on purpose. So
-  expect some unmatched, and read `meta.authentik.unmatchedApplications` as the list of
-  gates LabView can see but cannot place. The fix is a name or a redirect URI that
-  agrees with the compose file, not a looser rule: every loosening trades a visible gap
-  for an invisible wrong answer.
+  expect some unmatched, and read `meta.authentik.unmatchedApplications` — behind the
+  `authentik` count in the topbar — as the list of gates LabView can see but cannot
+  place, each with the rule-by-rule trace of what it tried. The fix is a name or a
+  redirect URI that agrees with the compose file, not a looser rule: every loosening
+  trades a visible gap for an invisible wrong answer.
 - **A name match cannot be verified, only reported.** Rule 4 rests on the operator
   having named things consistently. Two independently-named services could satisfy it
   the same way and only one be right — the matcher can tell that *two* candidates exist
@@ -1699,3 +1822,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | The excluded fields are a deny-list, not an allow-list | The two mistakes are not equal. Forgetting to exclude a newly *derived* field produces a spurious "changed" line — loud, and fixed the first time anyone sees it. Forgetting to *include* a field parsed from the compose document produces an edit that is silently never reported, which is the failure the whole feature exists to prevent. So anything new is compared by default. |
 | The diff is derived by the caller, not carried in the payload | It needs memory of the previous scan, and `buildOverview` is required to have none (I7). Both consumers already hold two payloads, so `diffStacks(prev, next)` as a pure function of them adds no API surface, no server state, and nothing to keep consistent between the log line and the topbar. |
 | "No config changes" is stated rather than left implied | A rescan that reports nothing is indistinguishable from a rescan that never ran, and `scanned <time>` moves either way. The commonest true answer to pressing the button is "I re-read everything and nothing in it differs" — which is only reassuring if it is said out loud. |
+| An unmatched entry carries the reason, not just the name | Both matchers already knew the difference between "nothing named this" and "two services named it" and threw it away at the `return`. Those are not one problem: the second is the operator's to settle with a label and the first is usually LabView's to explain, and a bare `string[]` reported them identically. The lists became objects rather than gaining a parallel array so the same fact cannot exist twice and drift — accepted as a **breaking change** to `/api/overview`, documented in both READMEs. |
+| The trace is a line per rule, including the rules that found nothing | A reason alone says what the verdict was, not what was examined to reach it, and an operator who disagrees with the verdict has nothing to check. Recording every rule also makes an omission visible: a new rule that forgets its line leaves a *short* trace, which an assertion can catch, where a silent rule reads exactly as if it never existed. |
+| `--critical` is not used in the integration panels | It is the exposure warning's colour (see the SAML row above), and the panel's worst news is an ambiguity or a failed connection — neither is a service reachable without authentication. Reusing red there would make the two indistinguishable at a glance, which costs more than the panel gains. `--warning` carries `ambiguous`, an unauthenticated proxy API and the failed phase. |
+| The matched side is derived in the browser, not duplicated into `ScanMeta` | Every matched pair is already on `svc.authentik` / `svc.traefikLive`, so adding a roll-up to the payload would mean two representations of one join, kept in step by nothing. A `useMemo` over `ov.stacks` reads the same source the service drawer reads, which is also what makes a row in the panel able to open that drawer. The unmatched side has no such home — it is by definition attached to no service — so that half genuinely lives on `meta`. |

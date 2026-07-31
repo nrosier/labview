@@ -213,6 +213,27 @@ code, .mono {
 .btn:disabled { opacity: 0.55; cursor: default; }
 .btn.icon { padding: 7px 9px; }
 
+/* A control that reads as part of its sentence rather than as a button: the topbar
+   count that opens an integration panel, the service name inside one that jumps to that
+   service. Inherits the type and colour of wherever it sits — a 12px muted header line
+   or a 12.5px table cell — so one rule serves both without either looking pasted in.
+   The dotted underline is what says it can be clicked at all; a bare span would not,
+   which is how the detail behind these numbers went unnoticed. */
+.linkbtn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.linkbtn:hover { color: var(--ink); text-decoration-style: solid; }
+.linkbtn:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; border-radius: 3px; }
+
 .tabs { display: flex; gap: 4px; margin: 16px 0; }
 .tab {
   appearance: none;
@@ -453,6 +474,12 @@ code, .mono {
 .kv dt { color: var(--ink-2); }
 .kv dd { margin: 0; word-break: break-word; }
 
+/* Text standing in for a value rather than being one: a redacted secret, an absent
+   hostname, "none". Muted everywhere, not only inside a table — an absence printed in the
+   same ink as a fact reads as a fact, and `∅` or "none" in ink is exactly that mistake.
+   The table rule below adds the letter-spacing the redaction dots want. */
+.masked { color: var(--muted); }
+
 table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.data th, table.data td {
   text-align: left;
@@ -481,6 +508,15 @@ table.data tr:last-child td { border-bottom: none; }
 .pill.crit {
   background: color-mix(in srgb, var(--critical) 12%, transparent);
   border-color: color-mix(in srgb, var(--critical) 40%, transparent);
+}
+/* A pill marking something diagnostic rather than dangerous — an application whose
+   evidence pointed at two services, a proxy API that answered unauthenticated, the stage
+   a connection failed at. Tinted like `.note` and `.banner`, which is the same register:
+   worth acting on, not an emergency. Deliberately not `.crit`, so the critical tint keeps
+   meaning one thing — a service reachable from the internet with no gate in front of it. */
+.pill.warn {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
 }
 
 .evidence { margin: 0; padding-left: 18px; color: var(--ink-2); }

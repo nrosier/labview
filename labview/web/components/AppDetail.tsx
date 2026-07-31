@@ -3,15 +3,7 @@ import { fmtTime, shortImage, statusView } from "../lib/format";
 import { buildServiceMermaid } from "../lib/mermaidDef";
 import { AuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
 import { Mermaid } from "./Mermaid";
-
-function Section({ title, children }: { title: string; children: preact.ComponentChildren }) {
-  return (
-    <div class="section">
-      <h3>{title}</h3>
-      {children}
-    </div>
-  );
-}
+import { Section } from "./Section";
 
 /**
  * Where a tunnel origin was found to lead, in a few words. The full reasoning is

@@ -709,6 +709,23 @@ const ak = await overviewFor(authentikRoot, { fetchImpl: discovered.fetchImpl })
 const aSvc = lookup(ak);
 const akMeta = ak.meta.authentik!;
 
+/** The unmatched entry for one application slug, with its reason and trace. */
+function akUnplaced(slug: string) {
+  return akMeta.unmatchedApplications.find((u) => u.application.slug === slug);
+}
+/** Slugs LabView could not place, sorted — the shape most assertions below want. */
+function akUnplacedSlugs(): string {
+  return akMeta.unmatchedApplications
+    .map((u) => u.application.slug)
+    .sort()
+    .join(",");
+}
+/** Everything one unmatched entry says, for a substring assertion over the whole trace. */
+function akTrace(slug: string): string {
+  const u = akUnplaced(slug);
+  return u ? [u.reason, u.detail, ...u.considered].join(" | ") : `no unmatched entry for ${slug}`;
+}
+
 console.log("\nendpoint discovery");
 check("found 13 stacks", ak.stats.stacks === 13, `got ${ak.stats.stacks}`);
 check(
@@ -834,8 +851,19 @@ check(
 // identity provider itself, on 9443. Declining the form is the only safe reading.
 check(
   "a redirect URI on an IP literal is not resolved through the published-port table",
-  akMeta.unmatchedApplications.includes("ext-01") && aSvc("idp", "server").authentik === undefined,
-  `${akMeta.unmatchedApplications.join(",")} ${JSON.stringify(aSvc("idp", "server").authentik)}`,
+  akUnplaced("ext-01") !== undefined && aSvc("idp", "server").authentik === undefined,
+  `${akUnplacedSlugs()} ${JSON.stringify(aSvc("idp", "server").authentik)}`,
+);
+// Declining the form is only half the job: an operator looking at an application the
+// integration did not place needs to be told it was declined, or a deliberate refusal
+// reads as a defect. The reason is machine-readable so the UI can group on it and this
+// assertion can hold it without matching prose.
+check(
+  "...and says so, naming the address literal it refused to resolve",
+  akUnplaced("ext-01")?.reason === "no-candidate" &&
+    /address literal/.test(akUnplaced("ext-01")?.detail ?? "") &&
+    akTrace("ext-01").includes("198.51.100.10"),
+  akTrace("ext-01"),
 );
 
 console.log("\nmatch 3: a hostname both sides name");
@@ -965,8 +993,15 @@ check(
 );
 check(
   "...and a name that is nothing but mechanism words leaves the application unplaced",
-  akMeta.unmatchedApplications.includes("s01"),
-  akMeta.unmatchedApplications.join(","),
+  akUnplaced("s01") !== undefined,
+  akUnplacedSlugs(),
+);
+check(
+  "...reported as the short residue it was, not as a bare miss",
+  akUnplaced("s01")?.reason === "no-candidate" &&
+    /under 3 characters/.test(akUnplaced("s01")?.detail ?? "") &&
+    akTrace("s01").includes('"db"'),
+  akTrace("s01"),
 );
 
 console.log("\nan ambiguous name is discarded, not arbitrated");
@@ -977,8 +1012,18 @@ check(
 );
 check(
   "...and is reported as an application LabView could not place",
-  akMeta.unmatchedApplications.includes("pair"),
-  akMeta.unmatchedApplications.join(","),
+  akUnplaced("pair") !== undefined,
+  akUnplacedSlugs(),
+);
+// The one unmatched reason an operator can act on, so it must not read like the rest:
+// the contest is named as a contest, and both contestants are named. Grouping every
+// failure under one word is what made this invisible.
+check(
+  "...as contested rather than absent, naming both services it could not choose between",
+  akUnplaced("pair")?.reason === "ambiguous" &&
+    akTrace("pair").includes("pair/blue") &&
+    akTrace("pair").includes("pair/green"),
+  akTrace("pair"),
 );
 // Its provider reduces to the same contested name, and it is an OIDC one — so a match
 // arbitrated between the two services would visibly hand the winner a gate.
@@ -1000,16 +1045,43 @@ check(
 );
 check(
   "...leaving the application unplaced rather than misplaced",
-  akMeta.unmatchedApplications.includes("broad-app"),
-  akMeta.unmatchedApplications.join(","),
+  akUnplaced("broad-app") !== undefined,
+  akUnplacedSlugs(),
+);
+check(
+  "...and the exclusion is reported as a decision, naming the mode that caused it",
+  akUnplaced("broad-app")?.reason === "no-candidate" &&
+    /forward_domain/.test(akUnplaced("broad-app")?.detail ?? ""),
+  akTrace("broad-app"),
 );
 // The four that must stay unplaced, and no fifth: every other application in the stub
 // is reachable by exactly one rule, so a rule that started matching too freely would
 // show up here as a shorter list.
 check(
   "four applications in all, each for a stated reason",
-  akMeta.unmatchedApplications.slice().sort().join(",") === "broad-app,ext-01,pair,s01",
-  akMeta.unmatchedApplications.join(","),
+  akUnplacedSlugs() === "broad-app,ext-01,pair,s01",
+  akUnplacedSlugs(),
+);
+// Four unmatched applications and four distinguishable answers. A rule that stopped
+// recording what it looked at would leave a hole here rather than a wrong statement,
+// which is exactly the kind of gap a trace is supposed to make impossible.
+check(
+  "...and every one carries the application itself and a non-empty trace",
+  akMeta.unmatchedApplications.every(
+    (u) =>
+      u.application.name.length > 0 &&
+      u.application.providers.length > 0 &&
+      u.detail.length > 0 &&
+      u.considered.length > 0,
+  ),
+  JSON.stringify(
+    akMeta.unmatchedApplications.map((u) => [u.application.slug, u.considered.length]),
+  ),
+);
+check(
+  "...only one of the four is the operator's to fix",
+  akMeta.unmatchedApplications.filter((u) => u.reason === "ambiguous").length === 1,
+  akMeta.unmatchedApplications.map((u) => `${u.application.slug}=${u.reason}`).join(","),
 );
 
 console.log("\na provider no outpost serves enforces nothing");
@@ -1201,10 +1273,73 @@ check("8 services matched a live router", tfMeta.matchedServices === 8, String(t
 // The mirror of `unmatchedApplications`: ingress configured outside the scanned stacks.
 // `standalone@file` belongs to nothing scanned; `twin-blue@file` matches two services,
 // which is a match not made rather than a match to arbitrate.
+const tfUnplaced = (name: string) =>
+  tfMeta.unmatchedRouters.find((u) => `${u.router.router}@${u.router.provider}` === name);
+const tfTrace = (name: string) => {
+  const u = tfUnplaced(name);
+  return u ? [u.reason, u.detail, ...u.considered].join(" | ") : `no unmatched entry for ${name}`;
+};
 check(
   "the two routers no single service could be identified for are listed",
-  JSON.stringify(tfMeta.unmatchedRouters) === JSON.stringify(["standalone@file", "twin-blue@file"]),
-  JSON.stringify(tfMeta.unmatchedRouters),
+  JSON.stringify(
+    tfMeta.unmatchedRouters.map((u) => `${u.router.router}@${u.router.provider}`),
+  ) === JSON.stringify(["standalone@file", "twin-blue@file"]),
+  JSON.stringify(tfMeta.unmatchedRouters.map((u) => u.router.router)),
+);
+// The same distinction as on the Authentik side, and the same reason for it: one of
+// these two is a contest the operator can settle, the other is ingress that simply
+// belongs to nothing scanned. A single "unmatched" label hides the difference.
+check(
+  "...told apart: one contested between two services, one belonging to nothing scanned",
+  tfUnplaced("twin-blue@file")?.reason === "ambiguous" &&
+    tfTrace("twin-blue@file").includes("twin-a/blue") &&
+    tfTrace("twin-blue@file").includes("twin-b/green") &&
+    tfUnplaced("standalone@file")?.reason === "no-candidate",
+  `${tfTrace("twin-blue@file")} /// ${tfTrace("standalone@file")}`,
+);
+// `detail` is the headline, and every assertion above reads the whole trace — so a
+// `detail` reduced to a constant would pass all of them on the strength of `considered`
+// still carrying the contested line. Asserted on its own for that reason: the one-liner
+// a reader sees first has to be the actionable rule, not a restatement of "unmatched".
+check(
+  "...and the headline is the contested rule itself, not a generic one",
+  /twin-a\/blue|twin-b\/green/.test(tfUnplaced("twin-blue@file")?.detail ?? "") &&
+    tfUnplaced("standalone@file")?.detail !== tfUnplaced("twin-blue@file")?.detail,
+  `${tfUnplaced("twin-blue@file")?.detail} /// ${tfUnplaced("standalone@file")?.detail}`,
+);
+// A bare `name@provider` threw all of this away, which is why an unmatched router used
+// to be unreviewable: the rule is the only thing that says what the route actually is.
+check(
+  "...each carrying the router itself — rule, entrypoints and chain — and a trace",
+  tfMeta.unmatchedRouters.every(
+    (u) =>
+      u.router.rule !== undefined &&
+      u.router.entryPoints.length > 0 &&
+      u.detail.length > 0 &&
+      u.considered.length > 0,
+  ),
+  JSON.stringify(tfMeta.unmatchedRouters.map((u) => [u.router.rule, u.considered.length])),
+);
+// The name rule is skipped for a non-docker provider, and skipping is not the same as
+// looking and finding nothing. Say which, or the trace reads as if the name was checked.
+check(
+  "...and the trace says the router name was not matched on, not that it did not match",
+  tfTrace("standalone@file").includes("`file` provider takes the name from"),
+  tfTrace("standalone@file"),
+);
+// The traces are new prose built from scanned configuration and served to the browser,
+// so they are held to the same rule as every other string in the payload (I6). They may
+// name what the payload already holds — slugs, service keys, hostnames — and nothing else.
+const everyTraceLine = [
+  ...akMeta.unmatchedApplications.flatMap((u) => [u.detail, ...u.considered]),
+  ...tfMeta.unmatchedRouters.flatMap((u) => [u.detail, ...u.considered]),
+].join("\n");
+check(
+  "no unmatched trace carries a value out of the configuration",
+  !/super-secret-value|another-secret|ldap-bind-secret|oidc-client-secret-value|xxxxxxxx/.test(
+    everyTraceLine,
+  ) && !everyTraceLine.includes(AK_TOKEN),
+  everyTraceLine,
 );
 check(
   "...and neither twin was credited with the hostname both claim",

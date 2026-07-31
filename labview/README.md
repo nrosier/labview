@@ -59,6 +59,18 @@ live state from the Docker API, and never needs an agent inside each app.
   describes: where a route's origin resolves to another service, that service is
   drawn as the hop (`tunnel → proxy → service`) and highlighted as the
   infrastructure it was observed to be.
+- **Integration panel** — the `authentik: 13 apps · 9 matched` and
+  `traefik: 10 routers · 8 matched` counts in the topbar are buttons, because a count
+  states an outcome and hides the two questions behind it. Click one for the whole
+  join: every matched pair, with the evidence and how firmly the match was made
+  (`address`, `hostname` or `name`), and every application or router that could **not**
+  be placed — each with its reason (`ambiguous` where two services claim it,
+  `no-candidate` where nothing did), a one-line why, and the rule-by-rule trace of what
+  was tried. Clicking a matched row closes the panel and opens that service's own
+  drawer. When the integration is unreachable the pill shows the failed stage and the
+  same panel opens on the failure: what failed, the address, every candidate that was
+  tried with its own stage, and the suggested fix. `Escape` closes the panel first, the
+  service drawer second.
 - **Rescan** — re-reads every `compose.yml` and `.env` under the apps root and then
   reports what moved, inline beside `scanned <time>`: `+1 stack, 2 services changed`,
   with the stack and service names on hover. New stacks, deleted stacks, added
@@ -490,7 +502,10 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
      writing `Home Assistant` means the `home-assistant` stack.
 
   Anything that could name two services names neither, and is reported as an
-  unmatched application instead. `external_host` is used for matching except in
+  unmatched application instead — with the reason it was not placed and one line per
+  rule that ran, so "two services claim this slug" (yours to settle) never reads the
+  same as "nothing in this application names anything scanned" (LabView's to explain).
+  `external_host` is used for matching except in
   `forward_domain` mode, where it is the authentication domain shared by every
   application in it and so identifies no single service. An **IP literal** in a
   redirect URI is deliberately not resolved: it addresses the host, where port 443
@@ -528,7 +543,9 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   round-tripping), or by a host rule resolving to exactly one service. Two
   candidates is not an ambiguity to arbitrate but a match not made: the router lands
   in `meta.traefik.unmatchedRouters`, reported as ingress LabView could not
-  attribute. A `@file` router's name was typed by hand in a file this scan cannot
+  attribute — carrying the whole router, so its rule, entrypoints, chain and backends
+  stay reviewable, plus the same reason and trace as an unmatched application.
+  A `@file` router's name was typed by hand in a file this scan cannot
   read, so its resembling a label is a coincidence with no evidentiary weight and
   the name rule does not apply to it.
 - **A backend address needs its own index.** A docker-provider backend is
@@ -638,6 +655,36 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 | `/api/healthz` | GET | Liveness probe |
 
 The web UI is a static SPA served from the same origin.
+
+One field shape matters if you read that JSON yourself.
+`meta.authentik.unmatchedApplications` and `meta.traefik.unmatchedRouters` are
+**objects, not names**:
+
+```jsonc
+{
+  // the whole application, as it is elsewhere in the payload
+  "application": { "name": "Paired app", "slug": "pair", "providers": [ /* … */ ] },
+  "reason": "ambiguous",                    // "ambiguous" | "no-candidate" | "internal"
+  "detail": "its slug \"pair\" matches 2 scanned services — pair/blue, pair/green — so it identifies none of them.",
+  "considered": [                           // one line per rule that ran, strongest first
+    "no proxy provider, so there is no forwarded address to resolve.",
+    "no launch URL, external host or redirect URI, so there is no URL to read.",
+    "its slug \"pair\" matches 2 scanned services — pair/blue, pair/green — so it identifies none of them.",
+    "no stack, compose or container name equals \"paired app\" or \"pairedapp\" or \"paired\", tried for its name \"Paired app\".",
+    "the name of its oauth2 provider \"Provider for pair\" matches 2 scanned services — pair/blue, pair/green — so it identifies none of them."
+  ]
+}
+```
+
+`detail` is the most actionable line in `considered`, not a fifth restatement: a rule
+that was *contested* outranks one LabView deliberately *declined* to resolve, and both
+outrank the generic miss.
+
+`ambiguous` means two or more services claimed the entry and LabView declined to pick
+one; `no-candidate` means nothing claimed it; `internal` is defensive only. Both fields
+were `string[]` in earlier versions, so this is a **breaking change** for any external
+consumer. It was made instead of adding a second, parallel list so that why a match did
+not happen has one home rather than a name in one place and a reason in another.
 
 `GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
 `POST /api/rescan` ignores the cache and is answered only by a scan that started
@@ -752,10 +799,12 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   gate is not visible.
 - An application LabView cannot tie to exactly one service is reported as unmatched
   rather than guessed, in `meta.authentik.unmatchedApplications` — the gates it can see
-  but cannot place. Four rules are not every naming convention, and an application whose
-  names and URLs fit two services equally is discarded on purpose, so expect some. The
-  fix is a name or a redirect URI that agrees with the compose file, not a looser rule:
-  every loosening trades a visible gap for an invisible wrong answer.
+  but cannot place, behind the `authentik` count in the topbar. Four rules are not every
+  naming convention, and an application whose names and URLs fit two services equally is
+  discarded on purpose, so expect some. Each one carries the rule-by-rule trace of what
+  was tried, which is what makes the fix findable: a name or a redirect URI that agrees
+  with the compose file, not a looser rule — every loosening trades a visible gap for an
+  invisible wrong answer.
 - A name match cannot be verified, only reported. LabView can tell that *two*
   candidates exist and decline; it cannot tell that a single candidate is the wrong
   service. That is what `observed` and "by name alone" are for.

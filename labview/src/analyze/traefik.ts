@@ -22,7 +22,14 @@
  * is by far the cheaper error. A router that matches nothing is reported as unmatched,
  * which is how ingress configured outside the scanned stacks becomes visible.
  */
-import type { AppStack, AuthentikProvider, Service, TraefikLiveRouter } from "../model/types.js";
+import type {
+  AppStack,
+  AuthentikProvider,
+  Service,
+  TraefikLiveRouter,
+  UnmatchedReason,
+  UnmatchedRouter,
+} from "../model/types.js";
 import { providerEnforces, routerIsServing } from "../labels/auth.js";
 import {
   lookupContainerAddress,
@@ -35,8 +42,13 @@ import {
 export interface TraefikMatchOutcome {
   /** Number of services matched to at least one live router. */
   matchedServices: number;
-  /** Qualified names of live routers no single service could be identified for. */
-  unmatchedRouters: string[];
+  /**
+   * Live routers no single service could be identified for, each carrying why and the
+   * router itself — the rule, entrypoints, chain and backends a bare `name@provider`
+   * used to throw away. Ingress configured outside the scanned stacks is the *expected*
+   * content of this list, so it has to be legible enough to recognise as such.
+   */
+  unmatchedRouters: UnmatchedRouter[];
 }
 
 /**
@@ -58,15 +70,26 @@ export function matchTraefik(
   }
   const byRouterName = buildRouterNameIndex(stacks);
 
-  const unmatched: string[] = [];
+  const unmatched: UnmatchedRouter[] = [];
   for (const router of routers) {
-    const hit = matchOne(router, index, byRouterName);
-    const target = hit ? services.get(hit.key) : undefined;
-    if (!hit || !target) {
-      unmatched.push(qualify(router));
+    const outcome = matchOne(router, index, byRouterName);
+    if (!("key" in outcome)) {
+      unmatched.push({ router, ...outcome });
       continue;
     }
-    router.evidence.push(hit.evidence);
+    const target = services.get(outcome.key);
+    if (!target) {
+      // Defensive only, as in `matchAuthentik`: every key comes from an index built
+      // from these same stacks.
+      unmatched.push({
+        router,
+        reason: "internal",
+        detail: `matched ${outcome.key}, which this scan does not hold`,
+        considered: [outcome.evidence],
+      });
+      continue;
+    }
+    router.evidence.push(outcome.evidence);
     (target.traefikLive ??= []).push(router);
   }
 
@@ -81,12 +104,25 @@ interface Hit {
   evidence: string;
 }
 
+/** No rule placed the router, and why — everything but the router itself. */
+type Unplaced = Omit<UnmatchedRouter, "router">;
+
 function matchOne(
   router: TraefikLiveRouter,
   index: FleetIndex,
   byRouterName: Map<string, ServiceRef[]>,
-): Hit | undefined {
+): Hit | Unplaced {
   const subject = `live Traefik router \`${qualify(router)}\``;
+
+  // Same reporting discipline as `matchAuthentik`: every rule that does not fire says
+  // so, and a rule that pointed at *several* services is worth telling apart from one
+  // that pointed at none, because only the first is the operator's to fix.
+  const considered: string[] = [];
+  let contested: string | undefined;
+  const note = (line: string, kind?: "contested"): void => {
+    if (!considered.includes(line)) considered.push(line);
+    if (kind === "contested") contested ??= line;
+  };
 
   // 1. The backend address: the proxy naming its target. Resolved against the
   //    container-IP index rather than the published-port one — a backend is addressed
@@ -100,6 +136,12 @@ function matchOne(
       evidence: `${subject}: the proxy forwards it to ${backends.join(", ")}, which is this service.`,
     };
   }
+  note(
+    backends.length
+      ? `the proxy forwards it to ${backends.join(", ")}, which ${tally(byBackend, "resolves to")}.`
+      : "the proxy reports no backend for it, so there is no address to resolve.",
+    byBackend.length > 1 ? "contested" : undefined,
+  );
 
   // 2. The router name, docker provider only. Traefik takes the name from the
   //    container's own label, so equality is that label observed from the other side.
@@ -113,6 +155,16 @@ function matchOne(
         evidence: `${subject}: its name matches the \`routers.${router.router}\` label on this service, which is where Traefik took the name from.`,
       };
     }
+    note(
+      `its name \`${router.router}\` ${tally(named ?? [], "is declared as a router label by")}.`,
+      (named?.length ?? 0) > 1 ? "contested" : undefined,
+    );
+  } else {
+    // Not a miss but an inapplicable rule, and the trace has to say which: the name is
+    // right there, and declining to trust it looks like overlooking it.
+    note(
+      `its name \`${router.router}\` is not matched on: the \`${router.provider}\` provider takes the name from operator-written configuration rather than from a container label, so it proves nothing about which container it refers to.`,
+    );
   }
 
   // 3. A hostname in the rule, against what the service declared it serves.
@@ -124,7 +176,28 @@ function matchOne(
       evidence: `${subject}: its rule serves ${hosts.join(", ")}, which this service's own labels declare.`,
     };
   }
-  return undefined;
+  note(
+    hosts.length
+      ? `its rule serves ${hosts.join(", ")}, ${tally(byHost, "declared by")}.`
+      : `its rule ${router.rule ? `\`${router.rule}\`` : "(none reported)"} names no hostname to compare.`,
+    byHost.length > 1 ? "contested" : undefined,
+  );
+
+  const reason: UnmatchedReason = contested ? "ambiguous" : "no-candidate";
+  return {
+    reason,
+    detail:
+      contested ??
+      "no backend address, router name or hostname of this router identifies a scanned service.",
+    considered,
+  };
+}
+
+/** How a candidate list reads in a `considered` line. Only ever 0 or ≥ 2 — one is a match. */
+function tally(refs: ServiceRef[], verb: string): string {
+  if (!refs.length) return `${verb} no scanned service`;
+  const keys = refs.map(serviceRefKey).sort().join(", ");
+  return `${verb} ${refs.length} scanned services — ${keys} — so it identifies none of them`;
 }
 
 /**
