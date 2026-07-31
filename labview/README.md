@@ -33,19 +33,27 @@ live state from the Docker API, and never needs an agent inside each app.
   auth-protected, and a highlighted **exposed-without-auth** count) plus
   part-to-whole bars for **ingress exposure** and **authentication method**. The
   bar legends double as filters.
-- **App grid** — one card per service with a live status dot, image, hostnames,
-  and colored **ingress** / **auth** badges. Search and filter across the fleet.
+- **Stack list** — one card per stack, which is the unit you actually deploy. It
+  rolls up its services: live status dots, hostnames, every distinct **ingress** /
+  **auth** badge present, and a count of anything reachable without auth. Click to
+  expand the services underneath, and again on one to open its detail. Search and
+  filters are per service — exposure is a property of a service, not of a directory
+  — and a stack shows up whenever one of its services matches.
 - **Detail drawer** — for each service: a **Mermaid diagram** of its connections,
-  Cloudflare routes, Traefik routers (rule, hosts, entrypoints, TLS, middlewares),
-  the **derived auth posture with the evidence that led to it**, networks, ports,
-  volumes, environment (secrets masked), and live container state.
+  Cloudflare routes **with what each origin resolves to and why**, Traefik routers
+  (rule, hosts, entrypoints, TLS, middlewares), the **derived auth posture with the
+  evidence that led to it**, networks, ports, volumes, environment (secrets
+  masked), and live container state.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
   and tunnel / proxy / SSO hub nodes, connected by network membership,
   `depends_on`, shared volumes, ingress, and auth edges. Click a service to open
   its detail. A hub appears only when something observed calls for it — and an
   SSO gate whose provider could not be identified gets its own generic hub rather
-  than being drawn as a vendor.
+  than being drawn as a vendor. Tunnel ingress is drawn as the path the config
+  describes: where a route's origin resolves to another service, that service is
+  drawn as the hop (`tunnel → proxy → service`) and highlighted as the
+  infrastructure it was observed to be.
 - **Light / dark** theme (follows the OS, with a manual toggle).
 
 Colors follow a validated, colorblind-safe palette. The ingress and auth-method
@@ -214,7 +222,8 @@ host-naming convention like `auth.` is how unrelated providers get mislabelled.
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
       → build middleware registry → classify ingress → discover Authentik
-      → derive auth posture → build graph → serve /api/overview
+      → resolve tunnel origins → derive auth posture → build graph
+      → serve /api/overview
 ```
 
 - **Compose parsing** understands both label/env syntaxes (list `- k=v` and map

@@ -1,0 +1,26 @@
+# The reverse proxy the other stacks' tunnel origins point at.
+#
+# Nothing here says "I am the origin of anything" — no DockFlare labels, no
+# annotation naming the stacks it fronts. It is identified as a hop purely by
+# publishing the host port another stack's `dockflare.service` addresses, and by
+# sharing the external `proxy` network with that stack. Both facts are read off
+# these files; neither depends on the image or the directory name.
+services:
+  gateway:
+    image: example/reverse-proxy:3.1.0
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # Declared twice on purpose: an HTTP/3 proxy publishes the same host port
+      # over TCP and UDP, which must count as one candidate rather than two rivals.
+      - "443:443/tcp"
+      - "443:443/udp"
+    networks:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+networks:
+  proxy:
+    external: true

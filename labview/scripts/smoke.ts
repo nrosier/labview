@@ -62,7 +62,7 @@ const ov = await overviewFor(appsRoot);
 const svc = lookup(ov);
 
 console.log("discovery");
-check("found 5 stacks", ov.stats.stacks === 5, `got ${ov.stats.stacks}`);
+check("found 6 stacks", ov.stats.stacks === 6, `got ${ov.stats.stacks}`);
 check("docker reported unavailable", ov.meta.dockerAvailable === false);
 
 console.log("\ncompose parsing");
@@ -107,6 +107,75 @@ check("db password masked", ncDbPass?.masked === true);
 const ldapHost = nc.env.find((e) => e.key === "LDAP_HOST");
 check("non-secret LDAP_HOST kept visible", ldapHost?.masked === false && ldapHost.value === "ldap://authentik-server:389");
 
+console.log("\ntunnel origin resolution");
+const HOP = "svc:proxy/gateway";
+const outlineOrigin = outline.cloudflare[0]?.origin;
+check(
+  "an origin naming another service's published host port resolves to that service",
+  outlineOrigin?.kind === "fleet-service" && outlineOrigin.hopKey === "proxy/gateway",
+  `${outlineOrigin?.kind} ${outlineOrigin?.hopKey ?? ""}`,
+);
+check(
+  "...on the strength of the port and the shared network, both quoted",
+  (outlineOrigin?.evidence.includes("host port 443") && outlineOrigin.evidence.includes("proxy")) ?? false,
+  outlineOrigin?.evidence ?? "",
+);
+check(
+  "an origin naming this service's own host port stays direct",
+  emby.cloudflare[0]?.origin?.kind === "self-host-port",
+  `${emby.cloudflare[0]?.origin?.kind} — ${emby.cloudflare[0]?.origin?.evidence}`,
+);
+check(
+  "an origin naming this service's own container stays direct",
+  jf.cloudflare[0]?.origin?.kind === "self-network",
+  `${jf.cloudflare[0]?.origin?.kind} — ${jf.cloudflare[0]?.origin?.evidence}`,
+);
+// The same host port declared over TCP and UDP is one candidate, not two rivals.
+// If they were counted separately the origin above would be reported ambiguous.
+check(
+  "a port declared twice by one service is not a tie with itself",
+  svc("proxy", "gateway").ports.filter((p) => p.published === "443").length === 2,
+  String(svc("proxy", "gateway").ports.length),
+);
+
+console.log("\ngraph draws the path, not a shortcut");
+const cfEdges = ov.graph.edges.filter((e) => e.kind === "ingress" && e.source === "ext:cloudflare");
+check("tunnel -> proxy edge exists", cfEdges.some((e) => e.target === HOP), cfEdges.map((e) => e.target).join(","));
+check(
+  "proxy -> service edge exists",
+  ov.graph.edges.some((e) => e.kind === "ingress" && e.source === HOP && e.target === "svc:outline/outline"),
+);
+// The revert-proof assertion: back the chain out and this is what fails.
+check(
+  "and NO direct tunnel -> service edge remains",
+  !cfEdges.some((e) => e.target === "svc:outline/outline"),
+  cfEdges.filter((e) => e.target === "svc:outline/outline").map((e) => e.id).join(","),
+);
+check(
+  "the resolved hop is marked as a proxy",
+  ov.graph.nodes.find((n) => n.id === HOP)?.role === "proxy",
+  String(ov.graph.nodes.find((n) => n.id === HOP)?.role),
+);
+check(
+  "the hop stays an ordinary, clickable service node",
+  ov.graph.nodes.find((n) => n.id === HOP)?.kind === "service",
+);
+check(
+  "a service whose origin resolved to itself keeps the direct edge",
+  cfEdges.some((e) => e.target === "svc:emby/emby"),
+);
+// Outline's tunnel hostname and its proxy router describe one link between the
+// same two nodes; the graph states it once.
+check(
+  "one hop -> service edge, not one per route",
+  ov.graph.edges.filter((e) => e.source === HOP && e.target === "svc:outline/outline").length === 1,
+  String(ov.graph.edges.filter((e) => e.source === HOP && e.target === "svc:outline/outline").length),
+);
+check(
+  "the generic proxy hub is still used where no hop was resolved",
+  ov.graph.edges.some((e) => e.source === "ext:traefik" && e.target === "svc:jellyfin/jellyfin"),
+);
+
 console.log("\ngraph + interconnection");
 const proxyNode = ov.graph.nodes.find((n) => n.kind === "network" && n.label === "proxy");
 check("shared external 'proxy' network node exists", Boolean(proxyNode));
@@ -127,7 +196,7 @@ const eSvc = lookup(edge);
 console.log("\n--- regression fixtures (fixtures/edge) ---");
 
 console.log("\nedge discovery");
-check("found 7 edge stacks", edge.stats.stacks === 7, `got ${edge.stats.stacks}`);
+check("found 8 edge stacks", edge.stats.stacks === 8, `got ${edge.stats.stacks}`);
 
 console.log("\ncredentials embedded in URL values");
 const api = eSvc("dbstack", "api");
@@ -230,7 +299,9 @@ check(
   socketproxy.auth.exposedWithoutAuth === true,
   `exposedWithoutAuth=${socketproxy.auth.exposedWithoutAuth}`,
 );
-check("host-port services are counted", edge.stats.hostPortServices === 1, `got ${edge.stats.hostPortServices}`);
+// socketproxy, plus the two rival proxies in `tunnelorigin` — each publishes a
+// port with nothing in front of it.
+check("host-port services are counted", edge.stats.hostPortServices === 3, `got ${edge.stats.hostPortServices}`);
 
 const hpApp = eSvc("hostport", "app");
 check("proxied service keeps its local kind", hpApp.ingress === "local", hpApp.ingress);
@@ -251,6 +322,52 @@ check(
   "...and an internal service gets no bypass note",
   hpWorker.notes.every((n) => !n.includes("bypassing")),
   hpWorker.notes.join(" | "),
+);
+
+console.log("\nan unprovable tunnel origin stays unproven");
+const offsite = eSvc("tunnelorigin", "offsite");
+const offsiteOrigin = offsite.cloudflare[0]?.origin;
+check(
+  "an origin port nothing in the scan publishes -> unresolved",
+  offsiteOrigin?.kind === "unresolved" && offsiteOrigin.hopKey === undefined,
+  `${offsiteOrigin?.kind} — ${offsiteOrigin?.evidence}`,
+);
+check(
+  "...said out loud on the service",
+  offsite.notes.some((n) => n.includes("Tunnel origin could not be resolved")),
+  offsite.notes.join(" | "),
+);
+check(
+  "...and the direct edge is kept rather than dropped",
+  edge.graph.edges.some((e) => e.source === "ext:cloudflare" && e.target === "svc:tunnelorigin/offsite"),
+);
+
+const ambiguous = eSvc("tunnelorigin", "ambiguous");
+const ambOrigin = ambiguous.cloudflare[0]?.origin;
+check(
+  "two reachable services claiming one host port -> unresolved, not an arbitrary winner",
+  ambOrigin?.kind === "unresolved" && ambOrigin.hopKey === undefined,
+  `${ambOrigin?.kind} ${ambOrigin?.hopKey ?? ""}`,
+);
+check(
+  "...with the ambiguity itself as the stated reason",
+  ambOrigin?.evidence.includes("ambiguous") ?? false,
+  ambOrigin?.evidence ?? "",
+);
+check(
+  "no hop is drawn anywhere in a fleet where none could be proven",
+  !edge.graph.nodes.some((n) => n.role === "proxy"),
+  edge.graph.nodes.filter((n) => n.role === "proxy").map((n) => n.id).join(","),
+);
+check(
+  "a tunnel origin at the service's own published port is still direct",
+  media.cloudflare[0]?.origin?.kind === "self-host-port",
+  `${media.cloudflare[0]?.origin?.kind} — ${media.cloudflare[0]?.origin?.evidence}`,
+);
+check(
+  "an origin naming a container by name resolves to it without a port match",
+  live.cloudflare[0]?.origin?.kind === "self-network",
+  `${live.cloudflare[0]?.origin?.kind} — ${live.cloudflare[0]?.origin?.evidence}`,
 );
 
 console.log("\nprovider attribution needs proof, not a name");

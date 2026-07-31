@@ -9,6 +9,8 @@ export type {
   PortMapping,
   MountSpec,
   CloudflareRoute,
+  OriginTarget,
+  OriginKind,
   TraefikRoute,
   AuthMethod,
   AuthConfidence,

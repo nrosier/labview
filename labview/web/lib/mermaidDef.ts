@@ -20,6 +20,14 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
     return existing;
   };
   const esc = (s: string): string => s.replace(/"/g, "'").replace(/[\r\n]+/g, " ").trim();
+  // A tunnel hostname and the proxy router serving it describe the same link, so
+  // an edge is kept once no matter how many routes assert it.
+  const seenEdge = new Set<string>();
+  const edge = (line: string): void => {
+    if (seenEdge.has(line)) return;
+    seenEdge.add(line);
+    lines.push(line);
+  };
 
   // Node shapes: () rounded = service, [[ ]] subroutine = external hub,
   // ([ ]) stadium = network, [( )] cylinder = volume.
@@ -27,23 +35,61 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
   lines.push(`  ${svcId}("${esc(svc.name)}")`);
   lines.push(`  class ${svcId} svc`);
 
-  // Ingress: Cloudflare tunnel (public)
-  const cfHosts = svc.cloudflare.map((r) => r.hostname).filter(Boolean);
-  if (cfHosts.length) {
+  /**
+   * The service a tunnel origin resolved to, drawn as the service it is — rounded
+   * like any other, since it is one — but coloured as the proxy it was observed to
+   * act as. Named from `hopKey`, qualified by stack only when it lives elsewhere.
+   */
+  const definedHops = new Set<string>();
+  const hopNode = (hopKey: string): string => {
+    const nid = id(`hop:${hopKey}`);
+    if (!definedHops.has(hopKey)) {
+      definedHops.add(hopKey);
+      const slash = hopKey.indexOf("/");
+      const sameStack = slash > 0 && hopKey.slice(0, slash) === stack.id;
+      lines.push(`  ${nid}("${esc(sameStack ? hopKey.slice(slash + 1) : hopKey)}")`);
+      lines.push(`  class ${nid} tf`);
+    }
+    return nid;
+  };
+
+  // Ingress: Cloudflare tunnel (public). A route whose origin resolved to another
+  // scanned service is drawn through that service — the hop the configuration
+  // names — instead of as a straight line to this container. Every other kind of
+  // origin keeps the direct edge, since no hop was established.
+  const cfRoutes = svc.cloudflare.filter((r) => r.hostname);
+  let hopId: string | undefined;
+  if (cfRoutes.length) {
     const cf = id("hub:cf");
     lines.push(`  ${cf}[["Cloudflare Tunnel"]]`);
     lines.push(`  class ${cf} cf`);
-    for (const h of cfHosts) lines.push(`  ${cf} ==>|"${esc(h)}"| ${svcId}`);
+    for (const r of cfRoutes) {
+      const host = esc(r.hostname!);
+      const hopKey = r.origin?.kind === "fleet-service" ? r.origin.hopKey : undefined;
+      if (hopKey) {
+        const hop = hopNode(hopKey);
+        hopId ??= hop;
+        edge(`  ${cf} ==>|"${host}"| ${hop}`);
+        edge(`  ${hop} -->|"${host}"| ${svcId}`);
+      } else {
+        edge(`  ${cf} ==>|"${host}"| ${svcId}`);
+      }
+    }
   }
-  // Ingress: Traefik (local)
+  // Ingress: proxy routes (local). They start at the resolved hop when there is
+  // one — that service was observed to front this one, so drawing a second,
+  // synthetic proxy beside it would claim two hops where the config shows one.
   const tHosts = [...new Set(svc.traefik.flatMap((r) => r.hosts))];
   const hasTraefik = svc.traefik.length > 0;
   if (hasTraefik) {
-    const tf = id("hub:tf");
-    lines.push(`  ${tf}[["Traefik"]]`);
-    lines.push(`  class ${tf} tf`);
+    let tf = hopId;
+    if (!tf) {
+      tf = id("hub:tf");
+      lines.push(`  ${tf}[["Traefik"]]`);
+      lines.push(`  class ${tf} tf`);
+    }
     const labels = tHosts.length ? tHosts : ["route"];
-    for (const h of labels) lines.push(`  ${tf} -->|"${esc(h)}"| ${svcId}`);
+    for (const h of labels) edge(`  ${tf} -->|"${esc(h)}"| ${svcId}`);
   }
 
   // Auth posture (dashed "protected by" edge). The node is named after whatever

@@ -305,38 +305,73 @@ code, .mono {
 .chip .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .result-count { color: var(--muted); font-size: 12px; margin-left: auto; }
 
-/* ---- App grid & cards ------------------------------------------------ */
+/* ---- Stack list ------------------------------------------------------ */
 
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 12px;
-}
-.card {
+.stack-list { display: flex; flex-direction: column; gap: 8px; }
+.stack-card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px;
-  cursor: pointer;
+  overflow: hidden;
+}
+.stack-card.open { border-color: var(--baseline); }
+.stack-head {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 10px;
-  transition: box-shadow 0.12s ease, transform 0.12s ease;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: background 0.12s ease;
 }
-.card:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
-.card:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; }
-.card .head { display: flex; align-items: center; gap: 8px; }
-.card .name { font-weight: 650; font-size: 15px; }
-.card .stacktag {
-  font-size: 11px;
-  color: var(--ink-2);
-  background: var(--surface-2);
-  padding: 1px 7px;
-  border-radius: 5px;
+.stack-head:hover { background: var(--surface-2); }
+.stack-head:focus-visible { outline: 2px solid var(--c1); outline-offset: -2px; }
+.stack-head .chev { color: var(--muted); font-size: 11px; width: 10px; flex: none; }
+.stack-title { min-width: 0; flex: 1; }
+.stack-title .line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.stack-title .name { font-weight: 650; font-size: 15px; }
+.stack-title .count { color: var(--ink-2); font-size: 12px; }
+.stack-title .muted-inline { color: var(--muted); }
+.stack-title .dots { display: inline-flex; align-items: center; gap: 3px; }
+.stack-title .metaline {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.card .img { color: var(--muted); font-size: 12px; word-break: break-all; }
-.card .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
-.card .metaline { display: flex; gap: 12px; color: var(--muted); font-size: 12px; flex-wrap: wrap; }
+.stack-head .badges { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; flex: none; max-width: 45%; }
+
+.svc-list { border-top: 1px solid var(--border); }
+.svc-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px 8px 34px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.12s ease;
+}
+.svc-row:last-child { border-bottom: none; }
+.svc-row:hover { background: var(--surface-2); }
+.svc-row:focus-visible { outline: 2px solid var(--c1); outline-offset: -2px; }
+.svc-row .name { font-weight: 600; font-size: 13.5px; flex: none; }
+.svc-row .img {
+  color: var(--muted);
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.svc-row .badges { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+
+@media (max-width: 760px) {
+  .stack-head { flex-wrap: wrap; }
+  .stack-head .badges, .svc-row .badges { max-width: none; justify-content: flex-start; }
+  .svc-row { flex-wrap: wrap; padding-left: 14px; }
+}
 
 /* ---- Badges & status ------------------------------------------------- */
 

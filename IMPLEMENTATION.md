@@ -89,11 +89,13 @@ labview/
       auth.ts         routes + env + registry -> AuthPosture
     analyze/
       middlewares.ts  cross-stack Traefik middleware registry
+      origins.ts      cross-stack tunnel-origin resolution (what an origin points at)
+      networks.ts     real docker network names for a service (shared by graph + origins)
       index.ts        the pipeline; ingress classification; stats
       graph.ts        nodes/edges for the relationship graph
     enrich/docker.ts  Docker Engine snapshot (never throws)
     server/server.ts  Fastify: /api/* + static UI, with a TTL cache
-  web/                Preact UI (see §3.5)
+  web/                Preact UI (see §3.7)
   scripts/
     build-web.mjs     esbuild bundle
     smoke.ts          pipeline assertions over the fixtures
@@ -118,11 +120,12 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 4. Middleware registry | `analyze/middlewares.ts` | every Traefik middleware *defined* anywhere, by bare name |
 | 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker`, `svc.ingress` |
 | 6. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
-| 7. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
-| 8. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, ingress/auth hubs |
-| 9. Stats | `computeStats` | `OverviewStats` for the dashboard header |
+| 7. Origin resolution | `analyze/origins.ts` | `route.origin` — what each tunnel origin points at, and notes where it could not be told |
+| 8. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
+| 9. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
+| 10. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
-**Why two passes.** Steps 6 and 7 cannot run per-service inside step 5. Two
+**Why two passes.** Steps 6–7 cannot run per-service inside step 5. Three
 conclusions are only available once the *whole* fleet is parsed:
 
 1. A Traefik middleware referenced as `authentik@docker` is usually defined in a
@@ -130,6 +133,9 @@ conclusions are only available once the *whole* fleet is parsed:
    requires the global registry (step 4).
 2. Which hostnames represent the SSO provider is learned from whichever stack
    *runs* the provider — so its routes must already be parsed (step 6 after 5).
+3. A tunnel origin routinely names a reverse proxy defined in a *different* stack,
+   so resolving it needs a fleet-wide index of published host ports and DNS names
+   (step 7, after the routes exist and before the graph is drawn from them).
 
 A change that needs fleet-wide knowledge belongs in a new pass or in step 4/6,
 not in a per-service function reaching for global state.
@@ -153,7 +159,43 @@ Two properties matter and must be preserved:
   verbatim would make every `OIDC_ISSUER=https://server.example.com` look like
   Authentik.
 
-### 3.4 The data contract
+### 3.4 Tunnel origin resolution (step 7)
+
+A tunnel rarely terminates at the container whose labels declare it. The origin
+(`dockflare.service`) normally names a reverse proxy, which forwards to the
+container over a shared network. Drawing `tunnel → container` would state a
+topology the configuration contradicts, so `analyze/origins.ts` resolves the
+origin from evidence and records the conclusion on `route.origin`.
+
+Which evidence applies depends on how the origin addresses its target:
+
+- **An IP literal addresses the host.** The port is therefore a *published host
+  port*, and a host port can only be held by one service, so a match identifies
+  the target rather than suggesting it.
+- **A bare name addresses a container.** The port is container-internal and says
+  nothing about ownership, so the *name* is the evidence: compose publishes a
+  service's name and `container_name` as DNS aliases on its networks.
+
+One wrinkle needs a second kind of evidence. A fleet may declare the same host
+port on several services even though only one can hold it at a time, so a port
+match is not always unique. **Network membership breaks the tie**: a candidate
+sharing no network with the service it supposedly fronts cannot forward to it.
+That is the second leg of the path — and it is as observable as the port.
+
+Two rules keep this honest, and both have fixtures:
+
+- **Repeated declarations by one service are not rivals.** `443:443/tcp` beside
+  `443:443/udp` (HTTP/3), or a name equal to the service's own `container_name`,
+  reach the index twice. `distinct()` collapses them by service key; without it a
+  settled origin gets reported as ambiguous.
+- **A genuine tie stays unresolved.** Two reachable services claiming one port
+  yields `unresolved` with the ambiguity as its stated reason, never a winner
+  picked by order. Likewise a FQDN, or a port nobody publishes.
+
+No image, vendor or naming convention is consulted anywhere in the module — the
+proxy is identified structurally, by what it publishes and what it can reach.
+
+### 3.5 The data contract
 
 [model/types.ts](labview/src/model/types.ts) is the single contract between
 backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
@@ -165,7 +207,7 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   change**: the palette in `web/lib/palette.ts` maps every member to a colour and
   a label, and an unmapped member silently renders grey. See §10.
 
-### 3.5 Serving
+### 3.6 Serving
 
 Fastify with three routes and a static mount:
 
@@ -181,12 +223,26 @@ traffic cannot start N scans. The cache is warmed in the background at startup s
 the first page load is instant. If `web/dist` is absent the server still runs and
 says how to build it — the API is the primary product, the UI is a view of it.
 
-### 3.6 Frontend
+### 3.7 Frontend
 
 Preact + esbuild, bundled to a single `web/dist/app.js` with mermaid and cytoscape
 inlined; `web/index.html` and `web/styles.css` are copied verbatim. There is no
 CDN dependency and no network access beyond same-origin `api/*` (relative, so it
 works under a path prefix).
+
+**View hierarchy.** The Stacks tab lists one card per stack — the unit a compose
+fleet is organised in — which expands to its services, each opening the detail
+drawer. Two rules hold it together:
+
+- **Filtering stays service-level.** "Public" is a property of a service, not of a
+  directory. The predicate runs over the flat service list; a stack renders when at
+  least one of its services matches, and shows only the matching ones. A
+  stack-level predicate would have to reduce a stack to one posture, which it does
+  not have.
+- **A collapsed stack rolls up, it does not summarise.** Every distinct ingress and
+  auth posture present is shown, plus a count of services reachable without auth. A
+  stack with an internal database and a public UI is both at once; picking a "worst
+  case" badge would misreport it.
 
 `web/lib/palette.ts` is the single source of truth for categorical colour: every
 `IngressKind` and `AuthMethod` maps to a CSS custom property from the validated
@@ -352,6 +408,27 @@ the kind would collapse the whole distribution into one bucket. The note is not
 cosmetic: it is the difference between "protected by SSO" and "protected by SSO
 unless you use the port".
 
+**OriginTarget / OriginKind** — where a tunnel route's origin address was found to
+lead (§3.4). Attached to every `CloudflareRoute` whose `service` is non-empty, and
+carrying an `evidence` string in the same spirit as `AuthPosture.evidence`.
+
+| Kind | Meaning | Graph |
+|---|---|---|
+| `self-network` | the origin host is this service's own name or `container_name` | direct `tunnel → service` |
+| `self-host-port` | the origin port is a host port *this* service publishes | direct `tunnel → service` |
+| `fleet-service` | the origin resolves to another scanned service, which shares a network with this one — `hopKey` names it | chained `tunnel → hop → service` |
+| `unresolved` | nothing observable settles it: no match, a FQDN, or a tie between reachable candidates | direct `tunnel → service`, plus a service note |
+
+`unresolved` keeps the direct edge on purpose. It is the one shape that is not a
+claim about the path — an invented hop would be, and dropping the edge would hide
+a route that exists. The note states which of the reasons applied.
+
+**Proxy role** — `GraphNode.role: "proxy"` is set on a service another service's
+origin resolved to. It stays an ordinary service node (same kind, same drawer, same
+click target); the role only lets the UI colour it as infrastructure. Nothing else
+reads it, and no service is ever *declared* a proxy — the role is a consequence of
+having been resolved as a hop at least once.
+
 **AuthMethod / AuthConfidence** — see §4 I3. `confidence: "inferred"` means the
 method rests on a middleware *name* because no definition was found in any scanned
 stack; it also produces a service note saying so.
@@ -446,8 +523,9 @@ failure and gates CI.
 
 **`fixtures/apps`** — a representative happy-path fleet: a tunnel + proxy service,
 a proxy-bypassing service, cross-stack middleware resolution, LDAP and OIDC
-services, a stack with an `.env`, shared binds across stacks. Asserts the normal
-output is right.
+services, a stack with an `.env`, shared binds across stacks, and a `proxy` stack
+that is the resolved hop for another stack's tunnel origin (§3.4). Asserts the
+normal output is right.
 
 **`fixtures/edge`** — one stack per previously-fixed defect. The contract:
 
@@ -464,6 +542,7 @@ stacks:
 | `ldapapp` | LDAP against a non-Authentik directory stays generic |
 | `interp` | nested `${A:-${B:-lit}}` defaults, `$$`, unused-branch handling |
 | `hostport` | published ports are reachability; `expose:` is not; bypass notes |
+| `tunnelorigin` | an origin that cannot be resolved stays unresolved: a port nothing publishes, and a tie between two reachable claimants. Neither may invent a hop |
 | `otherprovider` | provider attribution needs proof, on both the env and the address path |
 | `authentik` | upstream's generic service names (`server`, `worker`) must not become fleet-wide hints — `isSpecificHint`. Doubles as the definition site for the cross-stack `authentik@docker` references |
 
@@ -610,8 +689,13 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | `now` injected into `buildOverview` | Determinism (I7) — required for fixture-based assertions. |
 | Bounded `inspect` concurrency instead of unbounded `Promise.all` | Per-container `inspect` is the bulk of scan latency, but hundreds of simultaneous connections can overwhelm a socket proxy. |
 | Cross-stack middleware registry keyed by bare name | Services reference `x@docker` while `x` is defined in another stack; a per-stack view could not classify the reference at all. |
+| A tunnel origin is resolved by *published port and shared network*, never by a name convention | The port is unique per host and the network membership is what makes forwarding possible, so both are facts. "The service called `proxy` is probably the proxy" is a guess about someone else's naming, and would break I2 the moment a fleet named it anything else. |
+| An unresolved origin keeps the direct edge | Two alternatives, both worse: inventing a plausible hop states a path that was never observed, and dropping the edge hides a route that exists. The direct edge plus a note is the only shape that claims nothing untrue. |
+| A hop is a role on a service node, not a node of its own | The proxy is a scanned service with its own image, mounts, auth posture and drawer. Synthesising a separate node beside it would duplicate it in the graph and make it unclickable. |
+| Edges deduped by (kind, source, target, label) | A tunnel hostname and the proxy router serving it describe one link. Emitting both drew dozens of parallel identical lines between the same two nodes. |
 | Auth type wins a registry name collision | A `headers` middleware sharing a name must not shadow a `forwardauth` one and erase a real gate. |
 | Compose files treated as untrusted | `env_file: ../../../../etc/shadow` would otherwise pull host files into a public API response. |
 | No `ports:` in LabView's own compose example | It would bypass the very SSO the dashboard documents (§7). |
 | Single self-contained JS bundle, no CDN | An air-gapped or egress-filtered homelab must still render the UI. |
+| Stack cards that expand, with service-level filters | The stack is the unit an operator deploys and thinks in; a flat service grid scattered a stack's parts alphabetically. But exposure and auth are per-service, so the filter predicate stays per-service and the grouping is applied to its results. |
 | Fastify + `@fastify/static` over a hand-rolled server | Correct static handling, SPA fallback and structured logging without writing any of it. |

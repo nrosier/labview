@@ -35,6 +35,49 @@ export interface MountSpec {
   raw: string;
 }
 
+/**
+ * What a tunnel origin address points at, resolved from observable evidence only.
+ *
+ * A tunnel does not usually terminate at the container it is declared on: the
+ * origin points at a reverse proxy, which forwards to the container over a shared
+ * network. Drawing the tunnel straight at the container would assert a topology
+ * the configuration contradicts, so the origin is resolved instead of assumed.
+ *
+ * The evidence is the origin's **port**. Host ports are unique per host, so a
+ * published port identifies exactly one service — which makes the match an
+ * observation rather than an inference, and needs no image or vendor detection to
+ * establish (invariants I1/I2 in IMPLEMENTATION.md).
+ */
+export interface OriginTarget {
+  /** The raw origin address as declared (`dockflare.service`). */
+  address: string;
+  host: string;
+  /** Explicit port, or the one implied by the scheme (443 for https, 80 for http). */
+  port: string;
+  kind: OriginKind;
+  /** For `fleet-service`: `${stackId}/${serviceName}` of the resolved hop. */
+  hopKey?: string;
+  /** Why this conclusion was reached, in the spirit of `AuthPosture.evidence`. */
+  evidence: string;
+}
+
+/**
+ * How a tunnel origin resolved.
+ *
+ * Only `fleet-service` establishes a hop. The three others all mean "the tunnel
+ * reaches this service directly", either because the config says so or because
+ * nothing in the scan could prove otherwise — and an unproven hop is not drawn.
+ */
+export type OriginKind =
+  /** Origin host is the service's own compose/container name — direct over a docker network. */
+  | "self-network"
+  /** Origin port is a port this very service publishes — direct at the host port. */
+  | "self-host-port"
+  /** Origin port is another scanned service's published port — that service is the hop. */
+  | "fleet-service"
+  /** Matched nothing published in the scanned stacks, or was ambiguous. */
+  | "unresolved";
+
 /** DockFlare-derived public ingress via a Cloudflare tunnel. */
 export interface CloudflareRoute {
   hostname: string;
@@ -48,6 +91,8 @@ export interface CloudflareRoute {
   };
   noTlsVerify?: boolean;
   raw: Record<string, string>;
+  /** What `service` resolves to. Absent when no origin was declared. */
+  origin?: OriginTarget;
 }
 
 /** Traefik-derived local ingress. */
@@ -195,6 +240,12 @@ export interface GraphNode {
   auth?: AuthMethod;
   ingress?: IngressKind;
   running?: boolean;
+  /**
+   * Set on a service that another service's tunnel origin resolved to, i.e. one
+   * observed to act as a reverse proxy. It stays an ordinary service node — this
+   * only lets the UI style it as infrastructure.
+   */
+  role?: "proxy";
 }
 
 export interface GraphEdge {

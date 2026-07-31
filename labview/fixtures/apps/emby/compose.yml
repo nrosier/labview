@@ -19,7 +19,9 @@ services:
     labels:
       - "dockflare.enable=true"
       - "dockflare.hostname=media.example.com"
-      - "dockflare.service=http://10.10.0.5:8096"
+      # The origin addresses this container's own published host port (8920), so the
+      # tunnel reaches it directly — no reverse proxy in the path either way.
+      - "dockflare.service=http://10.10.0.5:8920"
       - "dockflare.http2_origin=true"
       - "dockflare.match_sni_to_host=true"
 

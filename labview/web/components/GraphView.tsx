@@ -87,6 +87,20 @@ export function GraphView({
           },
         },
         {
+          // A service that another service's tunnel origin resolved to. It stays a
+          // service node — same shape, same click target, same drawer — but reads as
+          // the infrastructure it was observed to act as. Declared after the service
+          // rule so it wins on colour.
+          selector: 'node[role = "proxy"]',
+          style: {
+            "background-color": resolveVar("--hub-traefik"),
+            width: 30,
+            height: 30,
+            "border-width": 2,
+            "font-weight": "bold" as unknown as number,
+          },
+        },
+        {
           selector: 'node[kind = "network"]',
           style: {
             shape: "round-rectangle",
@@ -220,6 +234,7 @@ export function GraphView({
           <span class="item">{swatch("--ing-local", "round")} local</span>
           <span class="item">{swatch("--ing-hostport", "round")} host port</span>
           <span class="item">{swatch("--ing-internal", "round")} internal</span>
+          <span class="item">{swatch("--hub-traefik", "round")} proxy hop</span>
           <span class="item">{swatch("--node-network")} network</span>
           <span class="item">{swatch("--node-volume", "diamond")} volume</span>
           <span class="item">{swatch("--hub-auth", "diamond")} hub</span>

@@ -1,0 +1,52 @@
+# Regression fixture: an origin that cannot be resolved must stay unresolved.
+#
+# The chain `tunnel -> proxy -> container` is only drawn where the config proves
+# it. These two services are the cases where it does not, and both must keep the
+# direct edge and say why rather than pick a plausible-looking hop.
+services:
+  # The origin names a host port nothing in this scan publishes — a proxy running
+  # outside the apps root, on another host, or simply a stale label. Unknowable
+  # from here, so it is reported as unknown.
+  offsite:
+    image: example/app:2.0.0
+    container_name: tunnelorigin-offsite
+    networks:
+      - shared
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=offsite.edge.example.com"
+      - "dockflare.service=http://10.10.0.5:19999"
+
+  # The origin names a host port that *two* reachable services declare. Only one
+  # can hold it at a time, but which one is not observable, so neither is named.
+  ambiguous:
+    image: example/app:2.0.0
+    container_name: tunnelorigin-ambiguous
+    networks:
+      - shared
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=ambiguous.edge.example.com"
+      - "dockflare.service=https://10.10.0.5:8443"
+
+  # Two proxies, same declared host port, both on the network the service above
+  # joins. Reachability cannot break this tie — that is the point.
+  edge-a:
+    image: example/reverse-proxy:3.1.0
+    container_name: tunnelorigin-edge-a
+    ports:
+      - "8443:8443"
+    networks:
+      - shared
+
+  edge-b:
+    image: example/reverse-proxy:3.1.0
+    container_name: tunnelorigin-edge-b
+    ports:
+      - "8443:8443"
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true

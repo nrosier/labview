@@ -5,7 +5,7 @@ import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
 import { StatTile, DistributionBar, type DistSegment } from "./components/stats";
-import { AppCard } from "./components/AppCard";
+import { StackCard } from "./components/StackCard";
 import { AppDetail } from "./components/AppDetail";
 import { GraphView } from "./components/GraphView";
 
@@ -18,6 +18,19 @@ interface Flat {
   key: string;
 }
 
+/** A stack together with the services of it that survived the filters. */
+interface StackGroup {
+  stack: AppStack;
+  services: Service[];
+}
+
+/**
+ * Every service, paired with its stack.
+ *
+ * Filtering stays service-level even though the view is stack-level — "public" is
+ * a property of a service, not of a directory — so the flat list remains the thing
+ * the predicate runs over, and the stack grouping is applied to its results.
+ */
 function flatten(ov: Overview): Flat[] {
   const out: Flat[] = [];
   for (const stack of ov.stacks) {
@@ -48,6 +61,7 @@ function App() {
   const [authFilter, setAuthFilter] = useState<Set<string>>(new Set());
   const [exposedOnly, setExposedOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     applyTheme(theme);
@@ -103,6 +117,28 @@ function App() {
     });
   }, [flat, search, ingressFilter, authFilter, exposedOnly]);
 
+  // Group the surviving services back under their stacks. `filtered` is already
+  // ordered by stack then service, and a Map keeps insertion order, so the stacks
+  // come out sorted without a second sort.
+  const groups = useMemo<StackGroup[]>(() => {
+    const byStack = new Map<string, StackGroup>();
+    for (const { stack, svc } of filtered) {
+      const g = byStack.get(stack.id);
+      if (g) g.services.push(svc);
+      else byStack.set(stack.id, { stack, services: [svc] });
+    }
+    return [...byStack.values()];
+  }, [filtered]);
+
+  const filtering = search.trim() !== "" || ingressFilter.size > 0 || authFilter.size > 0 || exposedOnly;
+
+  // A match must never hide behind a click, so an active filter opens the stacks it
+  // matched, and clearing the filter collapses them again. Keyed on the filter
+  // inputs rather than on the results, so toggling a stack does not re-trigger it.
+  useEffect(() => {
+    setExpanded(filtering ? new Set(groups.map((g) => g.stack.id)) : new Set());
+  }, [search, ingressFilter, authFilter, exposedOnly]);
+
   const ingressSegments = useMemo<DistSegment[]>(() => {
     const counts = new Map<IngressKind, number>();
     for (const { svc } of flat) counts.set(svc.ingress, (counts.get(svc.ingress) ?? 0) + 1);
@@ -125,6 +161,15 @@ function App() {
 
   function openService(stackId: string, serviceName: string) {
     setSelected(serviceKey(stackId, serviceName));
+  }
+
+  function toggleStack(stackId: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(stackId)) next.delete(stackId);
+      else next.add(stackId);
+      return next;
+    });
   }
 
   if (error && !ov) {
@@ -151,6 +196,7 @@ function App() {
     );
   }
 
+  const allOpen = groups.length > 0 && expanded.size === groups.length;
   const nextTheme: Record<Theme, Theme> = { auto: "light", light: "dark", dark: "auto" };
   const themeIcon: Record<Theme, string> = { auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark" };
 
@@ -246,7 +292,7 @@ function App() {
 
       <nav class="tabs">
         <button class={`tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>
-          Apps ({ov.stats.services})
+          Stacks ({ov.stats.stacks})
         </button>
         <button class={`tab${tab === "graph" ? " active" : ""}`} onClick={() => setTab("graph")}>
           Relationship graph
@@ -269,7 +315,7 @@ function App() {
             >
               ⚠ Exposed, no auth
             </button>
-            {(ingressFilter.size > 0 || authFilter.size > 0 || exposedOnly || search) && (
+            {filtering && (
               <button
                 class="chip"
                 onClick={() => {
@@ -282,17 +328,33 @@ function App() {
                 Clear filters
               </button>
             )}
+            <button
+              class="chip"
+              disabled={groups.length === 0}
+              onClick={() => setExpanded(allOpen ? new Set() : new Set(groups.map((g) => g.stack.id)))}
+            >
+              {allOpen ? "Collapse all" : "Expand all"}
+            </button>
             <span class="result-count">
-              {filtered.length} of {flat.length}
+              {filtering
+                ? `${groups.length} of ${ov.stats.stacks} stacks · ${filtered.length} of ${flat.length} services`
+                : `${groups.length} stacks · ${flat.length} services`}
             </span>
           </div>
 
-          {filtered.length === 0 ? (
+          {groups.length === 0 ? (
             <div class="center-msg">No services match the current filters.</div>
           ) : (
-            <div class="grid">
-              {filtered.map(({ stack, svc, key }) => (
-                <AppCard key={key} stack={stack} svc={svc} onOpen={() => setSelected(key)} />
+            <div class="stack-list">
+              {groups.map((g) => (
+                <StackCard
+                  key={g.stack.id}
+                  stack={g.stack}
+                  services={g.services}
+                  expanded={expanded.has(g.stack.id)}
+                  onToggle={() => toggleStack(g.stack.id)}
+                  onOpenService={(svc) => setSelected(serviceKey(g.stack.id, svc.name))}
+                />
               ))}
             </div>
           )}

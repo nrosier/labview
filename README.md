@@ -47,9 +47,9 @@ It targets a specific, common TrueNAS Scale pattern:
 | | |
 |---|---|
 | **Dashboard** | Stat tiles (stacks, services, running, public, local-only, auth-protected, and a highlighted **exposed-without-auth** count) plus part-to-whole bars for ingress exposure and auth method. Legends double as filters. |
-| **App grid** | One card per service: live status dot, image, hostnames, colored ingress/auth badges. Search and filter across the fleet. |
-| **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
-| **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume, and tunnel/proxy/SSO hub nodes, linked by network membership, `depends_on`, shared volumes, ingress, and auth. |
+| **Stack list** | One card per stack — the unit you deploy — rolling up the live status, hostnames and every distinct ingress/auth badge of its services, with a count of anything reachable without auth. Click to expand the services underneath. Search and filters work per service and open the stacks that matched. |
+| **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
+| **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
 | **Ingress classification** | Every service resolves to `public`, `public+host-port`, `public+local`, `local`, `host-port`, or `internal`. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `observed` in the config or only `inferred` from a name. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. |
@@ -166,7 +166,8 @@ label prefixes and Authentik hints, is documented in
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
       → build middleware registry → classify ingress → discover Authentik
-      → derive auth posture → build graph → serve /api/overview
+      → resolve tunnel origins → derive auth posture → build graph
+      → serve /api/overview
 ```
 
 Compose parsing handles both label/env syntaxes (list `- k=v` and map `k: v`),
@@ -184,6 +185,16 @@ honest on a fleet that runs something else — with no Authentik to discover,
 nothing is learned and every issuer stays generic. No naming convention is
 assumed: `oauth.bigcorp.example.com` is not Authentik, and a middleware named
 `authentik` that points somewhere else isn't either.
+
+Tunnel origins get the same treatment. A tunnel usually terminates at a reverse
+proxy, not at the container whose labels declare the route, so LabView reads the
+origin address and works out where it actually leads: an IP literal addresses the
+host, so its port is a published host port and identifies exactly one service; a
+bare name addresses a container, so the DNS name is the evidence. A tie between two
+services declaring one port is broken by network membership — a candidate sharing
+no network with the service it supposedly fronts cannot forward to it. When that
+proves a hop, the graph draws `tunnel → proxy → service`. When nothing proves one,
+the direct edge stays and the service says why the hop is unknown.
 
 See [labview/README.md](labview/README.md#how-it-works) for the details, and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the design rules behind them.

@@ -1,4 +1,4 @@
-import type { AppStack, Service } from "../model";
+import type { AppStack, OriginTarget, Service } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { buildServiceMermaid } from "../lib/mermaidDef";
 import { AuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
@@ -11,6 +11,28 @@ function Section({ title, children }: { title: string; children: preact.Componen
       {children}
     </div>
   );
+}
+
+/**
+ * Where a tunnel origin was found to lead, in a few words. The full reasoning is
+ * listed as evidence under the table, so this only has to say which of the four
+ * conclusions was reached.
+ */
+function originLabel(o: OriginTarget): string {
+  switch (o.kind) {
+    case "fleet-service":
+      return `via ${o.hopKey}`;
+    case "self-host-port":
+      return "direct — own host port";
+    case "self-network":
+      return "direct — own network";
+    default:
+      return "hop unresolved";
+  }
+}
+
+function originEvidence(svc: Service): string[] {
+  return [...new Set(svc.cloudflare.map((r) => r.origin?.evidence).filter(Boolean))] as string[];
 }
 
 export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Service; onClose: () => void }) {
@@ -108,6 +130,16 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                       <td class="mono">
                         {r.service}
                         {r.noTlsVerify ? " (no-tls-verify)" : ""}
+                        {/* Where that address leads. A tunnel usually terminates at a
+                            reverse proxy rather than at this container, so the path is
+                            reported rather than assumed. */}
+                        {r.origin && (
+                          <div>
+                            <span class="pill" title={r.origin.evidence}>
+                              {originLabel(r.origin)}
+                            </span>
+                          </div>
+                        )}
                       </td>
                       <td>
                         {r.access
@@ -120,6 +152,15 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                   ))}
                 </tbody>
               </table>
+              {/* One line per distinct conclusion: several hostnames routinely share
+                  a single origin, and repeating its reasoning adds nothing. */}
+              {originEvidence(svc).length > 0 && (
+                <ul class="evidence" style="margin-top:8px;">
+                  {originEvidence(svc).map((e) => (
+                    <li>{e}</li>
+                  ))}
+                </ul>
+              )}
             </Section>
           )}
 

@@ -13,6 +13,7 @@ import { deriveAuth } from "../labels/auth.js";
 import { maskEnv } from "../secrets.js";
 import { buildGraph } from "./graph.js";
 import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.js";
+import { buildFleetIndex, resolveOrigins } from "./origins.js";
 import { snapshotDocker, composeKey, type DockerSnapshot } from "../enrich/docker.js";
 import { scanStacks } from "../scan/index.js";
 
@@ -34,6 +35,11 @@ export async function buildOverview(cfg: LabViewConfig, now: Date): Promise<Over
 
   // Authentik hostnames can only be discovered once routes are parsed.
   const authHints = discoverAuthentikHints(stacks, cfg);
+
+  // Where each tunnel origin points. Cross-stack by nature — an origin routinely
+  // names a proxy defined in a different stack — so it runs over the whole fleet
+  // once, after the routes exist and before the graph is drawn from them.
+  resolveOrigins(stacks, buildFleetIndex(stacks));
 
   // Pass 2: derive auth posture, finalize exposure, mask secrets.
   for (const stack of stacks) {
