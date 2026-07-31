@@ -1,0 +1,12 @@
+# Regression fixture: LDAP against a directory that is NOT Authentik. The host
+# happens to contain "server", which is exactly what the poisoned hint set from
+# ../authentik used to match on — producing a confident but wrong
+# "Authentik (LDAP)" attribution.
+services:
+  wiki:
+    image: example/wiki:2.4.0
+    container_name: ldapapp-wiki
+    environment:
+      LDAP_HOST: ldap://ldap-server.internal:389
+      LDAP_BIND_DN: cn=svc,dc=internal
+      LDAP_BIND_PASSWORD: hunter2

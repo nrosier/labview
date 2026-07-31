@@ -184,6 +184,14 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               <dt>Method</dt>
               <dd>
                 <AuthBadge method={svc.auth.method} />
+                {/* A conclusion drawn from a middleware name alone is labelled as
+                    such, so a reader never has to re-derive whether the evidence
+                    below is a definition or a guess. */}
+                {svc.auth.confidence === "inferred" && (
+                  <span class="pill" title="No middleware definition was found in the scanned stacks">
+                    inferred from name
+                  </span>
+                )}
               </dd>
               <dt>Detail</dt>
               <dd>{svc.auth.detail}</dd>
@@ -268,7 +276,16 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                     <tr>
                       <td class="mono">{e.key}</td>
                       <td class="mono">
-                        {e.masked ? <span class="masked">•••••• (masked)</span> : e.value ?? <span class="masked">∅</span>}
+                        {/* A masked entry either has no value at all (key matched a
+                            secret pattern) or a partially redacted one (an inline
+                            URI password was stripped) — show the latter. */}
+                        {e.masked && e.value === null ? (
+                          <span class="masked">•••••• (masked)</span>
+                        ) : e.masked && e.value !== null ? (
+                          <span title="password redacted">{e.value}</span>
+                        ) : (
+                          e.value ?? <span class="masked">∅</span>
+                        )}
                       </td>
                       <td>{e.source}</td>
                     </tr>

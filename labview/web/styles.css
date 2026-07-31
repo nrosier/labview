@@ -44,28 +44,43 @@
   --critical: #d03b3b;
 
   /* Semantic roles: ingress kind (identity).
-   * Order in the bar is public → public+local → local → internal; these hues are
-   * a validated adjacent run (orange, aqua, blue) so segments stay distinct in
-   * both light and dark — see scripts note in README. */
-  --ing-public:      var(--c2);  /* orange */
-  --ing-publiclocal: var(--c3);  /* aqua   */
-  --ing-local:       var(--c1);  /* blue   */
-  --ing-internal:    var(--muted);
+   * Bar order is public → public+host-port → public+local → local → host-port →
+   * internal. Each adjacent pair is a validated-distinct run in both light and
+   * dark (orange/violet, violet/aqua, aqua/blue, blue/magenta, magenta/neutral);
+   * violet and magenta mark the two "answers on a host port, no proxy in front"
+   * kinds so they read as a family without colliding with the proxied hues. Every
+   * segment also carries its text label, so hue is never the only channel. */
+  --ing-public:        var(--c2);  /* orange  */
+  --ing-publichostport: var(--c7); /* violet  */
+  --ing-publiclocal:   var(--c3);  /* aqua    */
+  --ing-local:         var(--c1);  /* blue    */
+  --ing-hostport:      var(--c5);  /* magenta */
+  --ing-internal:      var(--muted);
 
-  /* Semantic roles: auth method (identity). Bar order forward→oauth→ldap→
-   * other→basic→none maps to the validated run blue, orange, aqua, yellow,
-   * magenta (adjacent-safe in both modes); none is the recessive neutral. */
+  /* Semantic roles: auth method (identity). Bar order groups the methods whose
+   * provider was identified (blue, orange, aqua) ahead of those where only the
+   * mechanism was — starting at violet. blue/orange/aqua/green/yellow/magenta is
+   * the validated run from the CVD/contrast pass, adjacent-safe in both modes;
+   * none is the recessive neutral. The two LDAP roles sit next to each other on
+   * purpose: aqua/green reads as "same family, different directory" while staying
+   * distinguishable. Violet is the same hue as the auth hub in the graph, and its
+   * neighbours here (aqua, green) separate from it on lightness as well as hue.
+   * Every segment carries its text label, so hue is never the only channel. */
   --auth-forward:    var(--c1);  /* blue    */
   --auth-oauth:      var(--c2);  /* orange  */
   --auth-ldap:       var(--c3);  /* aqua    */
+  --auth-forwardany: var(--c7);  /* violet  */
+  --auth-ldapother:  var(--c6);  /* green   */
   --auth-otheroauth: var(--c4);  /* yellow  */
   --auth-basic:      var(--c5);  /* magenta */
   --auth-none:       var(--muted);
 
-  /* Graph hub roles */
+  /* Graph hub roles. Tunnel/proxy are vendor-specific because those labels are;
+   * the auth hub is named for its role, since the provider behind it may not be
+   * identifiable. */
   --hub-cloudflare:  var(--c2);
   --hub-traefik:     var(--c1);
-  --hub-authentik:   var(--c7);
+  --hub-auth:        var(--c7);
   --node-network:    var(--c1);
   --node-volume:     var(--c3);
 

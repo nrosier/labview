@@ -46,11 +46,21 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
     for (const h of labels) lines.push(`  ${tf} -->|"${esc(h)}"| ${svcId}`);
   }
 
-  // Auth posture (dashed "protected by" edge)
+  // Auth posture (dashed "protected by" edge). The node is named after whatever
+  // the scan could establish: the provider when it was identified, otherwise the
+  // mechanism alone — never the vendor it most likely is.
   if (svc.auth.method !== "none") {
     const isAk = svc.auth.method.startsWith("authentik");
     const ak = id(isAk ? "hub:ak" : "hub:auth");
-    const label = isAk ? "Authentik" : svc.auth.method === "basic-auth" ? "Basic auth" : "OAuth";
+    const label = isAk
+      ? "Authentik"
+      : svc.auth.method === "basic-auth"
+        ? "Basic auth"
+        : svc.auth.method === "ldap"
+          ? "LDAP directory"
+          : svc.auth.method === "forward-auth"
+            ? "Forward-auth (unidentified)"
+            : "OAuth";
     lines.push(`  ${ak}[["${label}"]]`);
     lines.push(`  class ${ak} auth`);
     lines.push(`  ${svcId} -.->|"${esc(svc.auth.method)}"| ${ak}`);
@@ -92,7 +102,7 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
   lines.push(`  classDef svc ${styleFor(resolveVar(ingressVar(svc.ingress)))}`);
   lines.push(`  classDef cf ${styleFor(resolveVar("--hub-cloudflare"))}`);
   lines.push(`  classDef tf ${styleFor(resolveVar("--hub-traefik"))}`);
-  lines.push(`  classDef auth ${styleFor(resolveVar("--hub-authentik"))}`);
+  lines.push(`  classDef auth ${styleFor(resolveVar("--hub-auth"))}`);
   lines.push(`  classDef net fill:${surface},stroke:${resolveVar("--node-network")},color:${ink},stroke-width:1.5px`);
   lines.push(`  classDef vol fill:${surface},stroke:${resolveVar("--node-volume")},color:${ink},stroke-width:1.5px`);
   lines.push(`  classDef dep fill:${surface},stroke:${border},color:${ink},stroke-width:1px`);

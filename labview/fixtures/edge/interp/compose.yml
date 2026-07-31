@@ -1,0 +1,16 @@
+# Regression fixture: nested `${A:-${B}}` interpolation. A non-recursive regex
+# cannot brace-match these, and leaves the inner expression in the output.
+services:
+  web:
+    # IMAGE_TAG is unset, so this falls through to DEFAULT_TAG (set in .env).
+    image: nginx:${IMAGE_TAG:-${DEFAULT_TAG:-1.27-alpine}}
+    container_name: interp-web
+    environment:
+      # Both levels unset except the innermost literal.
+      DEEP_LITERAL: ${A_MISSING:-${B_MISSING:-deep-literal}}
+      # Outer unset, inner set from .env.
+      RESOLVED_HOST: ${WEB_HOST:-${FALLBACK_HOST}}
+      # Outer set — the nested default must not be evaluated at all.
+      PRESENT_WINS: ${DEFAULT_TAG:-${SHOULD_NOT_BE_READ}}
+      # `$$` is a literal dollar, not a variable reference.
+      LITERAL_DOLLAR: cost is $$5 per unit

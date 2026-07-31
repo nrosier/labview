@@ -17,16 +17,25 @@ export interface RoleMeta<K extends string> {
 /** Ingress kinds in a fixed, meaningful order (most→least exposed). */
 export const INGRESS_META: RoleMeta<IngressKind>[] = [
   { key: "public", label: "Public", cssVar: "--ing-public" },
+  { key: "public+host-port", label: "Public + host port", cssVar: "--ing-publichostport" },
   { key: "public+local", label: "Public + Local", cssVar: "--ing-publiclocal" },
   { key: "local", label: "Local", cssVar: "--ing-local" },
+  { key: "host-port", label: "Host port (no proxy)", cssVar: "--ing-hostport" },
   { key: "internal", label: "Internal", cssVar: "--ing-internal" },
 ];
 
-/** Auth methods in a fixed order (grouped: Authentik variants, then others). */
+/**
+ * Auth methods in a fixed order: the ones whose provider was identified from the
+ * config first, then the ones where only the mechanism could be established.
+ * Labels say which is which — an unidentified provider is never labelled with the
+ * most likely vendor.
+ */
 export const AUTH_META: RoleMeta<AuthMethod>[] = [
   { key: "authentik-forward-auth", label: "Authentik (forward-auth)", cssVar: "--auth-forward" },
   { key: "authentik-oauth", label: "Authentik (OAuth/OIDC)", cssVar: "--auth-oauth" },
   { key: "authentik-ldap", label: "Authentik (LDAP)", cssVar: "--auth-ldap" },
+  { key: "forward-auth", label: "Forward-auth (provider unidentified)", cssVar: "--auth-forwardany" },
+  { key: "ldap", label: "LDAP (other directory)", cssVar: "--auth-ldapother" },
   { key: "other-oauth", label: "Other OAuth / Access", cssVar: "--auth-otheroauth" },
   { key: "basic-auth", label: "Basic auth", cssVar: "--auth-basic" },
   { key: "none", label: "No proxy auth", cssVar: "--auth-none" },

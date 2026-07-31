@@ -11,6 +11,7 @@ export type {
   CloudflareRoute,
   TraefikRoute,
   AuthMethod,
+  AuthConfidence,
   AuthPosture,
   DockerState,
   NetworkDecl,

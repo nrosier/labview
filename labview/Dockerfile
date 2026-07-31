@@ -27,15 +27,17 @@ COPY --from=build /app/web/dist ./web/dist
 COPY package.json ./
 COPY config.example.yml ./
 
-# Container defaults. Live Docker state is read via the docker-socket-proxy over
-# TCP by default (see compose.yml); set LABVIEW_DOCKER_SOCKET to use a socket.
+# Container defaults. Only paths LabView owns are set here: the Docker endpoint
+# is deliberately left unset, because any default TCP host would be a guess about
+# someone else's container names. Unset means the conventional local socket, and
+# a socket-proxy endpoint is opted into with LABVIEW_DOCKER_HOST (or the standard
+# DOCKER_HOST) — see compose.yml for the recommended proxy setup.
 ENV LABVIEW_APPS_ROOT=/data/apps \
-    LABVIEW_DOCKER_HOST=tcp://dockerproxy:2375 \
     LABVIEW_PORT=8080
 
 EXPOSE 8080
-# Run as an unprivileged user. No socket mount is needed — the socket proxy
-# handles Docker access on its own network.
+# Run as an unprivileged user. With a socket proxy no socket mount is needed at
+# all; if you mount the raw socket instead, mount it read-only.
 USER node
 
 CMD ["node", "dist/index.js"]

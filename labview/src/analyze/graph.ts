@@ -6,7 +6,9 @@ import type { AppStack, Service, Graph, GraphNode, GraphEdge } from "../model/ty
  *    networks correctly connect services from different stacks)
  *  - service -> service depends_on
  *  - service <-> shared volumes (named volumes, and bind paths used by 2+ stacks)
- *  - ingress/auth hubs: Cloudflare tunnel, Traefik, Authentik
+ *  - ingress/auth hubs, each added only when something observed calls for it:
+ *    a Cloudflare tunnel, Traefik, and either the identified SSO provider or a
+ *    generic hub when only the mechanism could be established
  */
 export function buildGraph(stacks: AppStack[]): Graph {
   const nodes = new Map<string, GraphNode>();
@@ -17,7 +19,7 @@ export function buildGraph(stacks: AppStack[]): Graph {
   const addEdge = (e: GraphEdge) => edges.push(e);
 
   // Hubs (added lazily only if used).
-  const hub = { cf: false, traefik: false, authentik: false };
+  const hub = { cf: false, traefik: false, authentik: false, auth: false };
 
   // First pass: count bind-path usage across distinct stacks to find shared data.
   const bindStacks = new Map<string, Set<string>>();
@@ -105,6 +107,9 @@ export function buildGraph(stacks: AppStack[]): Graph {
           label: r.hosts[0] ?? r.router,
         });
       }
+      // Auth hub. Only a service whose provider was actually identified hangs off
+      // the named hub; a mechanism-only detection gets the generic one, so the
+      // graph never draws a vendor it could not establish from the config.
       if (svc.auth.method.startsWith("authentik")) {
         hub.authentik = true;
         addEdge({
@@ -114,6 +119,15 @@ export function buildGraph(stacks: AppStack[]): Graph {
           kind: "auth",
           label: svc.auth.method.replace("authentik-", ""),
         });
+      } else if (svc.auth.method === "forward-auth" || svc.auth.method === "other-oauth") {
+        hub.auth = true;
+        addEdge({
+          id: `auth->${sid}`,
+          source: "ext:auth",
+          target: sid,
+          kind: "auth",
+          label: svc.auth.method,
+        });
       }
     }
   }
@@ -121,6 +135,7 @@ export function buildGraph(stacks: AppStack[]): Graph {
   if (hub.cf) addNode({ id: "ext:cloudflare", label: "Cloudflare Tunnel", kind: "external" });
   if (hub.traefik) addNode({ id: "ext:traefik", label: "Traefik", kind: "external" });
   if (hub.authentik) addNode({ id: "ext:authentik", label: "Authentik", kind: "external" });
+  if (hub.auth) addNode({ id: "ext:auth", label: "SSO (unidentified)", kind: "external" });
 
   return { nodes: [...nodes.values()], edges };
 }

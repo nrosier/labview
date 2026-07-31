@@ -23,7 +23,7 @@ services:
       - "traefik.http.services.outline.loadbalancer.server.port=3000"
       - "dockflare.enable=true"
       - "dockflare.hostname=docs.example.com"
-      - "dockflare.service=https://192.168.1.2"
+      - "dockflare.service=https://10.10.0.5"
 
 networks:
   proxy:

@@ -1,12 +1,15 @@
-# Deploy LabView on TrueNAS Scale (Apps -> Custom App -> "Install via YAML",
-# or drop this in /mnt/apps/labview/compose.yml and run `docker compose up -d`).
+# Deploy LabView next to the stacks it inspects (on TrueNAS Scale: Apps -> Custom
+# App -> "Install via YAML", or drop this in <apps-root>/labview/compose.yml and
+# run `docker compose up -d`).
 #
-# Live Docker state is read through the shared docker-socket-proxy (tcp://dockerproxy:2375)
-# — LabView never touches the raw socket. Your app stacks are mounted read-only.
+# Every name below is an example, not a requirement — network names, the socket
+# proxy's hostname and the apps root all come from your setup, and LabView reads
+# whatever you point it at. The only fixed parts are the LABVIEW_* variables.
 #
-# Prerequisites (already present in this homelab): the external `proxy` and
-# `dockerproxy` networks, and the `dockerproxy` (tecnativa/docker-socket-proxy)
-# stack. LabView only needs read endpoints (CONTAINERS/NETWORKS/VOLUMES/IMAGES/INFO/PING).
+# Live Docker state is read through a docker-socket-proxy over TCP so LabView
+# never touches the raw socket, and needs only its read endpoints
+# (CONTAINERS/NETWORKS/VOLUMES/IMAGES/INFO/PING). Your app stacks are mounted
+# read-only.
 services:
   labview:
     image: niqck/labview:latest
@@ -14,7 +17,10 @@ services:
     restart: unless-stopped
     environment:
       LABVIEW_APPS_ROOT: /data/apps
-      # Talk to the Docker API via the socket proxy instead of mounting the socket.
+      # Docker API endpoint. This example points at a socket-proxy container named
+      # `dockerproxy`; use whatever yours is called. Omit the variable entirely to
+      # use /var/run/docker.sock (then mount it read-only), or unset
+      # LABVIEW_DOCKER_ENABLED=false to run config-only.
       LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375
       LABVIEW_PORT: "8080"
       # LABVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
@@ -23,29 +29,41 @@ services:
       - /mnt/apps:/data/apps:ro
       # Optional tuned config:
       # - /mnt/apps/labview/config.yml:/config/config.yml:ro
-    ports:
-      # 8080 is very common on a homelab; publish LabView on an uncommon port.
-      # (Not needed at all if you only reach it through Traefik below.)
-      - "8459:8080"
+    # No `ports:` on purpose. A published host port answers directly at
+    # <host-ip>:<port>, bypassing the reverse proxy and therefore bypassing any
+    # SSO middleware on it — for a dashboard that lists your whole topology that
+    # is exactly the wrong default. Reach it through the proxy instead.
+    # Uncomment only if you need direct access while setting it up:
+    # ports:
+    #   - "8459:8080"   # 8080 is very common on a homelab; publish somewhere quiet
     networks:
       - default
-      - proxy         # reach it through Traefik / expose via DockFlare
+      - proxy         # reach it through the reverse proxy / publish via DockFlare
       - dockerproxy   # reach the docker-socket-proxy for live state
 
-    # --- Example: put LabView behind YOUR stack (Traefik + Authentik) ---
-    # Uncomment and adapt to expose it locally with SSO, matching your other apps.
+    # --- Example: put LabView behind your own edge (Traefik + Authentik) ---
+    # Uncomment and adapt to the label set your other apps already use, so
+    # LabView is reached and protected exactly like the rest of the fleet.
     # labels:
     #   - "traefik.enable=true"
     #   - "traefik.docker.network=proxy"
-    #   - "traefik.http.routers.labview.rule=Host(`labview.bunbun.be`)"
+    #   - "traefik.http.routers.labview.rule=Host(`labview.example.com`)"
     #   - "traefik.http.routers.labview.entrypoints=websecure"
     #   - "traefik.http.routers.labview.tls.certresolver=cloudflare"
+    #   - "traefik.http.routers.labview.priority=100"
     #   - "traefik.http.routers.labview.middlewares=authentik@docker"
+    #   - "traefik.http.services.labview.loadbalancer.passhostheader=true"
     #   - "traefik.http.services.labview.loadbalancer.server.port=8080"
-    #   # And/or publish it through the Cloudflare tunnel via DockFlare:
+    #   # And/or publish it through the Cloudflare tunnel via DockFlare.
+    #   # Point the tunnel origin at your reverse proxy, not at this container, so
+    #   # the request still passes through the auth middleware — sending it
+    #   # straight to http://labview:8080 would put the dashboard on the internet
+    #   # with no SSO at all.
     #   - "dockflare.enable=true"
-    #   - "dockflare.hostname=labview.bunbun.be"
-    #   - "dockflare.service=http://labview:8080"
+    #   - "dockflare.hostname=labview.example.com"
+    #   - "dockflare.service=https://<reverse-proxy-host>"
+    #   - "dockflare.http2_origin=true"
+    #   - "dockflare.match_sni_to_host=true"
 
 networks:
   proxy:

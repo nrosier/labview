@@ -12,12 +12,17 @@ export interface LabViewConfig {
     port: number;
     /** Local unix socket, used only when host is empty. */
     socketPath: string;
+    /** Max concurrent `container inspect` calls per scan. */
+    maxConcurrency: number;
   };
   secrets: {
     maskValues: boolean;
     keyPatterns: string[];
     keysAlways: string[];
     keysNever: string[];
+    /** Also strip inline `scheme://user:password@host` passwords from any value,
+     *  regardless of the key name (catches DATABASE_URL, REDIS_URL, …). */
+    redactUriCredentials: boolean;
   };
   labels: {
     dockflare: { prefix: string };
@@ -35,20 +40,36 @@ export interface LabViewConfig {
 const DEFAULTS: LabViewConfig = {
   appsRoot: "/data/apps",
   composeFilenames: ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"],
-  // Default to the tecnativa docker-socket-proxy (see compose.yml). Set host to
-  // "" (or LABVIEW_DOCKER_SOCKET) to talk to a mounted socket directly instead.
-  docker: { enabled: true, host: "dockerproxy", port: 2375, socketPath: "/var/run/docker.sock" },
+  // Default to the conventional local socket, the one endpoint that needs no
+  // naming assumption about the host. A TCP endpoint — typically a
+  // docker-socket-proxy, as in compose.yml — is opted into by setting
+  // `docker.host`, LABVIEW_DOCKER_HOST, or the standard DOCKER_HOST.
+  docker: {
+    enabled: true,
+    host: "",
+    port: 2375,
+    socketPath: "/var/run/docker.sock",
+    maxConcurrency: 8,
+  },
   secrets: {
     maskValues: true,
     keyPatterns: ["PASS", "SECRET", "TOKEN", "KEY", "APIKEY", "CREDENTIAL", "PRIVATE", "SALT", "PEPPER", "DSN"],
     keysAlways: [],
     keysNever: ["PUBLIC_KEY_URL", "KEYCLOAK_REALM"],
+    redactUriCredentials: true,
   },
   labels: {
     dockflare: { prefix: "dockflare" },
     traefik: { prefix: "traefik" },
     authentik: {
-      hostHints: ["authentik", "auth.", "outpost.goauthentik.io"],
+      // Markers that identify Authentik itself, all of them things Authentik
+      // publishes: its project name and the outpost endpoint path its
+      // forward-auth address always contains. Deliberately no host-naming
+      // convention (`auth.`, `sso.`) — a convention is a guess about someone
+      // else's DNS, and the real hostnames are discovered from the fleet at scan
+      // time instead. Add your own only if your Authentik is outside appsRoot and
+      // therefore cannot be discovered.
+      hostHints: ["authentik", "goauthentik.io"],
       ldapEnvHints: ["LDAP_HOST", "LDAP_URI", "LDAP_SERVER", "LDAP_URL"],
       oauthEnvHints: ["OIDC", "OAUTH", "OPENID", "ISSUER", "CLIENT_ID", "CLIENT_SECRET", "SSO"],
     },
@@ -57,16 +78,32 @@ const DEFAULTS: LabViewConfig = {
   server: { host: "0.0.0.0", port: 8080 },
 };
 
-/** Deep-merge a partial config onto defaults (arrays are replaced, not merged). */
+/**
+ * Deep-merge a partial config onto defaults (arrays are replaced, not merged).
+ * The result never aliases `base`: a spread would leave nested objects such as
+ * `docker` shared with DEFAULTS, and `applyEnvOverrides` mutates them in place,
+ * so a second `loadConfig()` would inherit the first call's overrides.
+ */
 function merge<T>(base: T, over: unknown): T {
-  if (over === null || over === undefined) return base;
-  if (Array.isArray(base) || typeof base !== "object") return over as T;
-  const out: Record<string, unknown> = { ...(base as Record<string, unknown>) };
+  if (over === null || over === undefined) return clone(base);
+  if (base === null || Array.isArray(base) || typeof base !== "object") return over as T;
+  const out = clone(base) as Record<string, unknown>;
   for (const [k, v] of Object.entries(over as Record<string, unknown>)) {
     const cur = (base as Record<string, unknown>)[k];
     out[k] = cur !== undefined && cur !== null ? merge(cur as unknown, v) : v;
   }
   return out as T;
+}
+
+/** Structural copy of plain data (objects, arrays, primitives). */
+function clone<T>(v: T): T {
+  if (Array.isArray(v)) return v.map((x) => clone(x)) as unknown as T;
+  if (v !== null && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = clone(val);
+    return out as T;
+  }
+  return v;
 }
 
 /**
@@ -88,10 +125,13 @@ function parseDockerTarget(value: string): { host?: string; port?: number; socke
 function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   const env = process.env;
   if (env.LABVIEW_APPS_ROOT) cfg.appsRoot = env.LABVIEW_APPS_ROOT;
-  // LABVIEW_DOCKER_HOST (DOCKER_HOST style) selects the TCP proxy; a socket-style
-  // value clears host so socketPath is used instead.
-  if (env.LABVIEW_DOCKER_HOST) {
-    const t = parseDockerTarget(env.LABVIEW_DOCKER_HOST);
+  // LABVIEW_DOCKER_HOST selects a TCP endpoint; a socket-style value clears host
+  // so socketPath is used instead. DOCKER_HOST is the standard variable every
+  // other Docker client already reads, so honour it too — LABVIEW_DOCKER_HOST
+  // wins when both are set, since it is the more specific of the two.
+  const dockerTarget = env.LABVIEW_DOCKER_HOST || env.DOCKER_HOST;
+  if (dockerTarget) {
+    const t = parseDockerTarget(dockerTarget);
     if (t.socketPath) {
       cfg.docker.socketPath = t.socketPath;
       cfg.docker.host = "";
@@ -107,6 +147,10 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
     cfg.docker.host = "";
   }
   if (env.LABVIEW_DOCKER_ENABLED) cfg.docker.enabled = env.LABVIEW_DOCKER_ENABLED !== "false";
+  if (env.LABVIEW_DOCKER_MAX_CONCURRENCY) {
+    const n = Number(env.LABVIEW_DOCKER_MAX_CONCURRENCY);
+    if (Number.isFinite(n) && n >= 1) cfg.docker.maxConcurrency = Math.floor(n);
+  }
   if (env.LABVIEW_PORT) cfg.server.port = Number(env.LABVIEW_PORT);
   if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;
   if (env.LABVIEW_CACHE_TTL) cfg.cacheTtlSeconds = Number(env.LABVIEW_CACHE_TTL);

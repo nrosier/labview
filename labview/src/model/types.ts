@@ -66,13 +66,34 @@ export interface TraefikRoute {
   servicePort?: string;
 }
 
+/**
+ * The auth mechanism in front of a service.
+ *
+ * A provider is only named when something observable in the configuration says
+ * so — a forward-auth address, an issuer URL, or an LDAP host that matches a
+ * provider identity discovered elsewhere in the same fleet. Where the mechanism
+ * is visible but the provider is not identifiable, the generic variant is used
+ * (`forward-auth`, `other-oauth`, `ldap`) rather than guessing a vendor.
+ */
 export type AuthMethod =
   | "authentik-forward-auth"
   | "authentik-oauth"
   | "authentik-ldap"
-  | "basic-auth"
+  /** Forward-auth middleware observed, provider not identifiable from its address. */
+  | "forward-auth"
+  /** OAuth/OIDC wired through the environment, issuer not identifiably Authentik. */
   | "other-oauth"
+  /** LDAP bind against a directory that is not identifiably Authentik. */
+  | "ldap"
+  | "basic-auth"
   | "none";
+
+/** How firmly a conclusion is grounded in the scanned configuration. */
+export type AuthConfidence =
+  /** A value in the config states it: a forwardauth address, an issuer, an LDAP host. */
+  | "observed"
+  /** Inferred from a name only — the referenced definition was never found. */
+  | "inferred";
 
 /** Derived authentication posture for a service. */
 export interface AuthPosture {
@@ -81,6 +102,11 @@ export interface AuthPosture {
   detail: string;
   /** The middleware / env keys / hints that led to this conclusion. */
   evidence: string[];
+  /**
+   * Whether `method` rests on a value read from the config or only on a name.
+   * Surfaced so a reader can tell a fact from a guess without re-deriving it.
+   */
+  confidence: AuthConfidence;
   /** True when the service is publicly reachable but has no detected auth. */
   exposedWithoutAuth: boolean;
 }
@@ -184,7 +210,23 @@ export interface Graph {
   edges: GraphEdge[];
 }
 
-export type IngressKind = "public" | "local" | "public+local" | "internal";
+/**
+ * How a service can be reached.
+ *
+ * `host-port` covers a service that publishes a port on the host but has no
+ * Traefik router — it is reachable directly at `hostIP:port`, bypassing the
+ * reverse proxy and therefore any proxy-level SSO. It is only reported when no
+ * Traefik route exists: a proxied service that *also* publishes a port keeps its
+ * `local` / `public+local` kind and gets a note instead, so the common case does
+ * not collapse every service into one bucket.
+ */
+export type IngressKind =
+  | "public"
+  | "public+host-port"
+  | "public+local"
+  | "local"
+  | "host-port"
+  | "internal";
 
 /** Aggregate counters for the dashboard header. */
 export interface OverviewStats {
@@ -193,6 +235,8 @@ export interface OverviewStats {
   running: number;
   publicServices: number;
   localOnlyServices: number;
+  /** Reachable only via a published host port (no proxy in front). */
+  hostPortServices: number;
   internalServices: number;
   authProtected: number;
   exposedWithoutAuth: number;

@@ -19,12 +19,18 @@ composeFilenames:
 # config-only automatically.
 docker:
   enabled: true
-  # Connect via the docker-socket-proxy over TCP (recommended; matches compose.yml).
-  host: dockerproxy
+  # Endpoint. Empty host = use socketPath below (the default: no assumption about
+  # your hostnames). Set host to reach the Engine over TCP instead — typically a
+  # docker-socket-proxy, whatever you named that container:
+  #   host: dockerproxy
+  # The standard DOCKER_HOST variable is honoured too, as is LABVIEW_DOCKER_HOST,
+  # and either takes precedence over this file.
+  host: ""
   port: 2375
-  # To talk to a mounted unix socket directly instead, set host to "" (empty)
-  # and point socketPath at the socket:
   socketPath: /var/run/docker.sock
+  # Max concurrent `container inspect` calls per scan. Raise for large fleets,
+  # lower if the socket proxy starts rate-limiting or dropping connections.
+  maxConcurrency: 8
 
 # Secret handling. Values of env keys matching these patterns are masked in the
 # API and UI (keys are always shown, values replaced with a placeholder).
@@ -48,6 +54,11 @@ secrets:
   keysNever:
     - PUBLIC_KEY_URL
     - KEYCLOAK_REALM
+  # Independently of the key name, strip the password out of any value shaped like
+  # "scheme://user:password@host". This is what catches connection strings such as
+  # DATABASE_URL / REDIS_URL / AMQP_URL, whose keys match none of the patterns
+  # above. Scheme, user and host stay visible; only the password is replaced.
+  redactUriCredentials: true
 
 # Label matching. These are tolerant of both list ("- k=v") and map (k: v) syntax.
 labels:
@@ -56,12 +67,18 @@ labels:
   traefik:
     prefix: traefik
   authentik:
-    # Substrings that, when found in a Traefik forwardauth middleware address or
-    # in an env value, mark a service as protected by Authentik.
+    # Markers that identify Authentik. Matched at token boundaries against a
+    # forwardauth address, an OIDC issuer or an LDAP host — so "authentik" matches
+    # "http://authentik-server:9000/..." but does NOT match "oauth.example.com".
+    #
+    # Your own Authentik hostnames do not belong here: they are discovered at scan
+    # time from whichever stack runs Authentik, together with its Traefik and
+    # DockFlare hostnames. Add an entry only if your Authentik lives outside
+    # appsRoot and so cannot be discovered. Avoid host-naming conventions
+    # ("auth.", "sso.") — they attribute other people's providers to Authentik.
     hostHints:
       - authentik
-      - auth.
-      - outpost.goauthentik.io
+      - goauthentik.io
     # Env key substrings that indicate LDAP-based auth wired to Authentik.
     ldapEnvHints:
       - LDAP_HOST

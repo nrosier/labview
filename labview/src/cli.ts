@@ -17,7 +17,10 @@ if (summary) {
   console.log(`  apps root:        ${meta.appsRoot}`);
   console.log(`  docker:           ${meta.dockerAvailable ? "available" : `unavailable (${meta.dockerError})`}`);
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
-  console.log(`  public/local/int: ${stats.publicServices}/${stats.localOnlyServices}/${stats.internalServices}`);
+  console.log(
+    `  public/local/int: ${stats.publicServices}/${stats.localOnlyServices}/${stats.internalServices}` +
+      `  (host-port only: ${stats.hostPortServices})`,
+  );
   console.log(`  auth protected:   ${stats.authProtected}`);
   console.log(`  EXPOSED, no auth: ${stats.exposedWithoutAuth}`);
   console.log(`  by auth method:   ${JSON.stringify(stats.byAuthMethod)}`);

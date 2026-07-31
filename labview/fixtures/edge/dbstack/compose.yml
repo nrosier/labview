@@ -1,0 +1,36 @@
+# Regression fixture: URL-embedded credential redaction + env_file containment.
+services:
+  api:
+    image: example/api:1.0.0
+    container_name: dbstack-api
+    env_file:
+      # Inside the stack directory — must be read.
+      - local.env
+      # Escapes the apps root — must be refused with a note. If containment
+      # regresses, LEAKED_FROM_OUTSIDE_ROOT appears in this service's env.
+      - ../../outside-root.env
+      # Compose long-form entry, inside the stack directory.
+      - path: local.env
+        required: false
+    environment:
+      # Key matches no secret pattern, but the value carries a password.
+      DATABASE_URL: postgresql://appuser:sup3rs3cret@db:5432/app
+      # Password with an empty user component.
+      REDIS_URL: redis://:redi5pw@cache:6379/0
+      # No credentials at all — must stay fully visible.
+      PUBLIC_ENDPOINT: https://api.example.com/health
+      # Userinfo but no password — nothing to redact, must stay visible.
+      SMTP_URL: smtp://notify@mail.example.com:587
+    networks:
+      - backend
+
+  db:
+    image: postgres:16-alpine
+    container_name: dbstack-db
+    environment:
+      POSTGRES_PASSWORD: sup3rs3cret
+    networks:
+      - backend
+
+networks:
+  backend:

@@ -1,0 +1,22 @@
+# Regression fixture: `dockflare.enable=false` must suppress the route entirely.
+# The hostname/service labels are left in place (a very common pattern — the
+# route is staged but switched off), so a scanner that ignores `enable` reports
+# this service as publicly exposed with no authentication.
+services:
+  app:
+    image: example/app:2.1.0
+    container_name: cfdisabled-app
+    labels:
+      - "dockflare.enable=false"
+      - "dockflare.hostname=staged.example.com"
+      - "dockflare.service=http://app:8080"
+
+  # Same thing in map-label syntax, with a capitalised truthy value to confirm
+  # `enable: "TRUE"` is still recognised as enabled.
+  live:
+    image: example/live:2.1.0
+    container_name: cfdisabled-live
+    labels:
+      dockflare.enable: "TRUE"
+      dockflare.hostname: "live.example.com"
+      dockflare.service: "http://live:8080"

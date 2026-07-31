@@ -13,7 +13,7 @@ export function scanStacks(cfg: LabViewConfig): { stacks: AppStack[]; warnings: 
   const stacks: AppStack[] = [];
   for (const disc of discovered) {
     try {
-      stacks.push(parseStack(disc));
+      stacks.push(parseStack(disc, cfg.appsRoot));
     } catch (err) {
       warnings.push(`Failed to parse ${disc.dir}: ${(err as Error).message}`);
     }

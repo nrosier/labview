@@ -8,7 +8,7 @@ import type { CloudflareRoute } from "../model/types.js";
  *   dockflare.hostname=app.example.com
  *   dockflare.service=http://app:8080
  *   dockflare.path=/foo
- *   dockflare.access.group=nas-family
+ *   dockflare.access.group=<access-group>
  *   dockflare.access.policy=authenticate
  *   dockflare.access.email=a@b.com,c@d.com
  *   dockflare.no-tls-verify=true
@@ -22,6 +22,16 @@ export function parseDockflare(labels: Record<string, string>, prefix: string): 
   const relevant = Object.entries(labels).filter(([k]) => k === prefix || k.startsWith(p));
   if (relevant.length === 0) return [];
 
+  // An explicit `dockflare.enable=false` means DockFlare skips this service, so
+  // the remaining labels describe a route that is not actually published. Treat
+  // it as having no Cloudflare ingress at all — otherwise the service is
+  // classified as public and can be reported as "exposed without auth" when it
+  // is not reachable from the internet in the first place. An absent `enable`
+  // label is left alone: the other labels are the only signal we have.
+  // Only an explicit falsy value disables; an unrecognised value is left to the
+  // normal path rather than silently hiding a route.
+  const enableLabel = labels[`${p}enable`] ?? labels[prefix];
+  if (enableLabel !== undefined && falsy(enableLabel)) return [];
   const enabled = truthy(labels[`${p}enable`]) || truthy(labels[prefix]);
 
   // Group labels by route index. The un-indexed labels form route "".
@@ -74,7 +84,13 @@ export function parseDockflare(labels: Record<string, string>, prefix: string): 
 }
 
 function truthy(v: string | undefined): boolean {
-  return v === "true" || v === "1" || v === "yes" || v === "on";
+  const s = v?.trim().toLowerCase();
+  return s === "true" || s === "1" || s === "yes" || s === "on";
+}
+
+function falsy(v: string | undefined): boolean {
+  const s = v?.trim().toLowerCase();
+  return s === "false" || s === "0" || s === "no" || s === "off";
 }
 
 function splitList(v: string | undefined): string[] | undefined {

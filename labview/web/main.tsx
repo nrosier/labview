@@ -209,8 +209,17 @@ function App() {
           value={ov.stats.services}
           sub={ov.meta.dockerAvailable ? `${ov.stats.running} running` : undefined}
         />
-        <StatTile label="Public" value={ov.stats.publicServices} sub="via Cloudflare" />
-        <StatTile label="Local only" value={ov.stats.localOnlyServices} sub="via Traefik" />
+        {/* Subtitles name the mechanism, not a vendor: which tunnel or proxy is in
+            front is the routes' business, and a fleet using neither should not be
+            told otherwise by a hard-coded caption. */}
+        <StatTile label="Public" value={ov.stats.publicServices} sub="tunnel route" />
+        <StatTile label="Local only" value={ov.stats.localOnlyServices} sub="proxy route" />
+        <StatTile
+          label="Host port only"
+          value={ov.stats.hostPortServices}
+          sub="no proxy in front"
+          alert={ov.stats.hostPortServices > 0}
+        />
         <StatTile label="Auth-protected" value={ov.stats.authProtected} />
         <StatTile
           label="Exposed, no auth"

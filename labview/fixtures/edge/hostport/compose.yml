@@ -1,0 +1,61 @@
+# Regression fixture: a published host port is real reachability.
+#
+# `ports:` publishes on the host (unlike `expose:`), so the service answers at
+# <host-ip>:<port> with no reverse proxy and therefore no proxy-level SSO in the
+# path. A classifier that only reads DockFlare/Traefik labels calls all of this
+# "internal" and can never flag it as exposed-without-auth.
+services:
+  # The "goes directly" pattern: the tunnel origin points at the container's own
+  # port instead of at Traefik, and the port is published on the LAN as well.
+  # Nothing proxies it, so no forward-auth middleware can ever apply.
+  media:
+    image: example/media:4.9.0
+    container_name: hostport-media
+    ports:
+      - 8096:8096
+      - 8920:8920
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=media.edge.example.com"
+      - "dockflare.service=http://10.10.0.5:8096"
+      - "dockflare.http2_origin=true"
+      - "dockflare.match_sni_to_host=true"
+
+  # Reachable on the LAN with nothing whatsoever in front of it, and holding
+  # something that matters. This is the case that used to read as "internal".
+  socketproxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:latest
+    container_name: hostport-socketproxy
+    ports:
+      - 2375:2375
+
+  # Proxied *and* published. The Traefik route stays the primary path, so the
+  # ingress kind is unchanged — but :9999 answers without the SSO middleware, so
+  # the bypass has to be surfaced as a note rather than silently ignored.
+  app:
+    image: example/app:1.0.0
+    container_name: hostport-app
+    ports:
+      - 9999:9999
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.hpapp.rule=Host(`app.edge.example.com`)"
+      - "traefik.http.routers.hpapp.entrypoints=websecure"
+      - "traefik.http.routers.hpapp.middlewares=authentik@docker"
+      - "traefik.http.services.hpapp.loadbalancer.server.port=9999"
+    networks:
+      - proxy
+
+  # Container-network only — `expose:` does not publish, so this stays internal.
+  worker:
+    image: example/worker:1.0.0
+    container_name: hostport-worker
+    expose:
+      - "9000"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

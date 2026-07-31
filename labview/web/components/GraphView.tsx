@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import cytoscape from "cytoscape";
 import type { Core, ElementDefinition, NodeSingular } from "cytoscape";
 import type { Graph } from "../model";
-import { isDarkTheme, resolveVar } from "../lib/palette";
+import { INGRESS_META, isDarkTheme, resolveVar } from "../lib/palette";
 
 /**
  * Full relationship graph. Service nodes are colored by ingress exposure and
@@ -33,23 +33,23 @@ export function GraphView({
       gridline: resolveVar("--gridline"),
       surface: resolveVar("--surface"),
     };
-    const ingressColor: Record<string, string> = {
-      public: resolveVar("--ing-public"),
-      "public+local": resolveVar("--ing-publiclocal"),
-      local: resolveVar("--ing-local"),
-      internal: resolveVar("--ing-internal"),
-    };
+    // Derived from INGRESS_META so a new ingress kind cannot silently fall back
+    // to the muted default here while the badges and bars show it correctly.
+    const ingressColor: Record<string, string> = Object.fromEntries(
+      INGRESS_META.map((m) => [m.key, resolveVar(m.cssVar)]),
+    );
     const hub: Record<string, string> = {
       "ext:cloudflare": resolveVar("--hub-cloudflare"),
       "ext:traefik": resolveVar("--hub-traefik"),
-      "ext:authentik": resolveVar("--hub-authentik"),
+      "ext:authentik": resolveVar("--hub-auth"),
+      "ext:auth": resolveVar("--hub-auth"),
     };
     const edgeColor: Record<string, string> = {
       network: c.gridline,
       depends_on: resolveVar("--c8"),
       volume: resolveVar("--node-volume"),
       ingress: c.muted,
-      auth: resolveVar("--hub-authentik"),
+      auth: resolveVar("--hub-auth"),
     };
 
     const elements: ElementDefinition[] = [
@@ -218,10 +218,11 @@ export function GraphView({
         <div class="graph-legend" aria-hidden={dark ? "false" : "false"}>
           <span class="item">{swatch("--ing-public", "round")} public</span>
           <span class="item">{swatch("--ing-local", "round")} local</span>
+          <span class="item">{swatch("--ing-hostport", "round")} host port</span>
           <span class="item">{swatch("--ing-internal", "round")} internal</span>
           <span class="item">{swatch("--node-network")} network</span>
           <span class="item">{swatch("--node-volume", "diamond")} volume</span>
-          <span class="item">{swatch("--hub-authentik", "diamond")} hub</span>
+          <span class="item">{swatch("--hub-auth", "diamond")} hub</span>
         </div>
       </div>
       <div id="cy" ref={container} />

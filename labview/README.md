@@ -6,7 +6,7 @@ optional `.env` files) and it produces a structured website showing **every app,
 how it's set up, how it's reached, what protects it, and how everything is wired
 together**.
 
-It is built for a specific, common TrueNAS Scale pattern:
+It understands a specific, common TrueNAS Scale pattern:
 
 - **Public ingress via a Cloudflare tunnel**, configured with **DockFlare**
   labels (`dockflare.hostname`, `dockflare.service`, …).
@@ -16,9 +16,14 @@ It is built for a specific, common TrueNAS Scale pattern:
   (`authentik@docker`), or via **OAuth/OIDC** or **LDAP** wired through a
   service's environment.
 
+None of it is required, and none of it is hard-coded. Every hostname, container
+name and network name is read from your files or discovered from your fleet at
+scan time; a stack with none of those labels is reported just as accurately, and a
+fleet running a different SSO provider is described by mechanism rather than
+mislabelled with a vendor it never mentions.
+
 LabView reads all of that from your compose files, optionally enriches it with
-live state from the Docker API (via the socket proxy), and never needs an agent
-inside each app.
+live state from the Docker API, and never needs an agent inside each app.
 
 ---
 
@@ -36,9 +41,11 @@ inside each app.
   volumes, environment (secrets masked), and live container state.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
-  and Cloudflare/Traefik/Authentik hub nodes, connected by network membership,
+  and tunnel / proxy / SSO hub nodes, connected by network membership,
   `depends_on`, shared volumes, ingress, and auth edges. Click a service to open
-  its detail.
+  its detail. A hub appears only when something observed calls for it — and an
+  SSO gate whose provider could not be identified gets its own generic hub rather
+  than being drawn as a vendor.
 - **Light / dark** theme (follows the OS, with a manual toggle).
 
 Colors follow a validated, colorblind-safe palette. The ingress and auth-method
@@ -59,11 +66,13 @@ LABVIEW_APPS_ROOT=/path/to/your/apps npm start
 # open http://localhost:8080
 ```
 
-Running locally (no socket proxy), point LabView at your own Docker socket for
-live state — otherwise it degrades cleanly to config-only:
+Live state comes from `/var/run/docker.sock` by default, so a local run needs no
+extra setup — and if the socket isn't reachable the scan degrades cleanly to
+config-only. To read the Engine over TCP instead (a socket proxy, typically), name
+the endpoint:
 
 ```bash
-LABVIEW_APPS_ROOT=/path/to/your/apps LABVIEW_DOCKER_SOCKET=/var/run/docker.sock npm start
+LABVIEW_APPS_ROOT=/path/to/your/apps LABVIEW_DOCKER_HOST=tcp://your-proxy:2375 npm start
 ```
 
 Just want a one-shot report on the terminal (no server)?
@@ -82,22 +91,23 @@ npm run dev              # esbuild --watch for the UI + tsx server with reload
 
 ## Deploy on TrueNAS Scale
 
-LabView runs as one more container next to the apps it inspects. It mounts your
-stacks **read-only** and reads live Docker state through the shared
-**docker-socket-proxy** (over TCP) — it never touches the raw socket and never
-writes anything.
+LabView runs as one more container next to the apps it inspects. Mount your stacks
+**read-only** and — recommended — read live Docker state through a
+[docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) over TCP,
+so LabView never touches the raw socket. It never writes anything either way.
 
-**Prerequisites** (already present in this homelab): the external `proxy` and
-`dockerproxy` networks and the `dockerproxy` (tecnativa/docker-socket-proxy)
-stack. LabView only needs the proxy's read endpoints
-(`CONTAINERS`, `NETWORKS`, `VOLUMES`, `IMAGES`, `INFO`, `PING`).
+**Prerequisites:** a reverse-proxy network to join, plus (for live state) a
+socket-proxy container and its network. LabView only needs the proxy's read
+endpoints (`CONTAINERS`, `NETWORKS`, `VOLUMES`, `IMAGES`, `INFO`, `PING`). The
+names used below — `proxy`, `dockerproxy`, `/mnt/apps` — are this example's; use
+whatever yours are called.
 
 1. Copy this `labview/` directory to your box, e.g. to
    `/mnt/apps/labview/`.
-2. Review [`compose.yml`](compose.yml) — the defaults mount `/mnt/apps` →
-   `/data/apps:ro`, reach Docker via `tcp://dockerproxy:2375`, join the `proxy`
-   and `dockerproxy` networks, and publish port `8459` (8080 is too common on a
-   homelab).
+2. Review [`compose.yml`](compose.yml) — the example mounts `/mnt/apps` →
+   `/data/apps:ro`, reaches Docker via a socket proxy, and joins a reverse-proxy
+   network. It deliberately publishes **no** host port: reach it through your
+   proxy so the SSO middleware actually applies (see below).
 3. Deploy it one of two ways:
    - **Apps → Custom App → Install via YAML**, pasting the compose file, or
    - drop it at `/mnt/apps/labview/compose.yml` and run
@@ -111,12 +121,14 @@ services:
     restart: unless-stopped
     environment:
       LABVIEW_APPS_ROOT: /data/apps
-      LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375   # via the socket proxy
+      # Whatever your socket-proxy container is called. Omit to use
+      # /var/run/docker.sock (then mount it read-only).
+      LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375
       LABVIEW_PORT: "8080"
     volumes:
       - /mnt/apps:/data/apps:ro
-    ports:
-      - "8459:8080"
+    # No `ports:` — a published port answers directly at <host-ip>:<port>,
+    # bypassing Traefik and therefore the Authentik middleware below.
     networks:
       - default
       - proxy
@@ -146,9 +158,22 @@ for **Traefik + Authentik forward-auth** and/or **DockFlare**:
       - "traefik.http.routers.labview.rule=Host(`labview.example.com`)"
       - "traefik.http.routers.labview.entrypoints=websecure"
       - "traefik.http.routers.labview.tls.certresolver=cloudflare"
+      - "traefik.http.routers.labview.priority=100"
       - "traefik.http.routers.labview.middlewares=authentik@docker"
+      - "traefik.http.services.labview.loadbalancer.passhostheader=true"
       - "traefik.http.services.labview.loadbalancer.server.port=8080"
+      # And/or via the Cloudflare tunnel. Point the origin at Traefik, not at
+      # this container — `dockflare.service=http://labview:8080` would put the
+      # dashboard on the internet with the SSO middleware skipped entirely.
+      - "dockflare.enable=true"
+      - "dockflare.hostname=labview.example.com"
+      - "dockflare.service=https://<traefik-host-ip>"
 ```
+
+Two things LabView will tell you about itself once it is running: if you publish
+a host port it appears as `host-port` / `public+host-port` exposure, and if you
+point a tunnel origin straight at a container it shows up with no auth even
+though the Traefik route looks protected.
 
 ---
 
@@ -162,18 +187,25 @@ Everything works out of the box. To tune, copy
 |---|---|---|
 | `LABVIEW_APPS_ROOT` | `/data/apps` | Root directory of your stacks |
 | `LABVIEW_DOCKER_ENABLED` | `true` | Enrich with live Docker state |
-| `LABVIEW_DOCKER_HOST` | `tcp://dockerproxy:2375` | Docker API endpoint (socket proxy). Accepts `tcp://host:port`, `host:port`, or a `unix://`/absolute socket path |
-| `LABVIEW_DOCKER_PORT` | `2375` | Proxy port (when host has no port) |
-| `LABVIEW_DOCKER_SOCKET` | *(unset)* | Use a mounted socket directly instead of the proxy |
+| `LABVIEW_DOCKER_HOST` | *(unset)* | Docker API endpoint. Accepts `tcp://host:port`, `host:port`, or a `unix://`/absolute socket path. Unset = the socket path below. The standard **`DOCKER_HOST`** is honoured too; `LABVIEW_DOCKER_HOST` wins when both are set |
+| `LABVIEW_DOCKER_PORT` | `2375` | TCP port (when the host has no port) |
+| `LABVIEW_DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path. Setting it always wins and disables the TCP host |
+| `LABVIEW_DOCKER_MAX_CONCURRENCY` | `8` | Max concurrent container inspects per scan |
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_HOST` | `0.0.0.0` | Bind address |
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_CONFIG` | `config.yml` | Path to a config file |
 
+The default Docker endpoint is the conventional local socket, since it is the one
+endpoint that needs no assumption about your container names; a socket proxy is
+opted into with `LABVIEW_DOCKER_HOST`.
+
 The config file also controls the secret key-patterns, the DockFlare/Traefik
 label prefixes, and the Authentik detection hints — see the comments in
-`config.example.yml`.
+`config.example.yml`. Your own SSO hostnames do **not** belong in those hints:
+they are discovered from your fleet at scan time (see below), and adding a
+host-naming convention like `auth.` is how unrelated providers get mislabelled.
 
 ---
 
@@ -187,7 +219,11 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 
 - **Compose parsing** understands both label/env syntaxes (list `- k=v` and map
   `k: v`), YAML anchors, `${VAR}` / `${VAR:-default}` interpolation from adjacent
-  `.env` files, and the full port/volume short and long forms.
+  `.env` files — including nested forms like `${A:-${B:-fallback}}` — and the
+  full port/volume short and long forms.
+- **DockFlare `enable`** is honoured: an explicit `dockflare.enable=false`
+  suppresses the route even when the `hostname`/`service` labels are still
+  present, so a staged-but-disabled route is not reported as public.
 - **DockFlare** labels become public **Cloudflare routes** (hostname → origin,
   Access policy, TLS options).
 - **Traefik** labels become local **routes** (router rule → hosts/path prefixes,
@@ -195,14 +231,40 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 - A global **middleware registry** classifies referenced middlewares by *type*,
   so `authentik@docker` (forward-auth) counts as SSO while a `headers` or
   `redirect` middleware does not — even when it's defined in a different stack.
-- **Authentik auto-discovery** learns your Authentik hostnames (e.g. from the
-  `goauthentik` image or the outpost forward-auth address), so an OIDC issuer or
-  LDAP host pointing at `sso.example.com` is recognized as Authentik even though
-  the string "authentik" never appears.
-- **Ingress** is classified `public` / `local` / `public+local` / `internal`.
+- **Authentik auto-discovery** learns your Authentik hostnames from the fleet
+  itself — whichever stack runs the `goauthentik` image or defines the outpost
+  forward-auth address — so an OIDC issuer or LDAP host pointing at
+  `sso.example.com` is recognized as Authentik even though the string "authentik"
+  never appears in it. The same mechanism is what keeps it honest elsewhere: with
+  no Authentik in the fleet nothing is learned, and every issuer stays generic.
+  Hints are matched at **token boundaries**, so `oauth.bigcorp.example.com` is not
+  read as Authentik on the strength of four shared letters.
+- **Ingress** is classified `public` / `public+host-port` / `public+local` /
+  `local` / `host-port` / `internal`. A `ports:` entry publishes on the host
+  (unlike `expose:`), so the service answers at `<host-ip>:<port>` with no proxy
+  and no SSO in the path — that is real reachability and it is classified as such.
+  `host-port` is reported when nothing else fronts the service; when Traefik
+  *does* front it, the kind is unchanged and the bypass is raised as a note
+  instead, since most services in a fleet publish a port and folding that into
+  the kind would flatten the whole distribution.
 - **Auth posture** resolves to one of `authentik-forward-auth`,
-  `authentik-oauth`, `authentik-ldap`, `other-oauth`, `basic-auth`, or `none`,
-  each with the evidence that produced it.
+  `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`,
+  `basic-auth`, or `none`, each with the evidence that produced it.
+- **A provider is named only when something proves it.** The mechanism and the
+  provider are two separate conclusions, and only the mechanism is usually
+  certain: a `forwardauth` middleware definition proves a gate exists, but naming
+  *whose* gate requires a value that says so — the forward-auth address, an issuer
+  URL, or an LDAP host matching a discovered identity. Where it can't be
+  established, the mechanism is reported (`forward-auth`, `other-oauth`, `ldap`)
+  rather than the most likely vendor. So an oauth2-proxy gate reads as
+  `forward-auth`, and an OpenLDAP or AD directory reads as plain `ldap`. The
+  *address* also outranks the *name*: a middleware called `authentik` that points
+  somewhere else is not Authentik.
+- **`observed` vs `inferred`.** Each posture carries a confidence. `observed`
+  means a value in the config states it. `inferred` means the referenced
+  middleware was defined nowhere in the scanned stacks — a Traefik file provider,
+  say — so only its name was available; the UI labels it, and the service gets a
+  note saying the definition could not be found.
 - **Exposed-without-auth**: a service reachable (public or local) with no detected
   *proxy/SSO* auth is flagged. Note this is honest about *proxy* auth only — apps
   with their own built-in login (Emby, Home Assistant, Authentik itself) will
@@ -215,6 +277,19 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 - Secret-looking env values (`*PASS*`, `*SECRET*`, `*TOKEN*`, `*KEY*`, …) are
   **masked** in both the API and UI by default. Keys stay visible; values are
   replaced with a placeholder.
+- Independently of the key name, values shaped like
+  `scheme://user:password@host` have the **password stripped** — this is what
+  catches connection strings such as `DATABASE_URL` and `REDIS_URL`, whose keys
+  match none of the patterns above. Scheme, user and host stay readable.
+- Files referenced by a compose document (`env_file`) are **confined to the apps
+  root**. A `env_file: ../../../secrets.env` entry is refused and noted on the
+  service rather than read, both for lexical `..` escapes and for symlinks
+  pointing out of the tree.
+- **Published host ports are treated as real exposure.** A service with a
+  `ports:` mapping and no proxy in front is `host-port`, counted in its own stat
+  tile, and flagged exposed-without-auth — it answers on the LAN whatever your
+  Traefik config says. When a proxy *is* in front, the service keeps its kind and
+  gains an explicit note that the published port bypasses the proxy and its SSO.
 - No built-in auth — put it behind your own edge (see above).
 
 ---
@@ -233,16 +308,24 @@ The web UI is a static SPA served from the same origin.
 
 ## Development
 
+**Read [../IMPLEMENTATION.md](../IMPLEMENTATION.md) before changing the scanner or
+analyzer.** It documents the requirements, the pipeline stage by stage, and the
+invariants that keep the output trustworthy — evidence-only conclusions, no
+fleet-specific identifiers, mechanism vs. provider, degrade-never-fail — plus a
+decision log explaining why the non-obvious choices are what they are.
+
 ```text
 src/
   scan/       discover + compose/.env parsing
-  labels/     dockflare, traefik, authentik derivation
+  labels/     dockflare, traefik, auth derivation
   analyze/    two-pass pipeline, middleware registry, graph, stats
-  enrich/     docker snapshot via the socket-proxy (dockerode)
+  enrich/     docker snapshot (dockerode)
   model/      types.ts — the shared backend⇄frontend contract
   server/     fastify server + static hosting
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
-fixtures/     sample stacks used by the smoke test
+fixtures/
+  apps/       a representative happy-path fleet
+  edge/       regression cases for previously-fixed defects
 ```
 
 ```bash
@@ -250,6 +333,15 @@ npm run typecheck    # tsc for both server and web
 npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
 ```
+
+`npm run smoke` runs the whole pipeline twice — once over `fixtures/apps` for the
+expected classifications, once over `fixtures/edge` for the regression cases: URL
+credential redaction, `env_file` containment, `dockflare.enable=false`, LDAP
+attribution, nested interpolation, host-port exposure (`ports:` vs `expose:`, the
+tunnel-straight-at-the-container pattern, and the bypass note on a proxied
+service), and provider attribution (a fleet whose SSO is *not* Authentik, where
+every mechanism is observable but nothing may be attributed to a vendor). Each
+edge fixture is written so that it fails if the corresponding fix is reverted.
 
 The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 ~3 MB) so the dashboard works fully offline with no CDN dependency.
@@ -261,5 +353,10 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - Live state (status, health, IPs) requires access to the Docker API (via the
   socket proxy); without it the
   scan degrades cleanly to config-only.
-- Auth detection is heuristic and label/env-driven; it reports the evidence so
-  you can verify each conclusion.
+- Auth detection is label/env-driven and reports its evidence so you can verify
+  each conclusion. It describes *configuration*, not enforcement: a middleware
+  reference proves the gate was configured, not that Traefik is currently running
+  with that config.
+- Traefik middlewares defined in a dynamic config **file** rather than in labels
+  are invisible to the scan — a reference to one resolves to nothing, which is why
+  the name-based fallback and the `inferred` confidence exist.

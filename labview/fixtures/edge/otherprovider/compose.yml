@@ -1,0 +1,85 @@
+# Regression fixture: a fleet whose SSO is NOT Authentik.
+#
+# Nothing here may be attributed to Authentik. The mechanisms are observable — a
+# forwardauth middleware definition, OIDC env keys — but every value that could
+# name a provider points somewhere else, so the report must stop at the mechanism.
+#
+# The trap is `oauth.`: a host-prefix hint of "auth." matches the substring inside
+# "oauth.bigcorp.example.com", which used to label this service as Authentik OIDC
+# on the strength of four shared letters. Hints are matched at token boundaries now,
+# and no host-naming convention ships as a default.
+services:
+  app:
+    image: someapp:2.1
+    container_name: otherprovider-app
+    environment:
+      OIDC_ISSUER: https://oauth.bigcorp.example.com/realms/main
+      OIDC_CLIENT_ID: labview-example
+      OIDC_CLIENT_SECRET: not-a-real-secret
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.opapp.rule=Host(`app.edge.example.com`)"
+      - "traefik.http.routers.opapp.middlewares=fwdauth@docker"
+    networks:
+      - proxy
+
+  # Same third-party issuer, but OIDC is the *only* auth signal — no middleware
+  # detection can mask a misattribution here, so this is the service that pins the
+  # `oauth.` / `auth.` collision.
+  oidconly:
+    image: someapp:2.1
+    container_name: otherprovider-oidconly
+    environment:
+      OIDC_ISSUER: https://oauth.bigcorp.example.com/realms/main
+      OIDC_CLIENT_ID: labview-example
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.opoidc.rule=Host(`oidc.edge.example.com`)"
+    networks:
+      - proxy
+
+  # Defines the forward-auth middleware `app` references. The address resolves, so
+  # the mechanism is confirmed — but it names a provider this scan knows nothing
+  # about, so the posture must be the generic `forward-auth`, not a guess.
+  #
+  # The address is deliberately an oauth2-proxy-shaped one: it contains "auth"
+  # three times, so a hint matched as a bare substring would read this as
+  # Authentik's outpost. It is the same trap as `oauth.` above, on the other code
+  # path — an address read from a definition rather than a value read from env.
+  gatekeeper:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    container_name: otherprovider-gatekeeper
+    labels:
+      - "traefik.http.middlewares.fwdauth.forwardauth.address=http://gatekeeper:4180/oauth2/auth"
+      - "traefik.http.middlewares.fwdauth.forwardauth.trustforwardheader=true"
+    networks:
+      - proxy
+
+  # References a middleware that is defined nowhere in the scanned stacks (a
+  # Traefik file provider, say). The name is all there is, so the posture is
+  # reported as inferred rather than as an established fact.
+  unresolved:
+    image: someapp:2.1
+    container_name: otherprovider-unresolved
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.opunres.rule=Host(`unres.edge.example.com`)"
+      - "traefik.http.routers.opunres.middlewares=sso-gate@file"
+    networks:
+      - proxy
+
+  # A middleware named like a header mangler, referenced but undefined: it must
+  # not be read as an auth gate just because the fallback path is in play.
+  headersonly:
+    image: someapp:2.1
+    container_name: otherprovider-headersonly
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ophdr.rule=Host(`hdr.edge.example.com`)"
+      - "traefik.http.routers.ophdr.middlewares=oauth-headers@file"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

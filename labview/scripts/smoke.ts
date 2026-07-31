@@ -1,26 +1,33 @@
 /**
- * Smoke test: run the full pipeline against ./fixtures/apps (docker disabled) and
- * assert the analyzer produced the expected classifications. Exits non-zero on
- * any failure so it can gate CI / a pre-commit check.
+ * Smoke test: run the full pipeline (docker disabled) against two fixture roots
+ * and assert the analyzer produced the expected classifications. Exits non-zero
+ * on any failure so it can gate CI / a pre-commit check.
+ *
+ *   ./fixtures/apps — a representative happy-path fleet.
+ *   ./fixtures/edge — regression cases for previously-fixed defects.
  *
  *   npx tsx scripts/smoke.ts
  */
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import type { Overview, Service } from "../src/model/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const fixturesRoot = resolve(here, "..", "fixtures", "apps");
+const appsRoot = resolve(here, "..", "fixtures", "apps");
+const edgeRoot = resolve(here, "..", "fixtures", "edge");
 
 // Configure via env BEFORE importing config.
-process.env.LABVIEW_APPS_ROOT = fixturesRoot;
 process.env.LABVIEW_DOCKER_ENABLED = "false";
 process.env.LABVIEW_CONFIG = "___none___"; // force defaults
 
 const { loadConfig } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
 
-const cfg = loadConfig();
-const ov = await buildOverview(cfg, new Date("2024-01-01T00:00:00Z"));
+/** Build an overview for one fixture root. loadConfig() re-reads env each call. */
+async function overviewFor(root: string): Promise<Overview> {
+  process.env.LABVIEW_APPS_ROOT = root;
+  return buildOverview(loadConfig(), new Date("2024-01-01T00:00:00Z"));
+}
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = "") {
@@ -32,13 +39,27 @@ function check(name: string, cond: boolean, detail = "") {
   }
 }
 
-function svc(stackId: string, serviceName: string) {
-  const s = ov.stacks.find((s) => s.id === stackId)?.services.find((x) => x.name === serviceName);
-  if (!s) throw new Error(`service ${stackId}/${serviceName} not found`);
-  return s;
+/** Service lookup bound to one overview. */
+function lookup(ov: Overview): (stackId: string, serviceName: string) => Service {
+  return (stackId, serviceName) => {
+    const s = ov.stacks.find((x) => x.id === stackId)?.services.find((x) => x.name === serviceName);
+    if (!s) throw new Error(`service ${stackId}/${serviceName} not found`);
+    return s;
+  };
+}
+
+function envValue(s: Service, key: string): string | null | undefined {
+  return s.env.find((e) => e.key === key)?.value;
 }
 
 console.log("LabView smoke test\n");
+
+/* ========================================================================== */
+/* fixtures/apps — representative fleet                                       */
+/* ========================================================================== */
+
+const ov = await overviewFor(appsRoot);
+const svc = lookup(ov);
 
 console.log("discovery");
 check("found 5 stacks", ov.stats.stacks === 5, `got ${ov.stats.stacks}`);
@@ -55,7 +76,9 @@ check("jellyfin is public+local", jf.ingress === "public+local", jf.ingress);
 check("jellyfin cloudflare hostname", jf.cloudflare[0]?.hostname === "jellyfin.example.com");
 check("jellyfin traefik host", jf.traefik[0]?.hosts.includes("jellyfin.example.com") ?? false);
 const emby = svc("emby", "emby");
-check("emby is public (dockflare only)", emby.ingress === "public", emby.ingress);
+// Tunnel origin straight at the container, plus a published host port: public
+// via Cloudflare and directly answerable on the LAN, with no proxy either way.
+check("emby is public+host-port (dockflare only, port published)", emby.ingress === "public+host-port", emby.ingress);
 check("emby has no traefik route", emby.traefik.length === 0);
 
 console.log("\nauth posture");
@@ -93,6 +116,226 @@ check("cloudflare hub node exists", ov.graph.nodes.some((n) => n.id === "ext:clo
 check("authentik hub node exists", ov.graph.nodes.some((n) => n.id === "ext:authentik"));
 const dependsEdges = ov.graph.edges.filter((e) => e.kind === "depends_on");
 check("authentik depends_on edges present", dependsEdges.length >= 2, String(dependsEdges.length));
+
+/* ========================================================================== */
+/* fixtures/edge — regression cases                                           */
+/* ========================================================================== */
+
+const edge = await overviewFor(edgeRoot);
+const eSvc = lookup(edge);
+
+console.log("\n--- regression fixtures (fixtures/edge) ---");
+
+console.log("\nedge discovery");
+check("found 7 edge stacks", edge.stats.stacks === 7, `got ${edge.stats.stacks}`);
+
+console.log("\ncredentials embedded in URL values");
+const api = eSvc("dbstack", "api");
+check(
+  "DATABASE_URL password redacted, host kept",
+  envValue(api, "DATABASE_URL") === "postgresql://appuser:***@db:5432/app",
+  String(envValue(api, "DATABASE_URL")),
+);
+check("DATABASE_URL flagged as masked", api.env.find((e) => e.key === "DATABASE_URL")?.masked === true);
+check(
+  "REDIS_URL password redacted with empty user",
+  envValue(api, "REDIS_URL") === "redis://:***@cache:6379/0",
+  String(envValue(api, "REDIS_URL")),
+);
+check(
+  "credential-free URL left untouched",
+  envValue(api, "PUBLIC_ENDPOINT") === "https://api.example.com/health" &&
+    api.env.find((e) => e.key === "PUBLIC_ENDPOINT")?.masked === false,
+  String(envValue(api, "PUBLIC_ENDPOINT")),
+);
+check(
+  "userinfo without a password left untouched",
+  envValue(api, "SMTP_URL") === "smtp://notify@mail.example.com:587" &&
+    api.env.find((e) => e.key === "SMTP_URL")?.masked === false,
+  String(envValue(api, "SMTP_URL")),
+);
+
+console.log("\nenv_file containment");
+check("env_file inside the stack dir is loaded", envValue(api, "LOCAL_ENV_FILE_LOADED") === "yes");
+check(
+  "env_file escaping the apps root is refused",
+  !api.env.some((e) => e.key === "LEAKED_FROM_OUTSIDE_ROOT"),
+  api.env.map((e) => e.key).join(","),
+);
+check(
+  "refusal is surfaced as a service note",
+  api.notes.some((n) => n.includes("outside the apps root")),
+  api.notes.join(" | "),
+);
+
+console.log("\ndockflare enable flag");
+const staged = eSvc("cfdisabled", "app");
+check("dockflare.enable=false yields no route", staged.cloudflare.length === 0, String(staged.cloudflare.length));
+check("...so the service is internal", staged.ingress === "internal", staged.ingress);
+check("...and is not flagged exposed-without-auth", staged.auth.exposedWithoutAuth === false);
+const live = eSvc("cfdisabled", "live");
+check('dockflare.enable="TRUE" still enables the route', live.ingress === "public", live.ingress);
+
+console.log("\nLDAP attribution");
+const wiki = eSvc("ldapapp", "wiki");
+check(
+  "LDAP against a non-Authentik directory -> generic ldap",
+  wiki.auth.method === "ldap",
+  `${wiki.auth.method} (${wiki.auth.detail})`,
+);
+const bindPw = wiki.env.find((e) => e.key === "LDAP_BIND_PASSWORD");
+check("LDAP bind password masked", bindPw?.masked === true && bindPw.value === null);
+
+console.log("\nnested interpolation");
+const web = eSvc("interp", "web");
+check("nested default resolves the inner set var", web.image === "nginx:1.27.2", web.image ?? "");
+check(
+  "nested defaults fall through to the innermost literal",
+  envValue(web, "DEEP_LITERAL") === "deep-literal",
+  String(envValue(web, "DEEP_LITERAL")),
+);
+check(
+  "nested default reads an inner variable",
+  envValue(web, "RESOLVED_HOST") === "fallback.example.com",
+  String(envValue(web, "RESOLVED_HOST")),
+);
+check(
+  "a set outer value wins over the nested default",
+  envValue(web, "PRESENT_WINS") === "1.27.2",
+  String(envValue(web, "PRESENT_WINS")),
+);
+check(
+  "$$ resolves to a literal dollar",
+  envValue(web, "LITERAL_DOLLAR") === "cost is $5 per unit",
+  String(envValue(web, "LITERAL_DOLLAR")),
+);
+
+console.log("\npublished host ports are reachability");
+const media = eSvc("hostport", "media");
+check(
+  "tunnel origin at the container + published port -> public+host-port",
+  media.ingress === "public+host-port",
+  media.ingress,
+);
+check("...and is flagged exposed without auth", media.auth.exposedWithoutAuth === true);
+
+const socketproxy = eSvc("hostport", "socketproxy");
+check(
+  "published port with nothing in front -> host-port, not internal",
+  socketproxy.ingress === "host-port",
+  socketproxy.ingress,
+);
+check(
+  "...and is flagged exposed without auth",
+  socketproxy.auth.exposedWithoutAuth === true,
+  `exposedWithoutAuth=${socketproxy.auth.exposedWithoutAuth}`,
+);
+check("host-port services are counted", edge.stats.hostPortServices === 1, `got ${edge.stats.hostPortServices}`);
+
+const hpApp = eSvc("hostport", "app");
+check("proxied service keeps its local kind", hpApp.ingress === "local", hpApp.ingress);
+check(
+  "cross-stack authentik@docker still resolves",
+  hpApp.auth.method === "authentik-forward-auth",
+  hpApp.auth.method,
+);
+check(
+  "...but the host-port bypass of that SSO is noted",
+  hpApp.notes.some((n) => n.includes("9999") && n.includes("bypassing")),
+  hpApp.notes.join(" | "),
+);
+
+const hpWorker = eSvc("hostport", "worker");
+check("expose: does not publish -> stays internal", hpWorker.ingress === "internal", hpWorker.ingress);
+check(
+  "...and an internal service gets no bypass note",
+  hpWorker.notes.every((n) => !n.includes("bypassing")),
+  hpWorker.notes.join(" | "),
+);
+
+console.log("\nprovider attribution needs proof, not a name");
+const opApp = eSvc("otherprovider", "app");
+check(
+  "third-party OIDC issuer is not attributed to Authentik",
+  opApp.auth.method !== "authentik-oauth" && opApp.auth.method !== "authentik-forward-auth",
+  `${opApp.auth.method} (${opApp.auth.detail})`,
+);
+check(
+  "a resolved forwardauth address naming an unknown provider -> generic forward-auth",
+  opApp.auth.method === "forward-auth",
+  opApp.auth.method,
+);
+check(
+  "...backed by the address that was actually read",
+  opApp.auth.evidence.some((e) => e.includes("forwardauth -> http://gatekeeper:4180/oauth2/auth")),
+  opApp.auth.evidence.join(" | "),
+);
+check(
+  "...and an oauth2-proxy address is not read as Authentik's outpost",
+  !/authentik/i.test(opApp.auth.detail),
+  opApp.auth.detail,
+);
+check(
+  "...and marked as observed, not inferred",
+  opApp.auth.confidence === "observed",
+  opApp.auth.confidence,
+);
+check(
+  "...with the unidentified provider stated in the evidence",
+  opApp.auth.evidence.some((e) => e.includes("provider not identified")),
+  opApp.auth.evidence.join(" | "),
+);
+check(
+  "the OIDC detection is still reported, just not as Authentik",
+  opApp.auth.detail.includes("OAuth/OIDC") && opApp.auth.evidence.includes("env OIDC_ISSUER"),
+  opApp.auth.detail,
+);
+
+// The pinning case: OIDC is the only signal, so no middleware detection can
+// outrank a misattribution and hide it in the secondary detail. If hint matching
+// goes back to bare substrings, or a `auth.`-style host convention returns to the
+// defaults, `oauth.bigcorp.example.com` matches and these two fail.
+const opOidc = eSvc("otherprovider", "oidconly");
+check(
+  "an `oauth.` issuer host is not read as Authentik",
+  opOidc.auth.method === "other-oauth",
+  `${opOidc.auth.method} (${opOidc.auth.detail})`,
+);
+check(
+  "...and the report claims no provider it could not establish",
+  !/authentik/i.test(opOidc.auth.detail) && opOidc.auth.evidence.some((e) => e.includes("provider not identified")),
+  `${opOidc.auth.detail} | ${opOidc.auth.evidence.join(" | ")}`,
+);
+
+const opUnres = eSvc("otherprovider", "unresolved");
+check(
+  "an undefined auth-looking middleware is inferred, not asserted",
+  opUnres.auth.method === "forward-auth" && opUnres.auth.confidence === "inferred",
+  `${opUnres.auth.method}/${opUnres.auth.confidence}`,
+);
+check(
+  "...and the unresolved definition is said out loud",
+  opUnres.auth.evidence.some((e) => e.includes("definition not found")),
+  opUnres.auth.evidence.join(" | "),
+);
+check(
+  "...and surfaced as a service note",
+  opUnres.notes.some((n) => n.includes("inferred from a middleware name")),
+  opUnres.notes.join(" | "),
+);
+
+const opHdr = eSvc("otherprovider", "headersonly");
+check(
+  "an undefined header middleware is not read as an auth gate",
+  opHdr.auth.method === "none",
+  `${opHdr.auth.method} (${opHdr.auth.detail})`,
+);
+check("...so it counts as exposed without auth", opHdr.auth.exposedWithoutAuth === true);
+check(
+  "the identified-provider path still works alongside all of this",
+  eSvc("hostport", "app").auth.method === "authentik-forward-auth",
+  eSvc("hostport", "app").auth.method,
+);
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

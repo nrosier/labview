@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
-import { dirname, join, basename } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { basename, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type {
   AppStack,
@@ -13,8 +13,15 @@ import type {
 import { parseEnvFile, interpolate } from "./env.js";
 import type { DiscoveredStack } from "./discover.js";
 
-/** Parse and normalize a single stack's compose file into an AppStack. */
-export function parseStack(disc: DiscoveredStack): AppStack {
+/**
+ * Parse and normalize a single stack's compose file into an AppStack.
+ *
+ * `appsRoot` is the containment boundary for any file the compose document asks
+ * us to read (currently `env_file`). Compose documents are untrusted input as
+ * far as LabView is concerned — a `env_file: ../../../../etc/shadow` entry must
+ * not be able to pull arbitrary host files into the API response.
+ */
+export function parseStack(disc: DiscoveredStack, appsRoot: string): AppStack {
   const warnings: string[] = [];
   const dir = disc.dir;
   const raw = readFileSync(disc.composeFile, "utf8");
@@ -38,7 +45,7 @@ export function parseStack(disc: DiscoveredStack): AppStack {
   const services: Service[] = [];
   for (const [name, svc] of Object.entries(servicesRaw)) {
     if (svc == null || typeof svc !== "object") continue;
-    services.push(normalizeService(name, svc, { dir, projectName, lookup, warnings }));
+    services.push(normalizeService(name, svc, { dir, appsRoot, projectName, lookup, warnings }));
   }
 
   return {
@@ -57,6 +64,8 @@ export function parseStack(disc: DiscoveredStack): AppStack {
 
 interface Ctx {
   dir: string;
+  /** Containment boundary for files referenced by the compose document. */
+  appsRoot: string;
   projectName: string;
   lookup: Map<string, string>;
   warnings: string[];
@@ -82,7 +91,7 @@ function normalizeService(name: string, svc: any, ctx: Ctx): Service {
     cloudflare: [],
     traefik: [],
     ingress: "internal",
-    auth: { method: "none", detail: "", evidence: [], exposedWithoutAuth: false },
+    auth: { method: "none", detail: "", evidence: [], confidence: "observed", exposedWithoutAuth: false },
     notes,
   };
 }
@@ -95,9 +104,13 @@ function normalizeEnv(_name: string, svc: any, ctx: Ctx, notes: string[]): EnvVa
   const byKey = new Map<string, EnvVar>();
 
   // 1. env_file entries (literal, not interpolated) — lowest precedence.
-  const envFiles = toStringArray(svc.env_file);
+  const envFiles = toEnvFileList(svc.env_file);
   for (const ef of envFiles) {
-    const path = join(ctx.dir, ef);
+    const path = resolveContained(ctx.dir, ctx.appsRoot, ef);
+    if (path === null) {
+      notes.push(`ignored env_file outside the apps root: ${ef}`);
+      continue;
+    }
     const parsed = parseEnvFile(path);
     for (const [key, value] of parsed) {
       byKey.set(key, { key, value, masked: false, source: "env_file" });
@@ -286,6 +299,55 @@ function toStringArray(v: any): string[] {
   if (typeof v === "string") return [v];
   if (Array.isArray(v)) return v.filter((x) => typeof x === "string");
   return [];
+}
+
+/**
+ * Collect `env_file` references in both Compose forms: the short form
+ * (`env_file: a.env` / `env_file: [a.env, b.env]`) and the long form
+ * (`env_file: [{path: a.env, required: false}]`).
+ */
+function toEnvFileList(v: any): string[] {
+  if (typeof v === "string") return [v];
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item === "string") out.push(item);
+    else if (item && typeof item === "object" && typeof item.path === "string") out.push(item.path);
+  }
+  return out;
+}
+
+/**
+ * Resolve `ref` relative to `dir` and return it only if it stays inside `root`.
+ * Returns null when the reference escapes the boundary, either lexically
+ * (`../../etc/passwd`) or through a symlink pointing out of the tree.
+ *
+ * Both the literal and the fully-resolved form of the root are accepted, because
+ * an apps root is often reached through a symlink (a TrueNAS dataset under
+ * `/mnt/.ix-apps`, a bind mount) and a real path must not be rejected just
+ * because it does not textually match the configured one.
+ */
+function resolveContained(dir: string, root: string, ref: string): string | null {
+  const lexicalRoot = resolve(root);
+  const roots = [lexicalRoot, realpathOrNull(lexicalRoot) ?? lexicalRoot];
+  const within = (p: string): boolean => roots.some((r) => p === r || p.startsWith(r + sep));
+
+  const target = resolve(dir, ref);
+  // Lexical escape: `../..` climbing out of the tree.
+  if (!within(target)) return null;
+  // Symlink escape: a link inside the tree pointing outside it. Only checkable
+  // when the file exists; if it does not there is nothing to read either way.
+  const real = realpathOrNull(target);
+  if (real !== null && !within(real)) return null;
+  return target;
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
 }
 
 function sanitizeProject(id: string): string {

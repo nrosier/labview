@@ -1,0 +1,27 @@
+# Regression fixture: the upstream Authentik compose file names its services
+# `server` and `worker`. Those names must NOT become fleet-wide Authentik hints,
+# or every value containing the substring "server" gets attributed to Authentik
+# (see ../ldapapp).
+services:
+  server:
+    image: ghcr.io/goauthentik/server:2024.10.5
+    command: server
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.authentik.rule=Host(`sso.edge.example.com`)"
+      # Defines the forward-auth middleware that services in *other* stacks
+      # reference as `authentik@docker` (see ../hostport).
+      - "traefik.http.middlewares.authentik.forwardauth.address=http://authentik-server:9000/outpost.goauthentik.io/auth/traefik"
+      - "traefik.http.middlewares.authentik.forwardauth.trustforwardheader=true"
+    networks:
+      - proxy
+
+  worker:
+    image: ghcr.io/goauthentik/server:2024.10.5
+    command: worker
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

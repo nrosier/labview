@@ -19,7 +19,7 @@ services:
     labels:
       - "dockflare.enable=true"
       - "dockflare.hostname=media.example.com"
-      - "dockflare.service=http://192.168.1.2:8096"
+      - "dockflare.service=http://10.10.0.5:8096"
       - "dockflare.http2_origin=true"
       - "dockflare.match_sni_to_host=true"
 
