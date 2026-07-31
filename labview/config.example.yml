@@ -31,6 +31,11 @@ docker:
   # Max concurrent `container inspect` calls per scan. Raise for large fleets,
   # lower if the socket proxy starts rate-limiting or dropping connections.
   maxConcurrency: 8
+  # Per-request socket-inactivity timeout, in milliseconds — reset whenever bytes
+  # arrive, so a large fleet's container listing is unaffected. It exists for the
+  # endpoint that accepts the connection and then says nothing: without it a scan
+  # waits forever, and with it the startup log reports `timeout` in five seconds.
+  timeoutMs: 5000
 
 # Secret handling. Values of env keys matching these patterns are masked in the
 # API and UI (keys are always shown, values replaced with a placeholder).

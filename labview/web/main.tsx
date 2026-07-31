@@ -3,11 +3,13 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 import type {
   AppStack,
   AuthentikSummary,
+  ConnectionReport,
   IngressKind,
   Overview,
   Service,
   TraefikSummary,
 } from "./model";
+import { phaseText, shouldBanner } from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, serviceKey } from "./lib/format";
@@ -92,6 +94,66 @@ function traefikTitle(tf: TraefikSummary): string {
   }
   if (tf.error) bits.push(tf.error);
   return bits.join("\n");
+}
+
+/**
+ * Why a connection failed, said where the reader already is.
+ *
+ * The status pills stay compact counts and keep their tooltips, but a tooltip is a
+ * place a reason goes to be missed — `authentik: unreachable` with the explanation
+ * behind a hover is the complaint this exists to answer. One row per target that is
+ * worth mentioning (`shouldBanner`), each naming the stage, the address, what happened
+ * and what to change. Candidate rows follow on a discovery failure, because "nothing
+ * answered" is unactionable and three addresses with a phase each is not.
+ *
+ * Reuses `.banner` and its warning colour: the red of `--c8` is reserved for the
+ * exposure warning, and a diagnostic is not the same class of problem.
+ */
+/**
+ * The long form for a pill's tooltip, for a target that did not connect.
+ *
+ * The banner says the reason once; this repeats it where the reader's pointer already
+ * is, and adds the candidate list, which is too long for a banner row but is exactly
+ * what a discovery failure needs.
+ */
+function connTitle(r: ConnectionReport | undefined, fallback: string | undefined): string {
+  if (!r) return fallback ?? "";
+  const bits = [`${r.endpoint ?? "no endpoint"} — ${phaseText(r.phase)}`];
+  if (r.detail) bits.push(r.detail);
+  if (r.hint) bits.push(r.hint);
+  for (const a of r.attempts) bits.push(`tried ${a.endpoint} (${a.why}) — ${a.phase}: ${a.detail}`);
+  return bits.join("\n");
+}
+
+function ConnectionBanner({ reports }: { reports: ConnectionReport[] | undefined }) {
+  const shown = (reports ?? []).filter(shouldBanner);
+  if (!shown.length) return null;
+  return (
+    <div class="banner">
+      {shown.map((r) => (
+        <div class="conn" key={r.target}>
+          <div>
+            <strong>{r.target}</strong>
+            {r.endpoint && <span class="mono"> {r.endpoint}</span>}
+            {" — "}
+            {phaseText(r.phase)}
+            {r.code && ` (${r.code})`}
+            {r.detail && <>: {r.detail}</>}
+          </div>
+          {r.hint && <div class="conn-hint">{r.hint}</div>}
+          {!r.ok && r.attempts.length > 0 && (
+            <ul class="conn-tried">
+              {r.attempts.map((a) => (
+                <li key={a.endpoint}>
+                  <span class="mono">{a.endpoint}</span> ({a.why}) — {a.phase}: {a.detail}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function applyTheme(theme: Theme) {
@@ -249,6 +311,8 @@ function App() {
   }
 
   const allOpen = groups.length > 0 && expanded.size === groups.length;
+  /** The report for one target, for the pill tooltips beside the banner. */
+  const conn = (target: string) => ov.meta.connections?.find((c) => c.target === target);
   const nextTheme: Record<Theme, Theme> = { auto: "light", light: "dark", dark: "auto" };
   const themeIcon: Record<Theme, string> = { auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark" };
 
@@ -267,7 +331,7 @@ function App() {
             {ov.meta.dockerAvailable ? (
               "connected"
             ) : (
-              <span title={ov.meta.dockerError ?? ""}>config-only</span>
+              <span title={connTitle(conn("docker"), ov.meta.dockerError)}>config-only</span>
             )}
           </span>
           {/* Only shown once a token exists: an unconfigured optional integration is
@@ -276,14 +340,20 @@ function App() {
             <span>
               authentik:{" "}
               {ov.meta.authentik.reachable ? (
-                <span title={authentikTitle(ov.meta.authentik)}>
+                <span
+                  title={[authentikTitle(ov.meta.authentik), conn("authentik")?.hint]
+                    .filter(Boolean)
+                    .join("\n")}
+                >
                   {ov.meta.authentik.applications} app
                   {ov.meta.authentik.applications === 1 ? "" : "s"}
                   {ov.meta.authentik.matchedServices > 0 &&
                     ` · ${ov.meta.authentik.matchedServices} matched`}
                 </span>
               ) : (
-                <span title={ov.meta.authentik.error ?? ""}>unreachable</span>
+                <span title={connTitle(conn("authentik"), ov.meta.authentik.error)}>
+                  {conn("authentik")?.phase ?? "unreachable"}
+                </span>
               )}
             </span>
           )}
@@ -294,14 +364,20 @@ function App() {
             <span>
               traefik:{" "}
               {ov.meta.traefik.reachable ? (
-                <span title={traefikTitle(ov.meta.traefik)}>
+                <span
+                  title={[traefikTitle(ov.meta.traefik), conn("traefik")?.hint]
+                    .filter(Boolean)
+                    .join("\n")}
+                >
                   {ov.meta.traefik.routers} router
                   {ov.meta.traefik.routers === 1 ? "" : "s"}
                   {ov.meta.traefik.matchedServices > 0 && ` · ${ov.meta.traefik.matchedServices} matched`}
                   {ov.meta.traefik.credential === "none" && " · no credential"}
                 </span>
               ) : (
-                <span title={ov.meta.traefik.error ?? ""}>unreachable</span>
+                <span title={connTitle(conn("traefik"), ov.meta.traefik.error)}>
+                  {conn("traefik")?.phase ?? "unreachable"}
+                </span>
               )}
             </span>
           )}
@@ -323,6 +399,7 @@ function App() {
         </button>
       </header>
 
+      <ConnectionBanner reports={ov.meta.connections} />
       {ov.meta.warnings.length > 0 && (
         <div class="banner">
           {ov.meta.warnings.length} scan warning(s): {ov.meta.warnings.slice(0, 3).join("; ")}

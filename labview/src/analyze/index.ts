@@ -154,6 +154,11 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
       matchedServices: matchedRouters.matchedServices,
       unmatchedRouters: matchedRouters.unmatchedRouters,
     },
+    // In the order LabView reads them. Carried in `meta` rather than logged from here
+    // because this function takes no logger and must stay deterministic (invariant I7):
+    // the server and the CLI turn these into lines, exactly as they already do for
+    // `dockerError`.
+    connections: [snapshot.connection, ak.connection, tf.connection],
     durationMs: Date.now() - started,
     warnings,
     version: VERSION,

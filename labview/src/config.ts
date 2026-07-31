@@ -14,6 +14,14 @@ export interface LabViewConfig {
     socketPath: string;
     /** Max concurrent `container inspect` calls per scan. */
     maxConcurrency: number;
+    /**
+     * Per-request timeout for the Docker endpoint.
+     *
+     * Socket inactivity, not total duration — it is reset whenever bytes arrive, so a
+     * large fleet's container listing is unaffected while an endpoint that accepts the
+     * connection and then says nothing is reported instead of hanging the scan.
+     */
+    timeoutMs: number;
   };
   secrets: {
     maskValues: boolean;
@@ -88,6 +96,15 @@ export interface LabViewConfig {
   server: { host: string; port: number };
 }
 
+/**
+ * The conventional Docker socket path.
+ *
+ * Exported because the enrichment layer has to tell "this is the default nobody chose"
+ * from "the operator named this path" — a scan quietly using the built-in path when a
+ * socket proxy was meant to be configured is a real mistake, and worth saying out loud.
+ */
+export const DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock";
+
 const DEFAULTS: LabViewConfig = {
   appsRoot: "/data/apps",
   composeFilenames: ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"],
@@ -99,8 +116,9 @@ const DEFAULTS: LabViewConfig = {
     enabled: true,
     host: "",
     port: 2375,
-    socketPath: "/var/run/docker.sock",
+    socketPath: DEFAULT_DOCKER_SOCKET,
     maxConcurrency: 8,
+    timeoutMs: 5000,
   },
   secrets: {
     maskValues: true,
@@ -220,6 +238,10 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_DOCKER_MAX_CONCURRENCY) {
     const n = Number(env.LABVIEW_DOCKER_MAX_CONCURRENCY);
     if (Number.isFinite(n) && n >= 1) cfg.docker.maxConcurrency = Math.floor(n);
+  }
+  if (env.LABVIEW_DOCKER_TIMEOUT) {
+    const n = Number(env.LABVIEW_DOCKER_TIMEOUT);
+    if (Number.isFinite(n) && n > 0) cfg.docker.timeoutMs = Math.floor(n);
   }
   if (env.LABVIEW_AUTHENTIK_ENABLED) cfg.authentik.enabled = env.LABVIEW_AUTHENTIK_ENABLED !== "false";
   if (env.LABVIEW_AUTHENTIK_URL) cfg.authentik.url = env.LABVIEW_AUTHENTIK_URL;

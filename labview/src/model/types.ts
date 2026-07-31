@@ -286,6 +286,104 @@ export interface AuthentikMatch {
   evidence: string[];
 }
 
+/**
+ * Which stage of an outbound connection failed.
+ *
+ * One vocabulary for every system LabView reads — the Docker endpoint, Authentik's
+ * API, the proxy's API, and whatever is added next. The point of naming the stage
+ * rather than passing an error message through is that each stage has a different
+ * fix, and "unreachable" hides all of them behind one word: a name that does not
+ * resolve is a wrong hostname or a network LabView is not on, a refused connection is
+ * nothing listening, a 401 is a missing credential, a 403 is a credential that is not
+ * allowed here, and a 200 carrying HTML is an SSO login page answering instead of the
+ * API. `authenticate` and `authorize` are deliberately separate for that reason: on a
+ * socket proxy with the endpoint switched off, the second is the likeliest cause of
+ * all and the first would send the operator looking at credentials.
+ */
+export type ConnectionPhase =
+  /** Switched off in configuration. Not a fault. */
+  | "disabled"
+  /** Nothing was asked for: no credential and no endpoint. Not a fault either. */
+  | "not-configured"
+  /**
+   * Asked for, but there was nowhere to send the request — nothing was configured and
+   * discovery identified no candidate. Distinct from `not-configured`: a half-finished
+   * configuration will never work and is worth saying so.
+   */
+  | "not-found"
+  /** A configured credential could not be read — a missing or empty token file. */
+  | "credential"
+  /** The name does not exist (`ENOTFOUND`, `EAI_AGAIN`). */
+  | "resolve"
+  /** Nothing is listening, or the socket is not there (`ECONNREFUSED`, `ENOENT`, …). */
+  | "connect"
+  /** The certificate was not trusted. */
+  | "tls"
+  /** Accepted the connection and never answered. */
+  | "timeout"
+  /** HTTP 401 — a credential is missing or wrong. */
+  | "authenticate"
+  /** HTTP 403 — the identity was accepted and the access denied. */
+  | "authorize"
+  /** HTTP 404/405 — nothing of this kind is served at this address. */
+  | "path"
+  /** Any other error status; the status itself is in the detail. */
+  | "status"
+  /** Answered, but not with this API's payload — HTML, or JSON of the wrong shape. */
+  | "protocol"
+  /** Connected, and part of what was wanted could not be read. */
+  | "partial"
+  /** Worked. */
+  | "connected";
+
+/** One candidate endpoint that was tried, and what came back. */
+export interface ConnectionAttempt {
+  /** Origin only, credential-free. */
+  endpoint: string;
+  /** Why this candidate was tried, in discovery's own words. */
+  why: string;
+  phase: ConnectionPhase;
+  /**
+   * The libuv/TLS code or HTTP status behind the phase, when there was one. A
+   * constant like `ENOTFOUND` or `403` — never an address and never a credential.
+   */
+  code?: string;
+  detail: string;
+}
+
+/**
+ * What happened when LabView tried to reach one other system.
+ *
+ * Built by the enrichment client that made the attempt, carried out through
+ * `ScanMeta` rather than logged in place: `buildOverview` takes no logger and must
+ * stay deterministic (**I7**), so the server and the CLI are what turn these into
+ * lines. `src/model/connections.ts` holds the formatting.
+ */
+export interface ConnectionReport {
+  /** The system, as logged and displayed: `docker`, `authentik`, `traefik`. */
+  target: string;
+  ok: boolean;
+  phase: ConnectionPhase;
+  /** Address reached or attempted, credential-free. */
+  endpoint?: string;
+  /** How that address was arrived at. */
+  source?: "config" | "discovered" | "default";
+  /** What happened, in one line, with no credential in the text. */
+  detail?: string;
+  /**
+   * The transport code or HTTP status behind the phase, when there was one — a
+   * constant like `ENOTFOUND` or `403`, never an address. Kept next to the phase it
+   * produced so a reader can tell an inferred phase from a reported one.
+   */
+  code?: string;
+  /** What to change. Absent when there is nothing useful to say. */
+  hint?: string;
+  /** What was read, when it worked: `86 containers`, `10 routers, 5 middlewares`. */
+  read?: string;
+  /** Every candidate tried and rejected, in the order tried. */
+  attempts: ConnectionAttempt[];
+}
+
 /** Outcome of the Authentik API exchange, for the scan metadata. */
 export interface AuthentikSummary {
   /** Whether the integration is switched on at all. */
@@ -513,6 +611,14 @@ export interface ScanMeta {
   authentik?: AuthentikSummary;
   /** Outcome of the optional Traefik API exchange. */
   traefik?: TraefikSummary;
+  /**
+   * One entry per system LabView tried to reach, whether it worked or not.
+   *
+   * The summaries above answer "what did that integration yield"; this answers "did
+   * the connection work, and if not, which stage failed and what should change".
+   * Always present, so a reader never has to infer silence.
+   */
+  connections: ConnectionReport[];
   durationMs: number;
   warnings: string[];
   version: string;

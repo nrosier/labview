@@ -33,6 +33,8 @@
 import { readFileSync } from "node:fs";
 import type {
   AppStack,
+  ConnectionAttempt,
+  ConnectionReport,
   Service,
   TraefikLiveMiddleware,
   TraefikLiveRouter,
@@ -40,6 +42,7 @@ import type {
   TraefikSummary,
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
+import { attemptText, dominantAttempt, hintFor, plural } from "../model/connections.js";
 import { extractHosts } from "../labels/traefik.js";
 import { lookupContainerAddress, serviceRefKey, type FleetIndex } from "../analyze/origins.js";
 import {
@@ -74,6 +77,8 @@ export interface TraefikSnapshot {
   routers: TraefikLiveRouter[];
   /** The proxy service the endpoint that answered belongs to, when it was identified. */
   proxyServiceKey?: string;
+  /** What happened on the way to the API, for the operator to read. */
+  connection: ConnectionReport;
 }
 
 /** Traefik's documented API paths. All three are plain GETs. */
@@ -277,7 +282,18 @@ export async function snapshotTraefik(
   fetchImpl?: FetchLike,
 ): Promise<TraefikSnapshot> {
   const cred = readCredential(cfg);
-  const empty = (over: Partial<TraefikSummary>): TraefikSnapshot => ({
+  const attempts: ConnectionAttempt[] = [];
+  const report = (over: Partial<ConnectionReport>): ConnectionReport => ({
+    target: "traefik",
+    ok: false,
+    phase: "not-configured",
+    attempts,
+    ...over,
+  });
+  const empty = (
+    over: Partial<TraefikSummary>,
+    conn: Partial<ConnectionReport>,
+  ): TraefikSnapshot => ({
     summary: {
       enabled: cfg.traefik.enabled,
       configured: false,
@@ -293,19 +309,42 @@ export async function snapshotTraefik(
       error: joinErrors([over.error, cred.error]),
     },
     routers: [],
+    connection: report(conn),
   });
 
-  if (!cfg.traefik.enabled) return empty({ error: "Traefik API lookup disabled in config" });
+  if (!cfg.traefik.enabled) {
+    return empty(
+      { error: "Traefik API lookup disabled in config" },
+      { phase: "disabled", detail: "Traefik API lookup is disabled in configuration" },
+    );
+  }
   if (!candidates.length) {
-    return empty({
-      error:
-        "no Traefik endpoint: none configured, and no scanned service was identified as a Traefik proxy",
-    });
+    // Unlike Authentik, this stage needs no credential, so a fleet with no Traefik at all
+    // is the ordinary case and stays quiet. A *configured* credential changes that: it
+    // says the operator expects an API here, and never finding one is worth showing.
+    const expected = Boolean(cred.basic || cred.error);
+    return empty(
+      {
+        error:
+          "no Traefik endpoint: none configured, and no scanned service was identified as a Traefik proxy",
+      },
+      expected
+        ? {
+            phase: "not-found",
+            detail:
+              "a credential is configured but there was nowhere to send it: no URL configured, and no scanned service was identified as a Traefik proxy",
+            hint: hintFor("traefik", "not-found"),
+          }
+        : {
+            phase: "not-configured",
+            detail:
+              "no URL is configured and no scanned service was identified as a Traefik proxy",
+          },
+    );
   }
 
   const doFetch: FetchLike = fetchImpl ?? ((url, init) => fetch(url, init) as Promise<HttpResponse>);
   const timeoutMs = cfg.traefik.timeoutMs;
-  const attempts: string[] = [];
 
   for (const candidate of candidates) {
     const base = candidate.url.replace(/\/+$/, "");
@@ -342,7 +381,15 @@ export async function snapshotTraefik(
       credential = "basic";
     }
     if (!isVersionBody(probe.body)) {
-      attempts.push(`${origin} (${candidate.why}): ${probe.error ?? "not a Traefik API"}`);
+      // A candidate that answered JSON of the wrong shape is at `protocol`: it is
+      // listening and speaking HTTP, it is simply not Traefik's API.
+      attempts.push({
+        endpoint: origin,
+        why: candidate.why,
+        phase: probe.ok ? "protocol" : probe.phase,
+        code: probe.code,
+        detail: probe.error ?? "not a Traefik API",
+      });
       continue;
     }
 
@@ -358,10 +405,21 @@ export async function snapshotTraefik(
 
     const raw = await get(RAWDATA_PATH, authenticate);
     if (!raw.ok || !isObject(raw.body)) {
-      return empty({
-        ...found,
-        error: `Traefik at ${origin} answered ${VERSION_PATH} but ${RAWDATA_PATH} could not be read: ${raw.error ?? "unexpected response body"}`,
-      });
+      const phase = raw.ok ? "protocol" : raw.phase;
+      return empty(
+        {
+          ...found,
+          error: `Traefik at ${origin} answered ${VERSION_PATH} but ${RAWDATA_PATH} could not be read: ${raw.error ?? "unexpected response body"}`,
+        },
+        {
+          phase,
+          endpoint: origin,
+          source: candidate.source,
+          code: raw.code,
+          detail: `${VERSION_PATH} answered and ${RAWDATA_PATH} did not: ${raw.error ?? "unexpected response body"}`,
+          hint: hintFor("traefik", phase),
+        },
+      );
     }
 
     // Entrypoints are read before anything is concluded about a *missing* gate: a
@@ -371,20 +429,21 @@ export async function snapshotTraefik(
     const entrypointMiddlewares = eps.ok ? parseEntrypoints(eps.body) : undefined;
 
     const parsed = parseRawData(raw.body, entrypointMiddlewares ?? new Map());
+    // A broken credential file is still worth reporting on a read that succeeded
+    // without one: the operator configured something that did not work.
+    const gap = joinErrors([
+      entrypointMiddlewares
+        ? undefined
+        : `${ENTRYPOINTS_PATH} could not be read (${eps.error ?? "unexpected response body"}), so entrypoint-level middlewares are unknown`,
+      cred.error,
+    ]);
     return {
       summary: {
         enabled: true,
         reachable: true,
         ...found,
         entrypointsRead: entrypointMiddlewares !== undefined,
-        // A broken credential file is still worth reporting on a read that succeeded
-        // without one: the operator configured something that did not work.
-        error: joinErrors([
-          entrypointMiddlewares
-            ? undefined
-            : `${ENTRYPOINTS_PATH} could not be read (${eps.error ?? "unexpected response body"}), so entrypoint-level middlewares are unknown`,
-          cred.error,
-        ]),
+        error: gap,
         routers: parsed.routers.length,
         middlewares: parsed.middlewareCount,
         services: parsed.serviceCount,
@@ -393,13 +452,43 @@ export async function snapshotTraefik(
       },
       routers: parsed.routers,
       proxyServiceKey: candidate.serviceKey,
+      connection: report({
+        ok: true,
+        phase: gap ? "partial" : "connected",
+        endpoint: origin,
+        source: candidate.source,
+        read: [
+          version ? `Traefik ${version}` : "Traefik",
+          plural(parsed.routers.length, "router"),
+          plural(parsed.middlewareCount, "middleware"),
+          plural(parsed.serviceCount, "service"),
+          credential === "basic" ? "with a credential" : "no credential",
+        ].join(", "),
+        detail: gap,
+        hint: gap ? hintFor("traefik", "partial") : undefined,
+      }),
     };
   }
 
-  return empty({
-    configured: true,
-    error: `no Traefik API endpoint answered — tried ${attempts.join("; ")}`,
-  });
+  // Every candidate failed. The phase is the furthest any of them got: a host that
+  // answered 401 is the API, and reporting an earlier candidate's DNS failure instead
+  // would send the operator to their resolver over a working address.
+  const worst = dominantAttempt(attempts);
+  return empty(
+    {
+      configured: true,
+      error: `no Traefik API endpoint answered — tried ${attempts.map(attemptText).join("; ")}`,
+    },
+    worst
+      ? {
+          phase: worst.phase,
+          endpoint: worst.endpoint,
+          code: worst.code,
+          detail: `${plural(candidates.length, "candidate")} tried, none answered as Traefik's API — the furthest got to ${worst.phase}: ${worst.detail}`,
+          hint: hintFor("traefik", worst.phase),
+        }
+      : { phase: "not-found", detail: "no candidate could be tried" },
+  );
 }
 
 /** Request headers: JSON, the cookies gathered in this exchange, and Basic when allowed. */

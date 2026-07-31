@@ -204,6 +204,7 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_DOCKER_PORT` | `2375` | TCP port (when the host has no port) |
 | `LABVIEW_DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path. Setting it always wins and disables the TCP host |
 | `LABVIEW_DOCKER_MAX_CONCURRENCY` | `8` | Max concurrent container inspects per scan |
+| `LABVIEW_DOCKER_TIMEOUT` | `5000` | Per-request socket-inactivity timeout, ms. Reset whenever bytes arrive, so a large fleet's listing is unaffected; it exists to turn an endpoint that accepts the connection and then says nothing into a reported `timeout` |
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_HOST` | `0.0.0.0` | Bind address |
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh |
@@ -213,13 +214,13 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a read-only API token (docker secret, mounted file). Wins over `LABVIEW_AUTHENTIK_TOKEN` |
 | `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | The token itself. Works, but is visible in `docker inspect` — prefer the file form |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://authentik-server:9000`. Needed only when Authentik is outside `appsRoot` or discovery picks the wrong endpoint |
-| `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `5000` | Per-request timeout. On timeout the scan continues without the API |
+| `LABVIEW_AUTHENTIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues without the API |
 | `LABVIEW_TRAEFIK_ENABLED` | `true` | Whether to read the reverse proxy's API at all. Needs no credential and no configuration; if nothing answers the scan continues from the labels |
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://traefik:8080`. Needed only when the proxy is outside `appsRoot` or discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
 | `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (docker secret, mounted file). Wins over `LABVIEW_TRAEFIK_PASSWORD` |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | The password itself. Works, but is visible in `docker inspect` — prefer the file form |
-| `LABVIEW_TRAEFIK_TIMEOUT_MS` | `5000` | Per-request timeout. On timeout the scan continues from the labels alone |
+| `LABVIEW_TRAEFIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues from the labels alone |
 
 The default Docker endpoint is the conventional local socket, since it is the one
 endpoint that needs no assumption about your container names; a socket proxy is
@@ -330,6 +331,49 @@ an error message.
 Every failure here is soft too: nothing answering, a rejected credential, a timeout
 or a shape the parser doesn't recognize leaves the posture exactly as the labels
 described it, with the reason in `meta.traefik.error`.
+
+---
+
+## When a connection fails
+
+Every outbound read — the Docker endpoint, the Authentik API, the Traefik API —
+reports the **stage** it stopped at, because "unreachable" covers a dozen different
+fixes. On startup and on any change you get one line per target:
+
+```text
+LabView scanning /data/apps
+LabView connected to docker at tcp://dockerproxy:2375 (config) — 86 containers
+LabView could not connect to authentik at https://sso.example.com (config) — resolve: fetch failed (ENOTFOUND)
+  No candidate hostname resolved. Set LABVIEW_AUTHENTIK_URL to the API's address — …
+  · http://authentik-server:9000 (runs the Authentik image): resolve — fetch failed (ENOTFOUND)
+```
+
+The same lines print under `npm run scan -- --summary`, the same phase and reason
+appear in a banner under the topbar, and the whole set is in `meta.connections` on
+`/api/overview`. A target nobody switched on is logged at `debug` and shows no
+banner — an optional integration being off is not a fault.
+
+| Phase | What it means | Where to look |
+|---|---|---|
+| `disabled` | switched off in config | `LABVIEW_*_ENABLED` |
+| `not-configured` | nothing was asked for | no token / no endpoint — nothing to fix unless you expected otherwise |
+| `not-found` | a credential is configured with no address to use it against | set `LABVIEW_AUTHENTIK_URL` / `LABVIEW_TRAEFIK_URL`; discovery only finds an instance that is itself one of the scanned stacks |
+| `credential` | the configured token or password file could not be read | the `*_FILE` path, its permissions, and that it is not empty |
+| `resolve` | the name does not exist here | the hostname, and whether LabView shares a network with it |
+| `connect` | nothing accepted the connection | the port; for a unix socket, whether it is mounted, is really a socket, and has a daemon behind it |
+| `tls` | the certificate was not trusted | `NODE_EXTRA_CA_CERTS` — verification is never skipped |
+| `timeout` | accepted, then silent | `LABVIEW_*_TIMEOUT`, or whether the address really is the API's |
+| `authenticate` | the credential is missing or wrong (HTTP 401) | the token; for a gated Traefik API, an Authentik **app password**, not an API token |
+| `authorize` | the identity was accepted and the access refused (HTTP 403) | **the socket proxy's `CONTAINERS=1`**, or the token's permissions; on a unix socket, the container user's group membership |
+| `path` | no API of this kind answered here (HTTP 404/405) | the base URL — no `/api/v3` suffix for Authentik, `api: {}` enabled for Traefik |
+| `status` | some other error status | the endpoint's own logs |
+| `protocol` | something answered, but not this API | almost always an SSO login page in front of it — point at the internal address instead |
+| `partial` | connected, part of the read failed | the reason is on the line; the posture is unchanged, and nothing is concluded from the missing part |
+
+The most common two in practice, both of which read like a network problem and are
+neither: `authorize` from a socket proxy that was never given `CONTAINERS=1`, and
+`protocol` from a URL that reaches an identity provider's login page rather than the
+API behind it.
 
 ---
 

@@ -168,10 +168,31 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
 
 The full table — including `LABVIEW_HOST`, `LABVIEW_DOCKER_PORT`,
-`LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_CONFIG` and the rest of the
-`LABVIEW_AUTHENTIK_*` and `LABVIEW_TRAEFIK_*` sets — plus the secret patterns,
-label prefixes and Authentik hints, is documented in
+`LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_DOCKER_TIMEOUT`, `LABVIEW_CONFIG` and
+the rest of the `LABVIEW_AUTHENTIK_*` and `LABVIEW_TRAEFIK_*` sets — plus the
+secret patterns, label prefixes and Authentik hints, is documented in
 [labview/README.md](labview/README.md#configuration).
+
+### When something doesn't connect
+
+Every outbound read reports the **stage** it stopped at, so "unreachable" is never
+the whole answer:
+
+```text
+LabView scanning /data/apps
+LabView connected to docker at tcp://dockerproxy:2375 (config) — 86 containers
+LabView could not connect to authentik at https://sso.example.com (config) — protocol: HTTP 200 but the body was not JSON — an HTML login page answers exactly like this
+  Something answered that is not Authentik's API — most often its own login page…
+```
+
+The same phase and reason appear in a banner under the topbar, under
+`npm run scan -- --summary`, and in `meta.connections` on `/api/overview`. The
+phases — `resolve`, `connect`, `tls`, `timeout`, `authenticate`, `authorize`,
+`path`, `protocol`, `partial` and the rest — are tabulated with what to check for
+each in [labview/README.md](labview/README.md#when-a-connection-fails). The two
+that most often look like a network problem and aren't: a socket proxy answering
+`403` because it was never given `CONTAINERS=1`, and a URL that reaches an SSO
+login page instead of the API behind it.
 
 ---
 
@@ -355,6 +376,12 @@ a stub that demands Basic auth on the gated hostname and answers unauthenticated
 only on the internal one, which is how the credential rule is asserted on the
 recorded calls. Each edge fixture is written so that it fails if the corresponding
 fix is reverted.
+
+The connection taxonomy is asserted the same way: every transport code, HTTP status
+and socket-file state mapped to its phase, the two that most invite conflation
+(`401` vs `403`, an unreadable socket vs a refused connection) each with an
+assertion that fails if they are merged, and the socket states driven against real
+paths made under `os.tmpdir()`.
 
 No Docker daemon is needed for any of them — set `LABVIEW_DOCKER_ENABLED=false`
 and the pipeline runs config-only.

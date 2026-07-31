@@ -11,7 +11,14 @@
  *  - **A credential never reaches an error string.** Error text carries the status,
  *    an optional caller-supplied hint and nothing else. Nothing in here has the
  *    headers in scope at the point a message is built.
+ *  - **A failure names the stage that failed.** Every result carries a
+ *    `ConnectionPhase`, classified here because here is the only place the error
+ *    object still exists — `fetch` collapses DNS, refused connections and certificate
+ *    problems into one `"fetch failed"` message and puts the reason on `cause.code`.
+ *    Doing it at the chokepoint is also what makes a client added later diagnosable
+ *    without writing any of this again.
  */
+import type { ConnectionPhase } from "../model/types.js";
 
 /** Minimal shape of a `fetch` response, so a test can supply a stub. */
 export interface HttpResponse {
@@ -39,8 +46,45 @@ export interface JsonResult {
   body?: unknown;
   /** Why the request did not produce a body, with no credential in the text. */
   error?: string;
+  /** Which stage failed, or `connected`. */
+  phase: ConnectionPhase;
+  /** The transport code or status behind the phase — a constant, never an address. */
+  code?: string;
   /** Raw `set-cookie`, when the response sent one and headers were available. */
   setCookie?: string;
+}
+
+/**
+ * The stage a transport-level failure belongs to.
+ *
+ * Node reports these as short constants on the error (or on `fetch`'s `cause`), and
+ * they are the only thing distinguishing a wrong hostname from a service that is not
+ * listening from a certificate the trust store does not accept. An unrecognised code
+ * falls through to `connect` rather than to a catch-all phase: something went wrong
+ * while establishing the connection is the one thing that is certainly true, and the
+ * code itself is kept alongside so nothing is lost by the generalisation.
+ */
+export function phaseForCode(code: string | undefined): ConnectionPhase {
+  if (!code) return "connect";
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "resolve";
+  // Certificate and handshake problems all mean the same thing to an operator — the
+  // trust store does not accept what the far end presented — and OpenSSL's names for
+  // them are many, so the shape of the name is matched rather than each constant.
+  if (/^(ERR_TLS|ERR_SSL|CERT_|UNABLE_TO_|SELF_SIGNED|DEPTH_ZERO|EPROTO$|HOSTNAME_MISMATCH)/.test(code)) {
+    return "tls";
+  }
+  if (code === "ETIMEDOUT" || code === "ERR_SOCKET_TIMEOUT" || code === "UND_ERR_HEADERS_TIMEOUT") {
+    return "timeout";
+  }
+  return "connect";
+}
+
+/** The stage an error status belongs to. */
+export function phaseForStatus(status: number): ConnectionPhase {
+  if (status === 401 || status === 407) return "authenticate";
+  if (status === 403) return "authorize";
+  if (status === 404 || status === 405) return "path";
+  return "status";
 }
 
 export interface GetJsonOptions {
@@ -60,7 +104,14 @@ export async function getJson(doFetch: FetchLike, url: string, opts: GetJsonOpti
     const setCookie = res.headers?.get("set-cookie") ?? undefined;
     if (!res.ok) {
       const hint = opts.hint?.(res.status);
-      return { ok: false, status: res.status, error: `HTTP ${res.status}${hint ?? ""}`, setCookie };
+      return {
+        ok: false,
+        status: res.status,
+        error: `HTTP ${res.status}${hint ?? ""}`,
+        phase: phaseForStatus(res.status),
+        code: String(res.status),
+        setCookie,
+      };
     }
     // A 200 whose body is not JSON is its own outcome, not a parser bug. It is also the
     // single most likely way an endpoint behind an SSO gate answers: the login page is
@@ -68,18 +119,22 @@ export async function getJson(doFetch: FetchLike, url: string, opts: GetJsonOpti
     // the parse error verbatim would read as a fault in LabView instead of the one
     // thing the operator needs to know — that something else answered.
     try {
-      return { ok: true, status: res.status, body: await res.json(), setCookie };
+      return { ok: true, status: res.status, body: await res.json(), phase: "connected", setCookie };
     } catch {
       return {
         ok: false,
         status: res.status,
         error: `HTTP ${res.status} but the body was not JSON — an HTML login page answers exactly like this`,
+        phase: "protocol",
+        code: String(res.status),
         setCookie,
       };
     }
   } catch (err) {
     const e = err as Error;
-    if (e.name === "TimeoutError" || e.name === "AbortError") return { ok: false, error: "timed out" };
+    if (e.name === "TimeoutError" || e.name === "AbortError") {
+      return { ok: false, error: "timed out", phase: "timeout" };
+    }
     // `fetch` reports every transport failure as the same opaque "fetch failed" and puts
     // the reason in `cause`. Kept, because the reasons call for entirely different
     // fixes: a name that does not resolve is a wrong hostname, a refused connection is
@@ -87,7 +142,7 @@ export async function getJson(doFetch: FetchLike, url: string, opts: GetJsonOpti
     // The code is a constant like `ENOTFOUND`, never an address or a credential.
     const cause = (err as { cause?: unknown }).cause;
     const code = isObject(cause) && typeof cause.code === "string" ? cause.code : undefined;
-    return { ok: false, error: code ? `${e.message} (${code})` : e.message };
+    return { ok: false, error: code ? `${e.message} (${code})` : e.message, phase: phaseForCode(code), code };
   }
 }
 

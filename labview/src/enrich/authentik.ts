@@ -23,6 +23,8 @@
  *  - **Never throws, never blocks a scan** (invariant I4). Not configured,
  *    unreachable, unauthorized, rate-limited, serving unexpected JSON: every path
  *    returns a summary explaining itself and the scan continues on labels alone.
+ *    Every one of those paths also returns a `ConnectionReport` naming the stage it
+ *    stopped at, because "unreachable" alone covers six different fixes.
  */
 import { readFileSync } from "node:fs";
 import type {
@@ -31,9 +33,13 @@ import type {
   AuthentikProvider,
   AuthentikProviderKind,
   AuthentikSummary,
+  ConnectionAttempt,
+  ConnectionPhase,
+  ConnectionReport,
   Service,
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
+import { attemptText, dominantAttempt, hintFor, plural } from "../model/connections.js";
 import { getJson, isObject, safeOrigin, str, type FetchLike, type HttpResponse } from "./http.js";
 
 // The HTTP plumbing is shared with the Traefik client. Re-exported so existing
@@ -51,6 +57,8 @@ export interface AuthentikEndpoint {
 export interface AuthentikSnapshot {
   summary: AuthentikSummary;
   applications: AuthentikApplication[];
+  /** What happened on the way to the API, for the operator to read. */
+  connection: ConnectionReport;
 }
 
 /** Authentik's documented API root, relative to the instance base URL. */
@@ -145,7 +153,18 @@ export async function snapshotAuthentik(
   candidates: AuthentikEndpoint[],
   fetchImpl?: FetchLike,
 ): Promise<AuthentikSnapshot> {
-  const empty = (over: Partial<AuthentikSummary>): AuthentikSnapshot => ({
+  const attempts: ConnectionAttempt[] = [];
+  const report = (over: Partial<ConnectionReport>): ConnectionReport => ({
+    target: "authentik",
+    ok: false,
+    phase: "not-configured",
+    attempts,
+    ...over,
+  });
+  const empty = (
+    over: Partial<AuthentikSummary>,
+    conn: Partial<ConnectionReport>,
+  ): AuthentikSnapshot => ({
     summary: {
       enabled: cfg.authentik.enabled,
       configured: false,
@@ -158,24 +177,54 @@ export async function snapshotAuthentik(
       ...over,
     },
     applications: [],
+    connection: report(conn),
   });
 
-  if (!cfg.authentik.enabled) return empty({ error: "Authentik API lookup disabled in config" });
+  if (!cfg.authentik.enabled) {
+    return empty(
+      { error: "Authentik API lookup disabled in config" },
+      { phase: "disabled", detail: "Authentik API lookup is disabled in configuration" },
+    );
+  }
 
   const token = readToken(cfg);
-  if (token.error) return empty({ error: token.error });
+  // A token that was configured and cannot be read is its own stage: the operator did
+  // ask for this integration, so unlike an absent token it is worth saying out loud.
+  if (token.error) {
+    return empty(
+      { error: token.error },
+      { phase: "credential", detail: token.error, hint: hintFor("authentik", "credential") },
+    );
+  }
   // Nothing useful is readable anonymously, so an absent token means "feature off"
   // rather than "feature broken" — reported without an error so the UI stays quiet.
-  if (!token.value) return empty({});
+  if (!token.value) {
+    return empty(
+      {},
+      {
+        phase: "not-configured",
+        detail: "no API token is configured, and Authentik exposes nothing useful anonymously",
+      },
+    );
+  }
   if (!candidates.length) {
-    return empty({
-      error:
-        "no Authentik endpoint: none configured, and no scanned service was identified as Authentik",
-    });
+    // A token with nowhere to send it is a half-finished configuration that will never
+    // work, so this is `not-found` rather than `not-configured` — and therefore visible.
+    return empty(
+      {
+        error:
+          "no Authentik endpoint: none configured, and no scanned service was identified as Authentik",
+      },
+      {
+        phase: "not-found",
+        detail:
+          "a token is configured but there was nowhere to send it: no URL configured, and no scanned service was identified as Authentik",
+        hint: hintFor("authentik", "not-found"),
+      },
+    );
   }
 
   const doFetch: FetchLike = fetchImpl ?? ((url, init) => fetch(url, init) as Promise<HttpResponse>);
-  const attempts: string[] = [];
 
   for (const candidate of candidates) {
     const base = candidate.url.replace(/\/+$/, "");
@@ -186,7 +235,16 @@ export async function snapshotAuthentik(
       timeoutMs: cfg.authentik.timeoutMs,
     });
     if (!probe.ok || !isObject(probe.body)) {
-      attempts.push(`${origin} (${candidate.why}): ${probe.error ?? "not an Authentik API root"}`);
+      // A candidate that answered with something other than Authentik's own root config
+      // is at `protocol`, not at whatever the transport did: it is listening and it is
+      // speaking HTTP, it is simply not the API — most often an SSO login page.
+      attempts.push({
+        endpoint: origin,
+        why: candidate.why,
+        phase: probe.ok ? "protocol" : probe.phase,
+        code: probe.code,
+        detail: probe.error ?? "not an Authentik API root",
+      });
       continue;
     }
 
@@ -195,12 +253,23 @@ export async function snapshotAuthentik(
     if (apps.error) {
       // A confirmed Authentik that refuses the token is a configuration problem
       // worth reporting rather than a candidate to skip past silently.
-      return empty({
-        configured: true,
-        endpoint: origin,
-        endpointSource: candidate.source,
-        error: `Authentik at ${origin} rejected the API request: ${apps.error}`,
-      });
+      const phase = apps.phase ?? "status";
+      return empty(
+        {
+          configured: true,
+          endpoint: origin,
+          endpointSource: candidate.source,
+          error: `Authentik at ${origin} rejected the API request: ${apps.error}`,
+        },
+        {
+          phase,
+          endpoint: origin,
+          source: candidate.source,
+          code: apps.code,
+          detail: `the API root answered, and the token was refused: ${apps.error}`,
+          hint: hintFor("authentik", phase),
+        },
+      );
     }
 
     const [proxies, oauth2, outposts] = await Promise.all([
@@ -211,6 +280,8 @@ export async function snapshotAuthentik(
 
     const applications = buildApplications(apps.items, proxies.items, oauth2.items, outposts.items);
     const soft = [proxies.error, oauth2.error, outposts.error].filter(Boolean);
+    const providers = applications.reduce((n, a) => n + a.providers.length, 0);
+    const gap = soft.length ? `some endpoints could not be read: ${soft.join("; ")}` : undefined;
     return {
       summary: {
         enabled: true,
@@ -220,21 +291,49 @@ export async function snapshotAuthentik(
         endpointSource: candidate.source,
         // A partial read still yields useful matches, so it is reported as reachable
         // with the gap stated rather than discarded wholesale.
-        error: soft.length ? `some endpoints could not be read: ${soft.join("; ")}` : undefined,
+        error: gap,
         applications: applications.length,
-        providers: applications.reduce((n, a) => n + a.providers.length, 0),
+        providers,
         outposts: outposts.items.length,
         matchedServices: 0,
         unmatchedApplications: [],
       },
       applications,
+      connection: report({
+        ok: true,
+        phase: gap ? "partial" : "connected",
+        endpoint: origin,
+        source: candidate.source,
+        read: [
+          plural(applications.length, "application"),
+          plural(providers, "provider"),
+          plural(outposts.items.length, "outpost"),
+        ].join(", "),
+        detail: gap,
+        hint: gap ? hintFor("authentik", "partial") : undefined,
+      }),
     };
   }
 
-  return empty({
-    configured: true,
-    error: `no Authentik API endpoint answered — tried ${attempts.join("; ")}`,
-  });
+  // Every candidate failed. The phase reported is the furthest any of them got, not the
+  // last one tried — see `dominantAttempt`. The full list travels in `attempts` so the
+  // log and the banner can name each address and what it did.
+  const worst = dominantAttempt(attempts);
+  return empty(
+    {
+      configured: true,
+      error: `no Authentik API endpoint answered — tried ${attempts.map(attemptText).join("; ")}`,
+    },
+    worst
+      ? {
+          phase: worst.phase,
+          endpoint: worst.endpoint,
+          code: worst.code,
+          detail: `${plural(candidates.length, "candidate")} tried, none answered as Authentik's API — the furthest got to ${worst.phase}: ${worst.detail}`,
+          hint: hintFor("authentik", worst.phase),
+        }
+      : { phase: "not-found", detail: "no candidate could be tried" },
+  );
 }
 
 /** Resolve the token from a file when given one, else from config/env. */
@@ -256,6 +355,9 @@ function readToken(cfg: LabViewConfig): { value?: string; error?: string } {
 interface ListResult {
   items: Record<string, unknown>[];
   error?: string;
+  /** The stage the failing request stopped at, so the caller can report it. */
+  phase?: ConnectionPhase;
+  code?: string;
 }
 
 /** What a rejected request most likely means, for the error text. No credential in it. */
@@ -290,9 +392,14 @@ async function getList(
       hint: tokenHint,
     });
     if (!res.ok || !isObject(res.body)) {
+      // An envelope that is not an object came from a request that itself succeeded, so
+      // the stage is `protocol`: something answered, just not as this API.
+      const phase = res.ok ? "protocol" : res.phase;
       // A later page failing still leaves the earlier ones usable.
-      if (items.length) return { items, error: `${path} page ${page}: ${res.error ?? "bad response"}` };
-      return { items, error: `${path}: ${res.error ?? "unexpected response body"}` };
+      if (items.length) {
+        return { items, error: `${path} page ${page}: ${res.error ?? "bad response"}`, phase, code: res.code };
+      }
+      return { items, error: `${path}: ${res.error ?? "unexpected response body"}`, phase, code: res.code };
     }
     const results = Array.isArray(res.body.results) ? res.body.results : [];
     for (const r of results) if (isObject(r)) items.push(r);

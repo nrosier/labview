@@ -5,6 +5,7 @@
  */
 import { loadConfig } from "./config.js";
 import { buildOverview } from "./analyze/index.js";
+import { formatConnection } from "./model/connections.js";
 
 const cfg = loadConfig();
 const summary = process.argv.includes("--summary");
@@ -15,7 +16,12 @@ if (summary) {
   const { stats, meta } = overview;
   console.log(`LabView scan @ ${meta.scannedAt} (${meta.durationMs}ms)`);
   console.log(`  apps root:        ${meta.appsRoot}`);
-  console.log(`  docker:           ${meta.dockerAvailable ? "available" : `unavailable (${meta.dockerError})`}`);
+  // Every target, including the ones nobody switched on: `--summary` is run on purpose,
+  // usually to find out why something is missing, and "not reading authentik" is an
+  // answer to that. The same formatter the server logs through, so the two agree.
+  for (const r of meta.connections) {
+    for (const line of formatConnection(r)) console.log(`  ${line}`);
+  }
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
   console.log(
     `  public/local/int: ${stats.publicServices}/${stats.localOnlyServices}/${stats.internalServices}` +

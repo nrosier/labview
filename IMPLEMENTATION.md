@@ -47,6 +47,7 @@ SSO provider. Each is listed with where it is satisfied.
 | **R6** | Build the documentation dynamically, and use the Docker socket proxy for live state when available | [enrich/docker.ts](labview/src/enrich/docker.ts); every scan is fresh, nothing is persisted |
 | **R7** | Serve the documentation from a built-in webserver, itself exposable through the same tunnel/proxy/SSO chain | [server/server.ts](labview/src/server/server.ts), labelled example in `labview/compose.yml` |
 | **R8** | Be generic: the above is an *example* of a fleet, never a description of one | §4 I1–I3, enforced by the fixtures in §8 |
+| **R9** | When one of those optional reads does not work, say which stage failed and what to change — for every target, present and future | [model/connections.ts](labview/src/model/connections.ts); §3.10, surfaced in the startup log, `--summary`, `meta.connections` and a banner |
 
 ### 2.1 What must not be assumed
 
@@ -80,6 +81,7 @@ labview/
     config.ts         defaults, config.yml merge, env overrides
     secrets.ts        env masking + URI credential redaction
     model/types.ts    THE contract between backend and frontend
+    model/connections.ts  connection-report wording, hints, log/banner rules (pure)
     scan/
       discover.ts     appsRoot -> stack directories
       compose.ts      compose YAML -> normalized AppStack/Service
@@ -129,6 +131,7 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 1. Discover | `scan/discover.ts` | one `DiscoveredStack` per subdirectory with a compose file, sorted by id |
 | 2. Parse | `scan/compose.ts` + `scan/env.ts` | `AppStack[]` — services, ports, mounts, env (interpolated), labels |
 | 3. Docker snapshot | `enrich/docker.ts` | `DockerSnapshot` keyed by `"project service"`, container name and short id |
+| — | each `enrich/*` client | a `ConnectionReport` per target, collected into `meta.connections` (§3.10) |
 | 4. Middleware registry | `analyze/middlewares.ts` | every Traefik middleware *defined* anywhere, by bare name |
 | 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker`, `svc.ingress` |
 | 6. Fleet index + origin resolution | `analyze/origins.ts` | `FleetIndex` (host ports, DNS names, container IPs, hostnames); `route.origin` — what each tunnel origin points at, and notes where it could not be told |
@@ -479,9 +482,79 @@ palette in `styles.css`. DOM nodes use `var(--…)` directly; canvas-based views
 (cytoscape, mermaid) call `resolveVar()` so both follow the light/dark toggle from
 one definition.
 
----
+### 3.10 Connection diagnostics
 
-## 4. Invariants
+Every outbound read degrades softly (§4 I4), which leaves the operator with a
+result that is quietly weaker than it looks. "Unreachable" is one word covering a
+name that does not resolve, a refused connection, an untrusted certificate, a
+rejected credential, a socket proxy with the endpoint switched off, and an SSO
+login page answering HTTP 200 — six different fixes. So every target reports a
+`ConnectionReport` (§5) naming the **phase** it got to, and the taxonomy is shared
+rather than per-integration: a fourth outbound read is diagnosable without
+inventing its own vocabulary.
+
+**Classification happens where the error object is**, and there are two of those:
+
+- [enrich/http.ts](labview/src/enrich/http.ts) is the chokepoint both API clients
+  already share. `phaseForCode` maps a libuv/TLS code, `phaseForStatus` maps an
+  HTTP status, and `getJson` returns the resulting `phase` and `code` beside the
+  `error` string it always returned. `fetch` is why this is needed at all: it
+  collapses DNS failure, refused connection and certificate rejection into one
+  `"fetch failed"` message, with the actual reason only on `err.cause.code`.
+- [enrich/docker.ts](labview/src/enrich/docker.ts) cannot use `getJson`, so
+  `classifyDockerError` reads dockerode's different surface — the code on
+  `err.code` rather than `err.cause`, the status on `err.statusCode` — and returns
+  the same phases from the same two helpers.
+
+Three rules in that mapping are load-bearing and each has an assertion that fails
+if it is undone:
+
+1. **`401` and `403` stay separate.** One says *bring a credential*, the other
+   says *this credential is not allowed here*. On a socket proxy the second is the
+   single most likely misconfiguration — an endpoint the proxy was never given
+   (`CONTAINERS=1`) — and it is not a network problem at all.
+2. **A unix socket is diagnosed before dockerode sees it.** `probeSocketPath` does
+   the `stat`/`access` (the only I/O) and `phaseForSocket` is pure over its result,
+   because the filesystem can tell apart four states that arrive as one opaque
+   connect error otherwise: absent, present-but-not-a-socket (a bind mount of a
+   missing host path creates an empty *directory* — the usual cause), present but
+   not accessible to this uid (`authorize`, not `connect`: the fix is group
+   membership or a socket proxy, not the network), and present and answering.
+3. **A timeout is established by the clock, not by the code.** dockerode
+   implements its `timeout` option by destroying the socket, so an endpoint that
+   accepts the connection and then says nothing surfaces as an ordinary
+   `ECONNRESET` / "socket hang up" — indistinguishable from a peer reset by the
+   error alone. Each awaited call is therefore timed, and `classifyDockerError`
+   returns `timeout` when the elapsed time reached `docker.timeoutMs` and there is
+   no HTTP status and the code is absent or one of the teardown codes. Timing each
+   call separately, rather than the phase, keeps a large fleet's cumulative scan
+   time from being read as one slow request; a genuinely slow `403` keeps its
+   status.
+
+**Wording, hints and emission rules live in
+[model/connections.ts](labview/src/model/connections.ts)** — pure, no I/O, so all
+of it is assertable:
+
+- `hintFor(target, phase)` — a table keyed by *both*, because the fix genuinely
+  differs per target: `resolve` on docker asks whether LabView is on the socket
+  proxy's network, on authentik it names `LABVIEW_AUTHENTIK_URL`.
+- `formatConnection(report)` — the log and `--summary` lines, one implementation so
+  [server.ts](labview/src/server/server.ts) and [cli.ts](labview/src/cli.ts) cannot
+  drift, followed by one indented `·` line per rejected candidate. A report is
+  kept with its attempts even when it succeeded: the list of candidates walked past
+  on the way to a working endpoint is the same list printed when none of them
+  answers, which is what makes that case diagnosable.
+- `changedConnections(prev, next)` — the on-change filter. The signature compared
+  is `target|ok|phase|endpoint` and deliberately **not** `read`, whose container
+  count changes on almost every scan.
+- `shouldBanner(report)` — the UI predicate: `partial`, or failed with a phase
+  other than `disabled` / `not-configured`. An optional integration nobody switched
+  on is not a fault and must not shout, in the log (`debug`) or on the page.
+
+Reports travel through `meta.connections` rather than being logged where they are
+produced, because `buildOverview` takes no logger and must not (§4 I7). The server
+logs what `changedConnections` returns — `info` for a working target, `warn` for
+`partial` and every failure — and the first scan logs all of them.
 
 These are the rules that make the output trustworthy. A change that breaks one is
 a bug even if every test passes.
@@ -553,7 +626,10 @@ object they belong to and the pipeline continues:
 - Unreadable stack → `meta.warnings` via `scanStacks`.
 - Docker unreachable → `snapshotDocker` returns `available: false` with the
   reason; it never throws, and the scan proceeds config-only.
-- A single container `inspect` failing → that container is skipped, not the scan.
+- A single container `inspect` failing → that container is skipped, not the scan,
+  and the number skipped is counted into the docker connection report as `partial`
+  so a systematic failure is visible rather than merely quiet. An **aggregate count
+  only** — never a container name (I2).
 - Identity provider unreachable, token rejected, request timed out, response
   malformed → `snapshotAuthentik` returns `reachable: false` with the reason in
   `meta.authentik.error`; the scan proceeds on label-derived evidence. A *partial*
@@ -582,6 +658,16 @@ disguised:
   in LabView; the message says the body was not JSON and that an HTML login page
   answers exactly like this. The endpoint is *not* treated as an API, so no credential
   follows it.
+
+And a reason is only worth anything if it names the *stage* that failed, because
+that is what selects the fix. So every soft failure above also carries a
+`ConnectionPhase` and, where there is something useful to say, a hint — the
+taxonomy and the three rules that hold it together are §3.10. The floor is that a
+degraded scan says which of "the name is wrong", "nothing is listening", "the
+certificate is not trusted", "the credential is missing", "the credential is not
+allowed here" and "that is not this API" happened. An unrecognised code falls
+through to `connect` carrying the raw message, which is still strictly more than
+the word *unreachable*.
 
 ### I5 — Read-only, least privilege
 
@@ -638,6 +724,13 @@ from the clock, stacks are sorted by id, routers are sorted by name, env is sort
 by key, and Docker keys are applied in list order so two containers colliding on a
 key do not race. Keep it that way: the smoke test and any future golden-file test
 depend on it.
+
+This is also why `buildOverview` has **no logger**. Diagnostics are data: a
+connection's outcome is returned on `meta.connections` and the *callers* print it,
+exactly as `meta.dockerError` has always worked. A logger threaded into the
+pipeline would make the same inputs produce different observable behaviour
+depending on who called it, and would put an I/O dependency inside a function whose
+value is that it has none.
 
 ### I8 — Containment for anything the config asks us to read
 
@@ -798,6 +891,36 @@ non-auth type, so a `headers` middleware cannot shadow a `forwardauth` one.
 (`labels.authentik.hostHints`) or discovered (§3.3). Matched at token boundaries
 against forward-auth addresses, issuer URLs and LDAP hosts.
 
+**ConnectionPhase** — how far an outbound read got, one vocabulary for every
+target (§3.10). `disabled` and `not-configured` are outcomes, not faults: nothing
+was attempted. `not-found` and `credential` are the two cases that stop before the
+network: the read was asked for and discovery identified no candidate at all, and a
+configured credential could not be read (a missing or empty `tokenFile`). Both are
+faults — a half-finished configuration will never work — which is what separates
+them from `not-configured`. Then the transport stages `resolve`, `connect`,
+`tls`, `timeout`; the answer stages `authenticate` (401), `authorize` (403), `path`
+(404/405), `status` (any other non-2xx), `protocol` (answered, but not with this
+API); and finally `partial` — connected, part of the read failed — and `connected`.
+The set is closed, and adding a member is a UI change for the same reason
+`AuthMethod` is (§3.7): `phaseText` in
+[model/connections.ts](labview/src/model/connections.ts) maps each one to prose.
+
+**ConnectionReport** — the per-target outcome carried on `meta.connections`:
+`target`, `ok`, `phase`, the `endpoint` reached and whether that endpoint came from
+`config`, was `discovered` or is the built-in `default`, a one-line `detail`, a
+`hint` naming what to change, `read` describing what arrived when it worked
+(`"86 containers"`, `"Traefik 3.1.2, 10 routers, 5 middlewares"`), and the
+`attempts`. `source` is worth reporting on its own: "LabView is using the default
+socket path and you meant to configure a proxy" is a real mistake, and only
+`default` shows it.
+
+**ConnectionAttempt** — one candidate that was tried: its credential-free
+`endpoint` (`safeOrigin` output), the `why` discovery offered it, and the `phase`,
+`code` and `detail` it failed with. Retained on successful reports too, so the
+endpoints walked past are visible. `code` is a constant — a libuv code, a TLS code
+or an HTTP status — never an address (I2), and no `detail` may carry a credential
+(I6); both are asserted.
+
 ---
 
 ## 6. Configuration
@@ -820,6 +943,7 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_DOCKER_SOCKET` | `docker.socketPath` | always wins and disables the TCP host |
 | `LABVIEW_DOCKER_ENABLED` | `docker.enabled` | `false` = config-only scan |
 | `LABVIEW_DOCKER_MAX_CONCURRENCY` | `docker.maxConcurrency` | bounded `inspect` fan-out; raise for big fleets, lower if the proxy drops connections |
+| `LABVIEW_DOCKER_TIMEOUT` | `docker.timeoutMs` | socket **inactivity** per request, not total time, so a large fleet's listing is unaffected. It exists so an endpoint that accepts and then says nothing becomes a reported `timeout` (§3.10) instead of a scan that never finishes |
 | `LABVIEW_MASK_SECRETS` | `secrets.maskValues` | leave on |
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
@@ -827,19 +951,21 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | with neither set, step 7 makes no request at all |
 | `LABVIEW_AUTHENTIK_URL` | `authentik.url` | skips discovery entirely; needed only when the provider is outside `appsRoot` |
 | `LABVIEW_AUTHENTIK_ENABLED` | `authentik.enabled` | `false` = never contact the provider |
-| `LABVIEW_AUTHENTIK_TIMEOUT_MS` | `authentik.timeoutMs` | per request; `authentik.maxPages` bounds pagination and is file-only |
+| `LABVIEW_AUTHENTIK_TIMEOUT` | `authentik.timeoutMs` | per request; `authentik.maxPages` bounds pagination and is file-only |
 | `LABVIEW_TRAEFIK_URL` | `traefik.url` | skips discovery, and is one of the two things that make an endpoint eligible for a credential (§3.6) |
 | `LABVIEW_TRAEFIK_USERNAME` | `traefik.username` | an Authentik user, or the reserved `goauthentik.io/token`. Only for an API behind a gate |
 | `LABVIEW_TRAEFIK_PASSWORD_FILE` | `traefik.passwordFile` | preferred over the password env var, which `docker inspect` exposes. Wins over `traefik.password` |
 | `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it |
 | `LABVIEW_TRAEFIK_ENABLED` | `traefik.enabled` | `false` = never contact the proxy. Unlike Authentik this stage is on by default, because it needs no credential |
-| `LABVIEW_TRAEFIK_TIMEOUT_MS` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
+| `LABVIEW_TRAEFIK_TIMEOUT` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
 
 **Docker endpoint resolution order:** explicit socket → configured/env TCP host →
 default socket path. The default is the conventional local socket, the one
 endpoint that requires no assumption about the operator's container names; a
 socket proxy is opted into. Neither the Dockerfile nor `config.ts` may ship a
-default TCP hostname (I2) — `compose.yml` sets it, as an example.
+default TCP hostname (I2) — `compose.yml` sets it, as an example. Which of the
+three was used is reported as the connection's `source`, because falling back to
+the default when a proxy was intended is a silent failure otherwise.
 
 **Authentik endpoint resolution order:** configured `url` → discovered internal
 container addresses → discovered public hostnames. `authentik.url` ships empty for
@@ -1014,6 +1140,31 @@ read — so the integration's contribution is measured in both directions rather
 assumed. The container-IP trap is asserted directly against `buildFleetIndex`, since
 a container IP exists only in live Docker state and smoke runs without a socket.
 
+**The connection taxonomy** (§3.10) is asserted the same way, but without a fixture
+root: the classifiers are pure, so each is driven directly. Every transport code,
+every HTTP status and every socket-file state is mapped to its phase, the reports
+are built through the real clients with a stubbed `fetchImpl`, and the formatter,
+the hint table and `changedConnections` are asserted on their output. Four
+properties are pinned deliberately, because each is a rule that could be quietly
+merged away:
+
+- **`401` and `403` do not collapse into each other**, and neither does *unreadable
+  socket* into *refused connection*. Both pairs have an assertion that fails if the
+  distinction is removed, since both would otherwise look like harmless
+  simplifications.
+- **A timeout is told from a peer reset by elapsed time**, asserted in both
+  directions: a teardown code past the deadline is `timeout`, the same code well
+  inside it is `connect`, and a slow `403` keeps its status.
+- **The socket states are driven against real paths** made under `os.tmpdir()` — a
+  name that does not exist, a regular file, and a listening `node:net` socket — so
+  no docker daemon is needed and CI behaves as a laptop does. The
+  not-readable-by-this-uid case is the exception: it goes through `phaseForSocket`
+  on a literal probe, because a test process running as root can open a socket of
+  any mode and the filesystem would refuse to reproduce the situation.
+- **No diagnostic carries a credential.** Every formatted line from every run is
+  checked against the stubs' token, password and session cookie, the same
+  discipline as the leak check above.
+
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
@@ -1138,6 +1289,36 @@ restriction on the router-name rule is not an optimisation, it is the difference
 between evidence and coincidence. Ask what an address-shaped rule reads the port as
 before reusing an existing lookup (see the container-IP row in §12).
 
+**Add a new outbound connection.** The diagnostics are shared, so most of this is
+already done for you — the work is to route through them rather than invent a
+parallel vocabulary.
+
+1. Read through `getJson` in `enrich/http.ts` if it is HTTP. That is where the
+   phase and code come from, and it is the whole reason a new integration is
+   diagnosable for free. If the client is a library with its own error surface
+   (dockerode is the precedent), classify with `phaseForCode` / `phaseForStatus`
+   from wherever *that* library puts the code and the status — write a
+   `classify<X>Error` beside it rather than teaching `http.ts` about it.
+2. Return a `ConnectionReport` from **every** exit of the snapshot function,
+   including the ones that are not faults: `disabled` when switched off,
+   `not-configured` when nothing was asked for, `not-found` when it was asked for
+   and no candidate could be located. A missing report is worse than a failed one —
+   the target silently vanishes from the log and the banner.
+3. Fill `read` on success with what arrived, as aggregate counts (I2). This is what
+   makes the success line worth printing: `connected` alone does not tell an
+   operator the credential has the rights the read needs.
+4. Add a `hintFor` row per phase that has a distinct fix for this target. Skip the
+   ones where the generic wording is already right; an unhelpful hint is worse than
+   none, and hints are worded as the likely fix ("check that…", "set…"), never as a
+   diagnosis of the operator's network.
+5. Push the report into `meta.connections` in `analyze/index.ts`. Nothing in
+   `server.ts`, `cli.ts` or the UI needs touching — they loop over that array, and
+   the log cadence, banner predicate and formatting all follow.
+6. Assert it: the phases the new client can produce, and a formatted line from a run
+   that was handed a credential not containing it (§8). If it has a timeout, assert
+   both directions of the deadline the way the docker one does — a classifier that
+   only ever returns the interesting phase proves nothing.
+
 ---
 
 ## 11. Known limitations
@@ -1185,6 +1366,14 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
 - **An unmatchable application is reported, not resolved.** On a fleet whose
   hostnames live only in the identity provider and never in a compose label, expect
   several unmatched. The fix is a matching label or slug, not a looser rule.
+- **A connection phase describes the answer, not the network.** It is derived from
+  one error object or one response, so it can name the stage that failed and the
+  likely fix, but it cannot tell a firewall from a stopped container, and dockerode's
+  error surface is not a documented contract — an unrecognised code falls through to
+  `connect` carrying the raw message. A wrong phase yields a wrong *hint*, never a
+  wrong posture: diagnostics feed no conclusion about the fleet. There are also no
+  retries, no backoff and no on-demand probe endpoint; a phase is what one attempt
+  during one scan produced.
 - **No history.** Every scan is a snapshot; nothing is persisted, so there is no
   drift detection or change log.
 - **The Docker snapshot lists all containers**, including ones with no compose
@@ -1245,3 +1434,11 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | A 200 with a non-JSON body is reported as that, not as a JSON parse error | It is the likeliest way a gated endpoint answers: an SSO login page is served with a success status, so the body is the only tell. Surfacing the `SyntaxError` blames LabView for the operator's missing credential and buries the one actionable fact. The endpoint is also not counted as an API, so nothing further — least of all a credential — follows it. |
 | `fetch`'s `cause.code` is kept in the failure reason | `fetch` collapses a name that does not resolve, a port nothing listens on and a rejected certificate into one `fetch failed`. Those have nothing in common as fixes, and the distinction is already in `error.cause` — discarding it makes the reason string worthless for exactly the setup step where it is read. The code is a constant like `ENOTFOUND`, so keeping it leaks no address and no credential. |
 | `scripts/` is typechecked by its own tsconfig | `tsx` strips types without checking them, so a stale field name in an assertion becomes `undefined` at runtime instead of a build error — and an assertion on `undefined` can pass while proving nothing. `rootDir: src` in the emit config is why it needs a second file rather than a wider `include`. |
+| One connection taxonomy for every target, not a message per integration | The three reads fail in the same six or seven ways, and the operator's next action is chosen by *which* way. A per-integration string means the fourth integration invents its own vocabulary and its own gaps — and it is the gaps that cost: "unreachable" covered a wrong hostname, a refused connection, an untrusted certificate, a rejected credential and an HTML login page, which have nothing in common as fixes. |
+| `401` and `403` are separate phases | They call for opposite actions: supply a credential, versus stop trying that credential and grant the access. On a socket proxy the second is the most likely misconfiguration of all — an endpoint the proxy was never given, `CONTAINERS=1` — and it is not a network fault, so folding it into `authenticate` would send the operator hunting for a credential that is already correct. |
+| The unix socket is probed before dockerode is handed it | Four states arrive as one opaque connect error otherwise, and they have four different fixes: the path is absent (mount it), it exists but is a directory (a bind mount of a missing host path creates one — the usual cause), it exists but this uid cannot open it (group membership, or better a socket proxy — `authorize`, not `connect`), or it is there and the daemon is not. `stat` distinguishes all four for the cost of one syscall, before any of it is guessed at. |
+| A docker timeout is established by the clock, not by the error code | dockerode implements its own `timeout` by destroying the socket, so a black-holed endpoint surfaces as `ECONNRESET` / "socket hang up" — the deadline appears nowhere in the error. Classifying that as `connect` prints "nothing accepted the connection" about an endpoint that demonstrably did. Each awaited call is timed instead; a `Promise.race` on the same deadline would tie nondeterministically, and racing on a *different* one would leave the request running. |
+| `read` is excluded from the change signature | The container count moves on almost every scan, so including it would log all three connection lines every 60 seconds and turn the on-change rule into no rule at all. The signature is `target`, `ok`, `phase` and `endpoint` — the part whose change an operator needs to see. |
+| `disabled` and `not-configured` log at `debug` and never banner | An optional integration nobody switched on is not a fault. Warning about it trains the operator to ignore the banner, which is the one place the real failures are stated. `not-found` and `credential` *are* faults for the same reason: the operator asked for the read and it cannot ever happen. |
+| Diagnostics are returned on `meta`, not logged where they happen | `buildOverview` has no logger and must not gain one (I4, I7): the same inputs would stop producing the same observable behaviour, and an I/O dependency would land inside the one function whose value is having none. `meta.dockerError` was already the precedent; `meta.connections` generalises it. |
+| Rejected candidates are kept on a *successful* report too | It is the same list that gets printed when none of them answers, which is what makes that case diagnosable at all — and on success it answers the question the log otherwise raises, namely why the endpoint in use is not the one the operator expected. |

@@ -25,6 +25,13 @@ services:
       LABVIEW_PORT: "8080"
       # LABVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
       #
+      # Per-request timeout for the Docker endpoint, in ms (default 5000). Raise it
+      # only for a genuinely slow host: it is socket inactivity, not total time, so
+      # a large fleet's listing is unaffected. Its job is to turn an endpoint that
+      # accepts the connection and then says nothing into a reported `timeout`
+      # rather than a scan that never finishes.
+      # LABVIEW_DOCKER_TIMEOUT: "5000"
+      #
       # --- Optional: read the Authentik API for confirmed auth posture ---
       # Without a token, protection is inferred from compose labels and env vars.
       # With one, LabView reads applications/providers/outposts and reports what

@@ -549,6 +549,16 @@ table.data tr:last-child td { border-bottom: none; }
   margin: 12px 0;
   font-size: 12.5px;
 }
+/* One connection report inside a .banner: the reason, then the fix, then what was
+   tried. Rows are separated by space alone — a second border inside the banner's own
+   border reads as a nested box. */
+.conn + .conn { margin-top: 6px; }
+.conn-hint { opacity: 0.85; }
+.conn-tried {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  opacity: 0.75;
+}
 .sr-only {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;

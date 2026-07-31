@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { DockerState, Overview, Service, TraefikLiveRouter } from "../src/model/types.js";
 import type { BuildDeps } from "../src/analyze/index.js";
+import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1542,6 +1543,483 @@ check(
   oSvc("metrics", "metrics").auth.method === "authentik-forward-auth" &&
     oSvc("metrics", "metrics").auth.confidence === "inferred",
   `${oSvc("metrics", "metrics").auth.method}/${oSvc("metrics", "metrics").auth.confidence}`,
+);
+traefikEnv({ enabled: false });
+authentikEnv({});
+
+/* ========================================================================== */
+/* connection diagnostics — why a read failed, for every target               */
+/* ========================================================================== */
+
+/*
+ * "unreachable" is one word for a dozen different fixes, so each of them is pinned
+ * here. Every assertion below is written to fail if its distinction is removed: merging
+ * 401 into 403, or an inaccessible socket into a refused connection, produces a report
+ * that is still plausible and sends the operator to the wrong place — which is exactly
+ * the failure mode a test has to catch, because nothing else will.
+ *
+ * No daemon, no network and no Authentik: the HTTP paths go through the injectable
+ * `fetchImpl`, the socket paths through real files under `os.tmpdir()`, and the one TCP
+ * assertion dials a closed port on loopback.
+ */
+const { phaseForCode, phaseForStatus, getJson } = await import("../src/enrich/http.js");
+const { probeSocketPath, phaseForSocket, classifyDockerError, snapshotDocker } = await import(
+  "../src/enrich/docker.js"
+);
+const {
+  changedConnections,
+  rememberConnections,
+  dominantPhase,
+  formatConnection,
+  hintFor,
+  shouldBanner,
+} = await import("../src/model/connections.js");
+const { createServer } = await import("node:net");
+// The unreadable-socket case is driven through `phaseForSocket` on a literal probe
+// rather than by chmod-ing a real one: a test running as root can open any socket
+// regardless of its mode, so the filesystem would refuse to reproduce the situation.
+const { mkdtempSync, writeFileSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
+
+console.log("\na transport failure names the stage, not just `fetch failed`");
+for (const [code, phase] of [
+  ["ENOTFOUND", "resolve"],
+  ["EAI_AGAIN", "resolve"],
+  ["ECONNREFUSED", "connect"],
+  ["EHOSTUNREACH", "connect"],
+  ["DEPTH_ZERO_SELF_SIGNED_CERT", "tls"],
+  ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "tls"],
+  ["CERT_HAS_EXPIRED", "tls"],
+  ["ERR_TLS_CERT_ALTNAME_INVALID", "tls"],
+  ["ETIMEDOUT", "timeout"],
+  ["UND_ERR_HEADERS_TIMEOUT", "timeout"],
+] as const) {
+  check(`${code} → ${phase}`, phaseForCode(code) === phase, phaseForCode(code));
+}
+// The generalisation is deliberate and has to stay one: an unknown code means the
+// connection did not come up, which is true and carries the code alongside it.
+check("an unknown code falls through to connect", phaseForCode("EWEIRD") === "connect", phaseForCode("EWEIRD"));
+check("...and so does no code at all", phaseForCode(undefined) === "connect", phaseForCode(undefined));
+
+console.log("\nan error status names the stage too");
+// The pair this whole taxonomy exists for. 401 means bring a credential; 403 means the
+// credential is not allowed here — and on a socket proxy the second is the single most
+// likely misconfiguration. Collapsing them yields the wrong hint every time.
+check(
+  "401 is authenticate and 403 is authorize, not one phase for both",
+  phaseForStatus(401) === "authenticate" && phaseForStatus(403) === "authorize",
+  `${phaseForStatus(401)}/${phaseForStatus(403)}`,
+);
+check("407 joins 401", phaseForStatus(407) === "authenticate", phaseForStatus(407));
+check("404 and 405 are path", phaseForStatus(404) === "path" && phaseForStatus(405) === "path");
+check("502 is a plain status", phaseForStatus(502) === "status", phaseForStatus(502));
+check("...and so is 500", phaseForStatus(500) === "status", phaseForStatus(500));
+
+console.log("\nthe shared HTTP client carries the phase to its caller");
+const statusStub = (status: number): FetchLike => async () => reply(status, { detail: "x" });
+for (const [status, phase] of [
+  [401, "authenticate"],
+  [403, "authorize"],
+  [404, "path"],
+  [502, "status"],
+] as const) {
+  const r = await getJson(statusStub(status), "http://stub.invalid/api", { timeoutMs: 100 });
+  check(
+    `HTTP ${status} arrives as ${phase}`,
+    r.phase === phase && r.code === String(status),
+    `${r.phase} ${r.code ?? ""}`,
+  );
+}
+const htmlResult = await getJson(loginPage, "http://stub.invalid/api", { timeoutMs: 100 });
+check(
+  "a 200 with an HTML body is protocol — something answered, and it was not this API",
+  htmlResult.phase === "protocol",
+  htmlResult.phase,
+);
+// Worth its own assertion: `path` would say "wrong URL" about an address that is
+// right and gated, which is the likeliest way this integration is misconfigured.
+check("...and explicitly not path", htmlResult.phase !== "path");
+const dnsResult = await getJson(opaque, "http://stub.invalid/api", { timeoutMs: 100 });
+check(
+  "a code hidden in `cause` reaches the phase and the report",
+  dnsResult.phase === "resolve" && dnsResult.code === "ENOTFOUND",
+  `${dnsResult.phase} ${dnsResult.code ?? ""}`,
+);
+const timedOut = await getJson(
+  async () => {
+    throw Object.assign(new Error("The operation was aborted"), { name: "TimeoutError" });
+  },
+  "http://stub.invalid/api",
+  { timeoutMs: 100 },
+);
+check("an aborted request is a timeout, not a connect failure", timedOut.phase === "timeout", timedOut.phase);
+const okResult = await getJson(async () => reply(200, { ok: true }), "http://stub.invalid/api", {
+  timeoutMs: 100,
+});
+check("and a success says so", okResult.phase === "connected" && okResult.ok, okResult.phase);
+
+console.log("\nthe docker socket file is diagnosed before dockerode sees it");
+const socketDir = mkdtempSync(resolve(tmpdir(), "labview-smoke-"));
+const missingSocket = resolve(socketDir, "missing.sock");
+const plainFile = resolve(socketDir, "not-a-socket");
+writeFileSync(plainFile, "");
+const liveSocket = resolve(socketDir, "live.sock");
+const socketServer = createServer();
+await new Promise<void>((ready) => socketServer.listen(liveSocket, () => ready()));
+
+check(
+  "a path that does not exist probes as absent",
+  JSON.stringify(probeSocketPath(missingSocket)) ===
+    JSON.stringify({ exists: false, isSocket: false, readable: false }),
+  JSON.stringify(probeSocketPath(missingSocket)),
+);
+// The empty-bind-mount case: docker creates a *directory* for a host path that is not
+// there, so "exists" is true and the socket is still not a socket.
+check(
+  "a regular file probes as present but not a socket",
+  JSON.stringify(probeSocketPath(plainFile)) ===
+    JSON.stringify({ exists: true, isSocket: false, readable: true }),
+  JSON.stringify(probeSocketPath(plainFile)),
+);
+check(
+  "a listening socket probes as usable",
+  JSON.stringify(probeSocketPath(liveSocket)) ===
+    JSON.stringify({ exists: true, isSocket: true, readable: true }),
+  JSON.stringify(probeSocketPath(liveSocket)),
+);
+
+const absent = phaseForSocket({ exists: false, isSocket: false, readable: false }, "/s.sock");
+check(
+  "an absent socket is a connect failure that names the mount",
+  absent?.phase === "connect" && absent.detail.includes("does not exist") && absent.hint.includes("/s.sock:/s.sock"),
+  JSON.stringify(absent),
+);
+const notSocket = phaseForSocket({ exists: true, isSocket: false, readable: true }, "/s.sock");
+check(
+  "...a non-socket says so rather than repeating the same message",
+  notSocket?.phase === "connect" && notSocket.detail.includes("is not a socket"),
+  JSON.stringify(notSocket),
+);
+// The distinction that matters most of the four: dockerode's own words for a socket the
+// process may not open are `connect EACCES`, which reads as a network problem. It is a
+// group-membership problem, and only `authorize` sends the operator to the right fix.
+const noAccess = phaseForSocket({ exists: true, isSocket: true, readable: false }, "/s.sock");
+check(
+  "...and an inaccessible socket is authorize, not connect",
+  noAccess?.phase === "authorize" && noAccess.detail.includes("not accessible"),
+  JSON.stringify(noAccess),
+);
+check(
+  "a usable socket produces no complaint at all",
+  phaseForSocket({ exists: true, isSocket: true, readable: true }, "/s.sock") === undefined,
+);
+
+console.log("\ndockerode's own failures map to the same phases");
+// A socket proxy with the containers endpoint switched off answers exactly this, and it
+// is indistinguishable from a network problem in dockerode's message alone.
+const refused403 = classifyDockerError({ statusCode: 403, reason: "Forbidden", message: "(HTTP code 403)" });
+check(
+  "a proxy's 403 is authorize with the status kept",
+  refused403.phase === "authorize" && refused403.code === "403",
+  JSON.stringify(refused403),
+);
+check(
+  "...and its hint names the proxy switch rather than the network",
+  (hintFor("docker", "authorize") ?? "").includes("CONTAINERS=1"),
+  hintFor("docker", "authorize") ?? "",
+);
+const noEntry = classifyDockerError(Object.assign(new Error("connect ENOENT /v.sock"), { code: "ENOENT" }));
+check("a libuv code on the error itself is read", noEntry.phase === "connect" && noEntry.code === "ENOENT", JSON.stringify(noEntry));
+// dockerode implements its `timeout` option by destroying the socket, so a black-holed
+// endpoint arrives as an ordinary reset: the deadline is nowhere in the error, and only
+// the clock separates it from a peer that hung up. Reporting `connect` here would print
+// "nothing accepted the connection" about an endpoint that demonstrably did.
+const blackHole = classifyDockerError(
+  Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+  { elapsedMs: 5001, timeoutMs: 5000 },
+);
+check(
+  "a reset at its own deadline is a timeout, not a connect failure",
+  blackHole.phase === "timeout" && blackHole.detail.includes("5000ms"),
+  JSON.stringify(blackHole),
+);
+const earlyReset = classifyDockerError(
+  Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+  { elapsedMs: 12, timeoutMs: 5000 },
+);
+check(
+  "...and the same reset well inside it is still a connect failure",
+  earlyReset.phase === "connect",
+  JSON.stringify(earlyReset),
+);
+const slow403 = classifyDockerError({ statusCode: 403, message: "(HTTP code 403)" }, { elapsedMs: 9000, timeoutMs: 5000 });
+check(
+  "...while a slow answer that did arrive keeps its status",
+  slow403.phase === "authorize",
+  JSON.stringify(slow403),
+);
+
+console.log("\nboth docker transports are named the way an operator writes them");
+const dockerBase = loadConfig();
+const dockerCfg = (over: Partial<typeof dockerBase.docker>) => ({
+  ...dockerBase,
+  docker: { ...dockerBase.docker, enabled: true, ...over },
+});
+const unixFail = await snapshotDocker(dockerCfg({ socketPath: missingSocket }));
+check(
+  "a socket endpoint is `unix://…` and its failure names the stage",
+  unixFail.connection.endpoint === `unix://${missingSocket}` &&
+    unixFail.connection.phase === "connect" &&
+    unixFail.connection.target === "docker",
+  JSON.stringify(unixFail.connection),
+);
+check(
+  "...and a socket path nobody configured would report as the default",
+  dockerCfg({}).docker.socketPath === "/var/run/docker.sock" &&
+    (await snapshotDocker(dockerCfg({ socketPath: plainFile }))).connection.source === "config",
+);
+// A closed port on loopback: no network, and refused in single-digit milliseconds.
+const tcpFail = await snapshotDocker(dockerCfg({ host: "127.0.0.1", port: 1 }));
+check(
+  "a TCP endpoint is `tcp://host:port`, so the log says which transport was used",
+  tcpFail.connection.endpoint === "tcp://127.0.0.1:1" && tcpFail.connection.phase === "connect",
+  JSON.stringify(tcpFail.connection),
+);
+check(
+  "a disabled endpoint is `disabled` — not a fault, and not banner-worthy",
+  (await snapshotDocker(dockerBase)).connection.phase === "disabled" &&
+    !shouldBanner((await snapshotDocker(dockerBase)).connection),
+);
+socketServer.close();
+
+console.log("\na container the Engine would not describe is a gap, and says so");
+// The Engine is injected for these two, because the situation cannot be asked of a real
+// daemon on demand: a socket proxy that allows the container *list* and refuses each
+// container's *detail* is an ordinary misconfiguration, and today it is the one failure
+// that leaves the scan quietly weaker than it looks — every port, network and health
+// value for the refused containers is simply missing from every conclusion drawn after.
+const fakeEngine = (count: number, refuse: (index: number) => boolean): DockerLike => {
+  const ids = Array.from({ length: count }, (_, i) => `feedface${String(i).padStart(4, "0")}`);
+  return {
+    ping: async () => ({}),
+    listContainers: async () => ids.map((Id) => ({ Id, Status: "Up 2 hours" })) as never,
+    getContainer: (id: string) => ({
+      inspect: async () => {
+        const index = ids.indexOf(id);
+        if (refuse(index)) throw Object.assign(new Error("(HTTP code 403) Forbidden"), { statusCode: 403 });
+        return {
+          Id: id,
+          Name: `/example-${index}`,
+          Created: "2024-01-01T00:00:00Z",
+          RestartCount: 0,
+          Image: "sha256:0000000000000000",
+          Config: { Image: "example.com/app:1", Labels: {} },
+          State: { Status: "running", Running: true, StartedAt: "2024-01-01T00:00:00Z" },
+          NetworkSettings: { Networks: {}, Ports: {} },
+        } as never;
+      },
+    }),
+  };
+};
+const engineCfg = dockerCfg({ host: "127.0.0.1", port: 2375 });
+const allInspected = await snapshotDocker(engineCfg, { createDocker: () => fakeEngine(3, () => false) });
+check(
+  "every container described is a plain `connected`, with the count read",
+  allInspected.connection.phase === "connected" && allInspected.connection.read === "3 containers",
+  JSON.stringify(allInspected.connection),
+);
+const someRefused = await snapshotDocker(engineCfg, { createDocker: () => fakeEngine(3, (i) => i === 1) });
+check(
+  "one refused inspect is `partial` — connected, and not everything was read",
+  someRefused.available &&
+    someRefused.connection.ok &&
+    someRefused.connection.phase === "partial" &&
+    someRefused.connection.read === "3 containers, 1 could not be inspected",
+  JSON.stringify(someRefused.connection),
+);
+check(
+  "...it banners, unlike the other two `ok` phases",
+  shouldBanner(someRefused.connection) && !shouldBanner(allInspected.connection),
+);
+check(
+  "...its hint names the proxy endpoint to widen",
+  (someRefused.connection.hint ?? "").includes("CONTAINERS=1"),
+  someRefused.connection.hint ?? "",
+);
+// The count is the whole report: which container failed is a fleet identifier (I2), and
+// the number is what tells the operator this happened at all.
+check(
+  "...and it counts them without naming one",
+  formatConnection(someRefused.connection).every((l) => !l.includes("example-") && !l.includes("feedface")),
+  formatConnection(someRefused.connection).join(" / "),
+);
+check(
+  "the two containers that did answer are still in the snapshot",
+  someRefused.byKey.get("example-0") !== undefined &&
+    someRefused.byKey.get("example-2") !== undefined &&
+    someRefused.byKey.get("example-1") === undefined,
+  [...someRefused.byKey.keys()].join(","),
+);
+
+console.log("\nevery target reports, in the order LabView reads them");
+traefikEnv({});
+authentikEnv({ token: AK_TOKEN });
+const diag = traefikStub();
+const ovConn = await overviewFor(traefikRoot, { fetchImpl: diag.fetchImpl });
+check(
+  "three reports, docker then authentik then traefik",
+  ovConn.meta.connections.map((c) => c.target).join(",") === "docker,authentik,traefik",
+  ovConn.meta.connections.map((c) => c.target).join(","),
+);
+const tfConn = ovConn.meta.connections.find((c) => c.target === "traefik")!;
+check(
+  "a working proxy read says what it read",
+  tfConn.ok &&
+    tfConn.phase === "connected" &&
+    tfConn.read?.includes("Traefik ") === true &&
+    tfConn.read?.includes(" routers") === true &&
+    tfConn.read?.includes(" middlewares") === true,
+  JSON.stringify(tfConn),
+);
+// The first candidate discovery generates is the proxy's own container address, and here
+// it answers — so nothing was rejected, and the report says so rather than inventing a
+// list. The case where candidates *were* rejected is asserted below.
+check(
+  "...and reaching it on the first candidate leaves no rejected ones",
+  tfConn.attempts.length === 0,
+  JSON.stringify(tfConn.attempts),
+);
+// Success is not a place to list candidates: they lost a race, and printing them reads
+// as a list of problems on a connection that is working.
+check(
+  "...but a successful line does not recite them",
+  !formatConnection(tfConn).some((l) => l.startsWith("  · ")),
+  formatConnection(tfConn).join("\n"),
+);
+check(
+  "the working line reads like the scanning line beside it",
+  formatConnection(tfConn)[0]?.startsWith("LabView connected to traefik at ") === true,
+  formatConnection(tfConn)[0] ?? "",
+);
+
+// A discovery run that had to walk past dead candidates to find the API. The report is
+// `ok` and still names every one it rejected, with the stage each failed at — the same
+// list that is printed when none of them answers, which is what makes that case
+// diagnosable at all.
+const gatedApi = traefikStub({ gated: true });
+const unresolvableInternally: FetchLike = async (url, init) => {
+  if (url.startsWith(TF_ORIGIN_GATED) || url.startsWith(TF_AK_ORIGIN)) return gatedApi.fetchImpl(url, init);
+  throw Object.assign(new Error("fetch failed"), { cause: { code: "ENOTFOUND" } });
+};
+traefikEnv({ credential: true });
+authentikEnv({ token: AK_TOKEN });
+const tfWalked = await overviewFor(traefikRoot, { fetchImpl: unresolvableInternally });
+const walkedConn = tfWalked.meta.connections.find((c) => c.target === "traefik")!;
+check(
+  "a candidate rejected on the way to a working endpoint is kept, with its stage",
+  walkedConn.ok &&
+    walkedConn.endpoint === TF_ORIGIN_GATED &&
+    walkedConn.attempts.length > 0 &&
+    walkedConn.attempts.every((a) => a.phase === "resolve" && a.code === "ENOTFOUND" && Boolean(a.why)),
+  JSON.stringify({ ok: walkedConn.ok, endpoint: walkedConn.endpoint, attempts: walkedConn.attempts }),
+);
+
+console.log("\nthe phase reported is the furthest any candidate got");
+// Several candidates, one failure each, one phase to report. A host that answered 401
+// exists, is listening and speaks the right protocol — so `authenticate` is the
+// operator's actual problem even though other candidates never resolved. Reporting
+// `resolve` would send them to DNS over a working endpoint with a wrong credential.
+const gatedNoCred = traefikStub({ gated: true });
+traefikEnv({});
+const tfGatedDiag = await overviewFor(traefikRoot, { fetchImpl: gatedNoCred.fetchImpl });
+const gatedConn = tfGatedDiag.meta.connections.find((c) => c.target === "traefik")!;
+check(
+  "a 401 among 404s reports authenticate",
+  gatedConn.phase === "authenticate" && !gatedConn.ok,
+  `${gatedConn.phase} ${JSON.stringify(gatedConn.attempts.map((a) => a.phase))}`,
+);
+check(
+  "...and its hint names the credential the gate wants",
+  (gatedConn.hint ?? "").includes("app password"),
+  gatedConn.hint ?? "",
+);
+check(
+  "the ranking is what produces that, on the attempts alone",
+  dominantPhase([
+    { endpoint: "http://a", why: "a", phase: "resolve", detail: "x" },
+    { endpoint: "http://b", why: "b", phase: "authenticate", detail: "y" },
+    { endpoint: "http://c", why: "c", phase: "connect", detail: "z" },
+  ]) === "authenticate",
+);
+check("...and it survives the order being reversed", dominantPhase([
+  { endpoint: "http://b", why: "b", phase: "authenticate", detail: "y" },
+  { endpoint: "http://a", why: "a", phase: "resolve", detail: "x" },
+]) === "authenticate");
+
+console.log("\nan integration nobody switched on says so quietly");
+traefikEnv({ enabled: false });
+authentikEnv({});
+const inert = await overviewFor(traefikRoot, { fetchImpl: traefikStub().fetchImpl });
+const akInert = inert.meta.connections.find((c) => c.target === "authentik")!;
+check(
+  "no token is `not-configured`, and no banner",
+  akInert.phase === "not-configured" && !shouldBanner(akInert),
+  JSON.stringify(akInert),
+);
+check(
+  "...and its line says LabView is not reading it, not that it failed",
+  formatConnection(akInert)[0]?.startsWith("LabView is not reading authentik") === true,
+  formatConnection(akInert)[0] ?? "",
+);
+// The half-configured case, which is the one worth shouting about: a token with nowhere
+// to send it will never work, and it is invisible if it shares `not-configured`.
+authentikEnv({ token: AK_TOKEN });
+const akOrphan = await overviewFor(appsRoot, { fetchImpl: async () => reply(404, {}) });
+const orphanConn = akOrphan.meta.connections.find((c) => c.target === "authentik")!;
+check(
+  "a token with no endpoint is its own phase and does banner",
+  orphanConn.phase !== "not-configured" && shouldBanner(orphanConn),
+  JSON.stringify({ phase: orphanConn.phase, banner: shouldBanner(orphanConn) }),
+);
+authentikEnv({});
+
+console.log("\nrepeat scans do not repeat themselves");
+const seen = new Map<string, string>();
+const base: Parameters<typeof changedConnections>[1] = [
+  { target: "docker", ok: true, phase: "connected", endpoint: "unix:///var/run/docker.sock", read: "86 containers", attempts: [] },
+  { target: "authentik", ok: false, phase: "resolve", endpoint: "https://sso.invalid", attempts: [] },
+];
+check("the first scan reports everything", changedConnections(seen, base).length === 2);
+rememberConnections(seen, base);
+check("an unchanged scan reports nothing", changedConnections(seen, base).length === 0);
+// The reason `read` is excluded from the signature: a container count moves on nearly
+// every scan, and including it turns "log on change" back into "log every scan".
+const counted = base.map((r) => (r.target === "docker" ? { ...r, read: "87 containers" } : r));
+check("a changed count alone is not a change", changedConnections(seen, counted).length === 0, JSON.stringify(changedConnections(seen, counted)));
+const moved = base.map((r) => (r.target === "authentik" ? { ...r, phase: "authenticate" as const } : r));
+check(
+  "a moved phase is, and only that one report is repeated",
+  changedConnections(seen, moved).length === 1 && changedConnections(seen, moved)[0]?.target === "authentik",
+  JSON.stringify(changedConnections(seen, moved).map((r) => r.target)),
+);
+const relocated = base.map((r) => (r.target === "authentik" ? { ...r, endpoint: "https://other.invalid" } : r));
+check("...and so is a different endpoint at the same phase", changedConnections(seen, relocated).length === 1);
+
+console.log("\nno diagnostic carries a credential");
+// Same discipline as the existing error-string checks: these lines go to a log the
+// operator may paste somewhere, and a report is built from a request that had a
+// credential in scope.
+traefikEnv({ url: TF_ORIGIN_GATED, credential: true });
+const leaky = await overviewFor(traefikRoot, { fetchImpl: traefikStub({ gated: true }).fetchImpl });
+const everyLine = leaky.meta.connections.flatMap(formatConnection).join("\n");
+check(
+  "not the password, not the basic header, not a cookie",
+  !everyLine.includes(TF_PASSWORD) && !everyLine.includes(TF_BASIC) && !everyLine.includes(TF_SESSION),
+  everyLine,
+);
+check(
+  "...and not the API token either",
+  !leaky.meta.connections.flatMap(formatConnection).join("\n").includes(AK_TOKEN),
 );
 traefikEnv({ enabled: false });
 authentikEnv({});
