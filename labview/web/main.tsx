@@ -60,11 +60,21 @@ function flatten(ov: Overview): Flat[] {
  * identify, not a misconfiguration on the provider's side.
  */
 function authentikTitle(ak: AuthentikSummary): string {
+  const configured = ak.applicationsConfigured ?? ak.applications;
   const bits = [
     `${ak.endpoint ?? "unknown endpoint"} (${ak.endpointSource ?? "unknown"})`,
-    `${ak.applications} applications, ${ak.providers} providers, ${ak.outposts} outposts`,
+    `${ak.applicationsWithheld ? `${ak.applications} of ${configured}` : ak.applications} applications, ${ak.providers} providers, ${ak.outposts} outposts`,
     `${ak.matchedServices} services matched`,
   ];
+  // The endpoint filters its own list by what this token's user may launch, so the gap
+  // between the two numbers above is a limit on every conclusion below them.
+  if (ak.applicationsWithheld) {
+    const unaccounted = Math.max(0, ak.applicationsWithheld - ak.applicationsRecovered);
+    bits.push(
+      `${ak.applicationsWithheld} withheld by the applications endpoint: ` +
+        `${ak.applicationsRecovered} rebuilt from providers, ${unaccounted} not readable`,
+    );
+  }
   if (ak.unmatchedApplications.length) {
     bits.push(
       `not matched to any service: ${ak.unmatchedApplications
@@ -405,8 +415,13 @@ function App() {
                     .filter(Boolean)
                     .join("\n")}
                 >
-                  {ov.meta.authentik.applications} app
-                  {ov.meta.authentik.applications === 1 ? "" : "s"}
+                  {/* Two numbers whenever the endpoint kept some back, because one of
+                      them would be a filtered count presented as a complete one. */}
+                  {ov.meta.authentik.applicationsWithheld > 0
+                    ? `${ov.meta.authentik.applications} of ${
+                        ov.meta.authentik.applicationsConfigured ?? ov.meta.authentik.applications
+                      } apps`
+                    : `${ov.meta.authentik.applications} app${ov.meta.authentik.applications === 1 ? "" : "s"}`}
                   {ov.meta.authentik.matchedServices > 0 &&
                     ` · ${ov.meta.authentik.matchedServices} matched`}
                 </button>

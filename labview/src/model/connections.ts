@@ -56,7 +56,8 @@ const HINTS: Record<string, Partial<Record<ConnectionPhase, string>>> = {
     path: "No Authentik API answered here. LABVIEW_AUTHENTIK_URL should be the instance's base URL, without `/api/v3`.",
     protocol:
       "Something answered that is not Authentik's API — most often its own login page, or a proxy in front of it. Point LABVIEW_AUTHENTIK_URL at an address that reaches Authentik directly, typically its container on the internal network.",
-    partial: "Part of the read failed, so some applications may be missing providers or outposts. Check the token's permissions.",
+    partial:
+      "Either part of the read failed, or the applications endpoint returned only the applications this token's user may launch — it filters its own list, so a service protected by an application LabView cannot see reads as unprotected. LabView rebuilds what the readable providers name; to receive the exact list instead, make the token's user a superuser. Otherwise check the token's permissions.",
   },
   traefik: {
     "not-found":

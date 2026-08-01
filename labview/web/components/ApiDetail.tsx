@@ -171,6 +171,25 @@ const STRENGTH_WHY: Record<AuthentikMatchStrength, string> = {
   name: "Only the names are alike — nothing addresses this service. The posture built on it is reported as observed rather than confirmed.",
 };
 
+/**
+ * Marks an application the applications endpoint withheld and a provider named.
+ *
+ * Worth its own pill in both lists: the record behind it is thinner than a listed one —
+ * no launch URL, no group, only the providers this token may read — so a match made on
+ * it rests on less, and a miss may be the missing fields rather than a missing service.
+ */
+function RebuiltPill({ app }: { app: AuthentikApplication }) {
+  if (app.discoveredVia !== "provider") return null;
+  return (
+    <span
+      class="pill warn"
+      title="The applications endpoint did not return this application to LabView's token — it filters its list to what that user may launch. It was rebuilt from the provider assigned to it, so it carries no launch URL and no group."
+    >
+      rebuilt
+    </span>
+  );
+}
+
 /** The providers behind an application, each with the kind that decides what it enforces. */
 function ProviderRows({ app }: { app: AuthentikApplication }) {
   if (app.providers.length === 0) {
@@ -405,12 +424,22 @@ export function AuthentikDetail({
 
   const unmatched: UnmatchedApplication[] = summary.unmatchedApplications;
 
+  // What the applications endpoint holds against what it handed over. It filters its own
+  // list to the applications the token's user may launch, so these three numbers are the
+  // difference between "LabView read everything" and "LabView read a slice".
+  const configured = summary.applicationsConfigured ?? summary.applications;
+  const withheld = summary.applicationsWithheld;
+  const recovered = summary.applicationsRecovered;
+  const unaccounted = Math.max(0, withheld - recovered);
+
   return (
     <Panel
       title="Authentik"
       sub={
         summary.reachable
-          ? `${summary.applications} application${summary.applications === 1 ? "" : "s"} read from its API`
+          ? withheld
+            ? `${summary.applications} of ${configured} applications read from its API`
+            : `${summary.applications} application${summary.applications === 1 ? "" : "s"} read from its API`
           : "the API was not read"
       }
       onClose={onClose}
@@ -422,7 +451,8 @@ export function AuthentikDetail({
               <EndpointRows endpoint={summary.endpoint} source={summary.endpointSource} />
               <dt>Read</dt>
               <dd>
-                {summary.applications} applications · {summary.providers} providers · {summary.outposts} outposts
+                {withheld ? `${summary.applications} of ${configured} applications` : `${summary.applications} applications`} ·{" "}
+                {summary.providers} providers · {summary.outposts} outposts
               </dd>
               <dt>Matched</dt>
               <dd>
@@ -430,6 +460,24 @@ export function AuthentikDetail({
                 {summary.matchedServices === 1 ? "" : "s"}
               </dd>
             </dl>
+            {/* Stated here rather than left to a tooltip, because it changes what the rest
+                of the panel is worth: a service protected by an application this token
+                never received reads as unprotected, and no list below can show that. */}
+            {withheld > 0 && (
+              <div class="note">
+                Authentik reports {configured} applications and returned {summary.applications - recovered}. Its
+                applications endpoint filters the list to what this token's user may launch.{" "}
+                {recovered > 0 && (
+                  <>
+                    {recovered} of the withheld ones were rebuilt from providers, which are not filtered that way —
+                    those carry no launch URL or group and are tagged <span class="pill">rebuilt</span> below.{" "}
+                  </>
+                )}
+                {unaccounted > 0
+                  ? `${unaccounted} could not be rebuilt: no provider LabView may read names them, so a service they protect reads as unprotected here. Making the token's user a superuser returns the exact list.`
+                  : "Nothing is missing after that."}
+              </div>
+            )}
           </Section>
 
           <Section title={`Matched (${matched.length})`}>
@@ -448,6 +496,7 @@ export function AuthentikDetail({
                       <span class="pill" title={STRENGTH_WHY[row.strength]}>
                         {row.strength}
                       </span>
+                      <RebuiltPill app={row.app} />
                       {row.app.group && <span class="pill">{row.app.group}</span>}
                     </>
                   }
@@ -486,6 +535,7 @@ export function AuthentikDetail({
                       {u.application.name}
                       <span class="mono masked">{u.application.slug}</span>
                       <ReasonPill reason={u.reason} noun="application" />
+                      <RebuiltPill app={u.application} />
                     </>
                   }
                 >

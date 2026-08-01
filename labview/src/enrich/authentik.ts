@@ -170,6 +170,8 @@ export async function snapshotAuthentik(
       configured: false,
       reachable: false,
       applications: 0,
+      applicationsWithheld: 0,
+      applicationsRecovered: 0,
       providers: 0,
       outposts: 0,
       matchedServices: 0,
@@ -249,7 +251,14 @@ export async function snapshotAuthentik(
     }
 
     const auth = { Authorization: `Bearer ${token.value}`, Accept: "application/json" };
-    const apps = await getList(doFetch, base, "core/applications", auth, cfg);
+    // `/core/applications/` is not a plain list: it drops `meta_hide` applications,
+    // paginates, and then filters the page through the policy engine as the token's own
+    // user — so by default it answers "what may this user launch", not "what exists".
+    // `superuser_full_list` is the documented opt-out and is ignored for a non-superuser
+    // token, so it is sent unconditionally: it can only ever widen the answer.
+    const apps = await getList(doFetch, base, "core/applications", auth, cfg, {
+      superuser_full_list: "true",
+    });
     if (apps.error) {
       // A confirmed Authentik that refuses the token is a configuration problem
       // worth reporting rather than a candidate to skip past silently.
@@ -278,10 +287,30 @@ export async function snapshotAuthentik(
       getList(doFetch, base, "outposts/instances", auth, cfg),
     ]);
 
-    const applications = buildApplications(apps.items, proxies.items, oauth2.items, outposts.items);
+    const { applications, recovered } = buildApplications(
+      apps.items,
+      proxies.items,
+      oauth2.items,
+      outposts.items,
+    );
     const soft = [proxies.error, oauth2.error, outposts.error].filter(Boolean);
     const providers = applications.reduce((n, a) => n + a.providers.length, 0);
     const gap = soft.length ? `some endpoints could not be read: ${soft.join("; ")}` : undefined;
+
+    // What the endpoint was shown to hold, against what it says exists. The difference is
+    // its policy filter, not a truncated read — pagination happens before that filter, so
+    // `count` is the unfiltered total even when the results are a subset of it.
+    const listed = apps.items.length;
+    const configured = apps.count ?? listed;
+    const withheld = Math.max(0, configured - listed);
+    const unaccounted = Math.max(0, withheld - recovered);
+    // Only what is still missing after recovery is an error. A gap fully closed from the
+    // providers is reported through the counts, not as a permanent warning.
+    const shortfall = unaccounted
+      ? `Authentik reports ${configured} applications and returned ${listed} — its list is filtered to what this token may launch; ` +
+        `${recovered} of the rest were rebuilt from their providers, ${unaccounted} could not be`
+      : undefined;
+    const incomplete = [gap, shortfall].filter(Boolean).join("; ") || undefined;
     return {
       summary: {
         enabled: true,
@@ -291,8 +320,11 @@ export async function snapshotAuthentik(
         endpointSource: candidate.source,
         // A partial read still yields useful matches, so it is reported as reachable
         // with the gap stated rather than discarded wholesale.
-        error: gap,
+        error: incomplete,
         applications: applications.length,
+        applicationsConfigured: apps.count,
+        applicationsWithheld: withheld,
+        applicationsRecovered: recovered,
         providers,
         outposts: outposts.items.length,
         matchedServices: 0,
@@ -301,16 +333,19 @@ export async function snapshotAuthentik(
       applications,
       connection: report({
         ok: true,
-        phase: gap ? "partial" : "connected",
+        phase: incomplete ? "partial" : "connected",
         endpoint: origin,
         source: candidate.source,
         read: [
-          plural(applications.length, "application"),
+          withheld
+            ? `${listed} of ${plural(configured, "application")}` +
+              (recovered ? ` (${recovered} recovered from providers)` : "")
+            : plural(applications.length, "application"),
           plural(providers, "provider"),
           plural(outposts.items.length, "outpost"),
         ].join(", "),
-        detail: gap,
-        hint: gap ? hintFor("authentik", "partial") : undefined,
+        detail: incomplete,
+        hint: incomplete ? hintFor("authentik", "partial") : undefined,
       }),
     };
   }
@@ -354,6 +389,15 @@ function readToken(cfg: LabViewConfig): { value?: string; error?: string } {
 
 interface ListResult {
   items: Record<string, unknown>[];
+  /**
+   * `pagination.count` as the API reported it, when it reported one.
+   *
+   * Worth keeping separately from `items.length` because the two are allowed to
+   * disagree: `/core/applications/` paginates *before* filtering the page by policy,
+   * so `count` is the number of records that exist and `items` is the subset this
+   * token was shown. Absent for a DRF-style envelope, which carries no count.
+   */
+  count?: number;
   error?: string;
   /** The stage the failing request stopped at, so the caller can report it. */
   phase?: ConnectionPhase;
@@ -375,6 +419,9 @@ function tokenHint(status: number): string | undefined {
  * DRF-style `{next: <url>}` is accepted too, so a change in either direction
  * degrades to a first page rather than a failure. `maxPages` bounds a very large
  * instance so one scan cannot stall on pagination.
+ *
+ * `pagination.count` is kept from the first page — later pages restate it, and a
+ * partial read still leaves the first page's count meaningful.
  */
 async function getList(
   doFetch: FetchLike,
@@ -382,10 +429,15 @@ async function getList(
   path: string,
   headers: Record<string, string>,
   cfg: LabViewConfig,
+  params: Record<string, string> = {},
 ): Promise<ListResult> {
   const items: Record<string, unknown>[] = [];
+  const extra = Object.entries(params)
+    .map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("");
+  let count: number | undefined;
   for (let page = 1; page <= Math.max(1, cfg.authentik.maxPages); page++) {
-    const url = `${base}${API}/${path}/?page=${page}&page_size=${PAGE_SIZE}`;
+    const url = `${base}${API}/${path}/?page=${page}&page_size=${PAGE_SIZE}${extra}`;
     const res = await getJson(doFetch, url, {
       headers,
       timeoutMs: cfg.authentik.timeoutMs,
@@ -397,14 +449,20 @@ async function getList(
       const phase = res.ok ? "protocol" : res.phase;
       // A later page failing still leaves the earlier ones usable.
       if (items.length) {
-        return { items, error: `${path} page ${page}: ${res.error ?? "bad response"}`, phase, code: res.code };
+        return { items, count, error: `${path} page ${page}: ${res.error ?? "bad response"}`, phase, code: res.code };
       }
-      return { items, error: `${path}: ${res.error ?? "unexpected response body"}`, phase, code: res.code };
+      return { items, count, error: `${path}: ${res.error ?? "unexpected response body"}`, phase, code: res.code };
     }
     const results = Array.isArray(res.body.results) ? res.body.results : [];
     for (const r of results) if (isObject(r)) items.push(r);
-    if (!results.length) break;
     const pagination = isObject(res.body.pagination) ? res.body.pagination : undefined;
+    if (count === undefined && pagination) {
+      const reported = Number(pagination.count);
+      // A negative or non-numeric count is no count at all — better absent than wrong,
+      // since every gap number downstream is derived from it.
+      if (Number.isFinite(reported) && reported >= 0) count = reported;
+    }
+    if (!results.length) break;
     const nextPage = pagination ? Number(pagination.next ?? 0) : NaN;
     if (pagination) {
       if (!Number.isFinite(nextPage) || nextPage <= page) break;
@@ -412,7 +470,7 @@ async function getList(
       break;
     }
   }
-  return { items };
+  return { items, count };
 }
 
 /**
@@ -421,13 +479,19 @@ async function getList(
  * LDAP and SCIM providers are attached to an application as *backchannel*
  * providers, so reading only the primary `provider` would miss every LDAP-protected
  * app. Both lists are walked, and `backchannel` records which was which.
+ *
+ * Two passes, because the applications endpoint filters its answer by what the token's
+ * user may launch while the provider endpoints do not. Pass one is the listed
+ * applications. Pass two rebuilds the applications only a provider names — `recovered`
+ * counts those, and each is tagged `discoveredVia: "provider"` so the thinner record is
+ * visible downstream.
  */
 function buildApplications(
   apps: Record<string, unknown>[],
   proxies: Record<string, unknown>[],
   oauth2: Record<string, unknown>[],
   outposts: Record<string, unknown>[],
-): AuthentikApplication[] {
+): { applications: AuthentikApplication[]; recovered: number } {
   const proxyByPk = byPk(proxies);
   const oauthByPk = byPk(oauth2);
 
@@ -466,7 +530,61 @@ function buildApplications(
       group: str(app.group) || undefined,
       launchUrl: concreteUrl(str(app.launch_url)) ?? concreteUrl(str(app.meta_launch_url)),
       providers,
+      discoveredVia: "list",
     });
+  }
+
+  // Pass two. Every provider serializer carries the application it is assigned to —
+  // `assigned_application_slug` and `assigned_application_name`, plus the backchannel
+  // pair — and these endpoints are permission-filtered but not policy-filtered. So the
+  // providers this token can read name applications the applications endpoint withheld.
+  const listed = new Set(out.map((a) => a.slug));
+  const rebuilt = new Map<string, AuthentikApplication>();
+  for (const [raw, backchannel] of assignedProviders(proxies, oauth2)) {
+    const slug = backchannel
+      ? str(raw.assigned_backchannel_application_slug)
+      : str(raw.assigned_application_slug);
+    // A provider assigned to no application names nothing to recover.
+    if (!slug || listed.has(slug)) continue;
+    const name = backchannel
+      ? str(raw.assigned_backchannel_application_name)
+      : str(raw.assigned_application_name);
+    const app = rebuilt.get(slug) ?? {
+      // The name comes from the provider's own record; the slug is the fallback, never
+      // a name LabView invented. No launch URL and no group exist on this path — the
+      // application record itself was never read.
+      name: name ?? slug,
+      slug,
+      providers: [],
+      discoveredVia: "provider" as const,
+    };
+    app.providers.push(toProvider(raw, backchannel, proxyByPk, oauthByPk, outpostsByProvider));
+    rebuilt.set(slug, app);
+  }
+
+  // Sorted by slug: the recovered order must not depend on which endpoint answered
+  // first (I7).
+  const recovered = [...rebuilt.keys()].sort();
+  for (const slug of recovered) {
+    const app = rebuilt.get(slug);
+    if (app) out.push(app);
+  }
+  return { applications: out, recovered: recovered.length };
+}
+
+/**
+ * Every provider that names an application, paired with whether it is the backchannel
+ * assignment. A provider can hold both, so both are offered and the caller skips the
+ * ones already listed.
+ */
+function assignedProviders(
+  proxies: Record<string, unknown>[],
+  oauth2: Record<string, unknown>[],
+): [Record<string, unknown>, boolean][] {
+  const out: [Record<string, unknown>, boolean][] = [];
+  for (const raw of [...proxies, ...oauth2]) {
+    if (str(raw.assigned_application_slug)) out.push([raw, false]);
+    if (str(raw.assigned_backchannel_application_slug)) out.push([raw, true]);
   }
   return out;
 }

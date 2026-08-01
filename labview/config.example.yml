@@ -118,6 +118,16 @@ labels:
 # it view_application / view_provider / view_outpost, and nothing else — LabView
 # only ever issues GETs, and a token with more rights than that is a token an
 # attacker reaching this container would inherit.
+#
+# One consequence of that is worth knowing, because it is Authentik's behaviour and
+# not a limit LabView chose: /core/applications/ filters its own answer through the
+# policy engine as the token's user, so a least-privilege token is served only the
+# applications that user may launch. LabView reads the total Authentik reports
+# alongside the subset it was given, rebuilds the withheld ones from the providers
+# assigned to them (provider endpoints are not policy-filtered), and states in the
+# banner how many were neither returned nor rebuildable. Making the service account
+# a superuser makes it hand over the exact list instead — strictly optional, and a
+# trade of least privilege for completeness that is yours to make.
 authentik:
   enabled: true
   # Base URL including scheme and port, e.g. http://authentik-server:9000. Leave

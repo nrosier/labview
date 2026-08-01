@@ -264,6 +264,58 @@ discovered endpoint is a guess, and a guess must never be handed a credential. O
 a candidate that *did* answer, a 401/403 is conclusive — the token is wrong, so
 later candidates are not tried and nothing further is sent.
 
+**Enumerating applications is not a plain list read.** `ApplicationViewSet.list()`
+upstream does three things, in this order: it drops every application with
+`meta_hide = True`, it **paginates**, and only *then* does it run the policy engine over
+the page **as the token's own user**, keeping the applications that user is allowed to
+launch. The filter is skipped only when `superuser_full_list=true` is sent *and* the
+token belongs to a superuser. So the default answer to a least-privilege token is "what
+may this user launch", not "what exists" — and a service protected by an application the
+token cannot launch would read as having no gate at all, which is exactly the failure
+**I1** exists to prevent.
+
+Two properties of that ordering make it recoverable without asking for more permission:
+
+- **Pagination runs before the filter, so `pagination.count` is the *unfiltered* total.**
+  `getList` keeps it (`ListResult.count`) for every Authentik read. It stays optional:
+  the DRF-shaped `outposts/instances/` envelope carries no `pagination` block, and a
+  non-numeric or negative count is treated as no count at all rather than propagated
+  into four derived numbers.
+- **`providers/proxy/` and `providers/oauth2/` — both already read — name the
+  application each provider is assigned to.** `ProviderSerializer.Meta.fields` carries
+  `assigned_application_slug` / `_name` and the backchannel pair, both subclasses extend
+  it, and neither viewset applies a policy filter (they are RBAC-only). The providers
+  this token can read therefore name applications the applications endpoint withheld,
+  and they carry the very fields rules 1–2 match on.
+
+`buildApplications` is therefore two passes. Pass one is the listed applications, tagged
+`discoveredVia: "list"`. Pass two walks the two provider lists, skips any slug pass one
+already produced — the list response always wins, since it alone carries `launch_url`
+and `group` — and rebuilds the rest as `discoveredVia: "provider"`, in slug order
+(**I7**). A rebuilt record is deliberately thinner: no launch URL, no group, and only
+the providers this token may read, so it can be tied by address or by name but never by
+a launch URL. `matchOne` states that basis as the first line of its `considered` trace,
+and the UI tags the row `rebuilt`.
+
+`superuser_full_list=true` is sent unconditionally on that one request. It is ignored for
+a non-superuser, so it can only ever widen the answer; there is no config knob for it.
+
+Four counts are reported, and only the last is a warning:
+
+| Count | Meaning |
+|---|---|
+| `applications` | what LabView knows about: listed **plus** recovered |
+| `applicationsConfigured` | `pagination.count` — what Authentik says exists |
+| `applicationsWithheld` | configured minus listed: what the policy filter removed |
+| `applicationsRecovered` | of those, how many a readable provider let LabView rebuild |
+
+`withheld - recovered` is derived where needed rather than stored, so the four cannot
+contradict each other. **The connection is `partial` only when that difference is
+non-zero**: a gap fully closed from the providers is reported through the counts, while
+applications LabView knows it cannot see must never be silent. The hint names both
+fixes — make the token's user a superuser for the exact list, or check the token's
+permissions.
+
 **Matching (step 10).** Neither side carries the other's identifier, so a match must
 come from something both sides name independently. Four such things exist, tried in
 descending order of strength:
@@ -336,10 +388,11 @@ carries an `UnmatchedReason` (`ambiguous` | `no-candidate` | `internal`), a one-
   service keys, hostnames. Never an env value (**I2**, **I6**), which smoke asserts
   over every `detail` and `considered` string.
 
-The four fixture applications in `fixtures/authentik` exist to produce four
+The five unplaced fixture applications in `fixtures/authentik` exist to produce five
 distinguishable answers: a contested slug (`ambiguous`), an excluded `forward_domain`
-host, a name residue under the 3-character floor, and an IP-literal redirect URI. If a
-future rule stops reporting, those assertions fail — see §10.
+host, a name residue under the 3-character floor, an IP-literal redirect URI, and one
+that was withheld by the policy filter and then rebuilt from a provider addressing
+nothing in the fleet. If a future rule stops reporting, those assertions fail — see §10.
 
 Three details are easy to get wrong and all have fixtures:
 
@@ -894,7 +947,11 @@ endpoint, and needs no privileged access:
   groupless service account with `view_application`, `view_provider` and
   `view_outpost`. A change that needs a write scope, or a scope beyond those three,
   is a change to this invariant and needs the operator's consent, not a wider
-  token.
+  token. Least privilege has a stated cost here rather than a hidden one:
+  `/core/applications/` filters its answer by what that account may launch, so the
+  recommended token is served a subset. LabView reports the shortfall and rebuilds
+  what the providers name (§3.5); it does not ask for superuser to avoid the
+  problem, and it does not stay quiet about it either.
 - The reverse proxy API is read with `GET` only, and only `/api/version`,
   `/api/rawdata` and `/api/entrypoints`. Traefik's API has no read-only credential
   to scope, which is another reason the recommended setup keeps it on an unpublished
@@ -1039,6 +1096,24 @@ match is visible rather than silent. A provider carries `kind` (normalized), `ra
 (Authentik's own `verbose_name`, so an unmodelled provider type is still readable),
 `backchannel`, and `outposts` — the names of the outposts serving it, empty when none
 is.
+
+**`discoveredVia`** — on `AuthentikApplication`: `"list"` when the applications
+endpoint returned it, `"provider"` when that endpoint withheld it and LabView rebuilt it
+from a provider naming it (§3.5). A `provider` record is the narrower thing it looks
+like: no launch URL, no group, and only the providers this token may read. Reported
+rather than smoothed over — a match made on less evidence should look like one — and the
+value is what the `considered` trace, the drawer's `rebuilt` tag and
+`applicationsRecovered` all rest on.
+
+**applicationsConfigured / applicationsWithheld / applicationsRecovered** — on
+`AuthentikSummary`, the arithmetic of what the applications endpoint did *not* return.
+`applicationsConfigured` is its own `pagination.count`, which counts records before its
+policy filter runs and is therefore the total Authentik holds; it is optional because an
+endpoint may report no count at all. `withheld` is that minus what was listed,
+`recovered` is how many of those a readable provider let LabView rebuild, and
+`applications` is listed **plus** recovered. The remainder, `withheld - recovered`, is
+derived where needed rather than stored, so the four numbers cannot disagree — and it,
+not `withheld`, is what makes the connection `partial`.
 
 **AuthentikMatchStrength** — `"address" | "hostname" | "name"`: what kind of thing
 established the tie, per match. An *address* is the provider pointing at the service; a
@@ -1362,16 +1437,36 @@ isolates one rule so an assertion cannot pass by accident through another path:
 | `pair` | a slug **and** a provider name each naming a two-service stack: unmatched, not arbitrated. The provider is an OIDC one so an arbitrated match would visibly claim a gate on the winner |
 | `orphan` | a proxy provider **no outpost serves** — matched, reported unprotected, reason on the service, and no bypass note for a gate that stands nowhere |
 | `reports` | a SAML gate: `method: "none"` yet **not** exposed-without-auth, provider quoted verbatim |
-| (api payload) | `broad-app`, whose only URL is a `forward_domain` `external_host` equal to the provider's own hostname — must stay unmatched rather than attach to `idp`. `ext-01`, whose redirect URI is an **IP literal** on a port `idp` publishes — must not be resolved through the published-port table (rule 2's guard) |
+| `archive` | an application the policy filter **withholds**: published with no gate in any label or env key, so it reads as exposed until the application is rebuilt from the provider whose redirect URI addresses the container. Its slug and name resemble nothing in the stack, so only the address can reach it |
+| (api payload) | `broad-app`, whose only URL is a `forward_domain` `external_host` equal to the provider's own hostname — must stay unmatched rather than attach to `idp`. `ext-01`, whose redirect URI is an **IP literal** on a port `idp` publishes — must not be resolved through the published-port table (rule 2's guard). `wh-02`, withheld and rebuilt but addressing nothing in the fleet — the rebuilt-and-still-unmatched case, which is where the narrower basis has to be stated. `hidden-01`, withheld and assigned a SAML provider LabView never reads — permanently unaccounted for, so `partial` has a case recovery cannot close |
 
-Four runs over that root assert the behaviours that are not about one stack:
-discovery + token; a configured URL (nothing else is probed); no token (zero
-requests, no error); and a throwing `fetchImpl` (reported, not raised, fleet still
-analyzed). The exposed-without-auth count is asserted **with and without** the API
-in the same run, so the integration's contribution is measured rather than assumed —
-that pair is what fails if any match rule regresses. Two of the gates in that gap are
-OIDC ones that appear in no label and no environment key, so the difference is the whole
+Six runs over that root assert the behaviours that are not about one stack:
+discovery + token; a configured URL (nothing else is probed); a **superuser** token that
+is served the whole list; a token whose withheld applications are *all* recoverable; no
+token (zero requests, no error); and a throwing `fetchImpl`
+(reported, not raised, fleet still analyzed). The exposed-without-auth count is asserted
+**with and without** the API in the same run, so the integration's contribution is
+measured rather than assumed — that pair is what fails if any match rule regresses. Three
+of the gates in that gap are OIDC ones that appear in no label and no environment key,
+and one of those three is an application the API withheld, so the difference is the whole
 of what reading the provider buys.
+
+The stub models the policy filter in both directions, because that is the only way the
+recovery can be shown to be *faithful* rather than merely present. It serves the filtered
+pages by default and appends the withheld page when `superuser_full_list=true` is sent to
+a token it treats as a superuser — while reporting `pagination.count` as the full total in
+**both** modes, which is the real upstream behaviour and the field the fix rests on. The
+two runs are then compared: the default run's slug set must be a **subset** of the
+superuser run's, short by exactly the SAML-only application, and the service the rebuilt
+application gates must read with the identical method and confidence either way.
+
+The third mode exists for the case in between, and it is the only thing holding one rule
+in place. Given a narrowed withheld set — every one of them recoverable — the counts must
+still state 14 of 16, and the connection must still be `connected` with no error, because
+recovery closed the whole gap. Reporting `partial` on the difference rather than on what
+is *still* missing passes every other assertion in the suite and fails only this one: a
+banner an operator cannot clear is a banner that stops being read, and then the case above
+stops working too.
 
 **`fixtures/traefik`** — a fleet built so the labels and the live routing table
 disagree in every way that matters, driven against `fixtures/traefik-api.json`
@@ -1596,6 +1691,14 @@ both with and without the API. Anything requiring a permission beyond
 `view_application` / `view_provider` / `view_outpost` is a change to I5 — say so
 explicitly and update the token guidance in `config.example.yml` and both READMEs.
 
+Two things a new list read must not drop. **Keep `pagination.count`** — `getList`
+returns it, and it is the only way to tell a complete answer from a filtered one; the
+applications endpoint has always reported the full total while returning a subset, and
+throwing that field away is what made the under-count invisible for as long as it was.
+And **ask what filters the endpoint applies to its own answer.** RBAC is not the only
+one: `/core/applications/` runs the policy engine as the token's user, and any endpoint
+that does something similar cannot be read as an inventory without saying so (§3.5).
+
 **Add a matching rule for applications.** Put it in `matchOne` in
 `analyze/authentik.ts`, in descending order of strength, and require **exactly one**
 candidate. Before adding one, ask what it would do to a fleet where two services
@@ -1720,7 +1823,16 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   is invisible. Provider types beyond proxy/oauth2 are read from the application's
   embedded `provider_obj` only, so their type-specific fields (a SAML ACS URL, for
   instance) are not available for matching.
-- **An unmatchable application is reported, not resolved.** Four rules (§3.5) is not
+- **A recovered application is a thinner record than a returned one, and some cannot
+  be recovered at all.** Rebuilding from a provider yields no launch URL and no group,
+  and only the providers this token may read, so such an application can be tied by
+  address or by name but never by a launch URL (§3.5). An application whose only
+  provider is a kind LabView does not fetch — SAML, or LDAP without a proxy alongside
+  — is named by nothing readable and stays a count. That is why a least-privilege token
+  can produce a `partial` banner no scan will clear: the honest alternative to the
+  silent under-count, not nagging. Superuser on the token's account removes the filter
+  entirely; widening the account's policies removes it case by case.
+- **An unmatchable application is reported, not resolved.** Four rules (§3.5) are not
   every naming convention an operator might use, and an application whose slug, name,
   provider names and URLs all resemble two services equally is discarded on purpose. So
   expect some unmatched, and read `meta.authentik.unmatchedApplications` — behind the
@@ -1784,7 +1896,10 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | A discovered endpoint is probed unauthenticated before the token is sent | A discovered address is a guess. `/api/v3/root/config/` is `AllowAny` upstream, so identity can be established without spending the credential — and a wrong guess (or a host that has taken over the name) never receives one. |
 | Internal container addresses are tried before public hostnames | The public hostname routes back out through the tunnel and the proxy, so it works but traverses the whole edge — and on a fleet where the provider fronts itself, that means authenticating to read the API. The container address is the same instance, one hop away. |
 | No flag to skip TLS verification | A bearer token sent to an unverified endpoint is a token given away, and such flags are set once "to get it working" and never unset. `NODE_EXTRA_CA_CERTS` covers a private CA; plain HTTP over the container network avoids the question. |
-| Provider→application is joined via the application's embedded `provider_obj` | `providers/proxy/` carries no `assigned_application` field, so walking from providers to applications would require guessing. The application already embeds its provider, so the join direction that exists in the data is the one used. |
+| Provider→application is joined via the application's embedded `provider_obj` | The application embeds its provider *and* its group and launch URL, so joining from that side yields the complete record in one read. The provider endpoints do name their application — `ProviderSerializer.Meta.fields` carries `assigned_application_slug` and `_name` — but that direction gives a strictly thinner record, so it is the fallback for applications the list withheld, not the primary. |
+| Applications the policy filter withholds are rebuilt from the providers already read, not from a new endpoint | `/api/v3/providers/all/` would reach provider kinds LabView cannot match on anyway, and it is a further permission to ask for. `providers/proxy/` and `providers/oauth2/` are already read, are RBAC-only rather than policy-filtered, and carry both the application assignment and the fields rules 1–2 match on. So the recommended token stays the same three `view_*` permissions. |
+| `superuser_full_list=true` is sent unconditionally, with no config knob | It is ignored for a non-superuser token, so it can only widen the answer — there is no case where an operator would want it off. A knob would add a way to be under-read silently, which is the defect it fixes. |
+| `partial` is reported on `withheld - recovered`, not on `withheld` | A banner nobody can clear becomes furniture and stops being read. Recovery that closes the whole gap has nothing left to warn about; a gap recovery *cannot* close is a real limit on what LabView can conclude, and the hint names both ways to close it. |
 | An application matching two services matches neither | Arbitrating by iteration order would move a service between "protected" and "exposed" on a coin toss, and the result would look identical to a real finding. An unmatched application is a visible gap the operator can close with a label. |
 | A provider with no outpost protects nothing | Proxy, LDAP and RADIUS providers are enforced by an outpost in the request path. With none assigned, nothing is in any path. This is the integration's most valuable output precisely because the admin UI shows such an application as complete. |
 | SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. Revisit if the palette gains a colour. |

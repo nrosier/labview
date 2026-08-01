@@ -269,6 +269,16 @@ export interface AuthentikApplication {
   /** Resolved launch URL, when the API supplied a concrete one (not a template). */
   launchUrl?: string;
   providers: AuthentikProvider[];
+  /**
+   * Which read produced this application.
+   *
+   * `list` is the applications endpoint. `provider` means the endpoint withheld it —
+   * it filters its answer by what the token's user may launch — and it was rebuilt
+   * from a provider that names it. A rebuilt record is narrower: no launch URL, no
+   * group, and only the providers this token may read. Reported rather than smoothed
+   * over, because a match made on less evidence should look like one.
+   */
+  discoveredVia: "list" | "provider";
 }
 
 /**
@@ -442,7 +452,19 @@ export interface AuthentikSummary {
   endpointSource?: "config" | "discovered";
   /** Why the exchange did not complete, with no credential in the text. */
   error?: string;
+  /** Applications LabView knows about: those listed, plus those rebuilt from providers. */
   applications: number;
+  /**
+   * Applications Authentik says exist, from the list endpoint's own `pagination.count`.
+   *
+   * It counts records before the policy filter, because that endpoint paginates first
+   * and filters the page afterwards. Absent only if the API reported no count.
+   */
+  applicationsConfigured?: number;
+  /** Configured minus listed: applications the endpoint did not return to this token. */
+  applicationsWithheld: number;
+  /** Of the withheld ones, how many a readable provider let LabView rebuild. */
+  applicationsRecovered: number;
   providers: number;
   outposts: number;
   /** Services that matched at least one application. */

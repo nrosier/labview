@@ -256,6 +256,18 @@ the inference: the provider named, and a proxy or LDAP provider with no outpost
 assigned reported as protecting nothing, because nothing is in the path to enforce
 it. Without a token this stage does not run and no request is made.
 
+One Authentik behaviour shows through here and is worth knowing, because it decides how
+much of that is even visible. `/core/applications/` filters its own answer through the
+policy engine as the requesting user, so a least-privilege service account is handed
+only the applications it may launch — and a service whose only gate is one of the others
+would read as having no gate at all. LabView therefore keeps the total that endpoint
+reports next to the subset it received, and rebuilds the missing applications from the
+providers assigned to them, which the provider endpoints do give out. Those are marked
+`rebuilt`, since the record is thinner — no launch URL, no group, only the providers this
+token can read. Whatever is neither returned nor rebuildable is reported as a count in
+the banner. Making the token's account a superuser gets the exact list instead; it is
+optional, and the three read permissions remain the recommendation.
+
 The second is what the reverse proxy built from those labels. Labels are a request;
 the running config is the answer, and the two differ more often than is comfortable
 — a rule with a typo, a reference to a middleware that doesn't exist, a gate
@@ -300,6 +312,14 @@ One shape is worth calling out if you consume that JSON yourself:
 so this is a **breaking change** for any external consumer. It was made rather
 than adding a second, parallel list so that why a match did not happen has exactly
 one home instead of a name in one place and an explanation in another.
+
+Also **breaking**: `meta.authentik.applications` now counts the applications
+Authentik's list endpoint withheld and LabView rebuilt from their providers, so the
+number moves for an unchanged Authentik. The alternative was to add the new counts
+beside a headline figure that under-reports, which is the defect being fixed.
+`applicationsConfigured` is what Authentik says exists, `applicationsWithheld` what its
+policy filter removed, `applicationsRecovered` how many of those were rebuilt, and
+`discoveredVia` on each application says which read produced it.
 
 `GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
 `POST /api/rescan` ignores that cache and is guaranteed to be answered by a scan
@@ -348,7 +368,10 @@ output is sensitive.
   answers as an Authentik API — a guessed host never receives it. Prefer
   `LABVIEW_AUTHENTIK_TOKEN_FILE` over the env var, which is readable by anyone who
   can run `docker inspect`. There is no flag to skip TLS verification; use
-  `NODE_EXTRA_CA_CERTS` for a private CA.
+  `NODE_EXTRA_CA_CERTS` for a private CA. Keeping the token that narrow costs
+  visibility, and LabView says so instead of absorbing it: Authentik withholds the
+  applications the account may not launch, so the banner names how many were withheld
+  and how many were rebuilt from their providers.
 - **The Traefik API is read without a credential wherever possible.** Discovered
   endpoints are probed on `/api/version`, which needs no authentication, and an
   endpoint that answers is used as-is with nothing sent. A credential is only ever
@@ -440,6 +463,12 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   available to confirm it. It is honest about *edge* auth only: an app with its own
   built-in login (Emby, Home Assistant, Authentik itself) will show up as
   exposed-without-auth, and the note says exactly that.
+- Authentik's applications endpoint filters itself by what the token's user may
+  launch, so a least-privilege token is not shown every application. LabView reports
+  the total and rebuilds the withheld ones from their providers, but an application
+  whose only provider is a kind LabView does not read (SAML, LDAP-only) cannot be
+  rebuilt and stays a count — a `partial` banner no scan will clear until the account
+  is widened or made a superuser.
 - The reverse-proxy integration reads Traefik's API. Another proxy (Caddy, nginx,
   HAProxy) is still classified from its labels; only Traefik's runtime config is
   read back. Its response shapes come from Traefik v3's runtime model, not a

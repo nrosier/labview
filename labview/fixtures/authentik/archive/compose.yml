@@ -1,0 +1,33 @@
+# Protected by an application the API refuses to hand over.
+#
+# `/core/applications/` filters its own answer to the applications the requesting
+# token's user is allowed to launch, so a least-privilege token is shown a subset and
+# told nothing about the rest. This service is what that costs: published to the
+# internet with no gate in any label or env key, so the scan reads it as exposed, and
+# the only record that says otherwise is an application the endpoint withholds.
+#
+# What recovers it is the provider. Provider endpoints are permission-filtered but not
+# policy-filtered, and every provider carries the application it is assigned to — so
+# `providers/oauth2` names an application `core/applications` withheld, and its
+# redirect URI addresses this container by name. The tie is therefore an *address*,
+# and the gate is reported confirmed rather than observed even though the application
+# record itself was never read.
+#
+# Nothing else could reach it: the slug is `rec-01` and the application name is
+# "Records portal", neither of which resembles this stack, this service or this
+# container.
+services:
+  archive:
+    image: example/archive:1.2.0
+    container_name: archive
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=archive.example.com"
+      - "dockflare.service=http://archive:8080"
+
+networks:
+  proxy:
+    external: true

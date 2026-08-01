@@ -270,6 +270,24 @@ volumes:
 LabView only ever issues `GET`s, so anything beyond those three permissions is
 authority an attacker who reached this container would inherit for free.
 
+**Why the app count may be lower than Authentik's own.** `/core/applications/`
+filters its answer through the policy engine as the requesting user, so a
+least-privilege service account is served only the applications it is allowed to
+launch. LabView reads the total Authentik reports for that endpoint alongside the
+subset it was handed, and rebuilds the missing ones from the providers assigned to
+them — the provider endpoints are not policy-filtered, and every provider names its
+application. A rebuilt application is marked `rebuilt` in the drawer, because the
+record is thinner: no launch URL and no group, and only the providers this token can
+read. Anything neither returned nor rebuildable is stated as a count in the banner
+rather than left out of the total.
+
+Two ways to close that gap, both optional. Grant the service account the policies it
+needs to see the applications in question, or make it a **superuser** — LabView asks
+for the full list on every scan, and a superuser token is given it verbatim, so
+nothing is withheld and nothing needs rebuilding. Neither is required; the three
+`view_*` permissions remain the recommendation, and the shortfall is reported rather
+than hidden.
+
 The endpoint is discovered when Authentik runs among the scanned stacks: LabView
 finds it by image, then tries its **container address first** and public hostnames
 only after, so the exchange stays on the container network. Discovery probes each
@@ -630,7 +648,10 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   token is sent only to a host that answered as an Authentik API, so a wrong guess
   never receives it. Prefer `LABVIEW_AUTHENTIK_TOKEN_FILE`; a token in the
   environment is readable via `docker inspect`. Certificate verification cannot be
-  disabled — use `NODE_EXTRA_CA_CERTS` for a private CA.
+  disabled — use `NODE_EXTRA_CA_CERTS` for a private CA. The cost of that narrow
+  token is stated rather than hidden: Authentik withholds the applications the
+  account may not launch, so LabView reports how many, rebuilds what the providers
+  name, and says what is left.
 - **The reverse proxy's API is read with no credential wherever possible.** Every
   discovered candidate is probed on `/api/version`, which needs no authentication,
   and one that answers is used as-is with nothing sent. A credential goes only to an
@@ -685,6 +706,15 @@ one; `no-candidate` means nothing claimed it; `internal` is defensive only. Both
 were `string[]` in earlier versions, so this is a **breaking change** for any external
 consumer. It was made instead of adding a second, parallel list so that why a match did
 not happen has one home rather than a name in one place and a reason in another.
+
+`meta.authentik.applications` changed meaning in the same spirit, which is also
+**breaking**: it counts the applications the list endpoint withheld and LabView rebuilt
+from their providers, so the figure moves for an unchanged Authentik. Three counts state
+the arithmetic behind it — `applicationsConfigured` (what Authentik says exists),
+`applicationsWithheld` (what its policy filter removed) and `applicationsRecovered` (how
+many of those were rebuilt) — and each application carries `discoveredVia`, `"list"` or
+`"provider"`, naming the read that produced it. Leaving `applications` alone would have
+kept a headline number that under-reports, which is the defect these fields exist to fix.
 
 `GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
 `POST /api/rescan` ignores the cache and is answered only by a scan that started
@@ -797,6 +827,16 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   bindings are not read, so an application whose access policy denies everyone
   still reads as protected — which it is — and a flow customization that weakens a
   gate is not visible.
+- **The applications endpoint does not hand over every application.** It runs the
+  policy engine as the token's own user, so a least-privilege service account is served
+  only what it may launch. LabView reports the total that endpoint declares, rebuilds
+  the withheld applications from the providers assigned to them, and marks those
+  `rebuilt` — such a record has no launch URL, no group, and only the providers the
+  token can read, so it can be tied to a service by address or by name but never by a
+  launch URL. An application whose only provider is a kind LabView does not read (SAML,
+  LDAP-only) cannot be rebuilt at all and is reported as a count, which is why a
+  narrow token can leave a `partial` banner that no scan will clear. Superuser on that
+  account removes the filter; the three read permissions are still the recommendation.
 - An application LabView cannot tie to exactly one service is reported as unmatched
   rather than guessed, in `meta.authentik.unmatchedApplications` — the gates it can see
   but cannot place, behind the `authentik` count in the topbar. Four rules are not every

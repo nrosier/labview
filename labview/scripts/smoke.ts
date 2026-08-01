@@ -131,10 +131,12 @@ function reply(status: number, body: unknown, setCookie?: string): HttpResponse 
  * for the three-way cross-check, and duplicating the pagination envelopes would mean
  * two places for the assumed shape to drift apart.
  *
- * It behaves like the real thing in the three ways that matter to the client:
+ * It behaves like the real thing in the four ways that matter to the client:
  * `/api/v3/root/config/` answers without credentials (it is `AllowAny` upstream),
- * every other endpoint demands the exact bearer token, and any other origin — the
- * outpost, the worker, a bare service name — is simply not an API.
+ * every other endpoint demands the exact bearer token, any other origin — the
+ * outpost, the worker, a bare service name — is simply not an API, and
+ * `/core/applications/` withholds part of its own list unless `superuser_full_list`
+ * is both sent and honoured, while still reporting the full `count`.
  */
 function authentikResponse(
   fixture: Record<string, unknown>,
@@ -142,6 +144,7 @@ function authentikResponse(
   token: string,
   url: URL,
   header: string | undefined,
+  opts: { superuser?: boolean; hides?: string[] } = {},
 ): HttpResponse | undefined {
   if (url.origin !== origin) return undefined;
 
@@ -156,8 +159,33 @@ function authentikResponse(
   // A fixture states one page as a flat array and several as an array of arrays.
   const pages: unknown[][] = Array.isArray(list[0]) ? (list as unknown[][]) : [list];
   const page = Number(url.searchParams.get("page") ?? "1");
-  const results: unknown[] = pages[page - 1] ?? [];
-  const count = pages.reduce((n, p) => n + p.length, 0);
+
+  // The applications endpoint paginates and *then* policy-filters the page as the
+  // token's own user, so the applications it withholds are missing from `results`
+  // while still counted in `pagination.count`. `count` is therefore the full total in
+  // every mode below, because upstream computes it before the filter runs — and it is
+  // the field the shortfall reporting rests on.
+  //
+  // What the filter removes is the `:withheld` key: all of it by default, or just the
+  // slugs in `hides`, which is how a run where recovery closes the *whole* gap is
+  // reachable. `superuser_full_list=true` skips the filter entirely, and only for a
+  // token this stub treats as a superuser — the two conditions the real early-return
+  // requires, so sending the parameter alone proves nothing.
+  const extra = fixture[`${endpoint}:withheld`];
+  const all: unknown[][] = Array.isArray(extra) ? [...pages, extra] : pages;
+  const count = all.reduce((n, p) => n + p.length, 0);
+  const honoured = opts.superuser && url.searchParams.get("superuser_full_list") === "true";
+  const filter = new Set(
+    opts.hides ??
+      (Array.isArray(extra) ? extra.map((r) => String((r as { slug?: unknown }).slug)) : []),
+  );
+  const served = honoured
+    ? all
+    : all
+        .map((p) => p.filter((r) => !filter.has(String((r as { slug?: unknown }).slug))))
+        .filter((p) => p.length > 0);
+
+  const results: unknown[] = served[page - 1] ?? [];
 
   // Outposts answer in the DRF envelope, everything else in Authentik's own, so
   // both branches of the pagination reader are exercised by one fixture.
@@ -166,11 +194,11 @@ function authentikResponse(
   }
   return reply(200, {
     pagination: {
-      next: page < pages.length ? page + 1 : 0,
+      next: page < served.length ? page + 1 : 0,
       previous: page > 1 ? page - 1 : 0,
       count,
       current: page,
-      total_pages: pages.length,
+      total_pages: served.length,
     },
     results,
   });
@@ -181,15 +209,22 @@ function authentikResponse(
  *
  * Every request is recorded, which is what lets the test assert the *absence* of a
  * request: the token must never be sent to a candidate that failed the probe.
+ *
+ * `superuser` decides whether the instance honours `superuser_full_list` — the default
+ * is the least-privilege token most fleets will use, and the one the reporting has to
+ * be honest under. `hides` narrows which applications the policy filter removes.
  */
-function authentikStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
+function authentikStub(opts: { superuser?: boolean; hides?: string[] } = {}): {
+  fetchImpl: FetchLike;
+  calls: Recorded[];
+} {
   const calls: Recorded[] = [];
 
   const fetchImpl: FetchLike = async (url, init) => {
     const header = init?.headers?.Authorization;
     calls.push({ url, sentToken: Boolean(header) });
     return (
-      authentikResponse(AK_FIXTURE, AK_ORIGIN, AK_TOKEN, new URL(url), header) ??
+      authentikResponse(AK_FIXTURE, AK_ORIGIN, AK_TOKEN, new URL(url), header, opts) ??
       reply(404, { detail: "Not found." })
     );
   };
@@ -725,9 +760,25 @@ function akTrace(slug: string): string {
   const u = akUnplaced(slug);
   return u ? [u.reason, u.detail, ...u.considered].join(" | ") : `no unmatched entry for ${slug}`;
 }
+/**
+ * Slugs of every application this run rebuilt from a provider, matched or not, sorted.
+ *
+ * Both halves matter: an application missing from here was silently upgraded to a
+ * list-sourced record, and one wrongly present claims less evidence than it has.
+ */
+function akRebuiltSlugs(): string {
+  const matched = ak.stacks
+    .flatMap((s) => s.services)
+    .flatMap((s) => s.authentik?.applications ?? []);
+  return [...matched, ...akMeta.unmatchedApplications.map((u) => u.application)]
+    .filter((a) => a.discoveredVia === "provider")
+    .map((a) => a.slug)
+    .sort()
+    .join(",");
+}
 
 console.log("\nendpoint discovery");
-check("found 13 stacks", ak.stats.stacks === 13, `got ${ak.stats.stacks}`);
+check("found 14 stacks", ak.stats.stacks === 14, `got ${ak.stats.stacks}`);
 check(
   "the endpoint is discovered from the fleet, not configured",
   akMeta.endpointSource === "discovered" && akMeta.endpoint === AK_ORIGIN,
@@ -741,7 +792,13 @@ check(
   discovered.calls.map((c) => c.url).join(" "),
 );
 check("the API answered and the token was accepted", akMeta.reachable === true, akMeta.error ?? "");
-check("no partial-read error was reported", akMeta.error === undefined, akMeta.error ?? "");
+// The one gap this run reports is the policy filter, asserted in full below. Any other
+// clause here would mean an endpoint failed, which would invalidate the counts.
+check(
+  "every endpoint was read",
+  !(akMeta.error ?? "").includes("could not be read"),
+  akMeta.error ?? "",
+);
 
 console.log("\nthe token goes nowhere it has not been earned");
 const rejected = discovered.calls.filter((c) => !c.url.startsWith(AK_ORIGIN));
@@ -765,8 +822,8 @@ check(
 
 console.log("\nwhat was read");
 check(
-  "13 applications across 2 pages, 14 providers, 2 outposts",
-  akMeta.applications === 13 && akMeta.providers === 14 && akMeta.outposts === 2,
+  "15 applications known, 16 providers, 2 outposts",
+  akMeta.applications === 15 && akMeta.providers === 16 && akMeta.outposts === 2,
   `${akMeta.applications}/${akMeta.providers}/${akMeta.outposts}`,
 );
 check(
@@ -774,7 +831,104 @@ check(
   discovered.calls.some((c) => c.url.includes("core/applications") && c.url.includes("page=2")),
   discovered.calls.filter((c) => c.url.includes("core/applications")).map((c) => c.url).join(" "),
 );
-check("9 of 13 applications were placed, on 9 distinct services", akMeta.matchedServices === 9, String(akMeta.matchedServices));
+check("10 of 15 applications were placed, on 10 distinct services", akMeta.matchedServices === 10, String(akMeta.matchedServices));
+
+// `/core/applications/` policy-filters the page it has already counted, so a
+// least-privilege token is served a subset and told the total. Reporting the subset as
+// the total is what made a service protected by a withheld application read as open.
+console.log("\nthe applications endpoint withholds part of its own list");
+check(
+  "the full list is asked for, so a superuser token is not silently under-read",
+  discovered.calls.some(
+    (c) => c.url.includes("core/applications") && c.url.includes("superuser_full_list=true"),
+  ),
+  discovered.calls.filter((c) => c.url.includes("core/applications")).map((c) => c.url).join(" "),
+);
+// The count survives the filter because pagination runs before it. Reverting the capture
+// leaves `applicationsConfigured` undefined and every number below collapses to the
+// filtered one, which is the bug.
+check(
+  "the total Authentik reports is kept, not the number it returned",
+  akMeta.applicationsConfigured === 16 && akMeta.applicationsWithheld === 3,
+  `configured=${akMeta.applicationsConfigured} withheld=${akMeta.applicationsWithheld}`,
+);
+check(
+  "...and the withheld ones are rebuilt from the providers assigned to them",
+  akMeta.applicationsRecovered === 2 && akMeta.applications === 15,
+  `recovered=${akMeta.applicationsRecovered} applications=${akMeta.applications}`,
+);
+// Recovery closing part of the gap must not be mistaken for closing all of it: the SAML
+// provider's application is named by nothing LabView reads, so it stays unaccounted for.
+check(
+  "...and the one it cannot reach is reported rather than rounded away",
+  akMeta.error?.includes("Authentik reports 16 applications and returned 13") === true &&
+    akMeta.error?.includes("2 of the rest were rebuilt") === true &&
+    akMeta.error?.includes("1 could not be") === true,
+  akMeta.error ?? "no error",
+);
+const akWithheldConn = ak.meta.connections.find((c) => c.target === "authentik");
+// `partial` on a connection that succeeded is the phase `shouldBanner` shows anyway
+// (asserted separately below), so reporting the gap here is what puts it in the banner.
+check(
+  "...as a partial connection that still succeeded, so the banner and the hint carry it",
+  akWithheldConn?.phase === "partial" &&
+    akWithheldConn.ok === true &&
+    (akWithheldConn.hint?.includes("superuser") ?? false),
+  `${akWithheldConn?.phase}/${akWithheldConn?.ok} ${akWithheldConn?.hint ?? ""}`,
+);
+check(
+  "...and the read line states the shortfall instead of the subset",
+  akWithheldConn?.read ===
+    "13 of 16 applications (2 recovered from providers), 16 providers, 2 outposts",
+  akWithheldConn?.read ?? "",
+);
+
+// The user-visible half of the bug: a service whose only gate is a withheld application.
+// Nothing in this stack's labels or env names a gate, so before recovery it read as
+// published with no authentication at all.
+const archive = aSvc("archive", "archive");
+check(
+  "a service gated only by a withheld application is no longer reported as open",
+  archive.authentik?.applications[0]?.slug === "rec-01" &&
+    archive.auth.method === "authentik-oauth" &&
+    archive.auth.exposedWithoutAuth === false,
+  `${archive.authentik?.applications.map((a) => a.slug).join(",") ?? "no match"} ${
+    archive.auth.method
+  } exposed=${archive.auth.exposedWithoutAuth}`,
+);
+check(
+  "...matched on the provider's own address, so the tie is confirmed",
+  archive.auth.confidence === "confirmed" &&
+    (archive.authentik?.evidence[0]?.includes("points at archive") ?? false),
+  `${archive.auth.confidence} ${archive.authentik?.evidence.join(" | ") ?? ""}`,
+);
+// A rebuilt record is thinner than a returned one — no launch URL, no group, only the
+// providers this token may read. Presenting it as equivalent would overstate the evidence.
+check(
+  "...and is marked as rebuilt, on exactly the applications that were",
+  akRebuiltSlugs() === "rec-01,wh-02",
+  akRebuiltSlugs(),
+);
+check(
+  "...and carries neither a launch URL nor a group, because neither was readable",
+  archive.authentik?.applications[0]?.launchUrl === undefined &&
+    archive.authentik?.applications[0]?.group === undefined,
+  JSON.stringify(archive.authentik?.applications[0]),
+);
+// The second recovered application matches nothing, which is where the narrower basis
+// has to be stated: an operator seeing it unplaced needs to know the record itself was
+// withheld, or the missing launch URL reads as an Authentik misconfiguration.
+check(
+  "a rebuilt application that matches nothing says what it was rebuilt from",
+  akUnplaced("wh-02")?.reason === "no-candidate" &&
+    akTrace("wh-02").includes("rebuilt from the provider that names it"),
+  akTrace("wh-02"),
+);
+check(
+  "...and its detail blames the withholding, not the application's own contents",
+  akUnplaced("wh-02")?.detail.includes("withheld by the applications endpoint") === true,
+  akUnplaced("wh-02")?.detail ?? "",
+);
 
 console.log("\nmatch 1: the provider names the service (internal host)");
 const akWiki = aSvc("wiki", "wiki");
@@ -1054,15 +1208,15 @@ check(
     /forward_domain/.test(akUnplaced("broad-app")?.detail ?? ""),
   akTrace("broad-app"),
 );
-// The four that must stay unplaced, and no fifth: every other application in the stub
+// The five that must stay unplaced, and no sixth: every other application in the stub
 // is reachable by exactly one rule, so a rule that started matching too freely would
 // show up here as a shorter list.
 check(
-  "four applications in all, each for a stated reason",
-  akUnplacedSlugs() === "broad-app,ext-01,pair,s01",
+  "five applications in all, each for a stated reason",
+  akUnplacedSlugs() === "broad-app,ext-01,pair,s01,wh-02",
   akUnplacedSlugs(),
 );
-// Four unmatched applications and four distinguishable answers. A rule that stopped
+// Five unmatched applications and five distinguishable answers. A rule that stopped
 // recording what it looked at would leave a hole here rather than a wrong statement,
 // which is exactly the kind of gap a trace is supposed to make impossible.
 check(
@@ -1079,7 +1233,7 @@ check(
   ),
 );
 check(
-  "...only one of the four is the operator's to fix",
+  "...only one of the five is the operator's to fix",
   akMeta.unmatchedApplications.filter((u) => u.reason === "ambiguous").length === 1,
   akMeta.unmatchedApplications.map((u) => `${u.application.slug}=${u.reason}`).join(","),
 );
@@ -1150,7 +1304,7 @@ check(
 );
 check(
   "...reaching the same conclusions",
-  akCfg.meta.authentik?.matchedServices === 9,
+  akCfg.meta.authentik?.matchedServices === 10,
   String(akCfg.meta.authentik?.matchedServices),
 );
 
@@ -1171,9 +1325,10 @@ check(
 );
 
 // The pair of numbers that shows what the API actually changed. Both must move: the
-// first because four gates only the API can see stop counting as absent, the second
-// because a label-only read cannot see them at all. Two of those four are OIDC gates
-// that appear in no label and no env key, so the gap is the whole of what reading the
+// first because five gates only the API can see stop counting as absent, the second
+// because a label-only read cannot see them at all. Three of those five are OIDC gates
+// that appear in no label and no env key — and one of those three is an application the
+// API withheld and LabView rebuilt — so the gap is the whole of what reading the
 // provider buys.
 console.log("\nwhat the provider's records are worth");
 check(
@@ -1182,8 +1337,8 @@ check(
   String(ak.stats.exposedWithoutAuth),
 );
 check(
-  "...and 8 without it",
-  akOff.stats.exposedWithoutAuth === 8,
+  "...and 9 without it",
+  akOff.stats.exposedWithoutAuth === 9,
   String(akOff.stats.exposedWithoutAuth),
 );
 check(
@@ -1191,6 +1346,105 @@ check(
   offSvc("wiki", "wiki").auth.method === "authentik-forward-auth" &&
     offSvc("wiki", "wiki").auth.confidence === "observed",
   `${offSvc("wiki", "wiki").auth.method}/${offSvc("wiki", "wiki").auth.confidence}`,
+);
+
+// The same instance read with a token whose user is a superuser, which is the one case
+// where `superuser_full_list` is honoured and the endpoint hands over its whole list.
+// Nothing about the fleet changes, so this run says whether the rebuilt records were
+// faithful to the ones they stood in for.
+console.log("\na superuser token is served the list itself");
+const full = authentikStub({ superuser: true });
+authentikEnv({ url: AK_ORIGIN, token: AK_TOKEN });
+const akFull = await overviewFor(authentikRoot, { fetchImpl: full.fetchImpl });
+const akFullMeta = akFull.meta.authentik!;
+/** Every application slug an overview knows, matched or not, sorted. */
+function akSlugs(ov: Overview): string[] {
+  const meta = ov.meta.authentik;
+  const matched = ov.stacks
+    .flatMap((s) => s.services)
+    .flatMap((s) => s.authentik?.applications ?? []);
+  return [...matched, ...(meta?.unmatchedApplications ?? []).map((u) => u.application)]
+    .map((a) => a.slug)
+    .sort();
+}
+check(
+  "the full list leaves nothing withheld and nothing to rebuild",
+  akFullMeta.applicationsConfigured === 16 &&
+    akFullMeta.applicationsWithheld === 0 &&
+    akFullMeta.applicationsRecovered === 0 &&
+    akFullMeta.applications === 16,
+  `configured=${akFullMeta.applicationsConfigured} withheld=${akFullMeta.applicationsWithheld} recovered=${akFullMeta.applicationsRecovered} applications=${akFullMeta.applications}`,
+);
+// The counterpart to the partial above: with nothing missing there is nothing to warn
+// about, so a closed gap must not leave a banner behind.
+check(
+  "...so the connection is plainly connected, with no gap to state",
+  akFull.meta.connections.find((c) => c.target === "authentik")?.phase === "connected" &&
+    akFullMeta.error === undefined,
+  `${akFull.meta.connections.find((c) => c.target === "authentik")?.phase} ${akFullMeta.error ?? ""}`,
+);
+check(
+  "...and every application is list-sourced, because every one was returned",
+  akSlugs(akFull).length === 16 &&
+    akFull.stacks
+      .flatMap((s) => s.services)
+      .flatMap((s) => s.authentik?.applications ?? [])
+      .every((a) => a.discoveredVia === "list"),
+  akSlugs(akFull).join(","),
+);
+// Recovery is faithful, not inventive: the rebuilt run knows a subset of what the full
+// run knows, and the difference is exactly the application no readable provider named.
+check(
+  "what the rebuilt run knew is a subset of what the full one returned",
+  akSlugs(ak).every((s) => akSlugs(akFull).includes(s)),
+  `${akSlugs(ak).join(",")} vs ${akSlugs(akFull).join(",")}`,
+);
+check(
+  "...short by exactly the application only a SAML provider names",
+  akSlugs(akFull).filter((s) => !akSlugs(ak).includes(s)).join(",") === "hidden-01",
+  akSlugs(akFull).filter((s) => !akSlugs(ak).includes(s)).join(","),
+);
+// The measure that matters to an operator: the rebuilt record produced the same posture
+// on the same service as the record it stood in for.
+const fullArchive = lookup(akFull)("archive", "archive");
+check(
+  "...and the service the rebuilt application gated reads identically either way",
+  fullArchive.auth.method === archive.auth.method &&
+    fullArchive.auth.confidence === archive.auth.confidence &&
+    akFullMeta.matchedServices === akMeta.matchedServices,
+  `${fullArchive.auth.method}/${fullArchive.auth.confidence} ${akFullMeta.matchedServices}`,
+);
+
+// The third possibility, and the one that decides whether the warning is trustworthy:
+// applications were withheld and every one of them was rebuilt. Nothing is missing, so
+// nothing may be reported as missing — a banner an operator cannot clear stops being
+// read, and then the case above stops working too.
+console.log("\na gap recovery closes completely is not reported as a gap");
+const closable = authentikStub({ hides: ["rec-01", "wh-02"] });
+authentikEnv({ url: AK_ORIGIN, token: AK_TOKEN });
+const akClosed = await overviewFor(authentikRoot, { fetchImpl: closable.fetchImpl });
+const akClosedMeta = akClosed.meta.authentik!;
+check(
+  "the withheld applications are counted and rebuilt",
+  akClosedMeta.applicationsConfigured === 16 &&
+    akClosedMeta.applicationsWithheld === 2 &&
+    akClosedMeta.applicationsRecovered === 2 &&
+    akClosedMeta.applications === 16,
+  `configured=${akClosedMeta.applicationsConfigured} withheld=${akClosedMeta.applicationsWithheld} recovered=${akClosedMeta.applicationsRecovered} applications=${akClosedMeta.applications}`,
+);
+check(
+  "...and with nothing left unaccounted for, no gap is stated and no banner is raised",
+  akClosedMeta.error === undefined &&
+    akClosed.meta.connections.find((c) => c.target === "authentik")?.phase === "connected",
+  `${akClosedMeta.error ?? "no error"} ${akClosed.meta.connections.find((c) => c.target === "authentik")?.phase}`,
+);
+// The count is still not the subset, so the read line has to say both numbers even
+// though there is nothing to warn about.
+check(
+  "...while the read line still distinguishes what was returned from what exists",
+  akClosed.meta.connections.find((c) => c.target === "authentik")?.read ===
+    "14 of 16 applications (2 recovered from providers), 17 providers, 2 outposts",
+  akClosed.meta.connections.find((c) => c.target === "authentik")?.read ?? "",
 );
 
 console.log("\nan unreachable provider never blocks a scan");
@@ -1212,7 +1466,7 @@ check(
 );
 check(
   "...and the whole fleet is still analyzed from its labels",
-  akDown.stats.stacks === 13 && akDown.stats.services === 17,
+  akDown.stats.stacks === 14 && akDown.stats.services === 18,
   `${akDown.stats.stacks}/${akDown.stats.services}`,
 );
 authentikEnv({});
@@ -1330,9 +1584,18 @@ check(
 // The traces are new prose built from scanned configuration and served to the browser,
 // so they are held to the same rule as every other string in the payload (I6). They may
 // name what the payload already holds — slugs, service keys, hostnames — and nothing else.
+// The gap-reporting strings are held to it too: they are assembled from a count and a
+// hint rather than from a payload field, so the only way one carries a credential or a
+// fleet identifier is a mistake — and it would be a mistake shown in the banner.
 const everyTraceLine = [
   ...akMeta.unmatchedApplications.flatMap((u) => [u.detail, ...u.considered]),
   ...tfMeta.unmatchedRouters.flatMap((u) => [u.detail, ...u.considered]),
+  ...[ak, akFull].flatMap((ov) => [
+    ov.meta.authentik?.error ?? "",
+    ...ov.meta.connections
+      .filter((c) => c.target === "authentik")
+      .flatMap((c) => [c.read ?? "", c.detail ?? "", c.hint ?? ""]),
+  ]),
 ].join("\n");
 check(
   "no unmatched trace carries a value out of the configuration",

@@ -150,6 +150,16 @@ function matchOne(
     if (kind === "blocked") blocked ??= line;
   };
 
+  // A rebuilt application is a narrower record than a listed one — the application
+  // itself was withheld, so there is no launch URL and no group to read, and only the
+  // providers this token may see. Stated first, as context for every rule below, and
+  // deliberately not marked: a specific rule that got closer is the better headline.
+  if (app.discoveredVia === "provider") {
+    note(
+      "the applications endpoint did not return this application to this token, so it was rebuilt from the provider that names it: no launch URL and no group were readable.",
+    );
+  }
+
   // 1. A proxy provider's internal host is the provider naming the service outright.
   let addressed = false;
   for (const provider of app.providers) {
@@ -262,7 +272,9 @@ function matchOne(
     detail:
       contested ??
       blocked ??
-      "no address, hostname or name in this application identifies a scanned service.",
+      (app.discoveredVia === "provider"
+        ? "this application was withheld by the applications endpoint, and nothing the provider it was rebuilt from carries identifies a scanned service."
+        : "no address, hostname or name in this application identifies a scanned service."),
     considered,
   };
 }
