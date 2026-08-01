@@ -6,11 +6,11 @@
 # beside this file declares. Whatever the comparison decides, it decided it from the
 # declaration alone.
 #
-# Nothing here publishes a port and nothing here has a tunnel route, so all four are
-# reachable only from the container network. That is deliberate: a declaration changes
-# the exposure verdict in exactly one case (nothing detected, reachable from outside),
-# and this fixture is about the other half of the feature — which declarations are
-# reported, which are a disagreement, and which are not worth saying twice.
+# Nothing has a tunnel route, and the first three publish nothing either, so those three
+# are reachable only from the container network. That is deliberate: a declaration
+# changes the exposure verdict in exactly one case (nothing detected, reachable from
+# outside), and this fixture is about the other half of the feature — which declarations
+# are reported, which are a disagreement, and which are not worth saying twice.
 # `declared/media` covers the exposure case.
 #
 # The fourth service is the one that must NOT warn: the app declares its own OIDC
@@ -52,11 +52,19 @@ services:
   # SSO defined in `authentik/`), the app's own OIDC login declared behind it. Same
   # declared mechanism as `conflict` above, opposite outcome — because what the scan
   # detected sits at a different tier. This is the pair that pins the layer rule.
+  #
+  # It is also the only fixture where a *multi-kind* expectation agrees with the scan, so
+  # it needs two kinds that survive classification: the proxy route below, and a published
+  # host port. Both are external, because `internal` is withheld beside either of them and
+  # an expectation written with it would collapse to a single kind. The port also earns a
+  # bypass note, which is correct and says so — the gate is on the route, not on :18443.
   defence:
     image: example/portal:2.0.0
     container_name: declcompare-defence
     expose:
       - "8080"
+    ports:
+      - "18443:8080"
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.dcportal.rule=Host(`portal.edge.example.com`)"

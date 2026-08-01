@@ -157,5 +157,12 @@ services:
     # compared as sets — and an expectation that matches is not shown at all, so this
     # block is silent until the day it has something to say. A single kind can be
     # written bare (`ingress: internal`); the list form is only needed for more than one.
+    #
+    # One exception, and it is the one you are most likely to hit: almost every service
+    # shares a network with a neighbour, so `internal` is implied by any of the three
+    # above and LabView reports it only on a service that has none of them. Writing it
+    # beside `public` or `lan` is not an error — it is simply dropped, quietly, rather
+    # than drifting against a rule this file has no way of knowing. So it is only ever
+    # worth writing on a service you expect to be reachable from nowhere else.
     expected:
-      ingress: [public, lan, internal]
+      ingress: [public, lan]

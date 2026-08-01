@@ -638,7 +638,12 @@ drawer. Two rules hold it together:
 - **A collapsed stack rolls up, it does not summarise.** Every distinct ingress and
   auth posture present is shown, plus a count of services reachable without auth. A
   stack with an internal database and a public UI is both at once; picking a "worst
-  case" badge would misreport it.
+  case" badge would misreport it. The union comes from `rollUpIngress` in
+  `model/ingress.ts` rather than from an inline `some()` in the card, for two reasons:
+  it must deliberately *not* withhold `internal` the way a service's own set does — the
+  UI's exposure would otherwise erase the database from the collapsed view — and a rule
+  that only exists in a `.tsx` file cannot be asserted, which for the one remaining
+  stack-level `internal` is not a risk worth carrying.
 
 **The ingress filter is an expression, not a selection.** Because a service carries
 several kinds, one chip per kind with one on/off state cannot express what an
@@ -670,8 +675,8 @@ it reads as. Three consequences:
 service can carry two kinds, a stacked bar's segments sum past the total and every
 proportion in it is wrong; clicking a segment labelled `11` would return 26 rows.
 So `TagBars` renders one row per kind — label, a bar of `count / services`, the
-count — and the `OverviewStats` doc comment says outright that the five ingress
-counters **overlap**. The authentication bar stays `DistributionBar`, because
+count — and the `OverviewStats` doc comment says outright that the three external
+ingress counters **overlap** while `internalServices` and `noIngressServices` do not. The authentication bar stays `DistributionBar`, because
 `svc.auth.method` is still one value per service. Both take the same tri-state
 legend API, so the two dimensions filter identically even though they aggregate
 differently.
@@ -1001,11 +1006,13 @@ each disagreement is one entry in `svc.declared.drift`, counted in
 - a declared mechanism that `compareDeclaredAuth` returned `conflicts` for, naming both
   sides and the layer they share, so the reader knows *which* of the two to go correct;
 - an `expected.ingress` that differs from the classification, reported through
-  `diffIngress` in **both** directions — `missing: lan; unexpected: internal` — because
+  `diffIngress` in **both** directions — `missing: lan; unexpected: traefik` — because
   a set compared by eye is exactly what the operator should not have to do. Order is
   irrelevant on both sides: the declared list is normalized into `INGRESS_KINDS` order
   at parse time and then compared as a set, so `[public, lan, traefik]` in any order is
-  one expectation.
+  one expectation. That same normalization is what drops a declared `internal` written
+  beside an external kind, so an expectation can never drift on a kind the scan would
+  never report (§5).
 
 **Agreement is silent, in both directions.** The `Expected ingress` row renders only
 when `expectedMatches` is false, and `DeclaredAuthBadge` and the declared
@@ -1299,18 +1306,34 @@ both keys the *presence* of an entry is the signal, never a parsed port number.
 | `public` | a Cloudflare tunnel route with a hostname |
 | `traefik` | a Traefik route with hosts or a rule |
 | `lan` | `ports:` is non-empty — published on the host |
-| `internal` | `expose:` is non-empty, **or** `realNetworks()` shares a name with another scanned service |
+| `internal` | `expose:` is non-empty, **or** `realNetworks()` shares a name with another scanned service — **and** none of the three above holds |
 | `none` | none of the above |
 
 **A service carries a set, not a value.** `svc.ingress` is `IngressKind[]`, and a
-container behind the tunnel, behind the proxy, with a published port and a
-listening container port is all four things at once — each separately true, each
-its own tag. A stack carries the union of its services'. Nothing combines two
-kinds into a third; the only function that picks a winner is `primaryIngress`,
-and it exists solely because a graph node has one fill colour.
+container behind the tunnel, behind the proxy and with a published port is all three
+things at once — each separately true, each its own tag. A stack carries the union of
+its services', built by `rollUpIngress` — the one place the withholding below must
+**not** apply, since a stack is not a service and a public frontend beside an
+internal-only database is genuinely both. Nothing combines two kinds into a third; the
+only function that picks a winner is `primaryIngress`, and it exists solely because a
+graph node has one fill colour.
 
-Three consequences worth stating, because each one used to be the other way:
+Four consequences worth stating, because each one used to be the other way:
 
+- **`internal` is withheld when anything external applies.** The three external kinds
+  are independent of each other; `internal` is not independent of them. Nearly every
+  service in a real fleet shares a network with a neighbour, so reporting it everywhere
+  puts one tag on almost everything and distinguishes nothing — while the service a
+  reader is looking for is the one reachable *only* over the container network. So
+  `normalizeIngress` drops `internal` from any set that already carries `public`,
+  `traefik` or `lan`, and `svc.ingress` answers "is a neighbour the only way in"
+  rather than "can a neighbour get in". The evidence is unchanged and nothing is
+  invented (I1) — this decides only when the tag is worth reporting. The cost: from
+  the tags of an externally-reachable service you cannot tell whether a sibling
+  reaches it too, which the drawer's Networks section and the graph's network edges
+  still say. Applied in `normalizeIngress` rather than in `classifyIngress` so the
+  other source of a kind set — a `.labview` `expected: ingress:` list — collapses the
+  same way, with no second rule to keep in step.
 - **`internal` is positive evidence, not a fallback.** It means another container
   demonstrably can reach this one — a declared `expose:`, or a real network shared
   with another scanned service. When neither holds, the answer is `none`, which is
@@ -1327,10 +1350,12 @@ Three consequences worth stating, because each one used to be the other way:
   nothing else". A proxied service that also publishes one keeps `traefik` *and*
   `lan` and still gets its note from `noteHostPortBypass`, which is the difference
   between "protected by SSO" and "protected by SSO unless you use the port".
-- **The five counters overlap and do not sum to `services`.** That is the point,
-  and both the CLI and the dashboard say so: the ingress distribution is rendered
-  as one gauge per kind (`TagBars`), not as a part-to-whole bar, because segments
-  that sum past the total are a lie about a whole.
+- **The three external counters overlap and do not sum to `services`.** That is the
+  point, and both the CLI and the dashboard say so: the ingress distribution is
+  rendered as one gauge per kind (`TagBars`), not as a part-to-whole bar, because
+  segments that sum past the total are a lie about a whole. `internalServices` and
+  `noIngressServices` are the two exclusive counters, and they are exclusive for the
+  same reason: both mean nothing outside the container network reaches the service.
 
 `traefik` is the one place a **kind names a product**, which reads against I3
 (§8). It is admitted because the kind is derived from Traefik-format route labels,
@@ -1342,7 +1367,8 @@ implements it (`authentik-forward-auth`) and both are reported.
 Every question about a set goes through
 [model/ingress.ts](labview/src/model/ingress.ts) rather than being asked inline,
 so five callers cannot drift apart: `normalizeIngress` is the only constructor
-(deduped, canonically ordered, never empty), `isExternallyReachable` is the single
+(deduped, canonically ordered, never empty, `internal` only when alone),
+`isExternallyReachable` is the single
 definition of "someone outside the container network can answer" — used by both
 `exposedWithoutAuth` and the stale-acceptance check — `externalIngress` narrows a
 note to the kinds that make it reachable, and `diffIngress` reports a sidecar
@@ -1502,12 +1528,13 @@ in-app login is an answer no scan can reach (§3.12, §4 I1). The two terms stay
 `hasEdgeAuth` is evidence alone — and a service that leaves the count on the strength of
 a declaration is counted in `stats.declaredAuthProtected` and says so on its own face.
 
-The test is `isExternallyReachable` and not "does the set contain `internal`",
-which are different questions now that the kinds are independent: a service can be
-`internal` *and* `lan` at once, and that service is exposed. `internal` and `none`
-are the two kinds that are not exposure, and the predicate is written as the
-positive `public | traefik | lan` so a sixth kind added later has to opt in rather
-than being counted as safe by omission. It lives in
+The test is `isExternallyReachable` and not "does the set contain `internal`". The two
+would now agree on every service the classifier produces, since `internal` survives only
+where nothing external does — which is exactly why the predicate is not written that way.
+It asks its own question of its own three kinds, so it cannot be quietly redefined by a
+change to the withholding rule, and a sixth kind added later has to opt in rather than
+being counted as safe by omission. `internal` and `none` are the two kinds that are not
+exposure. It lives in
 [model/ingress.ts](labview/src/model/ingress.ts) so this definition and the
 stale-acceptance check (§3.12) cannot disagree about the same service.
 
@@ -1783,7 +1810,7 @@ stacks:
 | Stack | Pins |
 |---|---|
 | `dbstack` | URI credential redaction; `env_file` containment |
-| `cfdisabled` | `dockflare.enable=false` yields no route (and truthy variants still do) |
+| `cfdisabled` | `dockflare.enable=false` yields no route (and truthy variants still do). Also the sharpest pair for the withholding rule: two siblings on one implicit network, so the `internal` evidence is identical and the tag survives on exactly the one whose route is switched off |
 | `ldapapp` | LDAP against a non-Authentik directory stays generic |
 | `interp` | nested `${A:-${B:-lit}}` defaults, `$$`, unused-branch handling |
 | `hostport` | published ports are reachability (`lan`) and `expose:` is not; the bypass note on a proxied service that also publishes |
@@ -1792,8 +1819,8 @@ stacks:
 | `declared` | the declaration layer's happy path: every stack-level field, a bare-string dependency, and in-app auth (`app-local-accounts` + `app-ldap`) shown as *declared* without moving `svc.auth.method`. Also the only `supplies` case — it publishes a host port and the scan finds no gate, so it is the fixture that proves a declaration takes a service out of the exposure count *and* that the service still says so on its face |
 | `accepted` | an exposure signed off with a reason: still counted in `exposedWithoutAuth`, badged accepted, reason shown |
 | `staledecl` | both checkable fields going stale at once — an acceptance for a listener that no longer exists, and an `expected.ingress` the scan disagrees with |
-| `partialdrift` | the same drift check against a set rather than a value: expected `[traefik, lan]`, scanned `[traefik, internal]` — same *first* kind, wrong in both directions. `staledecl` cannot catch a primary-only comparison; this can |
-| `declcompare` | the declared-vs-detected comparison, isolated: four services, and the first three are configured *identically* (same LDAP env, nothing published, nothing in front) so the scan reaches the same conclusion about all three and the sidecar is the only variable — `conflicts`, `redundant` and `supplements` decided from the declaration alone. The fourth is the pair that pins the layer rule: `defence` declares the *same* mechanism as `conflict` and must not warn, because what the scan detected sits at a different tier. It also carries the only *agreeing* multi-kind `expected.ingress` in the fixtures, written in the opposite order, so "order is not a disagreement" and "agreement is silent" are pinned by something other than a unit test |
+| `partialdrift` | the same drift check against a set rather than a value: expected `[public, lan]`, scanned `[public, traefik]` — same *first* kind, wrong in both directions. `staledecl` cannot catch a primary-only comparison; this can. Both differences are *external* kinds deliberately: `internal` is withheld from a service with a route, so a disagreement phrased with it would collapse to a one-directional one and the fixture would pass while covering half of what it claims. Its `expose:` stays, which puts the withholding itself under test here too |
+| `declcompare` | the declared-vs-detected comparison, isolated: four services, and the first three are configured *identically* (same LDAP env, nothing published, nothing in front) so the scan reaches the same conclusion about all three and the sidecar is the only variable — `conflicts`, `redundant` and `supplements` decided from the declaration alone. The fourth is the pair that pins the layer rule: `defence` declares the *same* mechanism as `conflict` and must not warn, because what the scan detected sits at a different tier. It also carries the only *agreeing* multi-kind `expected.ingress` in the fixtures — `[lan, traefik]`, written in the opposite order to the classification — so "order is not a disagreement" and "agreement is silent" are pinned by something other than a unit test. Two external kinds, for the same reason `partialdrift` uses them: an expectation containing `internal` would be collapsed to a single kind on both sides and stop being multi-kind at all. The published port that earns the `lan` also earns a bypass note, which is correct — the gate is on the route, not on the port |
 | `badsidecar` | four mistakes in one file — a mistyped key, a product name where a mechanism belongs, a reasonless acceptance, a service the compose file does not define — each warned about, with two valid declarations in the same file that must survive them |
 | `sidecaryml` | the `.labview.yml` filename variant, and the shorthand `auth: [app-token]` form |
 | `escapedecl` | containment (I8): a symlink to a sidecar **outside** the apps root must be refused. The target is valid on purpose, so a regression shows up as leaked declarations rather than as different warning text |
@@ -2012,9 +2039,13 @@ component (§3.9).
 
 **Ingress is asserted as a set, in canonical order, as a joined string.** `ing(svc)`
 returns `svc.ingress.join(", ")` so a failing assertion prints both sets — `got
-"public, lan, internal"` against an expected `"public, traefik, lan, internal"` names
-the kind that went missing, which is the whole question when a classification rule
-regresses. Element-by-element comparison would report only `false`.
+"public, lan"` against an expected `"public, traefik, lan"` names the kind that went
+missing, which is the whole question when a classification rule regresses.
+Element-by-element comparison would report only `false`. One fleet-wide assertion
+complements the per-service ones: over every service in both roots, no set carries
+`internal` beside an external kind, and `internalServices` equals the number of sets
+that are `internal` alone — so a stack added later, or a fourth external kind, is
+covered without anyone remembering to extend a list.
 
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
@@ -2097,7 +2128,9 @@ the start; the compiler will not catch the UI half.
    ingress kind that is an `includes()` counter, and it overlaps the others.
 5. `analyze/graph.ts` if it changes which hub a service hangs off (I3).
 6. `web/lib/palette.ts` — add a `RoleMeta` entry, keeping the ordering meaning
-   (ingress: most→least exposed; auth: identified providers before generic ones).
+   (ingress: most→least exposed; auth: identified providers before generic ones). The
+   stack roll-up does not need touching: `rollUpIngress` enumerates `INGRESS_KINDS`,
+   so a new kind appears on the stack row from step 2 alone.
 7. `web/styles.css` — define the CSS custom property in both themes, from the
    validated palette; do not invent a colour. For an ingress kind, check the new
    entry against its **neighbours in the bar order** in both themes: adjacent rows
@@ -2341,7 +2374,10 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Published ports are reachability, not metadata | `ports:` makes a service answerable at `hostIP:port` with no proxy and no SSO. Treating it as decoration under-reported exposure on real fleets. |
 | The ingress kinds are named `public` / `traefik` / `lan` / `internal` / `none` | These are the situations an operator distinguishes, and the previous `local` (meaning *proxy route*) collided with the separate LAN concept — the tile said "Local" for something that was not the LAN. `traefik` names a product against I3, admitted because the kind is derived from Traefik-format labels, so the name follows its evidence. |
 | `svc.ingress` is a **set** of independent kinds, and nothing is ever combined | A single-valued field forced the vocabulary to grow combinatorially, and it still could not express the fleet: a service that was tunnelled *and* proxied *and* published a port had no value at all, so the classifier silently dropped the LAN half. Compound values (`public+lan`) made the counters need folding to stay disjoint, which made "Traefik 2" true and useless in a fleet with 26 proxied services. Independent tags say each true thing once; the cost is that the counters overlap, which is stated rather than hidden. |
-| `internal` is positive evidence, not the leftover bucket | As a fallback it meant "nothing else applied", which is not a fact about the fleet — it conflated a database two containers talk to with a service nothing can reach at all. Now it requires proof another container can reach it (`expose:`, or a shared real network) and `none` is a populated category. It costs a much larger `internalServices`, and buys a `noIngressServices` that answers the question the old value only appeared to. |
+| `internal` is positive evidence, not the leftover bucket | As a fallback it meant "nothing else applied", which is not a fact about the fleet — it conflated a database two containers talk to with a service nothing can reach at all. Now it requires proof another container can reach it (`expose:`, or a shared real network) and `none` is a populated category. It buys a `noIngressServices` that answers the question the old value only appeared to. |
+| `internal` is **reported only when it is the only way in** | The other four kinds are independent of each other; this one is not independent of them. Nearly every service in a real fleet shares a network with a neighbour — 82 of 86 on the fleet this was measured against — so reporting it everywhere puts the same tag on almost everything, and a tag that is true of nearly everything says nothing about any of it. The service a reader is looking for is the one reachable *only* over the container network (the database behind a frontend), so that is the only place it is shown; the frontend shows `public`/`traefik`/`lan` alone. It is a withholding, not an inference: the evidence is unchanged, `internal` is still positive evidence, and I1 holds because nothing was added. It costs the ability to tell from an externally-reachable service's tags whether a sibling also reaches it — which the drawer's Networks section and the graph's network edges still say — and it moved `internalServices` from 82 to 25 on that fleet, which is breaking for a JSON consumer and worth it: that counter now answers a question. |
+| The **stack roll-up** is exempt from the withholding | A stack is not a service. Its badges are a union — the whole reason a collapsed row is not reduced to a "worst case" — so a public frontend beside a database only its neighbour can reach is a stack that is legitimately both, and the row saying `Public` `Internal` is what tells a reader there is something inside worth expanding for. Renormalizing the union would let the frontend's exposure delete the database from the collapsed view, which inverts the request that prompted the rule. So the union is built by `rollUpIngress` and not by `normalizeIngress`, the two are documented against each other, and the exemption is asserted over every mixed fixture stack rather than trusted: the roll-up is now the only stack-level place `internal` appears, and it previously lived as an inline expression in a `.tsx` file where nothing could test it. |
+| The withholding lives in `normalizeIngress`, not in `classifyIngress` | A kind set has exactly two sources — the classifier, and a `.labview` `expected: ingress:` list — and `normalizeIngress` is the only constructor for both. Putting the rule there means a sidecar written as `[public, lan, internal]` is read as `[public, lan]` and agrees with the scan, instead of drifting against a rule the file cannot know about. Collapsed silently rather than warned about: writing down everything that is true of a service is not a mistake, and a warning would train operators to omit true things. The alternative — hiding the tag in the badges only — would have left `stats.internalServices`, the filter chip and the gauge all answering the old, useless question. |
 | `depends_on` is not evidence of reachability | It expresses start order, not a network path: two services in disjoint networks can depend on each other and never connect. Counting it would make `internal` true for pairs that cannot reach each other, which is the exact failure the change above was made to fix. |
 | `lan` is tagged whether or not a proxy is in front, and the bypass note stays | As a fallback kind, `lan` answered "publishes a port with nothing in front of it", so the count could not answer "how many publish a port" — the more useful question, since a published port is answerable with no proxy and no SSO in the path. Both are now available: the tag counts the port, and `noteHostPortBypass` still says the proxied service can be reached around its gate. That note is not cosmetic; it is the difference between "protected by SSO" and "protected by SSO unless you use the port". |
 | The ingress distribution is per-tag gauges, not a stacked bar | A part-to-whole bar whose segments sum past the total misstates every proportion in it, and clicking a segment labelled `11` would return 26 rows. The auth bar stays part-to-whole because `auth.method` is still single-valued. |

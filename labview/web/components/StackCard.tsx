@@ -1,6 +1,7 @@
 import type { AppStack, AuthMethod, IngressKind, Service } from "../model";
+import { rollUpIngress } from "../model";
 import { ingressSummary, shortImage } from "../lib/format";
-import { AUTH_META, INGRESS_META } from "../lib/palette";
+import { AUTH_META } from "../lib/palette";
 import {
   AcceptedBadge,
   AuthBadge,
@@ -50,13 +51,12 @@ export function StackCard({
   const declared = stack.declared;
   const drift = services.reduce((n, s) => n + (s.declared?.drift.length ?? 0), 0);
 
-  // Ordered by the shared palette metadata rather than by appearance, so the same
-  // set of postures always reads the same way across stacks. The stack's ingress is
-  // the *union* of its services': one public service and one internal one make the
-  // stack both, which is the whole reason neither is reduced to a single verdict.
-  const ingressKinds = INGRESS_META.map((m) => m.key).filter((k) =>
-    services.some((s) => s.ingress.includes(k)),
-  );
+  // The union of the services' kinds, in the same canonical order the palette rows use:
+  // one public service and one internal one make the stack both, which is the whole
+  // reason neither is reduced to a single verdict. `rollUpIngress` rather than a `some()`
+  // here because it must *not* withhold `internal` the way a service's own set does —
+  // see there.
+  const ingressKinds = rollUpIngress(services.map((s) => s.ingress));
   const authMethods = AUTH_META.map((m) => m.key).filter((k) =>
     services.some((s) => s.auth.method === k),
   );

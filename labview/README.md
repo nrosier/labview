@@ -482,19 +482,37 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   the service says why the hop is unknown. No image, vendor or naming convention is
   consulted.
 - **Ingress is a set of independent tags, not one label.** A service carries as
-  many of the five as apply, because a container behind the tunnel, behind the
-  proxy, with a published port and a listening container port is all four of those
-  things and each is separately true. A stack carries the union of its services'.
+  many of the three external ones as apply, because a container behind the tunnel,
+  behind the proxy and with a published port is all three of those things and each
+  is separately true. A stack carries the union of its services'.
 
   | tag | what it means | the evidence |
   |---|---|---|
   | `public` | reachable from the internet through the tunnel | a Cloudflare route with a hostname |
   | `traefik` | reached through the reverse proxy | a Traefik route with hosts or a rule |
   | `lan` | answerable on the server's own network | a `ports:` entry — which publishes on the host, unlike `expose:`, so the service answers at `<host-ip>:<port>` with no proxy and no SSO in the path |
-  | `internal` | another container can reach it, and only another container | an `expose:` port, **or** a resolved network shared with another scanned service |
+  | `internal` | another container can reach it, **and nothing else can** | an `expose:` port, **or** a resolved network shared with another scanned service — and none of the three above |
   | `none` | nothing reaches it at all | none of the above |
 
-  `internal` is **positive evidence, not a fallback**: it says a neighbour
+  `internal` is the one tag that yields. Almost every service in a real fleet shares
+  a network with a neighbour, so reporting it everywhere would put the same tag on
+  nearly everything and tell a reader nothing; what they are looking for is the
+  service reachable *only* from the container network — the database behind a
+  frontend — so that is the only place it is shown. The frontend in the same stack
+  shows `public`, `traefik` or `lan` alone. Nothing is invented and nothing is
+  hidden: the evidence for `internal` is unchanged, and where the tag is withheld
+  the drawer's **Networks** section and the graph's network edges still show the
+  neighbour that can reach it. The cost, stated plainly: from the tags of an
+  externally-reachable service you cannot tell whether a sibling reaches it too.
+
+  The **stack row is the exception**, and deliberately so: its badges are the union of
+  its services', not a service's own set, so a stack with a public UI and a database
+  only that UI can reach shows **both** `Public` and `Internal` — which is how a
+  collapsed row tells you there is something inside worth expanding for. Withholding
+  there would let the UI's exposure erase the database from the only view that starts
+  out visible.
+
+  `internal` is also **positive evidence, not a fallback**: it says a neighbour
   demonstrably can reach this service. When neither an exposed port nor a shared
   network says so, the answer is `none` — a real category with its own tile, not a
   bucket for everything unclassified. Shared networks are counted on the names
@@ -835,14 +853,18 @@ in the summary:
   names both: `declares "OIDC login by the app", but the scan detected ldap (LDAP bind
   against …) — both describe the app's own login, so one of the two is out of date`.
 - An `expected.ingress` that disagrees with the classification names the difference in
-  both directions: `expects ingress "traefik, lan"; the scan classified this service
-  as "traefik, internal" (missing: lan; unexpected: internal)`. Order is irrelevant —
+  both directions: `expects ingress "public, lan"; the scan classified this service
+  as "public, traefik" (missing: lan; unexpected: traefik)`. Order is irrelevant —
   the two are compared as sets, so `[public, lan, traefik]` and `[traefik, public,
   lan]` are the same expectation.
 
 Agreement is silent, in both directions: an expectation that matches renders no row,
 and a declaration that repeats what the scan found renders nothing at all. A sidecar
-that is right about everything is invisible except for the prose you wrote.
+that is right about everything is invisible except for the prose you wrote. An
+expectation is read through the same rule that builds the classification, so an
+`internal` written beside `public`, `traefik` or `lan` is dropped from it quietly rather
+than drifting against a rule the file has no way of knowing — writing down everything
+that is true of a service is not a mistake worth a warning.
 
 The classification always stands. Drift is a report, never an override.
 
@@ -901,7 +923,7 @@ were `string[]` in earlier versions, so this is a **breaking change** for any ex
 consumer. It was made instead of adding a second, parallel list so that why a match did
 not happen has one home rather than a name in one place and a reason in another.
 
-The **ingress vocabulary** is a third **breaking change**, in two steps. The first was
+The **ingress vocabulary** is a third **breaking change**, in three steps. The first was
 a pure rename, every value mapping one-to-one onto the old one:
 
 | was | is |
@@ -931,18 +953,40 @@ breaking in shape as well as in value:
 The two combined values are gone; nothing combines any more. Three consequences worth
 planning for if you consume the JSON:
 
-- **The five `stats.*Services` counters now overlap** and no longer sum to
-  `stats.services`. Only `noIngressServices` is exclusive.
-- **`internalServices` jumps**, because most services in a real fleet do share a
-  network with a neighbour. It is now the honest count of "reachable inside Docker";
-  the question the old value answered — *how many are reachable by nothing at all* —
-  is `noIngressServices`.
+- **The three external `stats.*Services` counters overlap** and no longer sum to
+  `stats.services`. `internalServices` and `noIngressServices` are each exclusive of
+  every other counter.
+- **`internalServices` changed meaning twice** — see the third step below for where it
+  landed. The question the old single-value field answered — *how many are reachable
+  by nothing at all* — is `noIngressServices`.
 - **A `traefik` service may also be `lan`.** Under the old vocabulary a proxied
   service that published a port was classified `traefik` alone, and the LAN path was
   a note only. The note is still there; the tag is new.
 
-No exposure or auth measure moved in either step: `exposedWithoutAuth` asks whether
-any of `public`, `traefik` or `lan` is present, which is exactly what
+The third step **withholds `internal` from any service that also carries `public`,
+`traefik` or `lan`**, so the tag now marks the services reachable *only* from the
+container network. This is breaking in value, not in shape:
+
+| was | is |
+|---|---|
+| `["public", "lan", "internal"]` | `["public", "lan"]` |
+| `["traefik", "internal"]` | `["traefik"]` |
+| `["internal"]` | `["internal"]` — unchanged, and now the only place it appears |
+| `expected: ingress: [public, lan, internal]` in a `.labview` | read as `[public, lan]`, silently — no drift |
+
+Two consequences for a consumer:
+
+- **`internalServices` drops sharply** — on a fleet of 86 services it went from 82 to
+  25 — because it now counts internal-*only* services instead of every service with a
+  neighbour. It is the count the Internal badge, the Internal filter chip and the
+  dashboard gauge have always shown; those three simply became worth reading.
+- **Nothing else moved.** The evidence for `internal` is unchanged, no other tag and no
+  `stats` counter changed, and the graph keeps both its node colours and its network
+  edges — so the database-behind-a-frontend path is still drawn where the tag no longer
+  says it.
+
+No exposure or auth measure moved in any of the three steps: `exposedWithoutAuth` asks
+whether any of `public`, `traefik` or `lan` is present, which is exactly what
 `ingress !== "internal"` used to mean.
 
 `meta.authentik.applications` changed meaning in the same spirit, which is also

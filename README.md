@@ -53,7 +53,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Stack list** | One card per stack — the unit you deploy — rolling up the live status, hostnames and every distinct ingress/auth badge of its services, with a count of anything reachable without auth. Click to expand the services underneath. Search and filters work per service and open the stacks that matched. |
 | **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
 | **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by their most exposed ingress kind, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
-| **Ingress classification** | Five independent tags, and a service carries as many as apply: reachable from the internet through the tunnel (`public`), through the reverse proxy (`traefik`), on the server's LAN at a published port (`lan`), reachable by another container but nothing else (`internal`), or reached by nothing at all (`none`). A stack carries the union of its services'. `ports:` publishes on the host so it is `lan` whether or not a proxy sits in front of it; `expose:` publishes nothing and is `internal`, alongside sharing a real Docker network with another scanned service. So `internal` is positive proof of reachability rather than a leftover bucket, and `none` is a real answer. The counts overlap on purpose and do not sum to the service total. |
+| **Ingress classification** | Five tags, and a service carries as many as apply: reachable from the internet through the tunnel (`public`), through the reverse proxy (`traefik`), on the server's LAN at a published port (`lan`), reachable by another container and **only** by another container (`internal`), or reached by nothing at all (`none`). A stack carries the union of its services'. `ports:` publishes on the host so it is `lan` whether or not a proxy sits in front of it; `expose:` publishes nothing and is `internal`, alongside sharing a real Docker network with another scanned service. So `internal` is positive proof of reachability rather than a leftover bucket, and `none` is a real answer. The first three are independent and their counts overlap on purpose, so they do not sum to the service total. `internal` is the one tag that yields: nearly every container shares a network with a neighbour, so it is reported only when nothing else reaches the service — the database, not the frontend in front of it. |
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
@@ -327,11 +327,21 @@ and a service is routinely several of them at once. The combined values are gone
 `["public", "traefik", …]`. Two definitions changed with it — `internal` now means
 another container demonstrably can reach the service (`expose:`, or a shared Docker
 network) rather than "nothing else applied", and a service reached by nothing is
-`["none"]` — so `internalServices` rises sharply while a new `noIngressServices`
-answers the question the old value answered. The five ingress counters now
-**overlap** and no longer sum to `services`. No exposure or auth measure moved:
+`["none"]`, so a new `noIngressServices` answers the question the old value answered.
+The three external counters **overlap** and no longer sum to `services`.
+
+Most recently, **`internal` is reported only when it is the only way in**: a service
+that also carries `public`, `traefik` or `lan` no longer lists it, because nearly
+every container shares a network with a neighbour and a tag on almost everything
+distinguishes nothing. `["traefik", "internal"]` is now `["traefik"]`; a database
+reachable only from the container network is still `["internal"]`, and a `.labview`
+expectation of `[public, lan, internal]` is read as `[public, lan]` without
+complaint. So `internalServices` drops sharply — it counts internal-*only* services,
+which is what the Internal badge and filter chip have always shown.
+
+No exposure or auth measure moved in any of the three steps:
 `exposedWithoutAuth` and every auth count are identical, by construction. The full
-before/after is in the two migration tables under
+before/after is in the migration tables under
 [labview/README.md § API](labview/README.md#api).
 
 Also **breaking**: `meta.authentik.applications` now counts the applications

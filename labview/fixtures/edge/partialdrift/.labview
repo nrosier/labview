@@ -1,8 +1,9 @@
-# Written when the service also published a host port, and never updated after the
-# port was withdrawn. Both differences have to be reported: the `lan` that is gone,
-# and the `internal` reachability that was always there and never written down.
+# Written when the service published a host port and had no proxy route, and never
+# updated after the port was withdrawn and the route added. Both differences have to be
+# reported: the `lan` that is gone, and the `traefik` route that appeared and was never
+# written down.
 services:
   api:
-    description: Internal API behind the proxy.
+    description: API published through the tunnel.
     expected:
-      ingress: [traefik, lan]
+      ingress: [public, lan]

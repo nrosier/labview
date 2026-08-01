@@ -351,7 +351,10 @@ function finalizeAuth(
  *    `noteHostPortBypass` additionally says the port answers without it.
  *  - `internal` — another container can demonstrably reach it: a declared `expose:`
  *    port, or a real network shared with another scanned service. Positive evidence,
- *    never a fallback.
+ *    never a fallback. Decided here on its own evidence like the rest, and then
+ *    *withheld* by `normalizeIngress` on any service that already carries an external
+ *    kind — see there for why. So this function's own answer is "can a neighbour reach
+ *    it", and what survives into `svc.ingress` is "is that the only thing that can".
  *  - `none` — supplied by `normalizeIngress` when nothing above holds.
  *
  * `internal` deliberately does not consider `depends_on`: a dependency across two
@@ -554,7 +557,9 @@ function computeStats(stacks: AppStack[]): OverviewStats {
       stats.services++;
       if (svc.docker?.running) stats.running++;
       // Five independent counters, not a chain: a service tunnelled *and* proxied is
-      // counted in both, which is why these overlap and do not sum to `services`.
+      // counted in both, which is why these overlap and do not sum to `services`. Read
+      // off the tag set rather than re-derived, so `internalServices` counts what the
+      // badges show — the services a neighbour and only a neighbour can reach.
       if (svc.ingress.includes("public")) stats.publicServices++;
       if (svc.ingress.includes("traefik")) stats.traefikServices++;
       if (svc.ingress.includes("lan")) stats.lanServices++;

@@ -24,10 +24,10 @@ if (summary) {
     for (const line of formatConnection(r)) console.log(`  ${line}`);
   }
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
-  // The five ingress kinds, each counted independently. They **overlap** — a service
-  // behind the tunnel and the proxy is in both counts — so the line does not sum to
-  // `services` and says so rather than leaving a reader to add it up and doubt the
-  // scan. Only `none` is exclusive, by definition.
+  // The five ingress kinds, each counted independently. The first three **overlap** — a
+  // service behind the tunnel and the proxy is in both counts — so the line does not sum
+  // to `services` and says so rather than leaving a reader to add it up and doubt the
+  // scan. `internal` and `none` are exclusive: both mean nothing outside reaches it.
   console.log(
     `  by ingress:       public ${stats.publicServices}, traefik ${stats.traefikServices},` +
       ` lan ${stats.lanServices}, internal ${stats.internalServices},` +

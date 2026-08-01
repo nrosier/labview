@@ -4,10 +4,14 @@ import type { IngressKind } from "./types.js";
  * The ingress vocabulary and every pure operation on it.
  *
  * A service carries a *set* of kinds, not one: a container behind the tunnel, behind
- * the proxy, with a published port and a listening container port is all four things
- * at once, and each of them is separately true. The five kinds are independent by
- * construction, so nothing here combines them and nothing picks a winner except
- * `primaryIngress`, which exists only because a graph node has one fill colour.
+ * the proxy and publishing a host port is all three things at once, and each of them is
+ * separately true. Nothing here combines two kinds into a third and nothing picks a
+ * winner except `primaryIngress`, which exists only because a graph node has one fill
+ * colour.
+ *
+ * The three external kinds are independent of each other. `internal` is the exception
+ * and the one rule in this module: it is reported only when it is the whole answer, for
+ * the reason given on `normalizeIngress`.
  *
  * Here rather than in the analyzer because five places need the same answers and must
  * not drift: the classifier builds the set, the analyzer asks whether it is reachable,
@@ -43,18 +47,52 @@ export function isIngressKind(value: string): value is IngressKind {
 const EXTERNAL_KINDS: readonly IngressKind[] = ["public", "traefik", "lan"];
 
 /**
- * The only constructor for a kind set: deduped, in canonical order, and **never
- * empty** — nothing applying yields `["none"]` rather than `[]`.
+ * The only constructor for a kind set: deduped, in canonical order, **never empty**, and
+ * carrying `internal` only when nothing external does.
  *
  * Non-empty on purpose. An empty array would render as no badge at all, sort into no
  * bar segment, and match no filter, so a service with no ingress whatsoever would
  * quietly disappear from the one view that should show it. `none` is a real answer
  * and is stored as one.
+ *
+ * `internal` is withheld beside any external kind because in a real fleet nearly every
+ * service shares a network with a neighbour, so a tag that is true of almost everything
+ * says nothing about any of it. What a reader is looking for is the service reachable
+ * *only* from the container network — the database behind a frontend — and that is
+ * precisely the set this leaves it on. Nothing is invented: `internal` is still the same
+ * positive evidence (`expose:`, or a shared real network), and this only decides when it
+ * is worth reporting. What it costs is the ability to tell, from the tags of a public
+ * service, whether a sibling can also reach it; the drawer's networks and the graph's
+ * network edges still say so.
+ *
+ * Applied here rather than in the classifier so the one other source of a kind set — a
+ * `.labview` `expected: ingress:` list — is collapsed the same way. That is what makes a
+ * sidecar written as `[public, lan, internal]` agree with a scan of `[public, lan]`
+ * instead of drifting against a rule it has no way of knowing about.
  */
 export function normalizeIngress(kinds: Iterable<IngressKind>): IngressKind[] {
   const set = new Set(kinds);
+  if (EXTERNAL_KINDS.some((k) => set.has(k))) set.delete("internal");
   const out = INGRESS_KINDS.filter((k) => k !== "none" && set.has(k));
   return out.length ? out : ["none"];
+}
+
+/**
+ * A stack's kinds: every kind at least one of its services carries, in canonical order.
+ *
+ * Deliberately **not** put through `normalizeIngress`, and this is the one place that
+ * distinction matters. A stack is not a service: the whole point of rolling up rather
+ * than reducing is that a public frontend and a database only its neighbour can reach
+ * make the stack *both*, so the row says `Public` `Internal` and the reader can see
+ * there is something inside worth expanding for. Normalizing here would withhold
+ * `internal` on the union — the frontend's exposure would erase the database from the
+ * collapsed view, which is exactly backwards.
+ *
+ * Here rather than inline in the card so the rule is something a test can call: the
+ * badge is now the only stack-level place `internal` appears at all.
+ */
+export function rollUpIngress(services: readonly (readonly IngressKind[])[]): IngressKind[] {
+  return INGRESS_KINDS.filter((k) => services.some((kinds) => kinds.includes(k)));
 }
 
 /**

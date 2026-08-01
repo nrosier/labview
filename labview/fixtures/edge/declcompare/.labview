@@ -28,4 +28,4 @@ services:
     # opposite order to the classification, because the two are compared as sets —
     # so this pins both "agreement is silent" and "order is not a disagreement".
     expected:
-      ingress: [internal, traefik]
+      ingress: [lan, traefik]

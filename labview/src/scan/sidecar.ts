@@ -383,6 +383,10 @@ function readExpected(value: unknown, where: string, warnings: string[]): Ingres
   // Nothing survived: report no expectation at all rather than an empty one, which
   // `normalizeIngress` would turn into an expectation of `none` nobody wrote.
   if (!kinds.length) return undefined;
+  // Normalized through the same constructor the classifier uses, so the two sides of the
+  // comparison are built by one rule. That also silently drops an `internal` written
+  // beside an external kind: it is implied there, the scan will never report it, and
+  // drifting against a rule the file cannot know would punish an accurate sidecar.
   return normalizeIngress(kinds);
 }
 

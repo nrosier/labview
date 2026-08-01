@@ -91,6 +91,7 @@ export {
   isIngressKind,
   normalizeIngress,
   primaryIngress,
+  rollUpIngress,
 } from "../src/model/ingress";
 
 /**

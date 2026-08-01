@@ -1,27 +1,40 @@
 # Regression fixture: an expectation that agrees about the most exposed kind and
 # disagrees about the rest.
 #
-# The sidecar beside this file expects `[traefik, lan]`. The scan classifies the
-# service as `[traefik, internal]` — the same *first* kind, a different set. So a
-# drift check that compared only the primary kind, or only the badge colour, would
-# report nothing while the operator's expectation is wrong in both directions at
-# once: `lan` was expected and is absent, `internal` was found and was not expected.
+# The sidecar beside this file expects `[public, lan]`. The scan classifies the service
+# as `[public, traefik]` — the same *first* kind, a different set. So a drift check that
+# compared only the primary kind, or only the badge colour, would report nothing while
+# the operator's expectation is wrong in both directions at once: `lan` was expected and
+# is absent, `traefik` was found and was not expected.
 #
-# `staledecl/` is the other half of this pair: there the primary kinds differ too, so
-# it cannot tell a set comparison from a single-value one. This stack can.
+# Every kind in that disagreement is an external one, deliberately. `internal` is
+# withheld from any service that already carries an external kind (see
+# `normalizeIngress`), so a disagreement phrased in terms of `internal` would collapse to
+# a one-directional one and this fixture would quietly stop covering what it is named
+# for. The `expose:` below stays for the same reason from the other side: the evidence
+# for `internal` is present here, so the withholding itself is under test.
 #
-# The route carries a middleware that resolves to the SSO defined in `authentik/`, so
-# the service is protected. That is deliberate: this fixture is about the declaration
-# layer, and an exposure finding here would make it about two things.
+# `staledecl/` is the other half of this pair: there the primary kinds differ too, so it
+# cannot tell a set comparison from a single-value one. This stack can.
+#
+# The route carries a middleware that resolves to the SSO defined in `authentik/`, so the
+# service is protected. That is deliberate: this fixture is about the declaration layer,
+# and an exposure finding here would make it about two things.
 services:
   api:
     image: example/api:5.0.0
     container_name: partialdrift-api
-    # Listens inside the container network only — `expose:` is the `internal` half of
-    # the disagreement, and the absence of `ports:` is the missing `lan` half.
+    # Reachable through the tunnel and through the proxy — and, on the evidence of
+    # `expose:`, from a neighbouring container as well, which is the part the
+    # classification withholds. Nothing is published on the host, which is the missing
+    # `lan` half of the disagreement.
     expose:
       - "8080"
     labels:
+      # No `dockflare.service`: the hostname alone is what makes this public, and leaving
+      # the origin undeclared keeps the fixture from also being about origin resolution.
+      - "dockflare.enable=true"
+      - "dockflare.hostname=api.tunnel.example.com"
       - "traefik.enable=true"
       - "traefik.http.routers.pdapi.rule=Host(`api.edge.example.com`)"
       - "traefik.http.routers.pdapi.entrypoints=websecure"

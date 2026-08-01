@@ -86,9 +86,8 @@ const {
   formatExposureCount,
   showsDeclaredAuth,
 } = await import("../src/model/declarations.js");
-const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress } = await import(
-  "../src/model/ingress.js"
-);
+const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress, rollUpIngress } =
+  await import("../src/model/ingress.js");
 const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
@@ -418,17 +417,19 @@ check("jellyfin has published port 8096", jf.ports.some((p) => p.published === "
 check("jellyfin media bind is read-only", jf.mounts.some((m) => m.target === "/media" && m.readOnly));
 
 console.log("\ningress classification");
-// Four tags at once, which is the whole reason the field is a set: a tunnel route, a
-// proxy route, a published host port and a shared container network are four
-// independent facts about one service, and no single value could carry them.
-check("jellyfin carries all four reachability tags", ing(jf) === "public, traefik, lan, internal", ing(jf));
+// Three tags at once, which is the whole reason the field is a set: a tunnel route, a
+// proxy route and a published host port are three independent facts about one service,
+// and no single value could carry them. A shared container network is a fourth fact and
+// this service has that too — `internal` is absent from the set because the three above
+// already answer "who can reach it", not because the evidence for it is missing.
+check("jellyfin carries every external reachability tag", ing(jf) === "public, traefik, lan", ing(jf));
 check("jellyfin cloudflare hostname", jf.cloudflare[0]?.hostname === "jellyfin.example.com");
 check("jellyfin traefik host", jf.traefik[0]?.hosts.includes("jellyfin.example.com") ?? false);
 const emby = svc("emby", "emby");
 // Tunnel origin straight at the container, plus a published host port: public
 // via Cloudflare and directly answerable on the LAN, with no proxy either way —
-// so `traefik` is absent while the other three are present.
-check("emby is public+lan with no proxy tag", ing(emby) === "public, lan, internal", ing(emby));
+// so `traefik` is the one external kind that is absent.
+check("emby is public+lan with no proxy tag", ing(emby) === "public, lan", ing(emby));
 check("emby has no traefik route", emby.traefik.length === 0);
 
 console.log("\nauth posture");
@@ -594,8 +595,11 @@ check("dockflare.enable=false yields no route", staged.cloudflare.length === 0, 
 // but no external tag, which is the part the staged route must not grant.
 check("...so nothing external reaches it", ing(staged) === "internal", ing(staged));
 check("...and is not flagged exposed-without-auth", staged.auth.exposedWithoutAuth === false);
+// The sibling on the same implicit network, and the sharpest pair for the withholding
+// rule: identical `internal` evidence, and the tag survives on exactly the one of them
+// that has nothing else. The switched-on route is the whole difference.
 const live = eSvc("cfdisabled", "live");
-check('dockflare.enable="TRUE" still enables the route', ing(live) === "public, internal", ing(live));
+check('dockflare.enable="TRUE" still enables the route', ing(live) === "public", ing(live));
 
 console.log("\nLDAP attribution");
 const wiki = eSvc("ldapapp", "wiki");
@@ -635,7 +639,7 @@ console.log("\npublished host ports are LAN reachability");
 const media = eSvc("hostport", "media");
 check(
   "tunnel origin at the container + published port -> public and lan",
-  ing(media) === "public, lan, internal",
+  ing(media) === "public, lan",
   ing(media),
 );
 check("...and is flagged exposed without auth", media.auth.exposedWithoutAuth === true);
@@ -643,7 +647,7 @@ check("...and is flagged exposed without auth", media.auth.exposedWithoutAuth ==
 const socketproxy = eSvc("hostport", "socketproxy");
 check(
   "published port with nothing in front -> lan",
-  ing(socketproxy) === "lan, internal",
+  ing(socketproxy) === "lan",
   ing(socketproxy),
 );
 check(
@@ -654,13 +658,13 @@ check(
 // Every service with a published port, proxied or not — the counter no longer folds
 // the proxied ones away, which is what made "LAN 2" misleading in a fleet where a
 // dozen proxied services also answer on the host.
-check("every published port is counted as lan", edge.stats.lanServices === 7, `got ${edge.stats.lanServices}`);
+check("every published port is counted as lan", edge.stats.lanServices === 8, `got ${edge.stats.lanServices}`);
 
 // The overlap, now carried rather than collapsed: a proxied service that also
 // publishes a port holds `traefik` *and* `lan`, and the LAN path is still raised as a
 // note — the note explains the bypass, the tag makes it filterable.
 const hpApp = eSvc("hostport", "app");
-check("a proxied service that publishes a port holds both tags", ing(hpApp) === "traefik, lan, internal", ing(hpApp));
+check("a proxied service that publishes a port holds both tags", ing(hpApp) === "traefik, lan", ing(hpApp));
 check(
   "cross-stack authentik@docker still resolves",
   hpApp.auth.method === "authentik-forward-auth",
@@ -710,7 +714,13 @@ check("a lone service with nothing declared is no-ingress", ing(eSvc("interp", "
 check("...and so is the other one", ing(eSvc("ldapapp", "wiki")) === "none", ing(eSvc("ldapapp", "wiki")));
 check("no-ingress services are counted", edge.stats.noIngressServices === 2, `got ${edge.stats.noIngressServices}`);
 // A published port is not a reason to assume a neighbour: this service publishes on
-// the LAN and is alone in its stack, so `lan` stands without `internal` beside it.
+// the LAN and is alone in its stack, so `lan` stands on its own.
+//
+// Worth being honest about what this can and cannot catch now. Since `internal` is
+// withheld beside any external kind, a service with `lan` would read `lan` whether or
+// not it had a neighbour, so this line no longer distinguishes the two. What still pins
+// "`internal` is positive evidence, never a fallback" is the pair just above —
+// `interp/web` and `ldapapp/wiki` classify as `none`, and a fallback would say `internal`.
 check(
   "a published port alone does not imply internal reachability",
   ing(eSvc("accepted", "status")) === "lan",
@@ -987,13 +997,17 @@ check(
 );
 // The other half of the drift pair. `staledecl` disagrees about the primary kind as
 // well, so on its own it cannot tell a set comparison from a single-value one: this
-// service is `traefik, internal` against an expected `traefik, lan`, so the first kind
+// service is `public, traefik` against an expected `public, lan`, so the first kind
 // matches and everything after it does not.
+//
+// Both differences are external kinds on purpose. `internal` would be withheld from a
+// service with a route, so a disagreement phrased with it would collapse to a
+// one-directional one and this assertion would pass while covering half of what it says.
 const pdApi = eSvc("partialdrift", "api");
 check(
   "an expectation that agrees about the primary kind and nothing else still drifts",
-  ing(pdApi) === "traefik, internal" &&
-    pdApi.declared?.drift.some((d) => d.includes("missing: lan") && d.includes("unexpected: internal")) === true,
+  ing(pdApi) === "public, traefik" &&
+    pdApi.declared?.drift.some((d) => d.includes("missing: lan") && d.includes("unexpected: traefik")) === true,
   `${ing(pdApi)}: ${JSON.stringify(pdApi.declared?.drift)}`,
 );
 check("drift has its own counter too", edge.stats.declarationDrift === 3, `got ${edge.stats.declarationDrift}`);
@@ -1046,8 +1060,8 @@ check(
 // compared as a set on the way out, so this has to be silence rather than drift.
 check(
   "a multi-kind expectation that agrees with the scan is not a disagreement",
-  ing(dcDefence) === "traefik, internal" &&
-    dcDefence.declared?.expectedIngress?.join(",") === "traefik,internal" &&
+  ing(dcDefence) === "traefik, lan" &&
+    dcDefence.declared?.expectedIngress?.join(",") === "traefik,lan" &&
     dcDefence.declared.drift.every((d) => !d.includes("expects ingress")),
   `${ing(dcDefence)} vs ${JSON.stringify(dcDefence.declared?.expectedIngress)}: ${JSON.stringify(dcDefence.declared?.drift)}`,
 );
@@ -1082,7 +1096,7 @@ check(
 // sidecar the same statement however it was typed.
 check(
   "...and an expectation that holds is a match in any order, so its row never renders",
-  ingressMatchesExpectation(["internal", "traefik"], dcDefence.ingress) &&
+  ingressMatchesExpectation(["lan", "traefik"], dcDefence.ingress) &&
     ingressMatchesExpectation(dcDefence.declared?.expectedIngress ?? [], dcDefence.ingress) &&
     !ingressMatchesExpectation(["lan", "public", "traefik"], ["traefik", "public"]) &&
     ingressMatchesExpectation(["lan", "public", "traefik"], ["traefik", "lan", "public"]),
@@ -1415,6 +1429,34 @@ check(
   dupIngress.services.get("app")?.expectedIngress?.join(", ") === "public, lan",
   JSON.stringify(dupIngress.services.get("app")?.expectedIngress),
 );
+// The sidecar side of the withholding rule, and the reason the rule lives in
+// `normalizeIngress` rather than in the classifier. An operator writing down everything
+// that is true of a service — including the container network, which is true of nearly
+// all of them — must not be told they are wrong about a scan that will never report it.
+// So the declared `internal` is dropped here, quietly, leaving an expectation the scan
+// can actually match. The internal-only expectation below is the other half: there it is
+// the whole statement, and it survives untouched.
+const impliedInternal = parseSidecar(
+  "services:\n  app:\n    expected:\n      ingress: [public, lan, internal]\n",
+  names,
+  ".labview",
+);
+check(
+  "a declared `internal` beside an external kind is dropped, not drifted against",
+  impliedInternal.services.get("app")?.expectedIngress?.join(", ") === "public, lan" &&
+    impliedInternal.warnings.length === 0,
+  `${JSON.stringify(impliedInternal.services.get("app")?.expectedIngress)} ${JSON.stringify(impliedInternal.warnings)}`,
+);
+const onlyInternal = parseSidecar(
+  "services:\n  app:\n    expected:\n      ingress: internal\n",
+  names,
+  ".labview",
+);
+check(
+  "...and on its own it is an expectation like any other",
+  onlyInternal.services.get("app")?.expectedIngress?.join(", ") === "internal",
+  JSON.stringify(onlyInternal.services.get("app")?.expectedIngress),
+);
 const linkCred = parseSidecar("links:\n  - url: https://admin:hunter2@example.com/panel\n", names, ".labview");
 check(
   "a password embedded in a declared url is redacted, since no mask reaches prose",
@@ -1459,9 +1501,12 @@ check(
 // The skeleton is the only documentation most operators will read, so it has to
 // demonstrate the multi-kind form rather than describe it — and if the parser ever
 // stops accepting a list, the file shipped as an example is the first thing to break.
+// Two kinds, both external: the example is also the one place the `internal` rule would
+// be most tempting to write out, so it must not hand an operator a list that the reader
+// silently shortens.
 check(
-  "...including the skeleton's own multi-kind expectation, parsed as three kinds",
-  skeleton.services.get("emby")?.expectedIngress?.join(", ") === "public, lan, internal",
+  "...including the skeleton's own multi-kind expectation, parsed as two kinds",
+  skeleton.services.get("emby")?.expectedIngress?.join(", ") === "public, lan",
   JSON.stringify(skeleton.services.get("emby")?.expectedIngress),
 );
 // The size cap is I/O, so it is the one rule that needs a file — written to a temp
@@ -4002,18 +4047,94 @@ check(
 );
 
 console.log("\nthe ingress vocabulary normalizes on the way in");
-// `normalizeIngress` is the only constructor, so these three rules hold everywhere a
-// tag set exists — the classifier, the sidecar and any future source.
+// `normalizeIngress` is the only constructor, so these rules hold everywhere a tag set
+// exists — the classifier, the sidecar and any future source.
 const kinds = (...k: IngressKind[]): string => normalizeIngress(k).join(", ");
 check("duplicates collapse", kinds("lan", "lan", "public", "lan") === "public, lan", kinds("lan", "lan", "public", "lan"));
 check(
   "order is canonical, most exposed first, whatever order they arrived in",
-  kinds("internal", "lan", "traefik", "public") === "public, traefik, lan, internal",
-  kinds("internal", "lan", "traefik", "public"),
+  kinds("lan", "traefik", "public") === "public, traefik, lan",
+  kinds("lan", "traefik", "public"),
 );
 // The invariant the whole model rests on: a service always carries at least one tag,
 // so no view has to render an empty cell and no filter has to special-case nothing.
 check("an empty set becomes no-ingress rather than staying empty", kinds() === "none", kinds());
+// The withholding rule, enumerated from the vocabulary rather than from a hand-written
+// list of three: a kind added to `INGRESS_KINDS` and forgotten here would otherwise
+// leave `internal` sitting beside it, which is the whole thing this prevents.
+const externals = INGRESS_KINDS.filter((k) => k !== "internal" && k !== "none");
+check(
+  "`internal` is withheld beside every external kind there is",
+  externals.length === 3 && externals.every((k) => kinds("internal", k) === k),
+  externals.map((k) => `${k}: ${kinds("internal", k)}`).join(" | "),
+);
+check(
+  "...and beside all of them at once",
+  kinds("internal", ...externals) === "public, traefik, lan",
+  kinds("internal", ...externals),
+);
+// The other half, and the reason this is a withholding rather than a deletion: with
+// nothing external beside it, `internal` is the answer and is kept.
+check("...but stands alone when it is the only way in", kinds("internal") === "internal", kinds("internal"));
+check(
+  "...and `none` is not an external kind, so it cannot displace it either",
+  kinds("internal", "none") === "internal",
+  kinds("internal", "none"),
+);
+// The same rule as a property of every service both fixture roots produce, rather than of
+// the handful with a line of their own further up. A stack added later, a fourth external
+// kind, or a second classifier is covered by this without anyone remembering to extend a
+// list — and it is the assertion a revert of the withholding cannot get past.
+const everyService = [ov, edge].flatMap((o) => o.stacks.flatMap((s) => s.services));
+const bothAtOnce = everyService.filter((s) => s.ingress.includes("internal") && isExternallyReachable(s.ingress));
+check(
+  "no service anywhere carries `internal` beside a way in from outside",
+  bothAtOnce.length === 0 && everyService.length > 0,
+  `${bothAtOnce.length} of ${everyService.length}: ${bothAtOnce.map((s) => `${s.name}=${ing(s)}`).join(" | ")}`,
+);
+// And the counter is that partition, read off the tags rather than re-derived from
+// reachability — which would quietly fold in the services nothing reaches at all.
+const internalOnly = edge.stacks.flatMap((s) => s.services).filter((s) => ing(s) === "internal");
+check(
+  "...and `internalServices` counts exactly the services it is the only way in to",
+  edge.stats.internalServices === internalOnly.length && internalOnly.length > 0,
+  `${edge.stats.internalServices} counted, ${internalOnly.length} internal-only, ${edge.stats.noIngressServices} unreachable`,
+);
+// The stack row is the one place the withholding must NOT apply, and now the only place a
+// stack-level `internal` appears at all: a public frontend beside a database only its
+// neighbour can reach is a stack that is both, and rolling the union through the service
+// rule would let the frontend's exposure erase the database from the collapsed view. Every
+// mixed stack in the fixtures is checked, not one named example.
+const mixed = edge.stacks.filter(
+  (s) => s.services.some((v) => isExternallyReachable(v.ingress)) && s.services.some((v) => ing(v) === "internal"),
+);
+const rolledUp = mixed.map((s) => rollUpIngress(s.services.map((v) => v.ingress)));
+check(
+  "a stack keeps `internal` in its roll-up even when a sibling is reachable from outside",
+  mixed.length > 0 && rolledUp.every((r) => r.includes("internal") && isExternallyReachable(r)),
+  `${mixed.length} mixed stack(s): ${rolledUp.map((r) => r.join("+")).join(" | ")}`,
+);
+// ...while the services underneath it still carry the rule, so the badge on the row and the
+// badges on the rows below say different things on purpose.
+check(
+  "...and none of its externally reachable services carries the tag itself",
+  mixed.flatMap((s) => s.services).filter((v) => isExternallyReachable(v.ingress) && v.ingress.includes("internal"))
+    .length === 0,
+  mixed
+    .flatMap((s) => s.services)
+    .filter((v) => isExternallyReachable(v.ingress))
+    .map((v) => ing(v))
+    .join(" | "),
+);
+// A stack of one internal-only service rolls up to exactly that, so the union is not
+// smuggling the tag in from somewhere.
+const soloInternal = edge.stacks.filter((s) => s.services.every((v) => ing(v) === "internal"));
+check(
+  "...and a stack whose every service is internal-only rolls up to just `internal`",
+  soloInternal.length > 0 &&
+    soloInternal.every((s) => rollUpIngress(s.services.map((v) => v.ingress)).join(", ") === "internal"),
+  `${soloInternal.length} stack(s)`,
+);
 
 console.log("\nthe tag filter: OR, AND and NOT");
 // A truth table, because the UI is never rendered here and clicking three chips in a
@@ -4034,7 +4155,10 @@ check(
     !matchesTagFilter(["public"], F(["public", "lan"], [], "all")),
 );
 check("...and the same pair under `any` accepts the one-tag service", matchesTagFilter(["public"], F(["public", "lan"])));
-check("an exclude is AND-NOT", !matchesTagFilter(["public", "internal"], F([], ["internal"])));
+// Tag sets the classifier can actually produce, here and throughout: `internal` never
+// arrives beside an external kind, so a truth table built on `["public", "internal"]`
+// would read as an example of something the model forbids.
+check("an exclude is AND-NOT", !matchesTagFilter(["traefik", "lan"], F([], ["lan"])));
 check("...and passes a service that lacks it", matchesTagFilter(["public"], F([], ["internal"])));
 // The one genuinely ambiguous case, decided in `matchesTagFilter` and pinned here:
 // a contradictory filter rejects rather than quietly dropping half of itself.

@@ -836,8 +836,8 @@ export interface Graph {
  *  - `traefik` — the reverse proxy routes to it.
  *  - `lan` — a `ports:` entry publishes it at `hostIP:port`, answerable with no proxy
  *    and therefore no proxy-level SSO in the path.
- *  - `internal` — another container demonstrably can reach it: it declares `expose:`,
- *    or it shares a docker network with another scanned service.
+ *  - `internal` — another container demonstrably can reach it (it declares `expose:`, or
+ *    it shares a docker network with another scanned service) **and nothing else can**.
  *  - `none` — none of the above. A worker, a cron job, a one-shot init container.
  *
  * **Nothing here is combined and nothing is a fallback.** A proxied service that also
@@ -845,8 +845,14 @@ export interface Graph {
  * positive evidence of container-network reachability rather than "whatever was left
  * over", which is what makes `none` a real, populated category worth filtering on.
  *
+ * The three external kinds are independent of each other, and `internal` is the one
+ * kind that yields: almost every service in a fleet shares a network with a neighbour,
+ * so beside `public`, `traefik` or `lan` it is a tag true of nearly everything, and
+ * `normalizeIngress` withholds it there. What is left is the useful set — the services
+ * a neighbour and *only* a neighbour can reach.
+ *
  * Build a set only through `normalizeIngress` (`model/ingress.ts`): deduped, in
- * canonical order, never empty.
+ * canonical order, never empty, `internal` only when alone.
  */
 export type IngressKind = "public" | "traefik" | "lan" | "internal" | "none";
 
@@ -861,10 +867,15 @@ export interface OverviewStats {
    * of them, because all three are true of it. Anything presenting them as a
    * part-to-whole split would be presenting a number that is not there — the
    * dashboard draws them as five independent gauges for exactly this reason.
+   *
+   * The first three are what overlap. `internalServices` and `noIngressServices` are
+   * each exclusive of every other counter, since a service only carries `internal` when
+   * that is the only way in.
    */
   publicServices: number;
   traefikServices: number;
   lanServices: number;
+  /** Services a neighbouring container can reach, and nothing outside the container network can. */
   internalServices: number;
   /** Services nothing was found to reach, inside the container network or out. */
   noIngressServices: number;
