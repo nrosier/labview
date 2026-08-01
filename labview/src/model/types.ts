@@ -548,11 +548,20 @@ export interface AuthPosture {
  *
  * **A declaration is a second source, not stronger evidence.** It lives here, in
  * its own field, precisely so it can never be mistaken for something the scan
- * proved: `AuthPosture` is derived only from observable config and API state
- * (invariant I1) and is left untouched by everything in this section. A future
- * change must not "simplify" this by folding a declared mechanism into
- * `AuthPosture.method` or by adding a `declared` value to `AuthConfidence` —
- * confidence measures how strong the *evidence* is, and there is no evidence here.
+ * proved: `AuthPosture.method`, `.detail`, `.evidence` and `.confidence` are derived
+ * only from observable config and API state (invariant I1) and are left untouched by
+ * everything in this section, as are `OverviewStats.authProtected` and
+ * `.byAuthMethod`. A future change must not "simplify" this by folding a declared
+ * mechanism into `AuthPosture.method` or by adding a `declared` value to
+ * `AuthConfidence` — confidence measures how strong the *evidence* is, and there is
+ * no evidence here.
+ *
+ * The one field a declaration does reach is `AuthPosture.exposedWithoutAuth`, which
+ * is not a measurement but a *verdict* — "does a reader need to act on this" — and
+ * the operator's statement is an answer to that question. It is reported as its own
+ * outcome (`DeclaredAuthAgreement.supplies`) and counted in its own statistic, so the
+ * services resting on an unverifiable claim stay separable from the ones the scan
+ * proved.
  *
  * Named by mechanism and never by product (invariant I3): the same fleet may run
  * any application, and `app-local-accounts` is true of a hundred of them.
@@ -583,6 +592,38 @@ export interface DeclaredAuth {
   /** The operator's own words. Required for `other`, optional otherwise. */
   detail?: string;
 }
+
+/**
+ * A mechanism both vocabularies can name — the only ground on which a declaration and
+ * a detection can be compared at all.
+ *
+ * `DeclaredAuthMechanism` has nine members and `AuthMethod` eight, but they meet in
+ * three places; everything else one side can say, the other cannot. Deliberately not a
+ * superset of either: a family exists so two statements can be checked against each
+ * other, and where that check is impossible there must be no family to imply otherwise.
+ */
+export type AuthFamily = "oidc" | "ldap" | "proxy";
+
+/** How a declared mechanism stands relative to what the scan detected. */
+export type DeclaredAuthAgreement =
+  /**
+   * The scan found nothing and the service answers from outside: the declaration is
+   * the only reason it is not flagged. Reported in its own right, because the verdict
+   * now rests on a statement no scan can check.
+   */
+  | "supplies"
+  /** The scan detected the same family. Shown nowhere — it would repeat the scan. */
+  | "redundant"
+  /**
+   * Both sides name a mechanism at the same tier of the request path and they name
+   * different ones. One of the two is out of date; which one, only the operator knows.
+   */
+  | "conflicts"
+  /**
+   * Anything else: a mechanism the scan cannot observe, sitting alongside or behind
+   * whatever it did observe. The ordinary case for a layered setup, and not a warning.
+   */
+  | "supplements";
 
 /** A named URL from the sidecar (admin UI, upstream docs, a ticket). */
 export interface DeclaredLink {
@@ -623,7 +664,12 @@ export interface ServiceDeclaration extends Declaration {
    *
    * This never clears `AuthPosture.exposedWithoutAuth`: the service is still
    * reachable without authentication, which stays a fact. It records that the fact
-   * was reviewed.
+   * was reviewed — which is why the dashboard reads `23/28` rather than `23`: the
+   * finding is still counted, and separately shown to have been accepted.
+   *
+   * Note the difference from a declared *mechanism*, which does clear the flag: this
+   * says "nothing authenticates it and that is fine", so there is a finding to accept.
+   * That says "something authenticates it that you cannot see", so there is not.
    */
   unauthenticatedAccepted?: { reason: string };
   /**
@@ -638,6 +684,14 @@ export interface ServiceDeclaration extends Declaration {
    * by the analyzer, one entry per disagreement.
    */
   drift: string[];
+  /**
+   * How `auth` above stands relative to the detected posture. Filled by the analyzer;
+   * absent when nothing was declared, so `auth.length` and this are set together.
+   *
+   * Derived rather than parsed, which is why {@link Service} comparisons must ignore
+   * it: a change here means the *scan* moved, not that anyone edited the sidecar.
+   */
+  authAgreement?: DeclaredAuthAgreement;
 }
 
 /** Live data merged from the Docker Engine (present only when the socket works). */
@@ -818,13 +872,20 @@ export interface OverviewStats {
   exposedWithoutAuth: number;
   byAuthMethod: Record<string, number>;
   /**
-   * The three declaration counters. All of them count what the *operator* stated in
-   * a `.labview` file, and none of them move a detection metric — `authProtected`,
-   * `exposedWithoutAuth` and `byAuthMethod` above stay derived from evidence alone,
-   * so a fleet with no sidecar anywhere reads exactly as it did before.
+   * The four declaration counters. All of them count what the *operator* stated in a
+   * `.labview` file. `authProtected` and `byAuthMethod` above stay derived from
+   * evidence alone and none of these feeds them, so the "protected" figure keeps
+   * meaning *proven* protected; a fleet with no sidecar anywhere reads exactly as it
+   * did before the feature existed.
    */
   /** Services with at least one declared authentication mechanism. */
   declaredAuth: number;
+  /**
+   * Services that would be counted in `exposedWithoutAuth` but for a declared
+   * mechanism — the one place a declaration changes a verdict, kept visible as its own
+   * number so what left the exposed count can be found again.
+   */
+  declaredAuthProtected: number;
   /** Services that are `exposedWithoutAuth` **and** carry an accepted declaration. */
   exposureAccepted: number;
   /** Services whose declaration disagrees with what the scan found. */

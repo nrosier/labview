@@ -101,3 +101,23 @@ export function diffIngress(
     unexpected: actual.filter((k) => !expected.includes(k)),
   };
 }
+
+/**
+ * Whether a declared expectation and the classification agree.
+ *
+ * Read off {@link diffIngress} rather than compared separately, so the analyzer's drift
+ * note and the UI row that renders only on disagreement cannot reach opposite
+ * conclusions about one service. Sets, not sequences: the same kinds in any order are
+ * the same expectation.
+ *
+ * Here rather than in the component for the same reason `matchesTagFilter` is — a render
+ * decision in a `.tsx` file is unassertable, and "agreement is silent" is precisely the
+ * kind of rule that regresses invisibly.
+ */
+export function ingressMatchesExpectation(
+  expected: readonly IngressKind[],
+  actual: readonly IngressKind[],
+): boolean {
+  const { missing, unexpected } = diffIngress(expected, actual);
+  return missing.length === 0 && unexpected.length === 0;
+}

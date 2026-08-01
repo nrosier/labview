@@ -1,4 +1,4 @@
-import type { DeclaredAuth, DeclaredAuthMechanism } from "./types.js";
+import type { AuthFamily, AuthMethod, DeclaredAuth, DeclaredAuthAgreement, DeclaredAuthMechanism } from "./types.js";
 
 /**
  * The runtime side of the declaration vocabulary: the values a `.labview` file may
@@ -59,4 +59,158 @@ export function declaredAuthSummary(auth: readonly DeclaredAuth[]): string {
   return auth
     .map((a) => (a.detail ? `${declaredAuthLabel(a.mechanism)} (${a.detail})` : declaredAuthLabel(a.mechanism)))
     .join("; ");
+}
+
+/**
+ * The exposure figure as `23/28` — findings needing attention over findings found.
+ *
+ * Here, beside the declaration vocabulary, because the two numbers only differ on
+ * account of a declaration; and one implementation rather than two because the
+ * dashboard tile and the CLI line must not be able to describe the same scan
+ * differently.
+ *
+ * A plain total when nothing was accepted: `28/28` reads as though five are missing.
+ * `accepted` can never exceed `exposed` — a service is only counted as accepted if it
+ * is counted as exposed — so no clamp, which would hide that being untrue.
+ */
+export function formatExposureCount(exposed: number, accepted: number): string {
+  return accepted > 0 ? `${exposed - accepted}/${exposed}` : String(exposed);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Comparing a declaration against what the scan detected                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The three mechanisms both vocabularies can name.
+ *
+ * `DeclaredAuthMechanism` and `AuthMethod` describe *different things* — the first
+ * what an application does for itself, the second what LabView could see in front of
+ * it — and they overlap in only three places. Comparing them anywhere else produces a
+ * disagreement out of two statements that are both true, which is why the two maps
+ * below are deliberately partial: an absent entry means "not comparable", and that is
+ * the common case.
+ */
+const DECLARED_FAMILY: Partial<Record<DeclaredAuthMechanism, AuthFamily>> = {
+  "app-oidc": "oidc",
+  "app-ldap": "ldap",
+  "external-proxy": "proxy",
+};
+
+/** The same three families as the scan names them. Providers are irrelevant here. */
+const DETECTED_FAMILY: Partial<Record<AuthMethod, AuthFamily>> = {
+  "authentik-oauth": "oidc",
+  "other-oauth": "oidc",
+  "authentik-ldap": "ldap",
+  ldap: "ldap",
+  "authentik-forward-auth": "proxy",
+  "forward-auth": "proxy",
+};
+
+/**
+ * Which tier of the request path each family sits in.
+ *
+ * Two mechanisms only contradict each other when they answer the same question. "How
+ * does the app log a user in" (`oidc`, `ldap`) and "what stands in front of the app"
+ * (`proxy`) are different questions, so a declared OIDC login behind a detected
+ * forward-auth gate is defence in depth rather than drift — the single rule that keeps
+ * every layered setup out of the warning path.
+ */
+const FAMILY_LAYER: Record<AuthFamily, "app" | "proxy"> = {
+  oidc: "app",
+  ldap: "app",
+  proxy: "proxy",
+};
+
+/**
+ * How a declaration stands relative to the scan.
+ *
+ * `wouldBeExposed` is the exposure verdict *without* the declaration — reachable from
+ * outside with nothing observable in front. It is passed in rather than re-derived
+ * because the caller has already established it and the two must not be able to
+ * disagree: whenever this returns `supplies`, that is exactly the service the
+ * declaration took out of the exposed count.
+ *
+ * Returns `undefined` when nothing was declared, which is not an outcome but the
+ * absence of one — there is nothing to compare and nothing to show.
+ */
+export function compareDeclaredAuth(
+  declared: readonly DeclaredAuth[],
+  detected: AuthMethod,
+  wouldBeExposed: boolean,
+): DeclaredAuthAgreement | undefined {
+  if (!declared.length) return undefined;
+
+  // Load-bearing: the declaration is the only reason this service is not flagged.
+  // Necessarily means the scan detected nothing (`wouldBeExposed` already accounts for
+  // gates that carry no `AuthMethod`), so this can never coincide with a family
+  // comparison below — a declaration changes the verdict only in this one case.
+  if (wouldBeExposed) return "supplies";
+
+  const detectedFamily = DETECTED_FAMILY[detected];
+  // `basic-auth`, `none`, or a gate with no method: nothing to compare against.
+  if (!detectedFamily) return "supplements";
+
+  // The scan already says all of this, so there is nothing left to tell the reader.
+  if (declared.every((a) => DECLARED_FAMILY[a.mechanism] === detectedFamily)) return "redundant";
+
+  const families = declared
+    .map((a) => DECLARED_FAMILY[a.mechanism])
+    .filter((f): f is AuthFamily => f !== undefined);
+  const layer = FAMILY_LAYER[detectedFamily];
+  // Both sides name a mechanism at the same tier and they name different ones: one of
+  // the two is out of date. If either side also names the detected family, they agree
+  // about that tier and whatever else is declared is additional, not contradictory.
+  if (families.some((f) => FAMILY_LAYER[f] === layer) && !families.includes(detectedFamily)) {
+    return "conflicts";
+  }
+  return "supplements";
+}
+
+/**
+ * Whether a declared mechanism is worth putting in front of a reader at all.
+ *
+ * `redundant` is the one outcome that renders nowhere: the scan detected the same
+ * family, so a second statement of it sends the reader to check two sources that agree
+ * and buries the declarations that do add something. Every other outcome — including
+ * `conflicts`, which is a disagreement worth reading — is shown.
+ *
+ * In the model rather than in the components because three call sites share it (the
+ * badge on the stack row, the badge in the drawer, the declared `Authentication` row)
+ * and because a rule that only exists inside a `.tsx` file cannot be asserted.
+ */
+export function showsDeclaredAuth(agreement: DeclaredAuthAgreement | undefined): boolean {
+  return agreement !== "redundant";
+}
+
+/**
+ * Which family each side names, or `undefined` where that side's vocabulary has no
+ * counterpart. Exported so the tests can enumerate the incomparable mechanisms from
+ * the maps themselves rather than from a hand-written list that could fall behind them.
+ */
+export function declaredAuthFamily(mechanism: DeclaredAuthMechanism): AuthFamily | undefined {
+  return DECLARED_FAMILY[mechanism];
+}
+
+export function detectedAuthFamily(detected: AuthMethod): AuthFamily | undefined {
+  return DETECTED_FAMILY[detected];
+}
+
+/** What a family is about, for the sentence that reports a conflict. */
+const FAMILY_SUBJECT: Record<AuthFamily, string> = {
+  oidc: "the app's own login",
+  ldap: "the app's own login",
+  proxy: "the gate in front of the app",
+};
+
+/**
+ * How to refer to the tier a detected method sits in, in a sentence.
+ *
+ * Only ever called for a method that has a family — a conflict cannot arise without
+ * one — so the fallback exists to keep the caller branchless, not because it describes
+ * a real case.
+ */
+export function detectedAuthSubject(detected: AuthMethod): string {
+  const family = DETECTED_FAMILY[detected];
+  return family ? FAMILY_SUBJECT[family] : "the same mechanism";
 }

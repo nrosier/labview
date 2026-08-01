@@ -1,7 +1,15 @@
 import type { AppStack, AuthMethod, IngressKind, Service } from "../model";
 import { ingressSummary, shortImage } from "../lib/format";
 import { AUTH_META, INGRESS_META } from "../lib/palette";
-import { AcceptedBadge, AuthBadge, DeclaredAuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
+import {
+  AcceptedBadge,
+  AuthBadge,
+  DeclaredAuthBadge,
+  DeclaredProtectedBadge,
+  ExposedBadge,
+  IngressBadge,
+  StatusDot,
+} from "./badges";
 
 /**
  * One stack, the unit a compose fleet is actually organised in: a directory with a
@@ -168,16 +176,26 @@ export function StackCard({
                   <IngressBadge key={k} kind={k} />
                 ))}
                 <AuthBadge method={svc.auth.method} />
-                {svc.auth.exposedWithoutAuth &&
-                  (svc.declared?.unauthenticatedAccepted ? (
+                {/* One slot, three mutually exclusive outcomes — see `AppDetail`. */}
+                {svc.auth.exposedWithoutAuth ? (
+                  svc.declared?.unauthenticatedAccepted ? (
                     <AcceptedBadge
                       reason={svc.declared.unauthenticatedAccepted.reason}
                       file={svc.declared.file}
                     />
                   ) : (
                     <ExposedBadge />
-                  ))}
-                {svc.declared && <DeclaredAuthBadge auth={svc.declared.auth} file={svc.declared.file} />}
+                  )
+                ) : svc.declared?.authAgreement === "supplies" ? (
+                  <DeclaredProtectedBadge auth={svc.declared.auth} file={svc.declared.file} />
+                ) : null}
+                {svc.declared && (
+                  <DeclaredAuthBadge
+                    auth={svc.declared.auth}
+                    file={svc.declared.file}
+                    agreement={svc.declared.authAgreement}
+                  />
+                )}
               </span>
             </div>
           ))}

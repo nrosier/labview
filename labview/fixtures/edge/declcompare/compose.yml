@@ -1,0 +1,71 @@
+# Regression fixture: comparing a declaration against what the scan detected.
+#
+# Four services, one variable. The first three are configured *identically* — the same
+# LDAP environment, nothing published, nothing in front — so the scan reaches the same
+# conclusion about all three, and the only thing that differs is what the sidecar
+# beside this file declares. Whatever the comparison decides, it decided it from the
+# declaration alone.
+#
+# Nothing here publishes a port and nothing here has a tunnel route, so all four are
+# reachable only from the container network. That is deliberate: a declaration changes
+# the exposure verdict in exactly one case (nothing detected, reachable from outside),
+# and this fixture is about the other half of the feature — which declarations are
+# reported, which are a disagreement, and which are not worth saying twice.
+# `declared/media` covers the exposure case.
+#
+# The fourth service is the one that must NOT warn: the app declares its own OIDC
+# login while the scan detects a forward-auth gate in front of it. Both are true, they
+# describe different tiers of the request path, and reporting that as drift would warn
+# on every layered setup there is.
+services:
+  # Declares the app logs users in with OIDC; the scan found it binding LDAP. Both
+  # statements are about the app's own login, so one of them is out of date.
+  conflict:
+    image: example/tracker:3.1.0
+    container_name: declcompare-conflict
+    environment:
+      LDAP_HOST: ldap://directory.example.internal:389
+      LDAP_BIND_DN: cn=svc,dc=example
+      LDAP_BIND_PASSWORD: hunter2
+
+  # Declares exactly what the scan detected. Nothing to report: repeating it under
+  # "declared" would send a reader to check two sources that agree.
+  redundant:
+    image: example/tracker:3.1.0
+    container_name: declcompare-redundant
+    environment:
+      LDAP_HOST: ldap://directory.example.internal:389
+      LDAP_BIND_DN: cn=svc,dc=example
+      LDAP_BIND_PASSWORD: hunter2
+
+  # Declares a mechanism no scan can observe, alongside one it did. Reported, not
+  # warned about — the two are not answers to the same question.
+  layered:
+    image: example/tracker:3.1.0
+    container_name: declcompare-layered
+    environment:
+      LDAP_HOST: ldap://directory.example.internal:389
+      LDAP_BIND_DN: cn=svc,dc=example
+      LDAP_BIND_PASSWORD: hunter2
+
+  # Defence in depth: a proxy gate detected in front (the middleware resolves to the
+  # SSO defined in `authentik/`), the app's own OIDC login declared behind it. Same
+  # declared mechanism as `conflict` above, opposite outcome — because what the scan
+  # detected sits at a different tier. This is the pair that pins the layer rule.
+  defence:
+    image: example/portal:2.0.0
+    container_name: declcompare-defence
+    expose:
+      - "8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dcportal.rule=Host(`portal.edge.example.com`)"
+      - "traefik.http.routers.dcportal.entrypoints=websecure"
+      - "traefik.http.routers.dcportal.middlewares=authentik@docker"
+      - "traefik.http.services.dcportal.loadbalancer.server.port=8080"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

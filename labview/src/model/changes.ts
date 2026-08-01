@@ -23,7 +23,14 @@
  * effect. A comment-only edit is therefore not a change, and neither is a rewrite that
  * produces the same document.
  */
-import type { AppStack, AuthentikSummary, Overview, Service, TraefikSummary } from "./types.js";
+import type {
+  AppStack,
+  AuthentikSummary,
+  Overview,
+  Service,
+  ServiceDeclaration,
+  TraefikSummary,
+} from "./types.js";
 import { plural } from "./connections.js";
 
 /** What moved inside one stack that exists in both scans. */
@@ -83,14 +90,37 @@ const VOLATILE_SERVICE_FIELDS: readonly string[] = [
   "cloudflare",
 ];
 
+/**
+ * Members of a `declared` block the *analyzer* writes, which must be excluded for the
+ * same reason as the volatile fields above.
+ *
+ * A declaration is parsed from a file, so it belongs in the comparison — an edited
+ * sidecar is exactly the kind of change this is here to report. But `drift` and
+ * `authAgreement` are conclusions about the scan that happen to be stored on the
+ * declaration, so a service whose *detected* posture moved would otherwise be reported
+ * as an edited file, which is the one thing the deny-list above exists to prevent.
+ */
+const DERIVED_DECLARATION_FIELDS: readonly string[] = ["drift", "authAgreement"];
+
 /** Everything about a service that came out of the compose document, as one string. */
 function serviceConfig(svc: Service): string {
   const view: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(svc)) {
-    if (VOLATILE_SERVICE_FIELDS.includes(key)) continue;
+    if (VOLATILE_SERVICE_FIELDS.includes(key) || key === "declared") continue;
     view[key] = value;
   }
+  if (svc.declared) view.declared = declarationConfig(svc.declared);
   return stableStringify(view);
+}
+
+/** The sidecar as it was written, without what the analyzer added to it. */
+function declarationConfig(declared: ServiceDeclaration): Record<string, unknown> {
+  const view: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(declared)) {
+    if (DERIVED_DECLARATION_FIELDS.includes(key)) continue;
+    view[key] = value;
+  }
+  return view;
 }
 
 /** The stack's own configuration, without its services — those are compared by name. */

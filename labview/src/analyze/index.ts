@@ -15,7 +15,7 @@ import {
   isAuthMiddlewareRef,
   providerEnforces,
 } from "../labels/auth.js";
-import { declaredAuthSummary } from "../model/declarations.js";
+import { compareDeclaredAuth, declaredAuthSummary, detectedAuthSubject } from "../model/declarations.js";
 import {
   diffIngress,
   externalIngress,
@@ -292,7 +292,16 @@ function finalizeAuth(
   // proxy, or straight at a published port on the LAN. `internal` and `none` are
   // not — a container reaching another container is not exposure.
   const reachable = isExternallyReachable(svc.ingress);
-  svc.auth.exposedWithoutAuth = reachable && !hasEdgeAuth;
+  // The verdict, and the one place a `.labview` file changes an answer. `hasEdgeAuth`
+  // above stays evidence-only; the declaration is a separate term, so the two sources
+  // never merge and the count can always be reconstructed with the term dropped.
+  //
+  // Deliberately not `!svc.declared?.unauthenticatedAccepted` as well: an acceptance
+  // says the exposure is fine, which leaves it an exposure. A declared mechanism says
+  // there is no exposure. Only the second is grounds for not counting it.
+  const wouldBeExposed = reachable && !hasEdgeAuth;
+  const declaredAuth = svc.declared?.auth ?? [];
+  svc.auth.exposedWithoutAuth = wouldBeExposed && declaredAuth.length === 0;
 
   if (svc.auth.exposedWithoutAuth) {
     // An accepted exposure is still an exposure — the flag above is not cleared. What
@@ -314,7 +323,7 @@ function finalizeAuth(
       `Auth posture (${svc.auth.method}) inferred from a middleware name — its definition was not found in any scanned stack, so it could not be confirmed.`,
     );
   }
-  noteDeclarations(svc);
+  noteDeclarations(svc, wouldBeExposed);
   noteHostPortBypass(svc);
   noteAuthentikGaps(svc);
   noteTraefikLive(svc, key, live);
@@ -381,39 +390,67 @@ function sharedNetworks(stacks: AppStack[]): Set<string> {
 }
 
 /**
- * Report what the operator declared in a `.labview` sidecar, and where that
- * declaration and the scan disagree.
+ * Compare what the operator declared in a `.labview` sidecar against what the scan
+ * found: report the part the scan could not see, stay silent about the part it already
+ * says, and record a disagreement where the two contradict each other.
  *
- * The only place in the analyzer that reads a declaration, and deliberately the least
- * powerful one: it appends a note and fills `declared.drift`, and touches no field of
- * `AuthPosture` — not `method`, not `confidence`, not `exposedWithoutAuth`. A
- * declaration is a second source, not stronger evidence (invariant I1), so it is
- * reported beside the detected posture and never folded into it. The note names the
- * file it came from and says outright that the scan did not detect it, so the
- * distinction survives into the CLI and any non-UI consumer of the payload.
+ * The only place in the analyzer that reads a declaration. It touches
+ * `AuthPosture` not at all — `method`, `detail`, `evidence` and `confidence` are
+ * measurements and a declaration is not evidence (invariant I1). `exposedWithoutAuth`
+ * is settled by the caller, which is where the one term a declaration contributes to
+ * that verdict lives; here it is only read.
  *
- * The two drift checks exist because a declaration is the one input here that can go
- * stale silently: the compose file changes, the sidecar does not, and an acceptance
- * written for last year's setup would otherwise keep excusing a service that has
- * since moved.
+ * Three drift checks, all of them for the same reason: a declaration is the one input
+ * that can go stale in silence. The compose file changes, the sidecar does not, and
+ * a statement written for last year's setup would otherwise keep describing — or
+ * excusing — a service that has since moved.
+ *
+ * @param wouldBeExposed the exposure verdict with the declaration left out.
  */
-function noteDeclarations(svc: Service): void {
+function noteDeclarations(svc: Service, wouldBeExposed: boolean): void {
   const declared = svc.declared;
   if (!declared) return;
 
-  if (declared.auth.length) {
+  const agreement = compareDeclaredAuth(declared.auth, svc.auth.method, wouldBeExposed);
+  declared.authAgreement = agreement;
+  const summary = declaredAuthSummary(declared.auth);
+  if (agreement === "supplies") {
+    // Not silent. This service is the one case where the report says "no finding here"
+    // on the strength of something it cannot check, so it says exactly that, in place
+    // of the exposure note it would otherwise have carried.
     svc.notes.push(
-      `Authentication declared in ${declared.file} (not detected by this scan): ${declaredAuthSummary(declared.auth)}.`,
+      `Reachable (${formatIngress(externalIngress(svc.ingress))}) with no detected proxy/SSO authentication — ` +
+        `${declared.file} declares the service authenticates itself (${summary}). Not counted as exposed on the ` +
+        `strength of that declaration, which this scan cannot verify.`,
     );
+  } else if (agreement === "conflicts") {
+    // Both sides named the same tier and named it differently. Which of the two is
+    // stale is not knowable from here, so the note states both and neither wins.
+    declared.drift.push(
+      `${declared.file} declares ${summary}, but the scan detected ${svc.auth.method} (${svc.auth.detail}) — ` +
+        `both describe ${detectedAuthSubject(svc.auth.method)}, so one of the two is out of date.`,
+    );
+    svc.notes.push(`Authentication declared in ${declared.file}: ${summary}.`);
+  } else if (agreement === "supplements") {
+    // Something the scan cannot observe, alongside or behind whatever it did. The
+    // ordinary case, and the only wording that may say "not detected" — under the other
+    // outcomes it either was detected, or it is the reason there is no finding.
+    svc.notes.push(`Authentication declared in ${declared.file} (not detected by this scan): ${summary}.`);
   }
+  // `redundant` deliberately pushes nothing: the scan already reports this mechanism,
+  // and repeating it as a declaration would invite a reader to check two sources that
+  // say the same thing.
 
-  // An acceptance that no longer applies. Either the service is now protected or it is
-  // no longer reachable — in both cases the sidecar is describing something the scan
-  // cannot see any more, and quietly ignoring it would leave the file looking correct.
+  // An acceptance that no longer applies. The service is now protected, or no longer
+  // reachable, or — contradicting itself — declares authentication in the same file. In
+  // every case the sidecar describes something the scan no longer finds, and quietly
+  // ignoring it would leave the file looking correct.
   if (declared.unauthenticatedAccepted && !svc.auth.exposedWithoutAuth) {
     const why = !isExternallyReachable(svc.ingress)
       ? "unreachable from outside the container network"
-      : "authenticated at the edge";
+      : agreement === "supplies"
+        ? "authenticated by the mechanism declared in the same file"
+        : "authenticated at the edge";
     declared.drift.push(
       `${declared.file} marks this service as intentionally unauthenticated, but the scan found it ${why} — the declaration no longer applies.`,
     );
@@ -508,6 +545,7 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     exposedWithoutAuth: 0,
     byAuthMethod: {},
     declaredAuth: 0,
+    declaredAuthProtected: 0,
     exposureAccepted: 0,
     declarationDrift: 0,
   };
@@ -530,6 +568,10 @@ function computeStats(stacks: AppStack[]): OverviewStats {
       // anywhere reads exactly as it did before the feature existed.
       const declared = svc.declared;
       if (declared?.auth.length) stats.declaredAuth++;
+      // Read off the agreement the analyzer recorded rather than re-deriving the
+      // condition, so this counter and the badge beside it cannot disagree about which
+      // services left the exposed count.
+      if (declared?.authAgreement === "supplies") stats.declaredAuthProtected++;
       if (svc.auth.exposedWithoutAuth && declared?.unauthenticatedAccepted) stats.exposureAccepted++;
       if (declared?.drift.length) stats.declarationDrift++;
     }

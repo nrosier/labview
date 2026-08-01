@@ -743,24 +743,36 @@ services:
         detail: LDAP bind against the directory for staff accounts.
 ```
 
-### Two rules that make it trustworthy
+### Three rules that make it trustworthy
 
-Everything here is **a second source, never stronger evidence**. Two rules hold that
-line, and both are deliberate:
+Everything here is **a second source, never stronger evidence**. Three rules hold that
+line, and each is deliberate:
 
 1. **A declaration never changes what was detected.** `svc.auth.method` stays
    `none`, the detected-method distribution does not move, and the declared
    mechanisms are counted only in their own statistic (`stats.declaredAuth`) and
    badged as *declared*. A reader can always tell what LabView proved from what you
    told it.
-2. **Declaring an exposure intentional does not clear it.** A service reachable with
-   no proxy auth stays in `exposedWithoutAuth`, and the tile still shows the number the
-   scan found. What changes is around it: the subtitle reads `1 accepted`, the red goes
-   away only once the *unaccepted* remainder hits zero, the badge says
+2. **It can change one verdict, and only in the open.** `exposedWithoutAuth` is not a
+   measurement, it is a conclusion — *reachable, and nothing authenticates it* — and a
+   declared login is an answer to the second half. So a service that is reachable, has
+   no gate the scan could find, and declares that the app logs users in itself leaves
+   that count. It does not go quiet: it gets a *Protected — declared* badge, its own
+   tile and CLI line (`stats.declaredAuthProtected`), and a note on the service saying
+   the verdict rests on a statement this scan cannot verify. The number that left the
+   alarm is always visible as a number.
+3. **Declaring an exposure intentional does not clear it.** A service reachable with
+   no auth at all stays in `exposedWithoutAuth`, and the tile still shows the number the
+   scan found — as `23/28`: 28 findings, 5 accepted, 23 still wanting an answer. The
+   red goes away only once the *unaccepted* remainder hits zero, the badge says
    *Exposed, accepted*, and your reason is on the finding itself. A decision you can no
    longer see is a decision nobody will revisit. The `reason` is required for exactly
    that purpose — an acceptance with no reason cannot be told apart from a stray key,
    so it is refused and warned about.
+
+Rules 2 and 3 are two different statements and not interchangeable: `auth` says there
+*is* a login the scan cannot see, `unauthenticated` says there is *not* one and that is
+fine here. Only the first can take a service out of the count.
 
 ### What you can declare
 
@@ -775,25 +787,62 @@ line, and both are deliberate:
 | `unauthenticated` | service | that reachable-without-auth is a decision, with the reason |
 | `expected.ingress` | service | a tripwire: the reachability you expect, checked against the scan |
 
-The `auth` mechanisms are a **fixed vocabulary of mechanisms, not products** —
-`app-local-accounts`, `app-ldap`, `app-oidc`, `app-saml`, `app-token`, `mtls`,
-`network-restricted`, `external-proxy`, `other`. Naming a product
-(`authentik-proxy`) is refused with the vocabulary quoted back, because a mechanism is
-observable and a vendor is an attribution — the same rule the scan holds itself to.
-`other` needs a `detail`, since on its own it says nothing.
+The `auth` mechanisms are a **fixed vocabulary of mechanisms, not products**. Naming a
+product (`authentik-proxy`) is refused with the vocabulary quoted back, because a
+mechanism is observable and a vendor is an attribution — the same rule the scan holds
+itself to. `other` needs a `detail`, since on its own it says nothing.
+
+Three of them name something LabView can also detect for itself, so those three are
+**compared** against the scan rather than only shown beside it. The rest are invisible
+to any scanner, which is what makes them worth declaring — and also means they can
+never disagree with anything:
+
+| mechanism | family | compared against |
+|---|---|---|
+| `app-oidc` | `oidc` | detected `authentik-oauth`, `other-oauth` |
+| `app-ldap` | `ldap` | detected `authentik-ldap`, `ldap` |
+| `external-proxy` | `proxy` | detected `authentik-forward-auth`, `forward-auth` |
+| `app-local-accounts`, `app-saml`, `app-token`, `mtls`, `network-restricted`, `other` | — | nothing; always shown, never drift |
+
+A family sits in one of two **layers** — `oidc` and `ldap` are the app logging users in
+itself, `proxy` is a gate in front of it — and two statements are only compared inside a
+layer. That is the whole rule, and it exists to stop the obvious version of this feature
+from warning about every layered setup there is: declaring `app-oidc` while the scan
+detects `forward-auth` is defence in depth and correct, while declaring `app-oidc` where
+the scan found an `ldap` bind is two answers to one question, so one of them is stale.
+
+The four outcomes, in the order they are decided:
+
+| outcome | when | what you see |
+|---|---|---|
+| supplies | reachable, nothing detected | rule 2 above — leaves the exposed count, gains its own badge and counter |
+| conflicts | same layer, different family | a drift entry naming both, and the declaration shown without any "not detected" claim |
+| redundant | the scan detected the same family | **nothing** — repeating it would send a reader to check two sources that agree |
+| supplements | anything else | the declaration, shown as declared, no warning |
 
 ### Drift
 
 The failure mode a sidecar actually has is not a typo, it is going quietly out of
-date. So both of the checkable fields are checked on every scan, and a disagreement is
+date. So every checkable field is checked on every scan, and a disagreement is
 reported as **drift** on the service, one entry per disagreement, with its own counter
 in the summary:
 
 - An acceptance the scan can see **no longer applies** — the port was withdrawn, the
-  route was removed — says so instead of sitting there implying a risk that is gone.
+  route was removed, or something now authenticates the service, including the
+  mechanism declared in the same file — says so instead of sitting there implying a
+  risk that is gone.
+- A declared `auth` mechanism that **disagrees with a detected one at the same layer**
+  names both: `declares "OIDC login by the app", but the scan detected ldap (LDAP bind
+  against …) — both describe the app's own login, so one of the two is out of date`.
 - An `expected.ingress` that disagrees with the classification names the difference in
   both directions: `expects ingress "traefik, lan"; the scan classified this service
-  as "traefik, internal" (missing: lan; unexpected: internal)`.
+  as "traefik, internal" (missing: lan; unexpected: internal)`. Order is irrelevant —
+  the two are compared as sets, so `[public, lan, traefik]` and `[traefik, public,
+  lan]` are the same expectation.
+
+Agreement is silent, in both directions: an expectation that matches renders no row,
+and a declaration that repeats what the scan found renders nothing at all. A sidecar
+that is right about everything is invisible except for the prose you wrote.
 
 The classification always stands. Drift is a report, never an override.
 

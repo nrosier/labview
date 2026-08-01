@@ -1,0 +1,31 @@
+# The declaration side of the fixture beside it. Four services, four outcomes, and the
+# only thing that varies between the first three is this file.
+services:
+  conflict:
+    description: Declares OIDC; the scan detected LDAP. Same tier, different mechanism.
+    auth:
+      - mechanism: app-oidc
+        detail: Written when the app used the SSO's OIDC provider.
+
+  redundant:
+    description: Declares the LDAP bind the scan already detected.
+    auth:
+      - mechanism: app-ldap
+
+  layered:
+    description: Declares local accounts, which no scan can see, beside the detected bind.
+    auth:
+      - mechanism: app-local-accounts
+        detail: Break-glass admin account in the app's own database.
+
+  defence:
+    description: Declares its own OIDC login behind the detected proxy gate.
+    auth:
+      - mechanism: app-oidc
+        detail: The app performs the login itself; the gate in front is separate.
+    # An expectation that *agrees*, which the other two expectation fixtures cannot
+    # cover: both of them drift. Several kinds at once, and deliberately in the
+    # opposite order to the classification, because the two are compared as sets —
+    # so this pins both "agreement is silent" and "order is not a disagreement".
+    expected:
+      ingress: [internal, traefik]

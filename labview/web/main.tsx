@@ -11,7 +11,7 @@ import type {
   TagFilter,
   TraefikSummary,
 } from "./model";
-import { declaredAuthLabel, phaseText, shouldBanner } from "./model";
+import { declaredAuthLabel, formatExposureCount, phaseText, shouldBanner } from "./model";
 import {
   EMPTY_TAG_FILTER,
   cycleTag,
@@ -602,19 +602,20 @@ function App() {
             these, not even another container. */}
         <StatTile label="No ingress" value={ov.stats.noIngressServices} sub="nothing reaches it" />
         <StatTile label="Auth-protected" value={ov.stats.authProtected} />
-        {/* The count is what the scan found and does not move when an exposure is
-            accepted — the subtitle says how many were, and the alarm is driven by the
-            remainder, so a fleet where every exposure has been reviewed stops shouting
-            without ever understating what is reachable. */}
+        {/* `23/28` — needing attention over found. The denominator is what the scan
+            found and does not move when an exposure is accepted; the numerator is what
+            nobody has looked at yet, and drives the alarm. So a fleet where every
+            exposure has been reviewed stops shouting without ever understating what is
+            reachable, and the five that were reviewed stay countable. */}
         <StatTile
           label="Exposed, no auth"
-          value={ov.stats.exposedWithoutAuth}
+          value={formatExposureCount(ov.stats.exposedWithoutAuth, ov.stats.exposureAccepted)}
           alert={ov.stats.exposedWithoutAuth - ov.stats.exposureAccepted > 0}
           sub={
             ov.stats.exposedWithoutAuth === 0
               ? "none"
               : ov.stats.exposureAccepted > 0
-                ? `${ov.stats.exposureAccepted} accepted`
+                ? `${ov.stats.exposureAccepted} accepted in .labview`
                 : "⚠ review"
           }
         />
@@ -625,6 +626,16 @@ function App() {
             label="Declared auth"
             value={ov.stats.declaredAuth}
             sub="from .labview"
+          />
+        )}
+        {/* The services that left the tile above on the strength of a declaration. Its
+            own tile precisely so that number is never absorbed into "Auth-protected",
+            which means *proven* protected — these rest on a statement instead. */}
+        {ov.stats.declaredAuthProtected > 0 && (
+          <StatTile
+            label="Protected — declared"
+            value={ov.stats.declaredAuthProtected}
+            sub="unverified"
           />
         )}
         {ov.stats.declarationDrift > 0 && (

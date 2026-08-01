@@ -21,6 +21,7 @@ export type {
   AuthPosture,
   Declaration,
   DeclaredAuth,
+  DeclaredAuthAgreement,
   DeclaredAuthMechanism,
   DeclaredDependency,
   DeclaredLink,
@@ -65,9 +66,15 @@ export { phaseText, shouldBanner } from "../src/model/connections";
 /**
  * How a declared mechanism is worded, from the same module the analyzer's note is built
  * from — so a badge and the note beside it cannot describe one `.labview` entry in two
- * different ways.
+ * different ways. `formatExposureCount` is here for the same reason: the tile and the
+ * CLI line print the same figure.
  */
-export { declaredAuthLabel, declaredAuthSummary } from "../src/model/declarations";
+export {
+  declaredAuthLabel,
+  declaredAuthSummary,
+  formatExposureCount,
+  showsDeclaredAuth,
+} from "../src/model/declarations";
 
 /**
  * The ingress vocabulary and the operations on it, from the same module the analyzer
@@ -79,6 +86,7 @@ export {
   diffIngress,
   externalIngress,
   formatIngress,
+  ingressMatchesExpectation,
   isExternallyReachable,
   isIngressKind,
   normalizeIngress,

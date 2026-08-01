@@ -21,6 +21,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type {
   AppStack,
+  AuthMethod,
+  DeclaredAuthMechanism,
   DockerState,
   IngressKind,
   Overview,
@@ -72,8 +74,22 @@ const { matchTraefik } = await import("../src/analyze/traefik.js");
 // otherwise need a committed 64 KiB file and a thousand-entry list to reach.
 const { MAX_AUTH_ENTRIES, MAX_LIST_ENTRIES, MAX_SIDECAR_BYTES, MAX_TEXT_CHARS, parseSidecar, readSidecar } =
   await import("../src/scan/sidecar.js");
-const { DECLARED_AUTH_MECHANISMS, declaredAuthLabel } = await import("../src/model/declarations.js");
-const { INGRESS_KINDS, normalizeIngress } = await import("../src/model/ingress.js");
+// The declared-vs-detected comparison lives in `src/` for the same reason the filter
+// below does: it is a truth table over two vocabularies, and the only honest way to
+// assert the layer rule is to enumerate the pairs rather than click through a browser.
+const {
+  DECLARED_AUTH_MECHANISMS,
+  compareDeclaredAuth,
+  declaredAuthFamily,
+  declaredAuthLabel,
+  detectedAuthFamily,
+  formatExposureCount,
+  showsDeclaredAuth,
+} = await import("../src/model/declarations.js");
+const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress } = await import(
+  "../src/model/ingress.js"
+);
+const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
 // that deserves better than being exercised by hand in a browser.
@@ -530,7 +546,7 @@ const eSvc = lookup(edge);
 console.log("\n--- regression fixtures (fixtures/edge) ---");
 
 console.log("\nedge discovery");
-check("found 17 edge stacks", edge.stats.stacks === 17, `got ${edge.stats.stacks}`);
+check("found 18 edge stacks", edge.stats.stacks === 18, `got ${edge.stats.stacks}`);
 
 console.log("\ncredentials embedded in URL values");
 const api = eSvc("dbstack", "api");
@@ -832,22 +848,46 @@ check(
 );
 
 console.log("\noperator declarations (.labview)");
-// The one rule the whole declaration layer rests on: a statement in a sidecar is a
-// second source, not stronger evidence. Every assertion below is a way of saying
-// that — the detected posture, the exposure flag and the detection statistics all
-// have to read exactly as they would if the file were not there.
+// The line the whole declaration layer is drawn along: a statement in a sidecar is a
+// second source, not evidence. It may change a *verdict* — "does a reader need to act
+// on this" — and it may never touch a *measurement*. So `exposedWithoutAuth` considers
+// it and `method`, `confidence`, `byAuthMethod` and `authProtected` are computed as if
+// the file were not there.
 const decl = eSvc("declared", "media");
 check("a declared mechanism leaves the detected method alone", decl.auth.method === "none", decl.auth.method);
-check(
-  "...and does not clear the exposure it cannot prove is handled",
-  decl.auth.exposedWithoutAuth === true,
-  `exposedWithoutAuth=${decl.auth.exposedWithoutAuth}`,
-);
 check(
   "...and the detected-method distribution is unmoved",
   edge.stats.byAuthMethod.none === 25 &&
     !DECLARED_AUTH_MECHANISMS.some((m) => m in edge.stats.byAuthMethod),
   JSON.stringify(edge.stats.byAuthMethod),
+);
+// The verdict is the one thing it does move. This service publishes a host port with
+// nothing in front of it, so the scan found an exposure and the operator's statement
+// that the app authenticates itself is the only reason it is not counted.
+check(
+  "a declared mechanism takes a service out of the exposed count",
+  decl.auth.exposedWithoutAuth === false && decl.declared?.authAgreement === "supplies",
+  `exposedWithoutAuth=${decl.auth.exposedWithoutAuth} agreement=${decl.declared?.authAgreement}`,
+);
+check(
+  "...counted in its own statistic, apart from the ones the scan proved",
+  edge.stats.declaredAuthProtected === 1 && edge.stats.authProtected === 10,
+  `${edge.stats.declaredAuthProtected} declared-protected, ${edge.stats.authProtected} detected`,
+);
+// The failure this rule invites is a public service quietly becoming unremarkable, so
+// the note that replaces the exposure finding has to say all three things: that it is
+// reachable, that nothing was detected in front of it, and that the verdict rests on
+// something unverifiable.
+check(
+  "...and says so in place of the finding: reachable, nothing detected, unverified",
+  decl.notes.some(
+    (n) =>
+      n.includes("Reachable (lan)") &&
+      n.includes("no detected proxy/SSO authentication") &&
+      n.includes("declares the service authenticates itself") &&
+      n.includes("this scan cannot verify"),
+  ),
+  decl.notes.join(" | "),
 );
 check(
   "the declaration is attached beside the facts, tagged with the file it came from",
@@ -857,13 +897,8 @@ check(
 );
 check(
   "...counted only in its own statistic",
-  edge.stats.declaredAuth === 3,
+  edge.stats.declaredAuth === 7,
   `got ${edge.stats.declaredAuth}`,
-);
-check(
-  "...and reported to non-UI consumers as a note that names the file and disclaims detection",
-  decl.notes.some((n) => n.includes("declared in .labview") && n.includes("not detected by this scan")),
-  decl.notes.join(" | "),
 );
 check(
   "...worded through the shared mechanism labels, so a note and a badge cannot disagree",
@@ -908,8 +943,20 @@ check(
 );
 check(
   "the accepted count is beside the exposure count, never subtracted from it",
-  edge.stats.exposureAccepted === 1 && edge.stats.exposedWithoutAuth === 11,
+  edge.stats.exposureAccepted === 1 && edge.stats.exposedWithoutAuth === 10,
   `${edge.stats.exposureAccepted} accepted of ${edge.stats.exposedWithoutAuth} exposed`,
+);
+// `23/28` — needing attention over found. The numerator is what nobody has looked at;
+// the denominator never drops, which is the difference between "reviewed" and "gone".
+check(
+  "...and printed as unaccepted over total, from one shared formatter",
+  formatExposureCount(edge.stats.exposedWithoutAuth, edge.stats.exposureAccepted) === "9/10",
+  formatExposureCount(edge.stats.exposedWithoutAuth, edge.stats.exposureAccepted),
+);
+check(
+  "...a plain total when nothing was accepted, so no reader looks for a missing half",
+  formatExposureCount(28, 0) === "28" && formatExposureCount(28, 5) === "23/28" && formatExposureCount(0, 0) === "0",
+  `${formatExposureCount(28, 0)} / ${formatExposureCount(28, 5)} / ${formatExposureCount(0, 0)}`,
 );
 
 // A sidecar's real failure mode is not a typo, it is going quietly out of date.
@@ -949,7 +996,229 @@ check(
     pdApi.declared?.drift.some((d) => d.includes("missing: lan") && d.includes("unexpected: internal")) === true,
   `${ing(pdApi)}: ${JSON.stringify(pdApi.declared?.drift)}`,
 );
-check("drift has its own counter too", edge.stats.declarationDrift === 2, `got ${edge.stats.declarationDrift}`);
+check("drift has its own counter too", edge.stats.declarationDrift === 3, `got ${edge.stats.declarationDrift}`);
+
+/* -------------------------------------------------------------------------- */
+/* Declared against detected: which declarations are reported, and which warn  */
+/* -------------------------------------------------------------------------- */
+
+// Four services in `declcompare/`, three of them configured identically, so the only
+// thing that can explain a different outcome is the sidecar.
+const dcConflict = eSvc("declcompare", "conflict");
+const dcRedundant = eSvc("declcompare", "redundant");
+const dcLayered = eSvc("declcompare", "layered");
+const dcDefence = eSvc("declcompare", "defence");
+check(
+  "three identically configured services are detected identically",
+  [dcConflict, dcRedundant, dcLayered].every((s) => s.auth.method === "ldap" && ing(s) === "internal"),
+  [dcConflict, dcRedundant, dcLayered].map((s) => `${s.name}=${s.auth.method}/${ing(s)}`).join(" "),
+);
+check(
+  "...so an outcome that differs between them came from the declaration alone",
+  dcConflict.declared?.authAgreement === "conflicts" &&
+    dcRedundant.declared?.authAgreement === "redundant" &&
+    dcLayered.declared?.authAgreement === "supplements",
+  [dcConflict, dcRedundant, dcLayered].map((s) => `${s.name}=${s.declared?.authAgreement}`).join(" "),
+);
+// Declared OIDC against a detected LDAP bind: both are the app logging a user in, so
+// they cannot both be current.
+check(
+  "a declaration that contradicts the scan at the same tier is drift, naming both sides",
+  dcConflict.declared?.drift.some(
+    (d) => d.includes(declaredAuthLabel("app-oidc")) && d.includes("scan detected ldap") && d.includes("out of date"),
+  ) === true,
+  JSON.stringify(dcConflict.declared?.drift),
+);
+// The rule that keeps every layered setup out of the warning path: the same declared
+// mechanism as `conflict` above, and no warning, because the gate the scan found sits
+// at a different tier of the request path.
+check(
+  "the same declaration behind a detected proxy gate is not a disagreement",
+  dcDefence.auth.method === "authentik-forward-auth" &&
+    dcDefence.declared?.auth[0]?.mechanism === dcConflict.declared?.auth[0]?.mechanism &&
+    dcDefence.declared?.authAgreement === "supplements" &&
+    dcDefence.declared.drift.length === 0,
+  `${dcDefence.auth.method}: ${dcDefence.declared?.authAgreement}, drift=${JSON.stringify(dcDefence.declared?.drift)}`,
+);
+// The agreement half of the ingress comparison, which neither drift fixture can cover
+// because both of them disagree. Several kinds at once, written in the sidecar in the
+// opposite order to the classification: the expectation is normalized on the way in and
+// compared as a set on the way out, so this has to be silence rather than drift.
+check(
+  "a multi-kind expectation that agrees with the scan is not a disagreement",
+  ing(dcDefence) === "traefik, internal" &&
+    dcDefence.declared?.expectedIngress?.join(",") === "traefik,internal" &&
+    dcDefence.declared.drift.every((d) => !d.includes("expects ingress")),
+  `${ing(dcDefence)} vs ${JSON.stringify(dcDefence.declared?.expectedIngress)}: ${JSON.stringify(dcDefence.declared?.drift)}`,
+);
+// A declaration the scan already made is worth nothing to a reader and costs them a
+// second source to check, so it is reported nowhere at all.
+check(
+  "a declaration the scan already detected is reported nowhere",
+  dcRedundant.notes.length === 0 && dcRedundant.declared?.drift.length === 0,
+  `notes=${JSON.stringify(dcRedundant.notes)} drift=${JSON.stringify(dcRedundant.declared?.drift)}`,
+);
+check(
+  "...while one the scan could not see is reported, and only that one claims 'not detected'",
+  dcLayered.notes.some(
+    (n) => n.includes(declaredAuthLabel("app-local-accounts")) && n.includes("not detected by this scan"),
+  ) && !dcConflict.notes.some((n) => n.includes("not detected by this scan")),
+  `${JSON.stringify(dcLayered.notes)} | ${JSON.stringify(dcConflict.notes)}`,
+);
+// The same silence in the UI. Both render rules live in the model rather than in the
+// components precisely so this pass can call them: a decision inside a `.tsx` file is
+// unassertable, and "agreement is not shown" is the kind of rule that regresses without
+// anything failing. `conflicts` renders on purpose — it is the disagreement itself.
+check(
+  "the render rule agrees: a redundant declaration is shown nowhere, every other outcome is",
+  showsDeclaredAuth("redundant") === false &&
+    (["supplies", "conflicts", "supplements"] as const).every((a) => showsDeclaredAuth(a)) &&
+    showsDeclaredAuth(dcRedundant.declared?.authAgreement) === false &&
+    showsDeclaredAuth(dcLayered.declared?.authAgreement),
+  `redundant=${showsDeclaredAuth("redundant")} layered=${showsDeclaredAuth(dcLayered.declared?.authAgreement)}`,
+);
+// The expected-ingress row is gated on this, so an expectation that holds renders no row
+// at all. Order-independent on both sides, which is what makes `public+lan+traefik` in a
+// sidecar the same statement however it was typed.
+check(
+  "...and an expectation that holds is a match in any order, so its row never renders",
+  ingressMatchesExpectation(["internal", "traefik"], dcDefence.ingress) &&
+    ingressMatchesExpectation(dcDefence.declared?.expectedIngress ?? [], dcDefence.ingress) &&
+    !ingressMatchesExpectation(["lan", "public", "traefik"], ["traefik", "public"]) &&
+    ingressMatchesExpectation(["lan", "public", "traefik"], ["traefik", "lan", "public"]),
+  `${JSON.stringify(dcDefence.declared?.expectedIngress)} vs ${JSON.stringify(dcDefence.ingress)}`,
+);
+
+// The comparison itself, as a table. Reading `compareDeclaredAuth` and believing the
+// layer rule is not the same as enumerating the pairs it has to get right.
+const cmp = (mechanism: DeclaredAuthMechanism, detected: AuthMethod, wouldBeExposed = false) =>
+  compareDeclaredAuth([{ mechanism }], detected, wouldBeExposed);
+const CMP_TABLE: [DeclaredAuthMechanism, AuthMethod, string][] = [
+  // Same family, either provider: the scan already says it.
+  ["app-oidc", "authentik-oauth", "redundant"],
+  ["app-oidc", "other-oauth", "redundant"],
+  ["app-ldap", "authentik-ldap", "redundant"],
+  ["app-ldap", "ldap", "redundant"],
+  ["external-proxy", "authentik-forward-auth", "redundant"],
+  ["external-proxy", "forward-auth", "redundant"],
+  // Same tier, different mechanism: one of the two is stale.
+  ["app-oidc", "ldap", "conflicts"],
+  ["app-oidc", "authentik-ldap", "conflicts"],
+  ["app-ldap", "other-oauth", "conflicts"],
+  ["app-ldap", "authentik-oauth", "conflicts"],
+  // Different tiers. The app logging users in and a gate in front of it are both true
+  // at once, and this is the half of the table a "declared != detected" rule gets wrong.
+  ["app-oidc", "authentik-forward-auth", "supplements"],
+  ["app-oidc", "forward-auth", "supplements"],
+  ["app-ldap", "forward-auth", "supplements"],
+  ["external-proxy", "authentik-oauth", "supplements"],
+  ["external-proxy", "ldap", "supplements"],
+  // A detected mechanism with no counterpart in the declared vocabulary.
+  ["app-oidc", "basic-auth", "supplements"],
+  ["app-ldap", "basic-auth", "supplements"],
+];
+check(
+  "the declared/detected table holds in every direction",
+  CMP_TABLE.every(([m, d, want]) => cmp(m, d) === want),
+  CMP_TABLE.filter(([m, d, want]) => cmp(m, d) !== want)
+    .map(([m, d, want]) => `${m}+${d}: want ${want}, got ${cmp(m, d)}`)
+    .join("; ") || "all pairs",
+);
+// Enumerated from the map rather than from a list written beside it, so a mechanism
+// that gains a family later cannot keep being asserted as if it had none.
+const incomparable = DECLARED_AUTH_MECHANISMS.filter((m) => declaredAuthFamily(m) === undefined);
+const everyDetected: AuthMethod[] = [
+  "authentik-forward-auth",
+  "authentik-oauth",
+  "authentik-ldap",
+  "forward-auth",
+  "other-oauth",
+  "ldap",
+  "basic-auth",
+  "none",
+];
+check(
+  "a mechanism this scan can never observe never contradicts it",
+  incomparable.length === 6 &&
+    incomparable.every((m) => everyDetected.every((d) => cmp(m, d) !== "conflicts" && cmp(m, d) !== "redundant")),
+  `${incomparable.join(", ")} against ${everyDetected.length} detected methods`,
+);
+check(
+  "...and every detected method is either comparable or explicitly not",
+  everyDetected.every((d) => (d === "basic-auth" || d === "none") === (detectedAuthFamily(d) === undefined)),
+  everyDetected.map((d) => `${d}=${detectedAuthFamily(d) ?? "-"}`).join(" "),
+);
+// The bound on the whole feature. `supplies` is the only outcome that changes a verdict,
+// and what earns it is the exposure the scan found — not anything about the mechanism
+// named. So the same declaration against the same detected method is load-bearing on a
+// reachable service and merely additional on an unreachable one...
+check(
+  "what makes a declaration load-bearing is the exposure, not the mechanism",
+  cmp("app-oidc", "none", true) === "supplies" && cmp("app-oidc", "none", false) === "supplements",
+  `${cmp("app-oidc", "none", true)} / ${cmp("app-oidc", "none", false)}`,
+);
+// ...and no comparison of two *named* mechanisms can produce it, so a family table that
+// grew a wrong entry could at worst warn wrongly — never quietly un-flag a service.
+check(
+  "...so comparing two named mechanisms can never change one",
+  everyDetected.filter((d) => detectedAuthFamily(d) !== undefined).every((d) => cmp("app-oidc", d) !== "supplies"),
+  everyDetected.map((d) => `${d}=${cmp("app-oidc", d)}`).join(" "),
+);
+check(
+  "nothing declared is not an outcome, it is the absence of one",
+  compareDeclaredAuth([], "none", true) === undefined,
+  String(compareDeclaredAuth([], "none", true)),
+);
+// A declaration is only redundant when *all* of it is: the part the scan cannot see
+// still has to be reported.
+check(
+  "a declaration that is partly redundant is still shown",
+  compareDeclaredAuth([{ mechanism: "app-ldap" }, { mechanism: "app-local-accounts" }], "ldap", false) ===
+    "supplements",
+  String(compareDeclaredAuth([{ mechanism: "app-ldap" }, { mechanism: "app-local-accounts" }], "ldap", false)),
+);
+// Agreement about the tier settles the tier: something else declared alongside it is
+// additional, not contradictory.
+check(
+  "...and one that agrees about the tier does not conflict over what else it names",
+  compareDeclaredAuth([{ mechanism: "app-ldap" }, { mechanism: "app-oidc" }], "ldap", false) === "supplements",
+  String(compareDeclaredAuth([{ mechanism: "app-ldap" }, { mechanism: "app-oidc" }], "ldap", false)),
+);
+
+// Over every fixture at once, because the number on the dashboard and the badge on the
+// service are read by the same person and a divergence between them is invisible from
+// either side alone.
+const eAll = edge.stacks.flatMap((s) => s.services);
+const supplied = eAll.filter((s) => s.declared?.authAgreement === "supplies");
+check(
+  "the declared-protected counter is exactly the services wearing that badge",
+  supplied.length === edge.stats.declaredAuthProtected,
+  `${supplied.length} services, counter says ${edge.stats.declaredAuthProtected}`,
+);
+check(
+  "...none of which is also counted as exposed, or the same service would be both",
+  supplied.every((s) => !s.auth.exposedWithoutAuth && s.auth.method === "none"),
+  supplied.map((s) => `${s.name}=${s.auth.method}/${s.auth.exposedWithoutAuth}`).join(" "),
+);
+// The other direction, and the one that matters: every service reachable from outside
+// with nothing detected in front of it is either counted as exposed or accounted for by a
+// declaration. A third state would be a service that has quietly dropped out of the
+// report altogether — which is precisely the risk in letting a declaration clear a
+// finding. Recomputed from the evidence rather than read off `exposedWithoutAuth`, so it
+// is a partition check and not a restatement of the flag.
+const unprotected = (s: Service) =>
+  isExternallyReachable(s.ingress) &&
+  s.auth.method === "none" &&
+  !hasEnforcedAuthentikGate(s) &&
+  !s.cloudflare.some((r) => r.access && (r.access.policy || r.access.group || r.access.emails?.length));
+check(
+  "every reachable service with no detected auth is either exposed or declared-protected",
+  eAll.filter(unprotected).every((s) => s.auth.exposedWithoutAuth || s.declared?.authAgreement === "supplies"),
+  eAll
+    .filter((s) => unprotected(s) && !s.auth.exposedWithoutAuth && s.declared?.authAgreement !== "supplies")
+    .map((s) => s.name)
+    .join(" ") || "none unaccounted for",
+);
 
 // Everything wrong with a sidecar is a warning; nothing about it fails a scan (I4).
 const badStack = edge.stacks.find((s) => s.id === "badsidecar")!;
@@ -3279,6 +3548,31 @@ check(
   "a declaration added to a service is that service, changed",
   declSvcDiff.changed.length === 1 && declSvcDiff.changed[0]?.servicesChanged.join(",") === declSvc.name,
   JSON.stringify(declSvcDiff.changed),
+);
+
+// The other half of the same rule, and the reason `DERIVED_DECLARATION_FIELDS` exists.
+// `drift` and `authAgreement` live *on* the declaration but are written by the analyzer,
+// so a scan in which the detected posture moved — a Traefik read that worked this time,
+// a container that came up on another network — would otherwise be reported as an edit to
+// a sidecar nobody touched. The declaration is compared, its conclusions are not.
+const driftOnly = clone(declSvcEdited);
+const driftSvc = driftOnly[0]!.services[0]!.declared!;
+driftSvc.drift = ["the scan reached a different conclusion this pass"];
+driftSvc.authAgreement = "conflicts";
+check(
+  "a conclusion the analyzer wrote onto a declaration is not a file edit",
+  diffStacks(declSvcEdited, driftOnly).unchanged,
+  JSON.stringify(diffStacks(declSvcEdited, driftOnly).changed),
+);
+// …while the parsed part of the very same block still is, so the exclusion above is
+// narrow rather than "declarations are ignored".
+const descEdited = clone(declSvcEdited);
+descEdited[0]!.services[0]!.declared!.description = "what the operator now says this is";
+const descDiff = diffStacks(declSvcEdited, descEdited);
+check(
+  "…while an edit to the words in the same block is",
+  descDiff.changed.length === 1 && descDiff.changed[0]?.servicesChanged.join(",") === declSvc.name,
+  JSON.stringify(descDiff.changed),
 );
 
 // Key order is a property of how the object was built, not of the configuration. Without

@@ -6,6 +6,7 @@
 import { loadConfig } from "./config.js";
 import { buildOverview } from "./analyze/index.js";
 import { formatConnection } from "./model/connections.js";
+import { formatExposureCount } from "./model/declarations.js";
 
 const cfg = loadConfig();
 const summary = process.argv.includes("--summary");
@@ -33,10 +34,11 @@ if (summary) {
       ` none ${stats.noIngressServices}  (a service can have several)`,
   );
   console.log(`  auth protected:   ${stats.authProtected}`);
-  // The count is the scan's, unaltered; the parenthetical says how many of them somebody
-  // declared intentional. Never subtracted — an accepted exposure is still reachable.
+  // `23/28` — needing attention over found. The denominator is the scan's count,
+  // unaltered; the numerator drops the ones somebody declared intentional. Never
+  // subtracted from the total — an accepted exposure is still reachable.
   console.log(
-    `  EXPOSED, no auth: ${stats.exposedWithoutAuth}` +
+    `  EXPOSED, no auth: ${formatExposureCount(stats.exposedWithoutAuth, stats.exposureAccepted)}` +
       (stats.exposureAccepted > 0 ? `  (${stats.exposureAccepted} accepted in a sidecar)` : ""),
   );
   console.log(`  by auth method:   ${JSON.stringify(stats.byAuthMethod)}`);
@@ -45,6 +47,13 @@ if (summary) {
   // sidecar actually has.
   if (stats.declaredAuth > 0) {
     console.log(`  declared auth:    ${stats.declaredAuth}  (stated in a sidecar, not detected)`);
+  }
+  // The services kept out of the exposure count by a declaration. Printed separately
+  // from `auth protected` above, which counts only what the scan could prove.
+  if (stats.declaredAuthProtected > 0) {
+    console.log(
+      `  declared-protected: ${stats.declaredAuthProtected}  (reachable, no detected auth, declared self-authenticating — unverified)`,
+    );
   }
   if (stats.declarationDrift > 0) {
     console.log(`  ! declaration drift: ${stats.declarationDrift} service(s) disagree with their sidecar`);

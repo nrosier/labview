@@ -1,27 +1,51 @@
-import type { AppStack, AuthentikProviderKind, IngressKind, OriginTarget, Service } from "../model";
-import { declaredAuthLabel, diffIngress } from "../model";
+import type {
+  AppStack,
+  AuthentikProviderKind,
+  DeclaredAuthAgreement,
+  IngressKind,
+  OriginTarget,
+  Service,
+} from "../model";
+import { declaredAuthLabel, ingressMatchesExpectation, showsDeclaredAuth } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
-import { AcceptedBadge, AuthBadge, DeclaredAuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
+import {
+  AcceptedBadge,
+  AuthBadge,
+  DeclaredAuthBadge,
+  DeclaredProtectedBadge,
+  ExposedBadge,
+  IngressBadge,
+  StatusDot,
+} from "./badges";
 import { Mermaid } from "./Mermaid";
 import { Section } from "./Section";
+
+/**
+ * The one line under a declared mechanism, saying how it stands to the scan.
+ *
+ * Three captions for the three outcomes that render at all: `redundant` never reaches
+ * here because the row is skipped, and each of the others has to say something
+ * different — only one of them is "not detected", and calling a disagreement or a
+ * load-bearing claim by that name would be the same mistake in two directions.
+ */
+function declaredAuthCaption(agreement: DeclaredAuthAgreement | undefined): string {
+  switch (agreement) {
+    case "supplies":
+      return "This is why the service is not counted as exposed. Nothing above observed it — the verdict rests on this declaration.";
+    case "conflicts":
+      return "This disagrees with the detected posture above. One of the two is out of date; the scan cannot tell which.";
+    default:
+      return "Declared here, not detected by the scan — the posture above is what LabView could observe.";
+  }
+}
 
 /**
  * Where a tunnel origin was found to lead, in a few words. The full reasoning is
  * listed as evidence under the table, so this only has to say which of the four
  * conclusions was reached.
  */
-/**
- * Whether a declared expectation and the classification agree, from the same diff the
- * analyzer words its drift note with — so the pill and the note cannot disagree about
- * whether the two match.
- */
-function expectedMatches(expected: readonly IngressKind[], actual: readonly IngressKind[]): boolean {
-  const { missing, unexpected } = diffIngress(expected, actual);
-  return missing.length === 0 && unexpected.length === 0;
-}
-
 function originLabel(o: OriginTarget): string {
   switch (o.kind) {
     case "fleet-service":
@@ -134,14 +158,23 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
             {/* Detected first, declared second, and the detected posture is never
                 replaced: a service the operator says authenticates itself still shows
                 "No proxy auth" beside the declaration, because that is what the scan
-                found and it stays true. */}
-            {svc.auth.exposedWithoutAuth &&
-              (declared && accepted ? (
+                found and it stays true.
+
+                Three outcomes for one slot, and exactly one of them can hold: the scan
+                found an exposure and nobody has looked at it, or it found one that was
+                accepted, or the declaration is the only reason there is no finding. */}
+            {svc.auth.exposedWithoutAuth ? (
+              declared && accepted ? (
                 <AcceptedBadge reason={accepted.reason} file={declared.file} />
               ) : (
                 <ExposedBadge />
-              ))}
-            {declared && <DeclaredAuthBadge auth={declared.auth} file={declared.file} />}
+              )
+            ) : declared?.authAgreement === "supplies" ? (
+              <DeclaredProtectedBadge auth={declared.auth} file={declared.file} />
+            ) : null}
+            {declared && (
+              <DeclaredAuthBadge auth={declared.auth} file={declared.file} agreement={declared.authAgreement} />
+            )}
           </div>
 
           {svc.notes.length > 0 && (
@@ -485,7 +518,10 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                     </dd>
                   </>
                 )}
-                {declared && declared.auth.length > 0 && (
+                {/* Skipped entirely when the scan detected the same mechanism: the
+                    Authentication section above already says it, and repeating it here
+                    under "Declared" would read as a second, weaker source for one fact. */}
+                {declared && declared.auth.length > 0 && showsDeclaredAuth(declared.authAgreement) && (
                   <>
                     <dt>Authentication</dt>
                     <dd>
@@ -495,10 +531,7 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                           {a.detail && <span> {a.detail}</span>}
                         </div>
                       ))}
-                      <div class="muted-inline">
-                        Declared here, not detected by the scan — the posture above is what
-                        LabView could observe.
-                      </div>
+                      <div class="muted-inline">{declaredAuthCaption(declared.authAgreement)}</div>
                     </dd>
                   </>
                 )}
@@ -514,20 +547,18 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                     </dd>
                   </>
                 )}
-                {declared?.expectedIngress && (
+                {/* Shown only when it disagrees. Compared as sets, because the expectation
+                    and the scan are both lists: agreement means the same kinds in any
+                    order, and an expectation that holds is not news — it would just be one
+                    more row saying the classification above is the classification above.
+                    The disagreement is also in `drift` at the top of this section; this row
+                    is what puts the two lists side by side. */}
+                {declared?.expectedIngress && !ingressMatchesExpectation(declared.expectedIngress, svc.ingress) && (
                   <>
                     <dt>Expected ingress</dt>
                     <dd>
                       {declared.expectedIngress.map(ingressLabel).join(", ")}
-                      {/* Compared as sets, because the expectation and the scan are both
-                          lists now: agreement means the same kinds, in any order. */}
-                      {expectedMatches(declared.expectedIngress, svc.ingress) ? (
-                        <span class="pill">matches the scan</span>
-                      ) : (
-                        <span class="pill crit">
-                          scan says {svc.ingress.map(ingressLabel).join(", ")}
-                        </span>
-                      )}
+                      <span class="pill crit">scan says {svc.ingress.map(ingressLabel).join(", ")}</span>
                     </dd>
                   </>
                 )}

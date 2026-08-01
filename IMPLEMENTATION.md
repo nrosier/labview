@@ -922,20 +922,63 @@ an accepted exposure.
 
 This is the one place LabView accepts input that is *not* observable evidence, so the
 whole design is about keeping it separable from what was proved. Read by
-`scan/sidecar.ts`, attached as `stack.declared` / `svc.declared`, and governed by two
+`scan/sidecar.ts`, attached as `stack.declared` / `svc.declared`, and governed by three
 rules:
 
 - **A declaration never changes a detection.** Declared auth is `svc.declared.auth`,
-  not `svc.auth.method`, which stays `none`. The detected-method distribution does not
-  move, the declared mechanisms are counted only in `stats.declaredAuth`, and the UI
-  badges them *declared*. A reader can always tell what LabView proved from what it
-  was told — which is I1 (§4) surviving contact with an input that has no evidence
-  behind it.
-- **An accepted exposure is still an exposure.** A service reachable with no gate
-  stays in `exposedWithoutAuth` with `stats.exposureAccepted` counted beside it; the
-  alarm is driven by the *remainder*, so a reviewed fleet stops shouting without ever
+  not `svc.auth.method`, which stays `none`. `confidence`, `evidence`,
+  `stats.authProtected` and `stats.byAuthMethod` are untouched, the declared mechanisms
+  are counted only in `stats.declaredAuth`, and the UI badges them *declared*. A reader
+  can always tell what LabView proved from what it was told — which is I1 (§4)
+  surviving contact with an input that has no evidence behind it.
+- **A declaration can change one verdict, in the open.** `exposedWithoutAuth` is not a
+  measurement, it is a conclusion — *reachable, and nothing authenticates it* — and a
+  declared in-app login answers its second clause. So `reachable && !hasEdgeAuth &&
+  declaredAuth.length === 0`: a service whose sidecar says the app logs users in leaves
+  the count. `hasEdgeAuth` itself is untouched, so evidence and declaration remain two
+  terms of one expression rather than one merged source. The service does not go quiet —
+  it gets `declared.authAgreement === "supplies"`, a *Protected — declared* badge, its
+  own tile and CLI line (`stats.declaredAuthProtected`, counted off that same field so
+  badge and number cannot diverge), and a note stating that the verdict rests on a
+  declaration this scan cannot verify. **The one honest risk of the whole layer** is a
+  stale declaration on a public service, and this is the mitigation: it is loud in place
+  of an alarm rather than absent.
+- **An accepted exposure is still an exposure.** A service reachable with no gate and no
+  declared login stays in `exposedWithoutAuth` with `stats.exposureAccepted` counted
+  beside it; the alarm is driven by the *remainder* and the KPI reads
+  `formatExposureCount` → `23/28`, so a reviewed fleet stops shouting without ever
   understating what is reachable. `reason` is mandatory: an acceptance with no reason
   cannot be told apart from a stray key, so it is refused and warned about.
+
+The last two are different statements and deliberately not interchangeable: `auth` says
+there *is* a login, so the finding does not exist; `unauthenticated` says there is not
+one and that is accepted here. Only the first leaves the count.
+
+**Comparison: `compareDeclaredAuth`.** The declared and detected vocabularies describe
+*different layers* of one request path, so a literal "declared ≠ detected → warn" rule
+would fire on every layered setup there is. Three families are named by both sides —
+`oidc` (`app-oidc` / `authentik-oauth`, `other-oauth`), `ldap` (`app-ldap` /
+`authentik-ldap`, `ldap`), `proxy` (`external-proxy` / `authentik-forward-auth`,
+`forward-auth`) — and both maps are **`Partial`** on purpose: absent means *not
+comparable*, which is the common case and must stay the safe one. Each family sits in a
+layer (`FAMILY_LAYER`: `oidc` and `ldap` are the app authenticating its own users,
+`proxy` is a gate in front), and two statements are compared only *within* a layer.
+Four outcomes, decided in this order:
+
+| `DeclaredAuthAgreement` | when | effect |
+|---|---|---|
+| `supplies` | the caller's `wouldBeExposed` is true | rule 2 above |
+| `redundant` | every declared mechanism's family equals the detected family | rendered **nowhere** — two sources that agree are one source to check twice |
+| `conflicts` | the declaration names a mechanism in the detected family's layer, and none of them is that family | a `drift` entry naming both, and the declaration shown without any "not detected" claim |
+| `supplements` | anything else | shown as declared, no warning — defence in depth, or a declaration on an unreachable service |
+
+The third parameter is `wouldBeExposed`, not `reachable`: `hasEdgeAuth` includes
+Cloudflare Access and enforced Authentik gates that carry no `AuthMethod`, so with plain
+`reachable` an already-protected service would be labelled `supplies` and counted in
+`declaredAuthProtected` without ever having been in the exposed count. It follows that
+`supplies` implies `method === "none"`, which bounds the blast radius of the whole
+feature to one case: **a declaration can only change a verdict where the scan found
+nothing at all.**
 
 **The vocabulary is mechanisms, not products.** `DECLARED_AUTH_MECHANISMS` is
 `app-local-accounts`, `app-ldap`, `app-oidc`, `app-saml`, `app-token`, `mtls`,
@@ -945,16 +988,30 @@ back, because a mechanism is checkable and a vendor is an attribution. `other`
 requires a `detail`, since alone it says nothing.
 
 **Drift, because the real failure mode is not a typo.** A sidecar's actual risk is
-going quietly out of date, so both checkable fields are re-checked on every scan and
+going quietly out of date, so every checkable field is re-checked on every scan and
 each disagreement is one entry in `svc.declared.drift`, counted in
 `stats.declarationDrift`:
 
-- an acceptance for a service the scan no longer finds reachable — tested with
-  `isExternallyReachable`, the same predicate `exposedWithoutAuth` uses, so the two
-  cannot disagree about one service (§5);
+- an acceptance for a service the scan no longer finds reachable, or one that something
+  now authenticates — including the mechanism declared in the same file, which is the
+  `agreement === "supplies"` branch: an acceptance and a declared login on one service
+  contradict each other, and saying so is better than honouring whichever ran first.
+  Reachability is tested with `isExternallyReachable`, the same predicate
+  `exposedWithoutAuth` uses, so the two cannot disagree about one service (§5);
+- a declared mechanism that `compareDeclaredAuth` returned `conflicts` for, naming both
+  sides and the layer they share, so the reader knows *which* of the two to go correct;
 - an `expected.ingress` that differs from the classification, reported through
   `diffIngress` in **both** directions — `missing: lan; unexpected: internal` — because
-  a set compared by eye is exactly what the operator should not have to do.
+  a set compared by eye is exactly what the operator should not have to do. Order is
+  irrelevant on both sides: the declared list is normalized into `INGRESS_KINDS` order
+  at parse time and then compared as a set, so `[public, lan, traefik]` in any order is
+  one expectation.
+
+**Agreement is silent, in both directions.** The `Expected ingress` row renders only
+when `expectedMatches` is false, and `DeclaredAuthBadge` and the declared
+`Authentication` row render nothing for `redundant`. A sidecar that is right about
+everything is invisible beyond the prose in it — which is what makes the rows that *do*
+appear worth reading.
 
 The classification always stands. Drift is a report, never an override.
 
@@ -972,7 +1029,14 @@ link URL are redacted as a backstop, which is also why the link label falls back
 
 `declared` is parsed from a file on disk, so it deliberately stays **off**
 `VOLATILE_SERVICE_FIELDS` — the deny-list default (§3.11) then makes an edited sidecar
-a reported change for free.
+a reported change for free. Its two *analyzer-written* members are another matter:
+`drift` and `authAgreement` are conclusions about the scan that happen to be stored on
+the declaration, so `serviceConfig` compares `declarationConfig(svc.declared)` —
+everything except `DERIVED_DECLARATION_FIELDS`. Without that, a scan in which the
+*detected* posture moved (a Traefik read that worked this time, a container that came up
+on another network) would be reported as an edit to a sidecar nobody touched, which is
+the exact false positive the deny-list exists to prevent. The exclusion is narrow: an
+edit to the prose in the same block is still a change.
 
 ---
 
@@ -991,6 +1055,21 @@ Where a conclusion cannot be established, the correct output is the weaker,
 truthful one — plus a note saying what was missing. `AuthPosture.evidence` exists
 so a reader can check the derivation, and `AuthPosture.confidence` exists so they
 can tell a fact from a guess without re-deriving it.
+
+The invariant governs **what was observed**, which is not the same as every field in
+the output. A *measurement* — `auth.method`, `confidence`, `evidence`, the ingress
+tags, `stats.authProtected`, `stats.byAuthMethod` — may never contain anything the scan
+did not read. A *verdict* combines measurements with what the operator declared, and
+`exposedWithoutAuth` is the one verdict that does: it asks whether anything
+authenticates a reachable service, and a declared in-app login is an answer to that
+question that no scanner can reach (§3.12). Two things keep this inside the invariant.
+The declaration is a separate term of the expression rather than a value written into
+`hasEdgeAuth`, so the measurement it stands beside is still exactly what was proved.
+And a service that leaves the count on a declaration is *named* as such —
+`declared.authAgreement`, its own badge, its own counter, and a note saying the verdict
+rests on something unverified — so the weaker, truthful statement is still the one on
+screen. What the invariant forbids is a declaration reaching a measurement, and nothing
+here does.
 
 The identity provider's API is itself an observation, and the one place where a
 *name* is allowed to establish anything: Authentik's records carry no compose
@@ -1411,11 +1490,17 @@ signals (`middleware x`, `env OIDC_ISSUER`, `forwardauth -> …`,
 `provider not identified from the scanned config`); `notes` are per-service
 warnings for a human (bypasses, refusals, unresolved references, inferences).
 
-**`exposedWithoutAuth`** — `isExternallyReachable(svc.ingress)` and no auth
-detected (proxy gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an
-API-confirmed enforced gate). Note this counts a `lan`-only service as exposed,
-because it is — the LAN is outside the container network, and nothing gates the
-published port.
+**`exposedWithoutAuth`** — `isExternallyReachable(svc.ingress)`, no auth detected
+(proxy gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an API-confirmed
+enforced gate), **and** nothing declared in the sidecar beside the compose file. Note
+this counts a `lan`-only service as exposed, because it is — the LAN is outside the
+container network, and nothing gates the published port.
+
+A **verdict**, not a measurement, and the only field in the model where a declaration is
+a term: the question is whether anything authenticates a reachable service, and an
+in-app login is an answer no scan can reach (§3.12, §4 I1). The two terms stay separate —
+`hasEdgeAuth` is evidence alone — and a service that leaves the count on the strength of
+a declaration is counted in `stats.declaredAuthProtected` and says so on its own face.
 
 The test is `isExternallyReachable` and not "does the set contain `internal`",
 which are different questions now that the kinds are independent: a service can be
@@ -1503,13 +1588,42 @@ host.
 **DeclaredAuth** — `{ mechanism, detail? }`, where `mechanism` is one of
 `DECLARED_AUTH_MECHANISMS`. Authentication the operator states the app performs for
 itself. Counted in `stats.declaredAuth` and badged *declared*; it never becomes
-`svc.auth.method`, and `other` requires a `detail`.
+`svc.auth.method`, and `other` requires a `detail`. It is a term of one verdict —
+`exposedWithoutAuth` — and of no measurement.
+
+**AuthFamily** — `oidc | ldap | proxy`: the three mechanisms *both* vocabularies can
+name, and therefore the only ground on which a declaration and a detection can be
+compared at all. `DECLARED_FAMILY` and `DETECTED_FAMILY` are deliberately `Partial`
+maps: most members of either vocabulary have no family, which means *not comparable*,
+which is the safe answer. `FAMILY_LAYER` sorts the three into the app's own login
+(`oidc`, `ldap`) and a gate in front of it (`proxy`), and a comparison is only ever made
+within a layer — the rule that keeps defence in depth out of the warning path (§3.12).
+
+**DeclaredAuthAgreement** — `supplies | conflicts | redundant | supplements`, the
+outcome of `compareDeclaredAuth`, stored on the declaration by the analyzer and
+`undefined` when nothing was declared. It decides three separate things at once, which is
+why it exists as one value rather than three booleans: whether the service left the
+exposure count, whether a drift entry was written, and whether the declaration is
+rendered at all.
+
+**`declaredAuthProtected`** — services with `authAgreement === "supplies"`: reachable,
+nothing detected, and taken out of the exposure count by a declaration. Deliberately
+*not* folded into `stats.authProtected`, which counts only what the scan could prove —
+the two answer different questions and merging them would make the proven number
+unfalsifiable. Read off `authAgreement` rather than recomputed, so the counter and the
+badge cannot disagree.
 
 **`unauthenticatedAccepted`** — `{ reason }` on a service declaration, present only
 when the sidecar said `intentional: true` **and** gave a reason. It does not remove the
 service from `exposedWithoutAuth`; it adds it to `stats.exposureAccepted` and puts the
 reason on the finding. An acceptance with no reason is indistinguishable from a typo,
-so it is refused with a warning rather than honoured.
+so it is refused with a warning rather than honoured. Distinct from a declared
+mechanism, which says a login *exists* and does remove the finding.
+
+**`formatExposureCount`** — `23/28` when some exposures are accepted, plain `28` when
+none are. Shared by the tile and the CLI so the two cannot word one scan differently,
+and the numerator is the *unaccepted remainder* — an accepted exposure is still
+reachable, so it never leaves the denominator.
 
 **`expectedIngress`** — the sidecar's `expected.ingress`, normalized to
 `IngressKind[]`. A list because the thing it is compared against is one: expecting
@@ -1517,10 +1631,12 @@ so it is refused with a warning rather than honoured.
 comparing only the first kind would report "expected public, got public".
 
 **`drift`** — `svc.declared.drift[]`, one string per disagreement between the sidecar
-and the scan, counted in `stats.declarationDrift`. Two cases: an acceptance for a
-service that is no longer externally reachable, and an `expectedIngress` that differs
-from the classified set (reported in both directions). Filled by the analyzer, and a
-report rather than an override.
+and the scan, counted in `stats.declarationDrift`. Three cases: an acceptance that no
+longer applies (unreachable, or now authenticated — including by the mechanism declared
+in the same file), a declared mechanism that `conflicts` with a detected one at the same
+layer, and an `expectedIngress` that differs from the classified set (reported in both
+directions). Filled by the analyzer, and a report rather than an override — which is why
+it and `authAgreement` are excluded from the change comparison (§3.11).
 
 **TagFilter / TagMode** — the dashboard's tri-state filter (§3.9):
 `{ include, exclude, mode }` over string tags, with `exclude` always AND-NOT and
@@ -1673,10 +1789,11 @@ stacks:
 | `hostport` | published ports are reachability (`lan`) and `expose:` is not; the bypass note on a proxied service that also publishes |
 | `sharednet` | `internal` from the network compose creates for free: two services, no `networks:` key anywhere, both on the implied `<project>_default` — so the rule must resolve networks the way docker does rather than read `networks:` off the service |
 | `exposeonly` | `expose:` alone is `internal`. One service, so the shared-network arm cannot fire; the only stack that goes to `none` if that arm is dropped, since `hostport/worker` sits on a shared network too |
-| `declared` | the declaration layer's happy path: every stack-level field, a bare-string dependency, and in-app auth (`app-local-accounts` + `app-ldap`) shown as *declared* without moving `svc.auth.method` |
+| `declared` | the declaration layer's happy path: every stack-level field, a bare-string dependency, and in-app auth (`app-local-accounts` + `app-ldap`) shown as *declared* without moving `svc.auth.method`. Also the only `supplies` case — it publishes a host port and the scan finds no gate, so it is the fixture that proves a declaration takes a service out of the exposure count *and* that the service still says so on its face |
 | `accepted` | an exposure signed off with a reason: still counted in `exposedWithoutAuth`, badged accepted, reason shown |
 | `staledecl` | both checkable fields going stale at once — an acceptance for a listener that no longer exists, and an `expected.ingress` the scan disagrees with |
 | `partialdrift` | the same drift check against a set rather than a value: expected `[traefik, lan]`, scanned `[traefik, internal]` — same *first* kind, wrong in both directions. `staledecl` cannot catch a primary-only comparison; this can |
+| `declcompare` | the declared-vs-detected comparison, isolated: four services, and the first three are configured *identically* (same LDAP env, nothing published, nothing in front) so the scan reaches the same conclusion about all three and the sidecar is the only variable — `conflicts`, `redundant` and `supplements` decided from the declaration alone. The fourth is the pair that pins the layer rule: `defence` declares the *same* mechanism as `conflict` and must not warn, because what the scan detected sits at a different tier. It also carries the only *agreeing* multi-kind `expected.ingress` in the fixtures, written in the opposite order, so "order is not a disagreement" and "agreement is silent" are pinned by something other than a unit test |
 | `badsidecar` | four mistakes in one file — a mistyped key, a product name where a mechanism belongs, a reasonless acceptance, a service the compose file does not define — each warned about, with two valid declarations in the same file that must survive them |
 | `sidecaryml` | the `.labview.yml` filename variant, and the shorthand `auth: [app-token]` form |
 | `escapedecl` | containment (I8): a symlink to a sidecar **outside** the apps root must be refused. The target is valid on purpose, so a regression shows up as leaked declarations rather than as different warning text |
@@ -2300,6 +2417,11 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | An accepted exposure stays counted, and the alarm watches the remainder | Subtracting it is the obvious design and it is wrong twice: a reviewed exposure is still reachable, and a decision that disappears from the UI is a decision nobody revisits when the reason expires. Counting it and marking it accepted keeps the fact and records the review. Driving the red off the *unaccepted* remainder is what stops a fully-reviewed fleet from shouting, so there is no incentive to clear the finding by deleting it. |
 | An acceptance without a `reason` is refused, not honoured | `intentional: true` alone is indistinguishable from a stray key or a half-finished edit, and it is the one declaration that changes how a security finding reads. Requiring the reason means the field cannot be set by accident, and it puts the justification where the next reader will be — on the finding, not in a commit message. |
 | Both checkable declarations are re-checked every scan, and drift is a report | A sidecar's real failure mode is not a typo, it is going quietly out of date — the port is withdrawn, the route is removed, and the file still asserts the old shape. So the two fields that *can* be checked are, on every scan. Drift never overrides the classification, because the operator's expectation being wrong is the finding; silently adopting it would delete the finding. |
+| A declared login takes a service out of the exposure count — and gives it a badge, a counter and a note | `exposedWithoutAuth` is a conclusion, not a measurement: *reachable, and nothing authenticates it*. An in-app login is an answer to the second clause that no scanner can reach, so leaving the finding up asks the operator to keep dismissing a question they already answered in writing — which is how a real alarm gets trained into noise. The cost is real and is the honest risk of the whole layer: a stale declaration on a public service stops being flagged. So it is loud *in place of* the alarm rather than absent — `Protected — declared`, `stats.declaredAuthProtected`, and a note saying the verdict rests on something this scan cannot verify. The alternative considered and rejected was leaving the count untouched and only annotating it, which is what the acceptance field already does; two fields that behave identically would have made the distinction between "there is a login" and "there is none and that is fine" unrecoverable from the output. |
+| Only a **same-layer** disagreement warns | The literal reading of "declared ≠ detected → warn" fires on every layered setup there is: an app that logs users in *and* sits behind a proxy gate is defence in depth, and warning about it teaches the operator that drift means nothing. The two vocabularies describe different tiers of one request path, so they are compared only where both can name the same thing — three families, sorted into the app's own login and the gate in front of it. `declared app-oidc + detected ldap` is two answers to one question and warns; `declared app-oidc + detected forward-auth` is two true statements and does not. `declcompare` pins it with a *pair*: two services declaring the same mechanism, opposite outcomes, decided only by what the scan found. |
+| `declaredAuthProtected` is its own counter, never folded into `authProtected` | `authProtected` means *the scan proved a gate*, and that is the number a reader checks a fleet against. Adding unverifiable protection to it would make it unfalsifiable in exactly the way I1 exists to prevent, and would do it silently — the total would look better with no way to see why. A separate tile, badge and CLI line costs a few lines of UI and keeps both numbers meaning one thing each. |
+| The comparison takes `wouldBeExposed`, not `reachable` | `hasEdgeAuth` includes Cloudflare Access policies and API-confirmed enforced gates, neither of which carries an `AuthMethod`. With plain `reachable`, an already-protected service would be labelled `supplies` and counted in `declaredAuthProtected` — a service credited to a declaration that never left the exposed count, because it was never in it. Passing the caller's own verdict term also makes `supplies` imply `method === "none"`, which is what bounds the feature: a declaration can only change a verdict where the scan found nothing at all. |
+| A declaration that agrees with the scan is rendered nowhere | The point of the sidecar is to say what the scan cannot see. Repeating what it already found sends the reader to check two sources that agree, and makes the rows that do matter harder to spot — the same reason the expected-ingress row lost its `matches the scan` pill. `redundant` is the outcome that renders nothing, and the fixture that pins it asserts on *silence*: no note, no badge, no drift. |
 | The sidecar is parsed defensively and every mistake is a warning | It is operator input from inside a tree already treated as untrusted (§7), so it is contained like `env_file`, size-capped, length-capped per field, and its unknown keys are *named* — a mistyped `descripton` that silently does nothing is the one failure mode an optional-everything format has. Nothing in it can fail a scan (I4): a malformed sidecar costs the fields it got wrong. And because declared text is prose shown as written, with no key-name heuristic that could apply, the documentation says plainly never to put a secret in one; URL credentials are redacted as a backstop only, which is why a link's label falls back to the redacted URL. |
 | The diff is derived by the caller, not carried in the payload | It needs memory of the previous scan, and `buildOverview` is required to have none (I7). Both consumers already hold two payloads, so `diffStacks(prev, next)` as a pure function of them adds no API surface, no server state, and nothing to keep consistent between the log line and the topbar. |
 | "No config changes" is stated rather than left implied | A rescan that reports nothing is indistinguishable from a rescan that never ran, and `scanned <time>` moves either way. The commonest true answer to pressing the button is "I re-read everything and nothing in it differs" — which is only reassuring if it is said out loud. |

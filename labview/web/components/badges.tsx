@@ -1,5 +1,5 @@
-import type { AuthMethod, DeclaredAuth, DockerState, IngressKind } from "../model";
-import { declaredAuthLabel, declaredAuthSummary } from "../model";
+import type { AuthMethod, DeclaredAuth, DeclaredAuthAgreement, DockerState, IngressKind } from "../model";
+import { declaredAuthLabel, declaredAuthSummary, showsDeclaredAuth } from "../model";
 import { authLabel, authVar, ingressLabel, ingressVar } from "../lib/palette";
 import { statusView } from "../lib/format";
 import { IconCheck, IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
@@ -78,21 +78,54 @@ export function AcceptedBadge({ reason, file }: { reason: string; file: string }
 }
 
 /**
- * Authentication the operator declared and this scan did not detect.
+ * Where the exposure alarm would have been, on a service the operator says
+ * authenticates itself.
  *
- * Deliberately colourless: hue in this UI means a *detected* category, and a
- * declaration is a statement rather than an observation, so it is marked out by a
- * dashed outline and by saying so in words. It appears next to the detected
- * `AuthBadge` — usually next to "No proxy auth" — and the pair is the honest report:
- * the scan found nothing, the operator says otherwise.
+ * Its own badge rather than the ordinary "Protected": that word is reserved for what
+ * the scan proved, and this rests on a statement no scan can check. Saying so in the
+ * badge — and in the tooltip, which names the file to go and read — is what keeps a
+ * stale sidecar findable instead of making a public service quietly unremarkable.
  */
-export function DeclaredAuthBadge({ auth, file }: { auth: DeclaredAuth[]; file: string }) {
-  if (!auth.length) return null;
+export function DeclaredProtectedBadge({ auth, file }: { auth: DeclaredAuth[]; file: string }) {
   return (
     <span
       class="badge declared"
-      title={`Declared in ${file} — not detected by this scan:\n${declaredAuthSummary(auth)}`}
+      title={`Reachable with no detected proxy/SSO auth, but ${file} declares the service authenticates itself:\n${declaredAuthSummary(auth)}\n\nNot verified by this scan.`}
     >
+      <span class="icon">
+        <IconLock />
+      </span>
+      Protected — declared
+    </span>
+  );
+}
+
+/**
+ * Authentication the operator declared, where it adds something to what the scan found.
+ *
+ * Deliberately colourless: hue in this UI means a *detected* category, and a
+ * declaration is a statement rather than an observation, so it is marked out by a
+ * dashed outline and by saying so in words.
+ *
+ * Renders nothing when the declaration is `redundant` — the scan detected the same
+ * mechanism, so a second badge saying it would send a reader to check two sources that
+ * agree. The tooltip only claims "not detected" for the outcome where that is true:
+ * `supplies` has its own badge above, and `conflicts` is a disagreement the drift line
+ * spells out, so neither can be described that way here.
+ */
+export function DeclaredAuthBadge({
+  auth,
+  file,
+  agreement,
+}: {
+  auth: DeclaredAuth[];
+  file: string;
+  agreement: DeclaredAuthAgreement | undefined;
+}) {
+  if (!auth.length || !showsDeclaredAuth(agreement) || agreement === "supplies") return null;
+  const note = agreement === "conflicts" ? "disagrees with what this scan detected" : "not detected by this scan";
+  return (
+    <span class="badge declared" title={`Declared in ${file} — ${note}:\n${declaredAuthSummary(auth)}`}>
       <span class="icon">
         <IconLock />
       </span>

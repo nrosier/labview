@@ -10,15 +10,27 @@
 # APIs — so an app that keeps its own user database looks unauthenticated to it, and a
 # status page you deliberately left open looks like an oversight. Say so here.
 #
-# Two rules worth knowing before you write anything:
+# Three rules worth knowing before you write anything:
 #
-#   1. Nothing here changes what LabView detected. Declarations are stored, counted
-#      and rendered separately, and every one of them is labelled with the name of
-#      this file. A service you declare as internally authenticated still reads
-#      "No proxy auth" from the scan — with your declaration shown beside it.
-#   2. No secrets. Every value below is served verbatim on /api/overview and shown in
+#   1. Nothing here changes what LabView *detected*. The detected method, its
+#      confidence and its evidence come from the scan alone, and a service you declare
+#      as internally authenticated still reads "No proxy auth" from the scan — with
+#      your declaration shown beside it, labelled with the name of this file.
+#   2. A declaration can change one *verdict*. If a service is reachable from outside,
+#      the scan found no gate in front of it, and you declare that the app
+#      authenticates its own users, it is no longer counted as exposed without auth.
+#      It is not hidden either: it gets its own badge, its own counter and a note
+#      saying the verdict rests on a statement this scan cannot verify. So keep it
+#      true — a stale declaration here is a finding nobody will see.
+#   3. No secrets. Every value below is served verbatim on /api/overview and shown in
 #      the UI. Only the password inside a `links` URL is redacted, and only because
 #      that is the one place a credential plausibly lands by accident.
+#
+# LabView also compares what you declare against what it found. A declaration that
+# says what the scan already detected is not shown twice; one that disagrees *about the
+# same thing* is reported as drift, so one of the two can be corrected. Declaring the
+# app's own OIDC login while the scan detects a proxy gate in front of it is not a
+# disagreement — those are two tiers of the same request path, and both can be true.
 #
 # A typo is reported rather than ignored: an unknown key, an unknown mechanism, or a
 # service name your compose file does not define each produce a scan warning, so a
@@ -78,19 +90,27 @@ services:
     # ── Authentication the application performs for itself ───────────────────
     # This is the field most worth filling in: a login LabView has no way to see,
     # because it is enforced inside the app rather than by a proxy or by Authentik.
+    # It is also the one field that changes a verdict — see rule 2 in the header.
     #
     # `mechanism` names the mechanism and never the product, so this reads the same
     # whatever you run. List as many as apply (up to 8); `detail` is free text.
     #
     #   app-local-accounts   the app has its own user database
-    #   app-ldap             the app binds a directory itself
-    #   app-oidc             the app performs its own OIDC/OAuth login
+    #   app-ldap             the app binds a directory itself             ᵉ
+    #   app-oidc             the app performs its own OIDC/OAuth login    ᵉ
     #   app-saml             the app performs its own SAML login
     #   app-token            an API token or key is required
     #   mtls                 client certificates are required
     #   network-restricted   reachable only from restricted networks (VPN, VLAN, firewall)
-    #   external-proxy       an authenticating proxy outside the scanned fleet
+    #   external-proxy       an authenticating proxy outside the scanned fleet   ᵉ
     #   other                anything else — `detail` is then required
+    #
+    # ᵉ LabView can detect these itself, so a line naming one is compared against what
+    #   it found. Detected the same kind of thing → your line is not repeated. But
+    #   `app-ldap` and `app-oidc` are two answers to one question — how the app logs
+    #   users in — so declaring one where the scan detected the other is drift, and you
+    #   will hear about it until one of the two is corrected. The unmarked mechanisms
+    #   are invisible to any scan: always shown, never a disagreement.
     #
     # Shorthand: `auth: [app-local-accounts, app-ldap]` when there is nothing to add.
     auth:
@@ -103,8 +123,13 @@ services:
     # Declare that reachable-without-authentication is a decision rather than an
     # oversight. The service still counts as exposed — that is deliberate, because a
     # decision you can no longer see is a decision nobody will revisit. What changes
-    # is that the KPI reads "12 (1 accepted)", the badge says "Exposed, accepted",
-    # your reason is shown, and a "hide accepted" filter can put it out of the way.
+    # is that the KPI reads "23/28" (28 found, 5 of them accepted, 23 still wanting an
+    # answer), the badge says "Exposed, accepted", your reason is shown, and a "hide
+    # accepted" filter can put it out of the way.
+    #
+    # Different from the `auth` block above, and both are worth getting right: `auth`
+    # says there IS a login, so the service is not an exposure at all; this says there
+    # is NOT one and that is fine here. Do not use this to stand in for the other.
     #
     # `reason` is REQUIRED. An acceptance with no reason cannot be told apart from a
     # stray key, so LabView refuses it and warns instead of quieting a real finding.
@@ -128,7 +153,9 @@ services:
     #
     # These are independent, and most services have several. Write the full set you
     # expect: LabView reports both what is missing and what it found that you did not
-    # list, so a partial list drifts on purpose. A single kind can be written bare
-    # (`ingress: internal`) — the list form is only needed for more than one.
+    # list, so a partial list drifts on purpose. Order does not matter — the two are
+    # compared as sets — and an expectation that matches is not shown at all, so this
+    # block is silent until the day it has something to say. A single kind can be
+    # written bare (`ingress: internal`); the list form is only needed for more than one.
     expected:
       ingress: [public, lan, internal]
