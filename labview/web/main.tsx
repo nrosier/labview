@@ -10,7 +10,16 @@ import type {
   TraefikSummary,
 } from "./model";
 import { phaseText, shouldBanner } from "./model";
-import { diffStacks, scanDiffDetails, scanDiffText, type ScanDiff } from "./model";
+import {
+  diffIntegrations,
+  diffStacks,
+  integrationDiffDetails,
+  integrationDiffText,
+  scanDiffDetails,
+  scanDiffText,
+  type IntegrationDiff,
+  type ScanDiff,
+} from "./model";
 import { fetchOverview, rescan } from "./api";
 import { AUTH_META, INGRESS_META } from "./lib/palette";
 import { fmtTime, ingressSummary, qualifyRouter, serviceKey } from "./lib/format";
@@ -187,8 +196,10 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // What the last rescan found, held until the next one. The initial load has nothing to
-  // compare against, so it stays null and the note is absent rather than empty.
+  // compare against, so both stay null and the notes are absent rather than empty.
   const [diff, setDiff] = useState<ScanDiff | null>(null);
+  /** The other half of the same rescan: what the Authentik and Traefik reads came back with. */
+  const [apiDiff, setApiDiff] = useState<IntegrationDiff | null>(null);
   const [tab, setTab] = useState<"overview" | "graph">("overview");
   const [theme, setTheme] = useState<Theme>((localStorage.getItem(THEME_KEY) as Theme) || "auto");
 
@@ -242,6 +253,7 @@ function App() {
       const next = await rescan();
       setOv(next);
       setDiff(before ? diffStacks(before.stacks, next.stacks) : null);
+      setApiDiff(before ? diffIntegrations(before, next) : null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -250,6 +262,9 @@ function App() {
   }
 
   const flat = useMemo(() => (ov ? flatten(ov) : []), [ov]);
+  // Empty when no integration was read in either scan, which is what keeps the note
+  // unchanged for a fleet that has neither switched on.
+  const apiDiffText = apiDiff ? integrationDiffText(apiDiff) : "";
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -387,6 +402,24 @@ function App() {
               >
                 {" · "}
                 {scanDiffText(diff)}
+              </span>
+            )}
+            {/* The same proof for the other half of a rescan: both API exchanges are
+                re-run every time, and until this said so, an Authentik that gained
+                twenty applications still reported "no config changes". A second span
+                rather than a longer string, so each half highlights on its own — and
+                absent entirely when no integration was read in either scan. */}
+            {apiDiff && apiDiffText && (
+              <span
+                class={apiDiff.unchanged ? "rescan-note" : "rescan-note moved"}
+                title={
+                  apiDiff.unchanged
+                    ? "Re-read on this rescan, including the credentials: every count came back the same."
+                    : integrationDiffDetails(apiDiff).join("\n")
+                }
+              >
+                {" · "}
+                {apiDiffText}
               </span>
             )}
           </span>

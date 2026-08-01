@@ -59,7 +59,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
 | **Integration panel** | The `authentik: 13 apps · 9 matched` and `traefik: 10 routers · 8 matched` counts in the topbar are buttons. Click one and you get the whole join: every matched pair with the evidence behind it and how strongly it was established, and every application or router LabView could **not** place — with the reason (`ambiguous` where two services claim it, `no-candidate` where nothing did), plus the rule-by-rule trace of what was tried. Clicking a matched row jumps to that service's drawer. When an integration is unreachable the same panel shows the failure instead: the stage that failed, the address, every candidate that was tried, and the suggested fix. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
-| **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — and then says what moved, beside `scanned <time>`: `+1 stack, 2 services changed`, hover for the names. When nothing moved it says **`no config changes`**, so "LabView re-read everything and your files are the same" is never confused with "LabView didn't look". |
+| **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — **and re-runs both API exchanges**, credential files included. Then it says what moved on each side, beside `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, hover for the names. When nothing moved it says **`no config changes · authentik and traefik unchanged`**, so "LabView re-read everything and it is all the same" is never confused with "LabView didn't look". |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
 | **Light / dark** | Follows the OS, with a manual toggle. Colorblind-safe palette validated in both modes. |
 
@@ -326,13 +326,22 @@ policy filter removed, `applicationsRecovered` how many of those were rebuilt, a
 that started *after* the request arrived — so a rescan issued a second after you
 saved a file can never hand back a scan that read the old one. Concurrent requests
 still coalesce into a single sweep, so holding the button down does not multiply the
-load on the socket proxy. What the rescan found is logged too:
+load on the socket proxy. A rescan re-runs the Authentik and Traefik exchanges too —
+endpoint discovery, every request, and the credential files, so a rotated token is
+picked up. What the rescan found is logged, both halves of it:
 
 ```text
-LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service (57 stacks, 87 services)
+LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service; authentik +2 applications, +1 matched (57 stacks, 87 services)
   · added: monitoring (1 service)
   · changed: wiki — services added: search-sidecar
+  · authentik: +2 applications, +1 matched
+  · authentik appeared: monitoring, grafana
 ```
+
+The two halves are separate on purpose: an API that answers differently is not an
+edit to a file. And nothing numeric is ever compared across a *failed* read — a read
+that stopped working says `authentik not read`, never `-40 applications` about an
+instance this scan could not reach.
 
 ---
 

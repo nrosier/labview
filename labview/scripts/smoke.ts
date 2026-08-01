@@ -265,6 +265,25 @@ interface TraefikStubOptions {
   gated?: boolean;
   /** Fail `/api/entrypoints`, leaving the read partial. */
   entrypointsFail?: boolean;
+  /**
+   * Serve the runtime config without this route — its router and its like-named service.
+   *
+   * Both together because that is how a route leaves: the docker provider derives a router
+   * and a service from the same container, and deleting the container removes both. The one
+   * thing a stub option can produce that no fixture edit can — two *successful* reads of the
+   * same files that differ in what the proxy returned.
+   */
+  dropRoute?: string;
+}
+
+/** The runtime config as the stub serves it, minus a dropped route. */
+function traefikRawdata(opts: TraefikStubOptions): unknown {
+  const raw = TF_FIXTURE.rawdata as Record<string, unknown>;
+  const name = opts.dropRoute;
+  if (!name) return raw;
+  const without = (section: unknown): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(section as Record<string, unknown>).filter(([k]) => k.split("@")[0] !== name));
+  return { ...raw, routers: without(raw.routers), services: without(raw.services) };
 }
 
 /**
@@ -303,7 +322,7 @@ function traefikStub(opts: TraefikStubOptions = {}): { fetchImpl: FetchLike; cal
     }
 
     if (probing) return reply(200, TF_FIXTURE.version, opts.gated ? TF_SESSION : undefined);
-    if (parsed.pathname === "/api/rawdata") return reply(200, TF_FIXTURE.rawdata);
+    if (parsed.pathname === "/api/rawdata") return reply(200, traefikRawdata(opts));
     if (parsed.pathname === "/api/entrypoints") {
       return opts.entrypointsFail
         ? reply(500, { error: "internal server error" })
@@ -2547,11 +2566,24 @@ authentikEnv({});
  * restarted between two scans is not an edit, and a diff that says otherwise would report
  * everything on every rescan — the same trap `read` is kept out of the connection
  * signature for.
+ *
+ * Third, that the half the first two exclude is nevertheless reported. A rescan re-runs
+ * both API exchanges every time, and between the configuration diff excluding live answers
+ * and the connection signature excluding `read`, an application count going 18 → 40 used to
+ * produce no line anywhere.
  */
 const { createScanCache } = await import("../src/server/cache.js");
-const { diffStacks, scanDiffText, scanDiffDetails, formatScanDiff, formatScanTotals } = await import(
-  "../src/model/changes.js"
-);
+const {
+  diffStacks,
+  scanDiffText,
+  scanDiffDetails,
+  formatScanDiff,
+  formatScanTotals,
+  diffIntegrations,
+  integrationDiffText,
+  integrationDiffDetails,
+  formatRescan,
+} = await import("../src/model/changes.js");
 const { cpSync, mkdirSync } = await import("node:fs");
 
 console.log("\na forced rescan is never answered by a scan that started before it");
@@ -2959,6 +2991,167 @@ check(
   JSON.stringify(manyDetails.slice(-2)),
 );
 
+console.log("\na rescan also says what the integration reads came back with");
+// The same root, the same stub, twice. The configuration diff is silent about live API
+// answers on purpose, and `read` is kept out of the connection signature so a moving count
+// does not log every scan — between them, nothing said the reads had happened at all.
+const sameTwice = diffIntegrations(ak, ak);
+check(
+  "the same answer twice is stated as read and unchanged, not left silent",
+  sameTwice.unchanged &&
+    sameTwice.changes.length === 1 &&
+    sameTwice.changes[0]?.state === "unchanged" &&
+    integrationDiffText(sameTwice) === "authentik unchanged",
+  `${integrationDiffText(sameTwice)} | ${JSON.stringify(sameTwice.changes.map((c) => c.state))}`,
+);
+check(
+  "...and adds no detail line, because the summary already said it",
+  integrationDiffDetails(sameTwice).length === 0,
+  integrationDiffDetails(sameTwice).join("|"),
+);
+
+// Same files, a different answer from the API. The two diffs must disagree, and that is
+// the point: one reports what was edited, the other what was read.
+const apiMoved = diffIntegrations(ak, akFull);
+check(
+  "a different API answer over identical files moves one diff and not the other",
+  diffStacks(ak.stacks, akFull.stacks).unchanged && !apiMoved.unchanged,
+  `config unchanged=${diffStacks(ak.stacks, akFull.stacks).unchanged} integrations unchanged=${apiMoved.unchanged}`,
+);
+check(
+  "...with every count that moved signed, and the modifiers read as modifiers",
+  apiMoved.changes[0]?.counts.join(", ") === "+1 application, -3 withheld, -2 recovered, +1 provider, +1 unmatched",
+  apiMoved.changes[0]?.counts.join(", ") ?? "",
+);
+check(
+  "...and the application that appeared named, from the same payload the drawer shows",
+  apiMoved.changes[0]?.appeared.join(",") === "hidden-01" && apiMoved.changes[0]?.disappeared.length === 0,
+  `appeared=${apiMoved.changes[0]?.appeared.join(",")} disappeared=${apiMoved.changes[0]?.disappeared.join(",")}`,
+);
+
+// The rule the whole line's trustworthiness rests on. A failed read reports zeros, so
+// comparing counts across it would announce `-15 applications`: a claim about Authentik's
+// contents from a scan that never reached Authentik.
+const stopped = diffIntegrations(ak, akDown);
+check(
+  "a read that failed reports the failure and no delta at all",
+  stopped.changes[0]?.state === "stopped" && stopped.changes[0]?.counts.length === 0,
+  JSON.stringify(stopped.changes[0]),
+);
+check(
+  "...stating no loss anywhere, because nothing was lost — a read failed",
+  integrationDiffText(stopped) === "authentik not read" &&
+    !integrationDiffText(stopped).includes("-") &&
+    !integrationDiffDetails(stopped).join("|").includes("-"),
+  `${integrationDiffText(stopped)} | ${integrationDiffDetails(stopped).join("|")}`,
+);
+const started = diffIntegrations(akDown, ak);
+check(
+  "a read that recovered says so, and is equally silent about numbers",
+  started.changes[0]?.state === "started" &&
+    started.changes[0]?.counts.length === 0 &&
+    integrationDiffText(started) === "authentik now readable",
+  `${integrationDiffText(started)} | ${JSON.stringify(started.changes[0]?.counts)}`,
+);
+
+// An integration nobody switched on is not a status, and a failure that persists is not
+// news on every rescan — the banner and the connection line already carry it.
+check(
+  "an integration nobody configured contributes nothing to say",
+  diffIntegrations(akOff, akOff).changes.length === 0 && integrationDiffText(diffIntegrations(akOff, akOff)) === "",
+  `${diffIntegrations(akOff, akOff).changes.length} "${integrationDiffText(diffIntegrations(akOff, akOff))}"`,
+);
+check(
+  "...and neither does a failure that was already failing last scan",
+  diffIntegrations(akDown, akDown).changes.length === 0,
+  JSON.stringify(diffIntegrations(akDown, akDown).changes),
+);
+
+// The other target, over the other root: two successful reads of the same files where the
+// proxy stopped serving a route. Authentik and Traefik report different nouns off different
+// summaries, so a table covering one and not the other would look fine up to here.
+//
+// Both runs are made here rather than reusing the module-scope `tf`: an assertion above
+// attaches a synthetic router to that payload to test the matcher directly, so it is no
+// longer a faithful record of the scan that produced it.
+console.log("\nthe same holds for the proxy, in its own vocabulary");
+traefikEnv({});
+authentikEnv({ token: AK_TOKEN });
+const tfWhole = await overviewFor(traefikRoot, { fetchImpl: traefikStub().fetchImpl });
+const tfPruned = await overviewFor(traefikRoot, { fetchImpl: traefikStub({ dropRoute: "docs" }).fetchImpl });
+const proxyMoved = diffIntegrations(tfWhole, tfPruned);
+const proxyChange = proxyMoved.changes.find((c) => c.target === "traefik");
+check(
+  "a route the proxy stopped serving is counted and named",
+  proxyChange?.state === "moved" &&
+    proxyChange.disappeared.join(",") === "docs" &&
+    proxyChange.appeared.length === 0,
+  JSON.stringify(proxyChange),
+);
+check(
+  "...in the proxy's own nouns, where a live service is not a fleet service",
+  proxyChange?.counts.join(", ") === "-1 router, -1 live service, -1 matched",
+  proxyChange?.counts.join(", ") ?? "",
+);
+check(
+  "...and the two targets are reported side by side, each labelled",
+  integrationDiffText(proxyMoved) === "authentik unchanged; traefik -1 router, -1 live service, -1 matched" &&
+    integrationDiffDetails(proxyMoved).some((l) => l === "· traefik disappeared: docs"),
+  `${integrationDiffText(proxyMoved)} | ${integrationDiffDetails(proxyMoved).join(" | ")}`,
+);
+
+console.log("\nwhen a rescan speaks, and when it stays quiet");
+const quiet = diffStacks(stacksA, stacksA);
+check(
+  "a timer rebuild that found nothing on either side stays silent",
+  formatRescan("/data/apps", quiet, sameTwice, false).length === 0,
+  JSON.stringify(formatRescan("/data/apps", quiet, sameTwice, false)),
+);
+check(
+  "...but a rescan somebody pressed answers on both halves anyway",
+  formatRescan("/data/apps", quiet, sameTwice, true)[0] ===
+    `LabView rescanned /data/apps — no config changes; authentik unchanged (${quiet.stacks} stacks, ${quiet.services} services)`,
+  formatRescan("/data/apps", quiet, sameTwice, true)[0] ?? "",
+);
+check(
+  "...and an API that moved speaks even though no file was edited",
+  formatRescan("/data/apps", quiet, apiMoved, false)[1] === "  · authentik: +1 application, -3 withheld, -2 recovered, +1 provider, +1 unmatched" &&
+    formatRescan("/data/apps", quiet, apiMoved, false)[2] === "  · authentik appeared: hidden-01",
+  JSON.stringify(formatRescan("/data/apps", quiet, apiMoved, false)),
+);
+check(
+  "the configuration-only line is untouched by any of this",
+  formatScanDiff("/data/apps", svcAdded).join("|") === logLines.join("|"),
+  formatScanDiff("/data/apps", svcAdded).join("|"),
+);
+
+// A fleet with forty applications must not put forty names in one log line, and what it
+// left out is stated — the same rule as the stack list, applied per line because three
+// lines per target could never reach a line ceiling.
+const manyNames = {
+  changes: [
+    {
+      target: "authentik" as const,
+      state: "moved" as const,
+      counts: [] as string[],
+      appeared: Array.from({ length: 20 }, (_, i) => `app-${String(i).padStart(2, "0")}`),
+      disappeared: [] as string[],
+    },
+  ],
+  unchanged: false,
+};
+const manyNameLine = integrationDiffDetails(manyNames)[0] ?? "";
+check(
+  "a long list of names says how many it left out",
+  manyNameLine.endsWith("… and 8 more") && manyNameLine.includes("app-11") && !manyNameLine.includes("app-12"),
+  manyNameLine,
+);
+check(
+  "...and the summary says what happened, even when every count came back equal",
+  integrationDiffText(manyNames) === "authentik 20 applications replaced",
+  integrationDiffText(manyNames),
+);
+
 console.log("\nno rescan line carries a value out of the configuration");
 // Same discipline as the connection lines: these go to a log and to a tooltip, and the
 // diff is computed from a payload that has env values in it. It reports *that* a service
@@ -2967,6 +3160,12 @@ const everyDiffLine = [
   ...formatScanDiff(tmpRoot, envDiff),
   ...formatScanDiff(tmpRoot, grownDiff),
   ...scanDiffDetails(envDiff),
+  // The integration half too: it is built from a payload that holds an API token and the
+  // fixture's env values, and it reports records by name.
+  ...formatRescan(tmpRoot, envDiff, apiMoved, true),
+  ...formatRescan(tmpRoot, quiet, stopped, true),
+  ...integrationDiffDetails(apiMoved),
+  integrationDiffText(apiMoved),
 ].join("\n");
 check(
   "not the new value, and not the old one either",
@@ -2979,6 +3178,11 @@ check(
     !everyDiffLine.includes("another-secret") &&
     !everyDiffLine.includes("ldap-bind-secret") &&
     !everyDiffLine.includes("oidc-client-secret-value"),
+  everyDiffLine,
+);
+check(
+  "and no API token either, on a line that reports what that token was used to read",
+  !everyDiffLine.includes(AK_TOKEN),
   everyDiffLine,
 );
 

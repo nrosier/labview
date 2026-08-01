@@ -51,6 +51,11 @@ export { phaseText, shouldBanner } from "../src/model/connections";
  * What a rescan found, compared and worded by the same module the server logs through —
  * so the note beside `scanned <time>` and the line in the log can never disagree about
  * the same rescan.
+ *
+ * Two diffs, because a rescan does two things: it re-reads the compose files, and it
+ * re-runs the Authentik and Traefik exchanges. An API that answered differently is not an
+ * edit, so the second is reported beside the first rather than inside it.
  */
 export { diffStacks, scanDiffText, scanDiffDetails } from "../src/model/changes";
-export type { ScanDiff, StackChange } from "../src/model/changes";
+export { diffIntegrations, integrationDiffText, integrationDiffDetails } from "../src/model/changes";
+export type { ScanDiff, StackChange, IntegrationDiff, IntegrationChange } from "../src/model/changes";

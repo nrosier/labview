@@ -71,12 +71,15 @@ live state from the Docker API, and never needs an agent inside each app.
   same panel opens on the failure: what failed, the address, every candidate that was
   tried with its own stage, and the suggested fix. `Escape` closes the panel first, the
   service drawer second.
-- **Rescan** — re-reads every `compose.yml` and `.env` under the apps root and then
-  reports what moved, inline beside `scanned <time>`: `+1 stack, 2 services changed`,
-  with the stack and service names on hover. New stacks, deleted stacks, added
-  services and edited files all show up; live state changing on its own does not.
-  When your files are the same as last time it says so — `no config changes` —
-  rather than leaving you to guess whether it looked.
+- **Rescan** — re-reads every `compose.yml` and `.env` under the apps root *and*
+  re-runs both API exchanges, then reports what moved on each side, inline beside
+  `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, with
+  the names on hover. New stacks, deleted stacks, added services and edited files all
+  show up in the first note; applications, providers, routers and middlewares that
+  came or went show up in the second. Live state changing on its own does not appear
+  in either. When everything is the same as last time it says so — `no config changes
+  · authentik and traefik unchanged` — rather than leaving you to guess whether it
+  looked.
 - **Light / dark** theme (follows the OS, with a manual toggle).
 
 Colors follow a validated, colorblind-safe palette. The ingress and auth-method
@@ -390,9 +393,11 @@ mistyped `LABVIEW_APPS_ROOT` shows up as `read 0 stacks` rather than as an empty
 dashboard. Every later scan reports the difference from the one before it instead:
 
 ```text
-LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service (57 stacks, 87 services)
+LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service; authentik +2 applications, +1 matched (57 stacks, 87 services)
   · added: monitoring (1 service)
   · changed: wiki — services added: search-sidecar
+  · authentik: +2 applications, +1 matched
+  · authentik appeared: monitoring, grafana
 ```
 
 The same lines print under `npm run scan -- --summary`, the same phase and reason
@@ -621,6 +626,17 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   a diff nobody reads. When nothing in the files differs it says **`no config
   changes`**, which is the answer most rescans have and the one the button used to
   leave unsaid.
+- **The integration reads are re-run too, and reported beside the files.** A rescan
+  redoes endpoint discovery and every Authentik and Traefik request, re-reading the
+  credential files with them, so a rotated token takes effect on the next press. That
+  half gets its own note and its own log clause — `authentik +2 applications, +1
+  matched`, with the applications and routers that came or went named on hover —
+  because the configuration diff excludes live API answers by design, so an
+  application count going 18 → 40 used to produce no line anywhere. Two rules keep it
+  trustworthy. Nothing is compared across a **failed** read: a read that stopped
+  working says `authentik not read`, never `-40 applications` about an instance the
+  scan never reached. And a failure that was already failing last time is not
+  re-reported as a change — the banner already says it, continuously.
 
 ### Security
 
@@ -855,4 +871,7 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
   stays an explicit action; nothing auto-refreshes the page.
 - LabView's own `config.yml` is read once at startup. Rescan re-reads the fleet, not
-  LabView's configuration: changing a token or an endpoint needs a restart.
+  LabView's configuration: changing a configured endpoint, or a token given inline or
+  through an environment variable, needs a restart. A token or password given as a
+  **file** (`tokenFile`, `passwordFile`) is the exception — those are read on every
+  build, so rotating the file takes effect on the next rescan.

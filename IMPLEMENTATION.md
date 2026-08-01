@@ -809,6 +809,56 @@ payload across the request and renders `scanned 12:04:11 · +1 stack, +2 service
 with the per-stack detail as the tooltip. No new API fields: both consumers already
 hold the two payloads a diff needs.
 
+#### A rescan re-reads the integrations, and now says so
+
+A rescan already re-ran both API exchanges — endpoint discovery, every request, and
+the credential files with them, since `tokenFile` and `passwordFile` are read per
+build, so a rotated secret is picked up. Nothing was memoized. But **nothing
+reported it**, and the two rules above are why: the configuration diff excludes live
+API answers on purpose, and `read` is excluded from `changedConnections`'s
+signature for the same reason. Between them, an application count going 18 → 40
+produced no line anywhere, which from the operator's seat is indistinguishable from
+a rescan that never touched Authentik.
+
+`diffIntegrations(prev, next)` closes that, as a **second structure reported beside
+`ScanDiff`, never folded into it**. Folding them would make "changed" mean two
+things at once and would break the property the deny-list exists to protect — an
+API that answered differently is not an edit. So the note and the log line carry two
+labelled clauses: `no config changes; authentik +1 application, -3 withheld`.
+
+**Reachability is decided before any count is compared, and that is what keeps the
+numbers honest.** A failed read reports zeros, so comparing across it would announce
+`-40 applications` — a statement about Authentik's contents from a scan that never
+reached Authentik, and precisely the §4 I1 failure this codebase exists to prevent:
+
+| prev → next | `state` | Reports |
+|---|---|---|
+| neither read | *no entry at all* | — the banner and connection line own a persistent failure; repeating it every rescan makes it look like news |
+| both read | `unchanged` or `moved` | count deltas, and the records that appeared or disappeared, by name |
+| not read → read | `started` | nothing numeric; the connection line already carries the counts |
+| read → not read | `stopped` | nothing numeric; the banner carries why |
+
+Counts come from a small table per target, each compared only when **both** sides
+have a value — `applicationsConfigured` is optional, and an older payload without it
+must degrade to saying nothing rather than to claiming the total fell to nothing
+(§4 I4). True nouns go through `plural` (`+3 applications`); the modifiers of those
+same nouns read identically in both directions (`-3 withheld`, `+1 matched`),
+because `+3 withhelds` is not English and `-3 withheld applications` claims a loss
+when the opposite happened. Traefik's `services` is rendered **`live service`**: a
+proxy service is not a fleet service, and the two appear in the same line.
+
+Named records are read back off the payload rather than tracked separately, so what
+the diff names is exactly what the drawer shows — matched ones from the services
+(`svc.authentik.applications[].slug`, `svc.traefikLive[].router`), unmatched ones
+from the summary. Sorted, for determinism (§4 I7). Long lists are truncated **per
+line** with the remainder stated: each target contributes at most three lines, so
+the `MAX_DETAIL_LINES` ceiling could never be reached, while forty applications
+would otherwise put forty names in one log line.
+
+The cadence rule itself moved into `formatRescan`, out of `logScan`, so it can be
+asserted for the first time — and "quiet" now means *both* diffs. A rescan that
+found new applications is not quiet just because no file was edited.
+
 ### I1 — Documentation rests on observable evidence
 
 Every statement in the output must trace to a value read from a compose file, an
@@ -1257,6 +1307,19 @@ stack itself (compose filename, project name, declared networks or volumes, pars
 warnings). Service tallies count only stacks present in both scans; the services of
 a stack that was just added are already accounted for by the stack.
 
+**IntegrationDiff** — the other half of the same rescan: what the Authentik and
+Traefik reads came back with. Also derived locally, also not in the payload. One
+`IntegrationChange` per target read in either scan, in the order LabView reads them,
+and `unchanged` when every entry is — including when there are none, because an
+integration nobody switched on is not a status. Deliberately separate from
+`ScanDiff`: an API that answered differently is not an edit (§3.11).
+
+**IntegrationChange** — one target: `state` is `unchanged`, `moved`, `started` or
+`stopped`, decided from `reachable` on both summaries *before* any count is
+compared. `counts` holds the signed deltas and is empty for anything but `moved`,
+because nothing may be compared across a failed read. `appeared` and `disappeared`
+name the records that came and went — application slugs, router names — sorted.
+
 ---
 
 ## 6. Configuration
@@ -1556,7 +1619,7 @@ merged away:
 **The scan cache and the rescan diff** (§3.11) are asserted the same way, and for
 the same reason: the race *is* the behaviour, so it is driven through the injected
 clock and a build only the assertion can settle — no server, no timers, no sleeping
-on a real deadline. Four properties are pinned:
+on a real deadline. Seven properties are pinned:
 
 - **A forced request is never answered by a build that started before it.** Two
   concurrent passive gets coalesce into one build; a forced get arriving during a
@@ -1575,7 +1638,24 @@ on a real deadline. Four properties are pinned:
   runs before the payload exists (**I6**).
 - **The wording says what moved, and says so when nothing did.** Singular and plural
   forms, the no-change line, and the announced truncation past twelve stacks. No
-  formatted line may contain a fixture `.env` secret.
+  formatted line may contain a fixture `.env` secret, or the API token the
+  integration half of the line reports the results of reading with.
+- **The integration reads are reported too, and only where there is evidence.** The
+  same root read twice with the same stub must state `authentik unchanged` — the
+  assertion the whole gap was about. The same root with two *different* API answers
+  (the mode A and superuser Authentik stubs; for the proxy, a stub serving its
+  runtime config minus one route) must leave the configuration diff `unchanged` while
+  the integration diff moves, with every delta signed and the record that came or
+  went named. Both diffs disagreeing there is the correct outcome.
+- **Nothing is compared across a failed read.** A stub that throws, before and after
+  a working one, must yield `stopped` and `started` with empty `counts` — and the
+  `stopped` line must contain no negative anywhere, because a `-15 applications` from
+  a scan that never reached Authentik is the failure that would make the whole line
+  untrustworthy (**I1**). Two failed reads in a row, and an integration nobody
+  configured, contribute no entry at all.
+- **The cadence is asserted, now that it lives in `formatRescan`.** Quiet on both
+  sides and unforced returns nothing; forced answers on both halves; an API that
+  moved speaks even though no file was edited.
 
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
@@ -1667,6 +1747,17 @@ compose document, or out of a live read?*
 
 The failure modes are asymmetric on purpose: the first mistake is loud and gets
 fixed, the second is silent. When it is genuinely unclear, leave it compared.
+
+**Add a count to `AuthentikSummary` or `TraefikSummary`.** Add it to the target's
+metric table in `model/changes.ts` at the same time, or a rescan will re-read it and
+never say it moved — the gap this pair of tables exists to close. Pick `noun` if it
+counts things (`+3 applications`) and `label` if it modifies a count of the same
+things (`-3 withheld`); if the noun collides with a word already in the line, qualify
+it, as Traefik's `services` is qualified to `live service`. Make it optional only if
+a read can genuinely produce it sometimes, since an absent value is skipped, not
+compared as zero (**I4**). Then extend the `moved` assertion in §8 — the smoke run
+compares two API answers over one root, and a metric missing from the table fails
+nothing on its own.
 
 **Add a config knob.** `LabViewConfig` interface → `DEFAULTS` → an
 `applyEnvOverrides` line if it needs an env var → document it in
@@ -1940,4 +2031,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | An unmatched entry carries the reason, not just the name | Both matchers already knew the difference between "nothing named this" and "two services named it" and threw it away at the `return`. Those are not one problem: the second is the operator's to settle with a label and the first is usually LabView's to explain, and a bare `string[]` reported them identically. The lists became objects rather than gaining a parallel array so the same fact cannot exist twice and drift — accepted as a **breaking change** to `/api/overview`, documented in both READMEs. |
 | The trace is a line per rule, including the rules that found nothing | A reason alone says what the verdict was, not what was examined to reach it, and an operator who disagrees with the verdict has nothing to check. Recording every rule also makes an omission visible: a new rule that forgets its line leaves a *short* trace, which an assertion can catch, where a silent rule reads exactly as if it never existed. |
 | `--critical` is not used in the integration panels | It is the exposure warning's colour (see the SAML row above), and the panel's worst news is an ambiguity or a failed connection — neither is a service reachable without authentication. Reusing red there would make the two indistinguishable at a glance, which costs more than the panel gains. `--warning` carries `ambiguous`, an unauthenticated proxy API and the failed phase. |
+| Integration movement is a second diff, not a field on `ScanDiff` | Folding it in would make `unchanged` mean two different things and would destroy the property the deny-list protects: a container that restarted, or an API that answered this time, is not an edit to a file. Two labelled structures reported side by side keep both answers available — `no config changes; authentik +1 application` says exactly what happened, where one merged "changed" would say neither. |
+| Reachability is decided before any count is compared | An unreachable read reports zeros, so a count comparison across it announces `-40 applications`: a claim about Authentik's *contents* from a scan that never reached Authentik, and the clearest possible I1 violation. `started` and `stopped` therefore carry no numbers at all, and two failed reads in a row produce no entry — the banner and the connection line already state a standing failure, and repeating it as a change every rescan would make it read as news. |
+| The counts are compared, but the diff is still not the connection line | `read` stays out of `changedConnections`'s signature: a count that moves on every scan must not log three connection lines a minute, and that trade is still right. The difference is that a *rescan* is an event somebody asked about, so stating what the read returned there costs one line per press instead of one line per minute. |
 | The matched side is derived in the browser, not duplicated into `ScanMeta` | Every matched pair is already on `svc.authentik` / `svc.traefikLive`, so adding a roll-up to the payload would mean two representations of one join, kept in step by nothing. A `useMemo` over `ov.stacks` reads the same source the service drawer reads, which is also what makes a row in the panel able to open that drawer. The unmatched side has no such home — it is by definition attached to no service — so that half genuinely lives on `meta`. |

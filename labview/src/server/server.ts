@@ -12,7 +12,7 @@ import {
   levelFor,
   rememberConnections,
 } from "../model/connections.js";
-import { diffStacks, formatScanDiff, formatScanTotals } from "../model/changes.js";
+import { diffIntegrations, diffStacks, formatRescan, formatScanTotals } from "../model/changes.js";
 import { createScanCache } from "./cache.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -100,9 +100,14 @@ function logConnections(
  * root — because a startup block that says only "scanning <root>" leaves the operator
  * without the one number that proves the root was the right one.
  *
- * Afterwards the same cadence rule as the connection lines: a change always speaks, and
- * a rescan somebody asked for answers even when the answer is "nothing moved". Only a
- * timer rebuild that found nothing stays quiet — that one is LabView talking to itself.
+ * Afterwards two comparisons, side by side: what changed in the parsed configuration, and
+ * what the Authentik and Traefik reads came back with. A rescan re-runs both exchanges, so
+ * reporting only the first left an application count going 18 → 40 with no line anywhere.
+ *
+ * The cadence rule itself lives in {@link formatRescan}, where it can be asserted: a change
+ * on either side always speaks, a rescan somebody asked for answers even when the answer is
+ * "nothing moved", and only a timer rebuild that found nothing at all stays quiet — that
+ * one is LabView talking to itself.
  */
 function logScan(
   log: FastifyBaseLogger,
@@ -115,7 +120,7 @@ function logScan(
     log.info(formatScanTotals(appsRoot, next.stacks));
     return;
   }
-  const diff = diffStacks(prev.stacks, next.stacks);
-  if (diff.unchanged && !forced) return;
-  for (const line of formatScanDiff(appsRoot, diff)) log.info(line);
+  const config = diffStacks(prev.stacks, next.stacks);
+  const integrations = diffIntegrations(prev, next);
+  for (const line of formatRescan(appsRoot, config, integrations, forced)) log.info(line);
 }
