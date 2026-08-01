@@ -179,7 +179,7 @@ awaited after, overlapping the two. A *discovered* endpoint cannot be found unti
 pass 1 has parsed the routes, so it runs after. Either way the result is one value
 with the same shape.
 
-Origin resolution moved **ahead** of the discovered reads for two reasons. A
+Origin resolution runs **ahead** of the discovered reads for two reasons. A
 resolved origin structurally identifies the service acting as reverse proxy, which
 is one of the three signals Traefik endpoint discovery rests on; and with the index
 already built, both discovered exchanges go out under one `Promise.all` — one round
@@ -469,8 +469,8 @@ asking the proxy:
 2. a **middleware named in a label that is not in the chain the proxy built**, so a
    service reads "protected" and answers without a login;
 3. a **middleware defined in a Traefik file provider**, which has no definition in
-   any scanned stack and is therefore only ever `inferred` (§11's first limitation —
-   this stage is what retires it).
+   any scanned stack and is therefore only ever `inferred` (§11's first limitation;
+   this stage removes it when the API is readable, and only then).
 
 Same two-module split as §3.5:
 
@@ -585,7 +585,7 @@ drawer. `meta.traefik` reports the summary — endpoint, whether it came from co
 discovery, whether a credential was used, whether the API answered unauthenticated,
 version, counts, matched services, unmatched routers, and any error. The proxy
 service itself gets `role: "proxy"` in the graph and every matched router is drawn
-from it, which is what retires the old "the responsible proxy is unknown" edge.
+from it, so the hop is named rather than left to the reader.
 
 ### 3.7 The data contract
 
@@ -639,11 +639,9 @@ drawer. Two rules hold it together:
   auth posture present is shown, plus a count of services reachable without auth. A
   stack with an internal database and a public UI is both at once; picking a "worst
   case" badge would misreport it. The union comes from `rollUpIngress` in
-  `model/ingress.ts` rather than from an inline `some()` in the card, for two reasons:
-  it must deliberately *not* withhold `internal` the way a service's own set does — the
-  UI's exposure would otherwise erase the database from the collapsed view — and a rule
-  that only exists in a `.tsx` file cannot be asserted, which for the one remaining
-  stack-level `internal` is not a risk worth carrying.
+  `model/ingress.ts`, which must deliberately *not* withhold `internal` the way a
+  service's own set does, or the UI's exposure would erase the database from the
+  collapsed view (§12).
 
 **The ingress filter is an expression, not a selection.** Because a service carries
 several kinds, one chip per kind with one on/off state cannot express what an
@@ -864,22 +862,22 @@ payload across the request and renders `scanned 12:04:11 · +1 stack, +2 service
 with the per-stack detail as the tooltip. No new API fields: both consumers already
 hold the two payloads a diff needs.
 
-#### A rescan re-reads the integrations, and now says so
+#### A rescan re-reads the integrations, and reports what came back
 
-A rescan already re-ran both API exchanges — endpoint discovery, every request, and
-the credential files with them, since `tokenFile` and `passwordFile` are read per
-build, so a rotated secret is picked up. Nothing was memoized. But **nothing
-reported it**, and the two rules above are why: the configuration diff excludes live
-API answers on purpose, and `read` is excluded from `changedConnections`'s
-signature for the same reason. Between them, an application count going 18 → 40
-produced no line anywhere, which from the operator's seat is indistinguishable from
-a rescan that never touched Authentik.
+A rescan re-runs both API exchanges — endpoint discovery, every request, and the
+credential files with them, since `tokenFile` and `passwordFile` are read per build,
+so a rotated secret is picked up. Nothing is memoized. What changed in those answers
+is reported by `diffIntegrations(prev, next)`, and neither rule above would do it:
+the configuration diff excludes live API answers on purpose, and `read` is excluded
+from `changedConnections`'s signature for the same reason. Between them, an
+application count going 18 → 40 would produce no line anywhere, which from the
+operator's seat is indistinguishable from a rescan that never touched Authentik.
 
-`diffIntegrations(prev, next)` closes that, as a **second structure reported beside
-`ScanDiff`, never folded into it**. Folding them would make "changed" mean two
-things at once and would break the property the deny-list exists to protect — an
-API that answered differently is not an edit. So the note and the log line carry two
-labelled clauses: `no config changes; authentik +1 application, -3 withheld`.
+`diffIntegrations` is therefore a **second structure reported beside `ScanDiff`,
+never folded into it**. Folding them would make "changed" mean two things at once
+and would break the property the deny-list exists to protect — an API that answered
+differently is not an edit. So the note and the log line carry two labelled clauses:
+`no config changes; authentik +1 application, -3 withheld`.
 
 **Reachability is decided before any count is compared, and that is what keeps the
 numbers honest.** A failed read reports zeros, so comparing across it would announce
@@ -910,9 +908,9 @@ line** with the remainder stated: each target contributes at most three lines, s
 the `MAX_DETAIL_LINES` ceiling could never be reached, while forty applications
 would otherwise put forty names in one log line.
 
-The cadence rule itself moved into `formatRescan`, out of `logScan`, so it can be
-asserted for the first time — and "quiet" now means *both* diffs. A rescan that
-found new applications is not quiet just because no file was edited.
+The cadence rule lives in `formatRescan` rather than in `logScan`, so it is
+something a test can call, and "quiet" means *both* diffs. A rescan that found new
+applications is not quiet just because no file was edited.
 
 ### 3.12 The declaration layer (`.labview`)
 
@@ -1311,58 +1309,24 @@ both keys the *presence* of an entry is the signal, never a parsed port number.
 
 **A service carries a set, not a value.** `svc.ingress` is `IngressKind[]`, and a
 container behind the tunnel, behind the proxy and with a published port is all three
-things at once — each separately true, each its own tag. A stack carries the union of
-its services', built by `rollUpIngress` — the one place the withholding below must
-**not** apply, since a stack is not a service and a public frontend beside an
-internal-only database is genuinely both. Nothing combines two kinds into a third; the
-only function that picks a winner is `primaryIngress`, and it exists solely because a
-graph node has one fill colour.
+things at once — each separately true, each its own tag. `internal` is the one
+exception: `normalizeIngress` withholds it from any set that already carries `public`,
+`traefik` or `lan`, so `svc.ingress` answers *is a neighbour the only way in* rather
+than *can a neighbour get in* (§12). A stack carries the union of its services',
+built by `rollUpIngress` — the one place that withholding must **not** apply, since a
+stack is not a service and a public frontend beside an internal-only database is
+genuinely both. Nothing combines two kinds into a third; the only function that picks
+a winner is `primaryIngress`, and it exists solely because a graph node has one fill
+colour.
 
-Four consequences worth stating, because each one used to be the other way:
-
-- **`internal` is withheld when anything external applies.** The three external kinds
-  are independent of each other; `internal` is not independent of them. Nearly every
-  service in a real fleet shares a network with a neighbour, so reporting it everywhere
-  puts one tag on almost everything and distinguishes nothing — while the service a
-  reader is looking for is the one reachable *only* over the container network. So
-  `normalizeIngress` drops `internal` from any set that already carries `public`,
-  `traefik` or `lan`, and `svc.ingress` answers "is a neighbour the only way in"
-  rather than "can a neighbour get in". The evidence is unchanged and nothing is
-  invented (I1) — this decides only when the tag is worth reporting. The cost: from
-  the tags of an externally-reachable service you cannot tell whether a sibling
-  reaches it too, which the drawer's Networks section and the graph's network edges
-  still say. Applied in `normalizeIngress` rather than in `classifyIngress` so the
-  other source of a kind set — a `.labview` `expected: ingress:` list — collapses the
-  same way, with no second rule to keep in step.
-- **`internal` is positive evidence, not a fallback.** It means another container
-  demonstrably can reach this one — a declared `expose:`, or a real network shared
-  with another scanned service. When neither holds, the answer is `none`, which is
-  a populated category rather than a curiosity. `realNetworks` is what makes this
-  honest: it materializes the implicit `default` network, resolves
-  `${project}_${key}`, and honours `external:` under its verbatim name, so two
-  services in one file are mutually reachable without either declaring a network
-  and two *stacks* on one external network are too. `depends_on` is deliberately
-  **not** evidence — a dependency across two disjoint networks is not
-  reachability.
-- **`lan` is no longer suppressed by a proxy route.** Any service with a `ports:`
-  mapping is tagged `lan` whether or not something sits in front of it, so the
-  count answers "how many publish a port" rather than "how many publish a port and
-  nothing else". A proxied service that also publishes one keeps `traefik` *and*
-  `lan` and still gets its note from `noteHostPortBypass`, which is the difference
-  between "protected by SSO" and "protected by SSO unless you use the port".
-- **The three external counters overlap and do not sum to `services`.** That is the
-  point, and both the CLI and the dashboard say so: the ingress distribution is
-  rendered as one gauge per kind (`TagBars`), not as a part-to-whole bar, because
-  segments that sum past the total are a lie about a whole. `internalServices` and
-  `noIngressServices` are the two exclusive counters, and they are exclusive for the
-  same reason: both mean nothing outside the container network reaches the service.
-
-`traefik` is the one place a **kind names a product**, which reads against I3
-(§8). It is admitted because the kind is derived from Traefik-format route labels,
-so the name follows the evidence that produced it, and the graph already draws a
-hub node labelled `Traefik` on the same basis. Contrast `AuthMethod`, where the
-mechanism (`forward-auth`) is genuinely separable from the provider that
-implements it (`authentik-forward-auth`) and both are reported.
+**`realNetworks`** — the networks a service is demonstrably on, and what makes
+`internal` positive evidence rather than a leftover bucket (§12). It materializes the
+implicit `default` network, resolves `${project}_${key}`, and honours `external:`
+under its verbatim name, so two services in one file are mutually reachable without
+either declaring a network, and two *stacks* on one external network are too.
+`depends_on` is deliberately **not** evidence — a dependency across two disjoint
+networks is not reachability. With neither a shared real network nor an `expose:`, the
+answer is `none`, which is a populated category rather than a curiosity.
 
 Every question about a set goes through
 [model/ingress.ts](labview/src/model/ingress.ts) rather than being asked inline,
@@ -1416,29 +1380,22 @@ is.
 
 **`discoveredVia`** — on `AuthentikApplication`: `"list"` when the applications
 endpoint returned it, `"provider"` when that endpoint withheld it and LabView rebuilt it
-from a provider naming it (§3.5). A `provider` record is the narrower thing it looks
-like: no launch URL, no group, and only the providers this token may read. Reported
-rather than smoothed over — a match made on less evidence should look like one — and the
-value is what the `considered` trace, the drawer's `rebuilt` tag and
-`applicationsRecovered` all rest on.
+from a provider naming it (§3.5). The value is what the `considered` trace, the drawer's
+`rebuilt` tag and `applicationsRecovered` all rest on.
 
 **applicationsConfigured / applicationsWithheld / applicationsRecovered** — on
-`AuthentikSummary`, the arithmetic of what the applications endpoint did *not* return.
-`applicationsConfigured` is its own `pagination.count`, which counts records before its
-policy filter runs and is therefore the total Authentik holds; it is optional because an
-endpoint may report no count at all. `withheld` is that minus what was listed,
+`AuthentikSummary`, the arithmetic of what the applications endpoint did *not* return
+(§3.5). `applicationsConfigured` is its own `pagination.count`, optional because an
+endpoint may report no count at all; `withheld` is that minus what was listed,
 `recovered` is how many of those a readable provider let LabView rebuild, and
 `applications` is listed **plus** recovered. The remainder, `withheld - recovered`, is
-derived where needed rather than stored, so the four numbers cannot disagree — and it,
-not `withheld`, is what makes the connection `partial`.
+derived where needed rather than stored, so the four numbers cannot disagree.
 
 **AuthentikMatchStrength** — `"address" | "hostname" | "name"`: what kind of thing
 established the tie, per match. An *address* is the provider pointing at the service; a
 *hostname* is one name both sides declare independently; a *name* is only that the
-operator chose similar words on each side. Load-bearing rather than cosmetic — it sets
-the reported confidence (§3.5), because a posture resting on a name should not read the
-same as one resting on a resolved address. Absent is treated as `name`, the weakest
-reading, never the strongest.
+operator chose similar words on each side. It sets the reported confidence (§3.5).
+Absent is treated as `name`, the weakest reading, never the strongest.
 
 **Enforcement vs existence** — a provider existing is not a gate existing.
 `providerEnforces` decides: proxy/ldap/radius need at least one outpost, oauth2 and
@@ -1452,25 +1409,23 @@ service out of `exposedWithoutAuth` even when its provider type has no
 **UnmatchedApplication** — an application the matcher could not tie to exactly one
 service, in `meta.authentik.unmatchedApplications`. Carries the whole
 `AuthentikApplication`, an `UnmatchedReason`, a one-line `detail`, and a `considered`
-trace. Ambiguity is reported, never arbitrated: picking a candidate by iteration order
-would move a service between "protected" and "exposed" on a coin toss.
+trace. Ambiguity is reported, never arbitrated (§12).
 
 **UnmatchedRouter** — the same for a live router, in `meta.traefik.unmatchedRouters`,
 carrying the whole `TraefikLiveRouter`. Because such a router demonstrably *exists*, it
 must never produce a "declared but not live" note on anybody.
 
 **UnmatchedReason** — `"ambiguous" | "no-candidate" | "internal"`. Not a severity but a
-statement about who can act: `ambiguous` means the evidence pointed at more than one
-service and was discarded, which one distinct name fixes; `no-candidate` means nothing
-pointed anywhere, usually LabView's gap to explain; `internal` is defensive only — a
-matcher named a service key the scan does not hold. Reporting all three as "unmatched"
-hides the actionable one, which is the whole reason the field exists.
+statement about who can act (§3.5): `ambiguous` means the evidence pointed at more than
+one service and was discarded, which one distinct name fixes; `no-candidate` means
+nothing pointed anywhere, usually LabView's gap to explain; `internal` is defensive
+only — a matcher named a service key the scan does not hold.
 
 **`considered`** — one line per matching rule tried and what it produced, in the order
 tried: the same evidence discipline as `AuthPosture.evidence`, applied to the case that
-failed. A rule that could not run says why rather than being omitted. Constrained to
-what the payload already carries — slugs, provider and service names, hostnames — and
-never an env value, which smoke asserts.
+failed. What each rule owes the trace is in §3.5; the constraint is that it carries only
+what the payload already holds and never an env value (**I2**, **I6**), which smoke
+asserts.
 
 **TraefikRoute vs TraefikLiveRouter** — same subject, different source, and the
 distinction the whole of §3.6 rests on. `TraefikRoute` is what the compose labels
@@ -1495,10 +1450,8 @@ must be merged in before any conclusion about a *missing* gate can be drawn.
 for it, when it reported one. Absent status means "nothing known" and must not be
 read as healthy.
 
-**`chainComplete`** — `TraefikSummary.reachable && entrypointsRead`. The single gate
-on the downgrade (§3.6): only a read that got **both** `/api/rawdata` and
-`/api/entrypoints` may let a live chain supersede a label list. Anything less notes
-the gap and changes no posture.
+**`chainComplete`** — `TraefikSummary.reachable && entrypointsRead`: the single gate on
+the downgrade, and the reason a partial read changes no posture (§3.6).
 
 **`credential: "none" | "basic"`** — which credential the successful read needed.
 `none` means the API answered unauthenticated, which is direct evidence about how the
@@ -1523,19 +1476,15 @@ this counts a `lan`-only service as exposed, because it is — the LAN is outsid
 container network, and nothing gates the published port.
 
 A **verdict**, not a measurement, and the only field in the model where a declaration is
-a term: the question is whether anything authenticates a reachable service, and an
-in-app login is an answer no scan can reach (§3.12, §4 I1). The two terms stay separate —
-`hasEdgeAuth` is evidence alone — and a service that leaves the count on the strength of
-a declaration is counted in `stats.declaredAuthProtected` and says so on its own face.
+a term (§4 I1, §3.12). `hasEdgeAuth` stays evidence alone, and a service that leaves the
+count on the strength of a declaration is counted in `stats.declaredAuthProtected` and
+says so on its own face.
 
-The test is `isExternallyReachable` and not "does the set contain `internal`". The two
-would now agree on every service the classifier produces, since `internal` survives only
-where nothing external does — which is exactly why the predicate is not written that way.
-It asks its own question of its own three kinds, so it cannot be quietly redefined by a
-change to the withholding rule, and a sixth kind added later has to opt in rather than
-being counted as safe by omission. `internal` and `none` are the two kinds that are not
-exposure. It lives in
-[model/ingress.ts](labview/src/model/ingress.ts) so this definition and the
+The test is `isExternallyReachable` and not "does the set contain `internal`", even
+though the two agree on every service the classifier produces. Asking its own question
+of its own three kinds means a change to the withholding rule cannot quietly redefine it,
+and a sixth kind added later has to opt in rather than be counted safe by omission. It
+lives in [model/ingress.ts](labview/src/model/ingress.ts) so this definition and the
 stale-acceptance check (§3.12) cannot disagree about the same service.
 
 **Middleware registry** — every `traefik.http.middlewares.<name>.<type>` label
@@ -1595,75 +1544,69 @@ a stack that was just added are already accounted for by the stack.
 Traefik reads came back with. Also derived locally, also not in the payload. One
 `IntegrationChange` per target read in either scan, in the order LabView reads them,
 and `unchanged` when every entry is — including when there are none, because an
-integration nobody switched on is not a status. Deliberately separate from
-`ScanDiff`: an API that answered differently is not an edit (§3.11).
+integration nobody switched on is not a status. Reported beside `ScanDiff` and never
+folded into it (§3.11).
 
 **IntegrationChange** — one target: `state` is `unchanged`, `moved`, `started` or
 `stopped`, decided from `reachable` on both summaries *before* any count is
-compared. `counts` holds the signed deltas and is empty for anything but `moved`,
-because nothing may be compared across a failed read. `appeared` and `disappeared`
-name the records that came and went — application slugs, router names — sorted.
+compared. `counts` holds the signed deltas and is empty for anything but `moved`
+(§3.11). `appeared` and `disappeared` name the records that came and went —
+application slugs, router names — sorted.
 
 **Declaration / ServiceDeclaration** — what the operator wrote in a `.labview`,
 attached as `stack.declared` (the shared fields) and `svc.declared` (those plus the
 service-only ones) — see §3.12. Every field is optional and none of them is evidence,
-which is why they live in their own object rather than being merged into the fields the
-scan produced. `file` is the sidecar's name and never a full path, so a declared value
-is always attributable to the file that claimed it without leaking the layout of the
-host.
+which is why they live in their own object rather than in the fields the scan produced
+(§12). `file` is the sidecar's name and never a full path, so a declared value is always
+attributable to the file that claimed it without leaking the layout of the host.
 
 **DeclaredAuth** — `{ mechanism, detail? }`, where `mechanism` is one of
-`DECLARED_AUTH_MECHANISMS`. Authentication the operator states the app performs for
+`DECLARED_AUTH_MECHANISMS`: authentication the operator states the app performs for
 itself. Counted in `stats.declaredAuth` and badged *declared*; it never becomes
-`svc.auth.method`, and `other` requires a `detail`. It is a term of one verdict —
-`exposedWithoutAuth` — and of no measurement.
+`svc.auth.method`, and `other` requires a `detail` (§3.12).
 
 **AuthFamily** — `oidc | ldap | proxy`: the three mechanisms *both* vocabularies can
 name, and therefore the only ground on which a declaration and a detection can be
-compared at all. `DECLARED_FAMILY` and `DETECTED_FAMILY` are deliberately `Partial`
-maps: most members of either vocabulary have no family, which means *not comparable*,
-which is the safe answer. `FAMILY_LAYER` sorts the three into the app's own login
-(`oidc`, `ldap`) and a gate in front of it (`proxy`), and a comparison is only ever made
-within a layer — the rule that keeps defence in depth out of the warning path (§3.12).
+compared at all. `DECLARED_FAMILY` and `DETECTED_FAMILY` are `Partial` — most members of
+either vocabulary have no family, which means *not comparable* — and `FAMILY_LAYER` sorts
+the three into the app's own login (`oidc`, `ldap`) and a gate in front of it (`proxy`),
+so a comparison is only ever made within one layer (§3.12).
 
 **DeclaredAuthAgreement** — `supplies | conflicts | redundant | supplements`, the
 outcome of `compareDeclaredAuth`, stored on the declaration by the analyzer and
-`undefined` when nothing was declared. It decides three separate things at once, which is
-why it exists as one value rather than three booleans: whether the service left the
-exposure count, whether a drift entry was written, and whether the declaration is
-rendered at all.
+`undefined` when nothing was declared. One value rather than three booleans because it
+decides three things at once: whether the service left the exposure count, whether a
+drift entry was written, and whether the declaration is rendered at all. The four
+outcomes and their effects are tabled in §3.12.
 
 **`declaredAuthProtected`** — services with `authAgreement === "supplies"`: reachable,
-nothing detected, and taken out of the exposure count by a declaration. Deliberately
-*not* folded into `stats.authProtected`, which counts only what the scan could prove —
-the two answer different questions and merging them would make the proven number
-unfalsifiable. Read off `authAgreement` rather than recomputed, so the counter and the
-badge cannot disagree.
+nothing detected, and taken out of the exposure count by a declaration. Read off
+`authAgreement` rather than recomputed, so the counter and the badge cannot disagree.
+Never folded into `stats.authProtected`, which counts only what the scan could prove
+(§12).
 
 **`unauthenticatedAccepted`** — `{ reason }` on a service declaration, present only
-when the sidecar said `intentional: true` **and** gave a reason. It does not remove the
-service from `exposedWithoutAuth`; it adds it to `stats.exposureAccepted` and puts the
-reason on the finding. An acceptance with no reason is indistinguishable from a typo,
-so it is refused with a warning rather than honoured. Distinct from a declared
-mechanism, which says a login *exists* and does remove the finding.
+when the sidecar said `intentional: true` **and** gave a reason; without the reason it is
+refused with a warning (§3.12). It does not remove the service from `exposedWithoutAuth`;
+it adds it to `stats.exposureAccepted` and puts the reason on the finding. Distinct from
+a declared mechanism, which says a login *exists* and does remove the finding.
 
 **`formatExposureCount`** — `23/28` when some exposures are accepted, plain `28` when
-none are. Shared by the tile and the CLI so the two cannot word one scan differently,
-and the numerator is the *unaccepted remainder* — an accepted exposure is still
-reachable, so it never leaves the denominator.
+none are. Shared by the tile and the CLI, and the numerator is the *unaccepted
+remainder* (§3.12).
 
 **`expectedIngress`** — the sidecar's `expected.ingress`, normalized to
 `IngressKind[]`. A list because the thing it is compared against is one: expecting
 `[public, traefik]` and finding `[public, lan]` is a disagreement about the proxy, and
-comparing only the first kind would report "expected public, got public".
+comparing only the first kind would report "expected public, got public". Normalized
+through `normalizeIngress`, the same constructor the classifier uses, so a declared
+`internal` written beside an external kind is dropped instead of drifting against a rule
+the file cannot know about (§12).
 
 **`drift`** — `svc.declared.drift[]`, one string per disagreement between the sidecar
-and the scan, counted in `stats.declarationDrift`. Three cases: an acceptance that no
-longer applies (unreachable, or now authenticated — including by the mechanism declared
-in the same file), a declared mechanism that `conflicts` with a detected one at the same
-layer, and an `expectedIngress` that differs from the classified set (reported in both
-directions). Filled by the analyzer, and a report rather than an override — which is why
-it and `authAgreement` are excluded from the change comparison (§3.11).
+and the scan, counted in `stats.declarationDrift`; the three checkable disagreements are
+enumerated in §3.12. Filled by the analyzer, and a report rather than an override —
+which is why it and `authAgreement` are excluded from the change comparison (§3.11).
 
 **TagFilter / TagMode** — the dashboard's tri-state filter (§3.9):
 `{ include, exclude, mode }` over string tags, with `exclude` always AND-NOT and
@@ -1929,11 +1872,12 @@ a container IP exists only in live Docker state and smoke runs without a socket.
 **Why a match did not happen** (§3.5, §3.6) is asserted across both API fixture roots,
 because a reason nothing checks decays back into a shrug. Three properties:
 
-- **The four unplaced applications give four distinguishable answers.** `pair` is
+- **The five unplaced applications give five distinguishable answers.** `pair` is
   `ambiguous`, with both `pair/blue` and `pair/green` named in its trace; `broad-app`,
-  `s01` and `ext-01` are each `no-candidate` with their own cause quoted — the
-  `forward_domain` mode, the three-character floor, an address literal. Exactly one of
-  the four is `ambiguous`, so a matcher that stopped telling contested from absent fails
+  `s01`, `ext-01` and `wh-02` are each `no-candidate` with their own cause quoted — the
+  `forward_domain` mode, the three-character floor, an address literal, and a record the
+  applications endpoint withheld and the provider rebuilt. Exactly one of
+  the five is `ambiguous`, so a matcher that stopped telling contested from absent fails
   on the count as well as on the wording. Traefik pins the same pair: `twin-blue@file`
   contested between both twins, `standalone@file` belonging to nothing scanned.
 - **Every unmatched entry carries its subject and a non-empty trace** — the application
@@ -2064,7 +2008,7 @@ network nor change a result.
 ## 9. Build, CI, release
 
 ```
-npm run typecheck   # tsc --noEmit for server (tsconfig.json) AND web (tsconfig.web.json)
+npm run typecheck   # tsc --noEmit for server, web and scripts (three tsconfigs)
 npm run smoke       # pipeline assertions over the fixtures
 npm run build       # esbuild web bundle + tsc server -> dist/
 npm run dev         # build web once, then tsx watch on the server
@@ -2072,9 +2016,10 @@ npm run scan        # one-shot JSON to stdout; --summary for the digest
 ```
 
 `tsc` runs with `strict` and `noUncheckedIndexedAccess`; the web tsconfig uses
-`moduleResolution: Bundler` since esbuild resolves. **Both** projects must
+`moduleResolution: Bundler` since esbuild resolves. **All three** projects must
 typecheck — the web build imports backend types directly, so a model change can
-break the UI without touching a `.tsx` file.
+break the UI without touching a `.tsx` file, and the same is true of the assertions
+(§8).
 
 The gate before any commit:
 
