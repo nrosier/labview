@@ -1,5 +1,12 @@
-import type { AuthMethod, DeclaredAuth, DeclaredAuthAgreement, DockerState, IngressKind } from "../model";
-import { declaredAuthLabel, declaredAuthSummary, showsDeclaredAuth } from "../model";
+import type {
+  AuthMethod,
+  DeclaredAuth,
+  DeclaredAuthAgreement,
+  DockerState,
+  IngressKind,
+  NoAuthReason,
+} from "../model";
+import { declaredAuthLabel, declaredAuthSummary, noAuthText, showsAuthMethod, showsDeclaredAuth } from "../model";
 import { authLabel, authVar, ingressLabel, ingressVar } from "../lib/palette";
 import { statusView } from "../lib/format";
 import { IconCheck, IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
@@ -33,14 +40,41 @@ export function IngressBadge({ kind }: { kind: IngressKind }) {
   );
 }
 
-/** Auth method badge — colored swatch + shield/lock icon + label. */
+/**
+ * Auth method badge — colored swatch + shield/lock icon + label.
+ *
+ * Renders nothing for `none`, which is the absence of a mechanism rather than one of
+ * them: authentication is only expected in front of a service something outside the
+ * container network can reach, so a badge on every internal database would be a warning
+ * about a correct topology. Where the absence does matter, the exposure badge beside
+ * this one states it in words a reader can act on. `showsAuthMethod` is in the model so
+ * that rule is asserted rather than left to each call site to remember.
+ */
 export function AuthBadge({ method }: { method: AuthMethod }) {
-  const icon = method === "none" ? null : method === "basic-auth" ? <IconLock /> : <IconShield />;
+  if (!showsAuthMethod(method)) return null;
+  const icon = method === "basic-auth" ? <IconLock /> : <IconShield />;
   return (
     <span class="badge soft" title={`Auth: ${authLabel(method)}`}>
       <span class="swatch" style={`background:var(${authVar(method)})`} />
-      {icon && <span class="icon">{icon}</span>}
+      <span class="icon">{icon}</span>
       {authLabel(method)}
+    </span>
+  );
+}
+
+/**
+ * Why there is no mechanism, for the one place that has to answer it: the drawer's
+ * `Method` row, where an empty value beside the label would read as missing data.
+ *
+ * The badge rows say nothing at all instead — `AuthBadge` above returns null and the
+ * exposure badge covers the case that matters. Here the question has already been asked,
+ * so it gets an answer, and only `gap` is styled as a finding.
+ */
+export function NoAuthPill({ reason }: { reason: NoAuthReason }) {
+  const text = noAuthText(reason);
+  return (
+    <span class={`pill${reason === "gap" ? " crit" : ""}`} title={text.title}>
+      {text.label}
     </span>
   );
 }

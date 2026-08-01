@@ -42,8 +42,10 @@ live state from the Docker API, and never needs an agent inside each app.
   back — `ingress: all of Public, LAN; not Internal` — so a three-part filter
   never has to be inferred from which chips look bright.
 - **Stack list** — one card per stack, which is the unit you actually deploy. It
-  rolls up its services: live status dots, hostnames, every distinct **ingress** /
-  **auth** badge present, and a count of anything reachable without auth. Click to
+  rolls up its services: live status dots, hostnames, every distinct **ingress** tag and
+  **auth mechanism** present, and a count of anything reachable without auth. A missing
+  gate is not a mechanism and gets no badge — that count is where it is reported, and only
+  for services something outside the container network can reach. Click to
   expand the services underneath, and again on one to open its detail. Search and
   filters are per service — exposure is a property of a service, not of a directory
   — and a stack shows up whenever one of its services matches.
@@ -1002,7 +1004,11 @@ line, and each is deliberate:
    `none`, the detected-method distribution does not move, and the declared
    mechanisms are counted only in their own statistic (`stats.declaredAuth`) and
    badged as *declared*. A reader can always tell what LabView proved from what you
-   told it.
+   told it. What a declaration does change is what gets *said* about the absence: the
+   drawer's `Method` row reads *Declared, not detected* rather than warning about a
+   missing gate, because a warning there would argue with the declaration beside it.
+   LabView takes the declaration at face value and says it cannot verify it — it does not
+   both believe you and keep asking.
 2. **It can change one verdict, and only in the open.** `exposedWithoutAuth` is not a
    measurement, it is a conclusion — *reachable, and nothing authenticates it* — and a
    declared login is an answer to the second half. So a service that is reachable, has

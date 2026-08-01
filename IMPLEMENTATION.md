@@ -98,6 +98,7 @@ labview/
     model/connections.ts  connection-report wording, hints, log/banner rules (pure)
     model/changes.ts  what changed between two scans, and its wording (pure)
     model/access.ts   access-control vocabulary: posture line, failure text, username rule (pure, web-safe)
+    model/auth.ts     when a missing gate may be reported at all, and its wording (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
       discover.ts     appsRoot -> stack directories
@@ -626,11 +627,20 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   `src/auth/`, and none of it is reachable from `web/`. `SessionInfo`, `LoginMethod`,
   `LoginFailureReason` and `AccessMode` are in `model/types.ts` with the rest of the
   contract; the *wording* for them is in `model/access.ts`.
+- [model/auth.ts](labview/src/model/auth.ts) is web-safe under the same rule, and is
+  there for the §8 reason rather than the bundling one: whether the absence of a
+  mechanism may be reported at all is a statement about the fleet, and four call sites
+  ask it. As a predicate in `src/` it is asserted once; as a condition repeated in the
+  components it would be unfalsifiable and would drift. Not to be confused with
+  `model/access.ts` beside it — that is LabView's own login, this is what was found in
+  front of somebody else's service.
 - Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
   **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
   a colour and a label, and an unmapped member silently renders grey. For
-  `IngressKind` two smoke assertions catch that (§8); `AuthMethod` has no
-  equivalent yet. See §10.
+  `IngressKind` two smoke assertions catch that (§8). For `AuthMethod` the palette's
+  own row count is pinned, and `none` is asserted to be the only member `showsAuthMethod`
+  suppresses — so a *removed* or renamed entry is caught, but a union member added with no
+  palette entry still is not. See §10.
 
 ### 3.8 Serving
 
@@ -681,10 +691,13 @@ drawer. Two rules hold it together:
   least one of its services matches, and shows only the matching ones. A
   stack-level predicate would have to reduce a stack to one posture, which it does
   not have.
-- **A collapsed stack rolls up, it does not summarise.** Every distinct ingress and
-  auth posture present is shown, plus a count of services reachable without auth. A
-  stack with an internal database and a public UI is both at once; picking a "worst
-  case" badge would misreport it. The union comes from `rollUpIngress` in
+- **A collapsed stack rolls up, it does not summarise.** Every distinct ingress kind and
+  every auth *mechanism* present is shown, plus a count of services reachable without
+  auth. A stack with an internal database and a public UI is both at once; picking a "worst
+  case" badge would misreport it. `none` is the absence of a mechanism rather than one of
+  them, so it rolls up to nothing — the exposure count beside the badges is where a
+  missing gate is reported, and only where one was expected (§5). The ingress union comes
+  from `rollUpIngress` in
   `model/ingress.ts`, which must deliberately *not* withhold `internal` the way a
   service's own set does, or the UI's exposure would erase the database from the
   collapsed view (§12).
@@ -1063,6 +1076,16 @@ when `expectedMatches` is false, and `DeclaredAuthBadge` and the declared
 `Authentication` row render nothing for `redundant`. A sidecar that is right about
 everything is invisible beyond the prose in it — which is what makes the rows that *do*
 appear worth reading.
+
+**An absence is silent too, unless it is a finding.** Nothing renders in place of a
+mechanism the scan did not find. On a service whose sidecar declares an in-app login, a
+badge reading "no auth" would argue with the declaration one slot to its left: this layer
+exists to take the operator's word for what no scan can reach and to say plainly that it
+is unverified — not to keep asking. And on the rest of the fleet it would be a warning
+about correct topology, since most services in a compose file are internal and have no
+gate because they need none. The one absence worth reporting is `exposedWithoutAuth`,
+which already has a badge, a counter and a note of its own; `NoAuthReason` (§5) separates
+it from the three that are not.
 
 The classification always stands. Drift is a report, never an override.
 
@@ -1771,6 +1794,29 @@ and a sixth kind added later has to opt in rather than be counted safe by omissi
 lives in [model/ingress.ts](labview/src/model/ingress.ts) so this definition and the
 stale-acceptance check (§3.12) cannot disagree about the same service.
 
+**`NoAuthReason`** — which of four different things it means that `auth.method` is
+`none`, and the only place the absence of a mechanism is put into words. Derived rather
+than stored: `noAuthReason` in [model/auth.ts](labview/src/model/auth.ts) reads
+`(method, exposedWithoutAuth, ingress, declared.auth)` and returns `undefined` the moment
+a mechanism was detected, so nothing downstream has to re-derive the distinction.
+
+| Reason | The service is | Wording |
+|---|---|---|
+| `gap` | `exposedWithoutAuth`: reachable from outside the container network, no gate of any kind detected, nothing declared | `No proxy auth`, styled as a finding |
+| `not-reachable` | `internal` only, or has no ingress at all | `None expected` |
+| `declared` | reachable, and its sidecar names a mechanism this scan cannot see | `Declared, not detected` |
+| `unnamed-gate` | reachable, nothing declared, and yet not exposed — so a gate was confirmed that carries no `AuthMethod` (an API-confirmed enforced gate) | `None named — gate confirmed` |
+
+A gate is only *expected* in front of something answerable from outside the container
+network, so **only `gap` is a finding** — and `gap` is exactly `exposedWithoutAuth` above,
+read through rather than re-decided, so the two can never disagree. The other three are
+answers given only where the question was asked: the drawer's `Method` row, where a blank
+beside the label would read as missing data. `showsAuthMethod` is the same rule for the
+badge rows, which carry mechanisms only and render nothing at all where there is none
+(§3.12, §12). The `none` bucket of `stats.byAuthMethod` is untouched by any of this — it
+is a count of a categorical field, and its palette label says `None detected`, so the
+finding's wording exists in exactly one place.
+
 **Middleware registry** — every `traefik.http.middlewares.<name>.<type>` label
 found in *any* stack, keyed by bare name (references carry a `@docker` /`@file`
 provider suffix that is stripped). On a name collision an auth type wins over a
@@ -2211,6 +2257,17 @@ stacks:
 | `otherprovider` | provider attribution needs proof, on both the env and the address path |
 | `authentik` | upstream's generic service names (`server`, `worker`) must not become fleet-wide hints — `isSpecificHint`. Doubles as the definition site for the cross-stack `authentik@docker` references |
 
+**Some rules are pinned across the existing stacks rather than by a new one.** The four
+`NoAuthReason` branches (§5) are asserted on `cfdisabled` (`gap`), `exposeonly` and
+`interp` (`not-reachable`), `declared` (`declared`), and — from the Authentik fleet below —
+the application whose gate is API-confirmed but carries no `AuthMethod` (`unnamed-gate`),
+plus a fleet-wide check that a reason exists for exactly the services whose method is
+`none`. A purpose-built stack was considered and rejected: the obvious candidate, a
+Cloudflare Access policy, already resolves to `other-oauth` and so cannot reach the branch
+it was meant to cover, and a new stack would have moved the fleet counts several unrelated
+assertions are written against. The contract holds per branch either way — dropping any one
+of the three conditions in `noAuthReason` turns a check red.
+
 Two caveats worth knowing when writing these:
 
 - **Assert on the primary conclusion, not a secondary one.** A misattribution can
@@ -2413,6 +2470,14 @@ second enumerates `INGRESS_KINDS` itself rather than a list written out in the t
 so adding a kind cannot be half-done: a new member with no palette entry fails
 immediately, and renaming one breaks the build.
 
+**The auth palette is read the same way, for a narrower rule.** `AUTH_META`'s block is
+parsed out of the same text, and two things are asserted about it: `none` is the only
+member `showsAuthMethod` suppresses — so the badge rows cannot start rendering an absence,
+and cannot stop rendering a mechanism — and the block contains the finding's wording
+nowhere, so the bucket in the distribution bar cannot re-acquire "no proxy auth" (§5, §12).
+There is no `AUTH_METHODS` array to enumerate the way `INGRESS_KINDS` is enumerated above,
+so the row count is pinned as a number; §3.7 says what that does and does not catch.
+
 **The filter semantics are asserted as a truth table.** `matchesTagFilter`,
 `cycleTag` and `describeTagFilter` are called directly — OR, AND, exclusion as
 AND-NOT, exclusion beating an include, the empty filter matching everything, the
@@ -2572,7 +2637,11 @@ the start; the compiler will not catch the UI half.
 6. `web/lib/palette.ts` — add a `RoleMeta` entry, keeping the ordering meaning
    (ingress: most→least exposed; auth: identified providers before generic ones). The
    stack roll-up does not need touching: `rollUpIngress` enumerates `INGRESS_KINDS`,
-   so a new kind appears on the stack row from step 2 alone.
+   so a new kind appears on the stack row from step 2 alone. A new `AuthMethod` also
+   raises the literal row count asserted in §8, and is a badge unless `showsAuthMethod`
+   is changed to say otherwise — `none` is the only member that is not one, and any
+   second exception has to be argued for in `model/auth.ts` rather than added at a call
+   site.
 7. `web/styles.css` — define the CSS custom property in both themes, from the
    validated palette; do not invent a colour. For an ingress kind, check the new
    entry against its **neighbours in the bar order** in both themes: adjacent rows
@@ -2885,7 +2954,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | `partial` is reported on `withheld - recovered`, not on `withheld` | A banner nobody can clear becomes furniture and stops being read. Recovery that closes the whole gap has nothing left to warn about; a gap recovery *cannot* close is a real limit on what LabView can conclude, and the hint names both ways to close it. |
 | An application matching two services matches neither | Arbitrating by iteration order would move a service between "protected" and "exposed" on a coin toss, and the result would look identical to a real finding. An unmatched application is a visible gap the operator can close with a label. |
 | A provider with no outpost protects nothing | Proxy, LDAP and RADIUS providers are enforced by an outpost in the request path. With none assigned, nothing is in any path. This is the integration's most valuable output precisely because the admin UI shows such an application as complete. |
-| SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. Revisit if the palette gains a colour. |
+| SAML gets no `AuthMethod`, but is excluded from exposed-without-auth | Every `AuthMethod` has a palette colour and the only one left is the red reserved for the exposure warning — colouring a protected service in the warning colour is worse than having no badge. Reporting it as reachable without auth, though, would be plainly false, so the count excludes it and the drawer names the provider. It is also the one case behind `NoAuthReason`'s `unnamed-gate` (§5): the `Method` row reads `None named — gate confirmed` rather than leaving the reader to infer a missing gate from a blank. Revisit if the palette gains a colour. |
 | `forward_domain` external hosts are not matched on | In that mode `external_host` is the authentication domain shared by every application in it, usually the provider's own hostname. Matching it attaches unrelated gates to whichever service serves the SSO domain — which is the identity provider itself, so the error inflates the protected count. |
 | The hostname index dedupes by service key | A service fronted by both a tunnel and a reverse proxy declares the same hostname in both label sets. Those are two statements about one service; counting them as rival candidates makes the commonest configuration in a fleet unmatchable. |
 | A redirect URI's bare-name host is resolved as an address; an IP literal is not | `http://app:3000/oauth/callback` is the provider pointing at a container, and compose publishes that name as the container's network alias — a pointer, not a resemblance. An IP literal in the same field addresses the *host*, where port 443 belongs to the reverse proxy, so resolving it through the published-port table would attach the application to whatever answers there. Confidently wrong beats unmatched here, which is why the guard is not an optimisation. |
@@ -2923,6 +2992,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | An acceptance without a `reason` is refused, not honoured | `intentional: true` alone is indistinguishable from a stray key or a half-finished edit, and it is the one declaration that changes how a security finding reads. Requiring the reason means the field cannot be set by accident, and it puts the justification where the next reader will be — on the finding, not in a commit message. |
 | Both checkable declarations are re-checked every scan, and drift is a report | A sidecar's real failure mode is not a typo, it is going quietly out of date — the port is withdrawn, the route is removed, and the file still asserts the old shape. So the two fields that *can* be checked are, on every scan. Drift never overrides the classification, because the operator's expectation being wrong is the finding; silently adopting it would delete the finding. |
 | A declared login takes a service out of the exposure count — and gives it a badge, a counter and a note | `exposedWithoutAuth` is a conclusion, not a measurement: *reachable, and nothing authenticates it*. An in-app login is an answer to the second clause that no scanner can reach, so leaving the finding up asks the operator to keep dismissing a question they already answered in writing — which is how a real alarm gets trained into noise. The cost is real and is the honest risk of the whole layer: a stale declaration on a public service stops being flagged. So it is loud *in place of* the alarm rather than absent — `Protected — declared`, `stats.declaredAuthProtected`, and a note saying the verdict rests on something this scan cannot verify. The alternative considered and rejected was leaving the count untouched and only annotating it, which is what the acceptance field already does; two fields that behave identically would have made the distinction between "there is a login" and "there is none and that is fine" unrecoverable from the output. |
+| A missing mechanism is reported only where a gate was expected | "No auth detected" is true of most services in a compose fleet and worth saying about almost none of them: a database on an internal network has no gate because it needs none, so a badge saying so on every card teaches the reader to skip the words that matter — and on a service whose sidecar declares its own login it contradicts the declaration one slot to its left, which is the opposite of taking the operator at their word. The condition that *is* worth stating was already computed and already loud: `exposedWithoutAuth`. So the badge rows carry mechanisms only and `AuthBadge` renders nothing for `none`, and the drawer's single `Method` row — the one place the question has been asked outright, where a blank would read as missing data — answers it through `noAuthReason`, which separates the one absence that is a finding from the three that are not (§5). This reverses the earlier decision to render `No proxy auth` beside a declaration so the two could be read together. The rule lives in `model/auth.ts` rather than in the four call sites, because a rule that only exists inside a `.tsx` cannot be asserted (§3.7). The `none` bucket keeps its row in the distribution bar and its filter chip, relabelled `None detected`: there it is a bucket of a measurement, not a verdict, and moving the finding's wording out of the palette leaves it in exactly one place — which smoke pins, so the bucket cannot re-acquire it. |
 | Only a **same-layer** disagreement warns | The literal reading of "declared ≠ detected → warn" fires on every layered setup there is: an app that logs users in *and* sits behind a proxy gate is defence in depth, and warning about it teaches the operator that drift means nothing. The two vocabularies describe different tiers of one request path, so they are compared only where both can name the same thing — three families, sorted into the app's own login and the gate in front of it. `declared app-oidc + detected ldap` is two answers to one question and warns; `declared app-oidc + detected forward-auth` is two true statements and does not. `declcompare` pins it with a *pair*: two services declaring the same mechanism, opposite outcomes, decided only by what the scan found. |
 | `declaredAuthProtected` is its own counter, never folded into `authProtected` | `authProtected` means *the scan proved a gate*, and that is the number a reader checks a fleet against. Adding unverifiable protection to it would make it unfalsifiable in exactly the way I1 exists to prevent, and would do it silently — the total would look better with no way to see why. A separate tile, badge and CLI line costs a few lines of UI and keeps both numbers meaning one thing each. |
 | The comparison takes `wouldBeExposed`, not `reachable` | `hasEdgeAuth` includes Cloudflare Access policies and API-confirmed enforced gates, neither of which carries an `AuthMethod`. With plain `reachable`, an already-protected service would be labelled `supplies` and counted in `declaredAuthProtected` — a service credited to a declaration that never left the exposed count, because it was never in it. Passing the caller's own verdict term also makes `supplies` imply `method === "none"`, which is what bounds the feature: a declaration can only change a verdict where the scan found nothing at all. |

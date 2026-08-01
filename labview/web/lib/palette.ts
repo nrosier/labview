@@ -36,6 +36,12 @@ export const INGRESS_META: RoleMeta<IngressKind>[] = [
  * config first, then the ones where only the mechanism could be established.
  * Labels say which is which — an unidentified provider is never labelled with the
  * most likely vendor.
+ *
+ * `none` is here only so the distribution bar and its filter chip have a row for it: it
+ * is a bucket of the `byAuthMethod` measurement, and its label is worded as one. What is
+ * *said about* a service with no mechanism is not a palette question — see
+ * `noAuthText` in `src/model/auth.ts`, which decides whether the absence is reportable
+ * at all before wording it.
  */
 export const AUTH_META: RoleMeta<AuthMethod>[] = [
   { key: "authentik-forward-auth", label: "Authentik (forward-auth)", cssVar: "--auth-forward" },
@@ -45,7 +51,7 @@ export const AUTH_META: RoleMeta<AuthMethod>[] = [
   { key: "ldap", label: "LDAP (other directory)", cssVar: "--auth-ldapother" },
   { key: "other-oauth", label: "Other OAuth / Access", cssVar: "--auth-otheroauth" },
   { key: "basic-auth", label: "Basic auth", cssVar: "--auth-basic" },
-  { key: "none", label: "No proxy auth", cssVar: "--auth-none" },
+  { key: "none", label: "None detected", cssVar: "--auth-none" },
 ];
 
 const INGRESS_BY_KEY = new Map(INGRESS_META.map((m) => [m.key, m]));

@@ -1,5 +1,5 @@
 import type { AppStack, AuthMethod, IngressKind, Service } from "../model";
-import { rollUpIngress } from "../model";
+import { rollUpIngress, showsAuthMethod } from "../model";
 import { ingressSummary, shortImage } from "../lib/format";
 import { AUTH_META } from "../lib/palette";
 import {
@@ -57,9 +57,12 @@ export function StackCard({
   // here because it must *not* withhold `internal` the way a service's own set does —
   // see there.
   const ingressKinds = rollUpIngress(services.map((s) => s.ingress));
-  const authMethods = AUTH_META.map((m) => m.key).filter((k) =>
-    services.some((s) => s.auth.method === k),
-  );
+  // Mechanisms only. A stack of internal services has none, and rolling `none` up into a
+  // badge would put "no auth" on every database stack in the fleet — the exposure count
+  // below is where a missing gate is reported, and only where one was expected.
+  const authMethods = AUTH_META.map((m) => m.key)
+    .filter(showsAuthMethod)
+    .filter((k) => services.some((s) => s.auth.method === k));
 
   return (
     <div class={`stack-card${expanded ? " open" : ""}`}>

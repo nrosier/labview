@@ -99,6 +99,15 @@ export {
 } from "../src/model/ingress";
 
 /**
+ * When the absence of an authentication mechanism may be reported, and how it is worded.
+ * In `src/` because it is a rule about the fleet rather than a rendering detail: a
+ * missing gate is only a finding where a gate was expected, and the four reasons a
+ * service has no mechanism have to be told apart before anything can be said about it.
+ */
+export { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } from "../src/model/auth";
+export type { NoAuthReason, NoAuthText } from "../src/model/auth";
+
+/**
  * The tri-state tag filter. In `src/` rather than here because the web bundle is never
  * rendered by the smoke pass: what a reader sees after clicking three chips is decided
  * by pure functions the test can call, and this module only holds the state.

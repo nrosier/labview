@@ -6,7 +6,7 @@ import type {
   OriginTarget,
   Service,
 } from "../model";
-import { declaredAuthLabel, ingressMatchesExpectation, showsDeclaredAuth } from "../model";
+import { declaredAuthLabel, ingressMatchesExpectation, noAuthReason, showsDeclaredAuth } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
@@ -17,6 +17,7 @@ import {
   DeclaredProtectedBadge,
   ExposedBadge,
   IngressBadge,
+  NoAuthPill,
   StatusDot,
 } from "./badges";
 import { Mermaid } from "./Mermaid";
@@ -120,6 +121,9 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
   const def = buildServiceMermaid(svc, stack);
   const declared = svc.declared;
   const accepted = declared?.unauthenticatedAccepted;
+  // Undefined whenever a mechanism was detected. When it is set, it says which of the
+  // four reasons applies — only one of which is something to report.
+  const noAuth = noAuthReason(svc);
   // The stack's own declarations, used only as the fallback for a field this service
   // did not declare itself.
   const stackDecl = stack.declared;
@@ -155,10 +159,12 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               <IngressBadge key={k} kind={k} />
             ))}
             <AuthBadge method={svc.auth.method} />
-            {/* Detected first, declared second, and the detected posture is never
-                replaced: a service the operator says authenticates itself still shows
-                "No proxy auth" beside the declaration, because that is what the scan
-                found and it stays true.
+            {/* Detected first, declared second. Nothing stands in for a mechanism that
+                was not found: a badge saying so would be wrong on everything internal,
+                and on a service the operator says authenticates itself it would argue
+                with the declaration beside it. The `Method` row further down answers the
+                question for whoever came here to ask it — with `noAuthReason`, which
+                separates the absence that is a finding from the three that are not.
 
                 Three outcomes for one slot, and exactly one of them can hold: the scan
                 found an exposure and nobody has looked at it, or it found one that was
@@ -465,6 +471,11 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               <dt>Method</dt>
               <dd>
                 <AuthBadge method={svc.auth.method} />
+                {/* The two are exclusive by construction — `noAuthReason` returns
+                    nothing once a mechanism was detected — so this row always has
+                    exactly one answer, and never the blank a suppressed badge would
+                    otherwise leave beside the label. */}
+                {noAuth && <NoAuthPill reason={noAuth} />}
                 {/* A conclusion drawn from a middleware name alone is labelled as
                     such, so a reader never has to re-derive whether the evidence
                     below is a definition or a guess. */}

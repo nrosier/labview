@@ -118,6 +118,10 @@ const {
 } = await import("../src/model/declarations.js");
 const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress, rollUpIngress } =
   await import("../src/model/ingress.js");
+// When the absence of an authentication mechanism may be reported at all. In `src/` for
+// the same reason as the two above, and asserted here because the alternative is a
+// dashboard that says "No proxy auth" about every internal database and gets believed.
+const { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } = await import("../src/model/auth.js");
 const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
@@ -4258,6 +4262,108 @@ check(
   "and every ingress kind has a palette entry, so none falls back to grey",
   unstyled.length === 0,
   `no entry for: ${unstyled.join(", ") || "none"}`,
+);
+
+console.log("\na missing gate is only reported where a gate was expected");
+// The rule this group exists for: authentication is expected in front of what someone
+// outside the container network can reach, and nowhere else. Say "no proxy auth" about
+// every internal database and the fleet acquires twenty warnings that are all correct
+// topology, after which nobody reads the one that is a finding. So the four reasons a
+// service has no mechanism are told apart, and exactly one of them is reportable.
+const bare = eSvc("cfdisabled", "live");
+check(
+  "reachable, nothing in front of it, nothing declared — the one reportable case",
+  noAuthReason(bare) === "gap" && bare.auth.exposedWithoutAuth === true,
+  `${noAuthReason(bare)}, exposedWithoutAuth=${bare.auth.exposedWithoutAuth}`,
+);
+// `acc` is the same finding with a reason attached. It stays `gap`, because an
+// acceptance says the exposure was read, not that it is gone.
+check(
+  "...still that case when the exposure has been accepted, which changes only who has read it",
+  noAuthReason(acc) === "gap",
+  String(noAuthReason(acc)),
+);
+// Both arms of "outside can reach it": a container-network neighbour, and nothing at all.
+check(
+  "nothing outside can reach it, so nothing is expected in front of it",
+  noAuthReason(eSvc("exposeonly", "cache")) === "not-reachable" &&
+    noAuthReason(eSvc("interp", "web")) === "not-reachable",
+  `${noAuthReason(eSvc("exposeonly", "cache"))} / ${noAuthReason(eSvc("interp", "web"))}`,
+);
+// The operator's statement is taken at face value here. It does not become evidence —
+// `decl.auth.method` is still `none` two hundred lines above — but a reader is not told
+// a gate is missing on a service someone has said authenticates itself.
+check(
+  "a declared mechanism is assumed to be working, not answered with a missing gate",
+  noAuthReason(decl) === "declared",
+  String(noAuthReason(decl)),
+);
+// The SAML application from the identity-provider section: protected, with no
+// `AuthMethod` to be reported as. Calling that a missing gate is the falsehood the
+// fixture beside it was written to prevent.
+check(
+  "a confirmed gate this model cannot name is protected, not bare",
+  noAuthReason(reports) === "unnamed-gate",
+  String(noAuthReason(reports)),
+);
+// The first branch, over a whole fleet: there is something to explain exactly when
+// there is no mechanism, so the drawer's `Method` row never renders two answers or none.
+check(
+  "...and there is a reason to give precisely when no mechanism was detected",
+  edge.stacks
+    .flatMap((s) => s.services)
+    .every((s) => (noAuthReason(s) === undefined) === (s.auth.method !== "none")),
+  edge.stacks
+    .flatMap((s) => s.services)
+    .filter((s) => (noAuthReason(s) === undefined) !== (s.auth.method !== "none"))
+    .map((s) => s.name)
+    .join(", "),
+);
+// Every branch has a fixture behind it, so none of the four can be quietly deleted.
+const reasonsSeen = new Set(
+  [...edge.stacks, ...ak.stacks].flatMap((s) => s.services).map(noAuthReason).filter(Boolean),
+);
+check(
+  "every reason is reached by a fixture",
+  NO_AUTH_REASONS.every((r) => reasonsSeen.has(r)) && reasonsSeen.size === NO_AUTH_REASONS.length,
+  [...reasonsSeen].join(", "),
+);
+// The wording, in one place, and the phrase that started this: it belongs to the finding
+// and to nothing else. The other three reasons describe an absence that is correct, and
+// a reader who sees the same six words on all four learns to skip all four.
+const claiming = NO_AUTH_REASONS.filter((r) =>
+  /no proxy auth/i.test(`${noAuthText(r).label} ${noAuthText(r).title}`),
+);
+check(
+  'the words "no proxy auth" are used for exactly one of the four',
+  claiming.length === 1 && claiming[0] === "gap",
+  claiming.join(", ") || "none",
+);
+check(
+  "...and each of the others still answers the question rather than leaving it blank",
+  NO_AUTH_REASONS.every((r) => noAuthText(r).label.length > 0 && noAuthText(r).title.length > 0),
+  NO_AUTH_REASONS.map((r) => `${r}=${noAuthText(r).label}`).join(" | "),
+);
+// A badge row lists mechanisms, and `none` is the absence of one. Read off the palette
+// text rather than a second list, for the reason the ingress check above gives.
+const authBlock = paletteSrc.slice(paletteSrc.indexOf("AUTH_META"));
+const authKeys = [...authBlock.matchAll(/key: "([a-z-]+)"/g)].map((m) => m[1] as AuthMethod);
+check(
+  "`none` is the only method with no badge of its own, because it is not one",
+  authKeys.length === 8 && authKeys.filter((k) => !showsAuthMethod(k)).join(",") === "none",
+  // "(nothing)" rather than "none": the suppressed member *is* called `none`, so the
+  // obvious fallback word makes a failure that suppresses nothing read exactly like a
+  // pass.
+  `${authKeys.length} methods, suppressed: ${authKeys.filter((k) => !showsAuthMethod(k)).join(",") || "(nothing)"}`,
+);
+// The bucket in the distribution bar keeps counting every service with no mechanism —
+// it is a measurement, and `byAuthMethod.none` is asserted above. What it may not do is
+// carry the finding's wording, which is how the phrase reached every internal service in
+// the fleet in the first place.
+check(
+  "...and the distribution bar labels that bucket as a count, not as a finding",
+  !/no proxy auth/i.test(authBlock),
+  authBlock.split("\n").find((l) => l.includes('key: "none"')) ?? "no entry",
 );
 
 // ---------------------------------------------------------------------------------
