@@ -1,0 +1,17 @@
+# Regression fixture: `expose:` alone is `internal` ingress.
+#
+# One service, so its implicit `default` network carries nobody else — the
+# shared-network arm of the `internal` rule cannot fire here. There is no route
+# and no `ports:`, so no external arm fires either. The only evidence left is
+# `expose:`, which declares a port the container answers on *inside* the network
+# without publishing it on the host.
+#
+# `hostport/worker` also has `expose:`, but it sits on the shared `proxy`
+# network, so it would stay `internal` even if this rule were dropped. This stack
+# is the one that goes to `none` the moment `expose:` stops counting.
+services:
+  cache:
+    image: example/cache:7.4.0
+    container_name: exposeonly-cache
+    expose:
+      - "6379"

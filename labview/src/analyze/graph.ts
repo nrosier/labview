@@ -1,5 +1,6 @@
 import type { AppStack, Service, Graph, GraphNode, GraphEdge } from "../model/types.js";
 import { routerIsServing } from "../labels/auth.js";
+import { primaryIngress } from "../model/ingress.js";
 import { realNetworks } from "./networks.js";
 
 /**
@@ -82,7 +83,9 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
         kind: "service",
         stack: stack.id,
         auth: svc.auth.method,
-        ingress: svc.ingress,
+        // A node has one background colour, so it carries the most exposed kind. The
+        // full set is on the badges beside it — see `GraphNode.ingress`.
+        ingress: primaryIngress(svc.ingress),
         running: svc.docker?.running,
       });
 

@@ -49,16 +49,17 @@ It targets a specific, common TrueNAS Scale pattern:
 
 | | |
 |---|---|
-| **Dashboard** | Stat tiles (stacks, services, running, public, local-only, auth-protected, and a highlighted **exposed-without-auth** count) plus part-to-whole bars for ingress exposure and auth method. Legends double as filters. |
+| **Dashboard** | Stat tiles (stacks, services, running, public, LAN, no-ingress, auth-protected, and a highlighted **exposed-without-auth** count), a per-tag gauge for each of the five ingress kinds, and a part-to-whole bar for auth method. Ingress gets gauges because a service can be several things at once, so stacked segments would sum past the total. Every row doubles as a filter, and it is an expression rather than a selection: click once to require the tag, again to exclude it (`¬ Internal`), a third time to clear; an `Any` / `All` switch OR's or AND's the required tags; exclusions are always AND-NOT. A line beside `Clear filters` reads the whole thing back — `ingress: all of Public, LAN; not Internal`. |
 | **Stack list** | One card per stack — the unit you deploy — rolling up the live status, hostnames and every distinct ingress/auth badge of its services, with a count of anything reachable without auth. Click to expand the services underneath. Search and filters work per service and open the stacks that matched. |
 | **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
-| **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
-| **Ingress classification** | The four network situations a fleet distinguishes: reachable from the internet through the tunnel (`public`), on the server's LAN at a published port (`lan`), through the reverse proxy (`traefik`), or on the container network alone (`internal`) — plus `public+lan` and `public+traefik` where the tunnel is one of two paths. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
+| **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by their most exposed ingress kind, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
+| **Ingress classification** | Five independent tags, and a service carries as many as apply: reachable from the internet through the tunnel (`public`), through the reverse proxy (`traefik`), on the server's LAN at a published port (`lan`), reachable by another container but nothing else (`internal`), or reached by nothing at all (`none`). A stack carries the union of its services'. `ports:` publishes on the host so it is `lan` whether or not a proxy sits in front of it; `expose:` publishes nothing and is `internal`, alongside sharing a real Docker network with another scanned service. So `internal` is positive proof of reachability rather than a leftover bucket, and `none` is a real answer. The counts overlap on purpose and do not sum to the service total. |
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
 | **Integration panel** | The `authentik: 13 apps · 9 matched` and `traefik: 10 routers · 8 matched` counts in the topbar are buttons. Click one and you get the whole join: every matched pair with the evidence behind it and how strongly it was established, and every application or router LabView could **not** place — with the reason (`ambiguous` where two services claim it, `no-candidate` where nothing did), plus the rule-by-rule trace of what was tried. Clicking a matched row jumps to that service's drawer. When an integration is unreachable the same panel shows the failure instead: the stage that failed, the address, every candidate that was tried, and the suggested fix. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
+| **Tell it what it can't see** | Drop an optional [`.labview`](labview/.labview.example) YAML file next to a `compose.yml` and it is read with it: a description, owner and criticality, links and dependencies, what lives in the volumes — and the two things a scan structurally cannot find. Authentication **inside** the app (Emby's built-in accounts plus its LDAP bind is `auth: [app-local-accounts, app-ldap]`) is shown as *declared*, from a fixed vocabulary of mechanisms rather than product names. An exposure that is **deliberate** is marked accepted, with a required reason. Two rules keep it honest: a declaration never changes what was detected — the detected distribution does not move and declared facts are badged and counted separately — and accepting an exposure does not clear it, it annotates it. Both checkable fields are re-checked every scan, so an acceptance whose port is gone, or an `expected.ingress` that no longer matches, is reported as **drift** instead of quietly going stale. |
 | **Rescan that tells you what it found** | The button re-reads every `compose.yml` and `.env` under the apps root — new stacks, deleted stacks, added services, edited files — **and re-runs both API exchanges**, credential files included. Then it says what moved on each side, beside `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, hover for the names. When nothing moved it says **`no config changes · authentik and traefik unchanged`**, so "LabView re-read everything and it is all the same" is never confused with "LabView didn't look". |
 | **Offline-first** | The web bundle is fully self-contained (mermaid + cytoscape inlined). No CDN, no external calls. |
 | **Light / dark** | Follows the OS, with a manual toggle. Colorblind-safe palette validated in both modes. |
@@ -313,14 +314,25 @@ so this is a **breaking change** for any external consumer. It was made rather
 than adding a second, parallel list so that why a match did not happen has exactly
 one home instead of a name in one place and an explanation in another.
 
-Also **breaking**: the ingress vocabulary. Every `service.ingress` value and the
-two counters named after it were renamed to the four situations an operator
-actually distinguishes — `public+host-port` → `public+lan`, `public+local` →
-`public+traefik`, `local` → `traefik`, `host-port` → `lan`, and in `stats`,
-`localOnlyServices` → `traefikServices`, `hostPortServices` → `lanServices`.
-Nothing is classified differently; only the names moved. The old `local` meant
-*proxy route*, which collided with the separate LAN concept — a tile reading
-"Local" for something that was not the LAN.
+Also **breaking**: the ingress vocabulary, in two steps. First the values were
+renamed to the situations an operator actually distinguishes (`local` → `traefik`,
+`host-port` → `lan`, and in `stats`, `localOnlyServices` → `traefikServices`,
+`hostPortServices` → `lanServices`) — the old `local` meant *proxy route*, which
+collided with the separate LAN concept, so a tile read "Local" for something that
+was not the LAN.
+
+Then **`service.ingress` became an array**, because the situations are independent
+and a service is routinely several of them at once. The combined values are gone:
+`"public+lan"` is `["public", "lan", …]` and `"public+traefik"` is
+`["public", "traefik", …]`. Two definitions changed with it — `internal` now means
+another container demonstrably can reach the service (`expose:`, or a shared Docker
+network) rather than "nothing else applied", and a service reached by nothing is
+`["none"]` — so `internalServices` rises sharply while a new `noIngressServices`
+answers the question the old value answered. The five ingress counters now
+**overlap** and no longer sum to `services`. No exposure or auth measure moved:
+`exposedWithoutAuth` and every auth count are identical, by construction. The full
+before/after is in the two migration tables under
+[labview/README.md § API](labview/README.md#api).
 
 Also **breaking**: `meta.authentik.applications` now counts the applications
 Authentik's list endpoint withheld and LabView rebuilt from their providers, so the

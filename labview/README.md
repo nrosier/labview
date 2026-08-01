@@ -30,10 +30,17 @@ live state from the Docker API, and never needs an agent inside each app.
 
 ## What you get
 
-- **Dashboard** — stat tiles (stacks, services, running, public, local-only,
-  auth-protected, and a highlighted **exposed-without-auth** count) plus
-  part-to-whole bars for **ingress exposure** and **authentication method**. The
-  bar legends double as filters.
+- **Dashboard** — stat tiles (stacks, services, running, public, LAN,
+  no-ingress, auth-protected, and a highlighted **exposed-without-auth** count),
+  a per-tag gauge for each of the five **ingress** kinds, and a part-to-whole bar
+  for **authentication method**. Ingress gets gauges rather than one bar because a
+  service can be several things at once, so the segments would sum past the total.
+  Every row doubles as a filter: click once to require the tag, again to exclude
+  it (`¬ Internal`, struck through), a third time to clear it. An `Any` / `All`
+  switch decides whether the required tags are OR'd or AND'd, exclusions are
+  always AND-NOT, and a line beside `Clear filters` reads the whole expression
+  back — `ingress: all of Public, LAN; not Internal` — so a three-part filter
+  never has to be inferred from which chips look bright.
 - **Stack list** — one card per stack, which is the unit you actually deploy. It
   rolls up its services: live status dots, hostnames, every distinct **ingress** /
   **auth** badge present, and a count of anything reachable without auth. Click to
@@ -204,10 +211,10 @@ for **Traefik + Authentik forward-auth** and/or **DockFlare**:
       - "dockflare.service=https://<traefik-host-ip>"
 ```
 
-Two things LabView will tell you about itself once it is running: if you publish
-a host port it appears as `lan` / `public+lan` exposure, and if you point a tunnel
-origin straight at a container it shows up with no auth even though the Traefik
-route looks protected.
+Two things LabView will tell you about itself once it is running: if you publish a
+host port it picks up the `lan` tag alongside whatever else it has, and if you point
+a tunnel origin straight at a container it shows up with no auth even though the
+Traefik route looks protected.
 
 ---
 
@@ -474,18 +481,35 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `tunnel → proxy → service`; where nothing proves one, the direct edge stays and
   the service says why the hop is unknown. No image, vendor or naming convention is
   consulted.
-- **Ingress** is classified as one of the four network situations — `public`
-  (reachable from the internet through the tunnel), `lan` (answerable on the
-  server's own network at a published port), `traefik` (reached through the reverse
-  proxy), `internal` (the container network only) — plus `public+lan` and
-  `public+traefik` where the tunnel is one of two paths. A `ports:` entry publishes
-  on the host (unlike `expose:`), so the service answers at `<host-ip>:<port>` with
-  no proxy and no SSO in the path — real reachability, classified as such.
-  **The kind names what is in *front* of the service**, so `lan` is reported when
-  nothing else fronts it; when Traefik *does* front it, the kind stays `traefik`
-  and the LAN bypass is raised as a note instead, since most services in a fleet
-  publish a port and folding that into the kind would flatten the whole
-  distribution.
+- **Ingress is a set of independent tags, not one label.** A service carries as
+  many of the five as apply, because a container behind the tunnel, behind the
+  proxy, with a published port and a listening container port is all four of those
+  things and each is separately true. A stack carries the union of its services'.
+
+  | tag | what it means | the evidence |
+  |---|---|---|
+  | `public` | reachable from the internet through the tunnel | a Cloudflare route with a hostname |
+  | `traefik` | reached through the reverse proxy | a Traefik route with hosts or a rule |
+  | `lan` | answerable on the server's own network | a `ports:` entry — which publishes on the host, unlike `expose:`, so the service answers at `<host-ip>:<port>` with no proxy and no SSO in the path |
+  | `internal` | another container can reach it, and only another container | an `expose:` port, **or** a resolved network shared with another scanned service |
+  | `none` | nothing reaches it at all | none of the above |
+
+  `internal` is **positive evidence, not a fallback**: it says a neighbour
+  demonstrably can reach this service. When neither an exposed port nor a shared
+  network says so, the answer is `none` — a real category with its own tile, not a
+  bucket for everything unclassified. Shared networks are counted on the names
+  docker actually uses, so the implicit `default` network compose gives a file that
+  declares none is enough to make two services in one stack mutually reachable, and
+  an `external:` network is enough across two stacks. `depends_on` is deliberately
+  not evidence: a dependency across two disjoint networks is not reachability.
+
+  Because the tags overlap, the five counts do **not** sum to the service count, and
+  the CLI summary says so on the line. A service that is both proxied and published
+  keeps `traefik` *and* `lan`, and the LAN bypass of the proxy's SSO is still raised
+  as a note — the note explains it, the tag makes it filterable.
+
+  `network_mode: host` is not modelled (it is not parsed either), so a
+  host-networked service is classified from its routes and `ports:` alone.
 - **Auth posture** resolves to one of `authentik-forward-auth`,
   `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`,
   `basic-auth`, or `none`, each with the evidence that produced it.
@@ -610,10 +634,12 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   application, or a matched provider whose mode means the request never reaches the
   outpost. A provider in `proxy` mode is exempt: there the outpost *is* the backend,
   so no forward-auth middleware exists and none should be expected.
-- **Exposed-without-auth**: a service reachable (public or local) with no detected
-  *proxy/SSO* auth is flagged. Note this is honest about *proxy* auth only — apps
-  with their own built-in login (Emby, Home Assistant, Authentik itself) will
-  appear here; the note wording says exactly that.
+- **Exposed-without-auth**: a service that is reachable — `public`, `traefik` or
+  `lan` — with no detected *proxy/SSO* auth is flagged. Note this is honest about
+  *proxy* auth only: apps with their own built-in login (Emby, Home Assistant,
+  Authentik itself) will appear here, and the note wording says exactly that. Where
+  that built-in login is the answer, a `.labview` sidecar is how you say so — see
+  [Declaring what the scan cannot see](#declaring-what-the-scan-cannot-see).
 - **Rescan re-reads everything, and says what moved.** Nothing is remembered
   between scans: every `compose.yml` and `.env` under the apps root is read again,
   the directory is re-walked, and the whole pipeline runs from scratch — so a new
@@ -657,11 +683,12 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   root**. A `env_file: ../../../secrets.env` entry is refused and noted on the
   service rather than read, both for lexical `..` escapes and for symlinks
   pointing out of the tree.
-- **Published host ports are treated as real exposure.** A service with a
-  `ports:` mapping and no proxy in front is `lan`, counted in its own stat tile,
-  and flagged exposed-without-auth — it answers on the LAN whatever your Traefik
-  config says. When a proxy *is* in front, the service keeps its `traefik` kind and
-  gains an explicit note that the published port bypasses the proxy and its SSO.
+- **Published host ports are treated as real exposure.** Any service with a
+  `ports:` mapping is tagged `lan`, counted in its own stat tile, and — with no
+  proxy or SSO in front — flagged exposed-without-auth, because it answers on the
+  LAN whatever your Traefik config says. When a proxy *is* in front, the service
+  holds `traefik` and `lan` together and gains an explicit note that the published
+  port bypasses the proxy and its SSO.
 - The **Authentik API token is optional and read-only** (`view_application`,
   `view_provider`, `view_outpost` on a groupless service account — LabView only
   issues `GET`s). A discovered endpoint is probed unauthenticated first and the
@@ -684,6 +711,104 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   its own stack cannot print its own credential, and no credential is interpolated
   into any error string.
 - No built-in auth — put it behind your own edge (see above).
+
+---
+
+## Declaring what the scan cannot see
+
+Some things are true about a service and written nowhere a scanner can read. Emby's
+built-in login is not a compose label. That a status page is *deliberately* open to
+the LAN is a decision, not a config value. Who owns a stack, what breaks if it stops,
+where its admin UI lives — none of it is in the files LabView reads.
+
+Drop a **`.labview`** file next to a `compose.yml` and it will be read with it.
+[`.labview.example`](.labview.example) is the annotated skeleton; copy it and delete
+what you do not need. `.labview.yml` and `.labview.yaml` work too, and the file name
+LabView actually used is reported back on every field it produced, so a stack with two
+of them is never ambiguous about which one is in effect.
+
+```yaml
+# /mnt/apps/emby/.labview
+description: Media server for the house.
+owner: platform-team
+criticality: high
+
+services:
+  emby:
+    # Authentication the scan cannot detect, because it is inside the app.
+    auth:
+      - mechanism: app-local-accounts
+        detail: Built-in user database.
+      - mechanism: app-ldap
+        detail: LDAP bind against the directory for staff accounts.
+```
+
+### Two rules that make it trustworthy
+
+Everything here is **a second source, never stronger evidence**. Two rules hold that
+line, and both are deliberate:
+
+1. **A declaration never changes what was detected.** `svc.auth.method` stays
+   `none`, the detected-method distribution does not move, and the declared
+   mechanisms are counted only in their own statistic (`stats.declaredAuth`) and
+   badged as *declared*. A reader can always tell what LabView proved from what you
+   told it.
+2. **Declaring an exposure intentional does not clear it.** A service reachable with
+   no proxy auth stays in `exposedWithoutAuth`, and the tile still shows the number the
+   scan found. What changes is around it: the subtitle reads `1 accepted`, the red goes
+   away only once the *unaccepted* remainder hits zero, the badge says
+   *Exposed, accepted*, and your reason is on the finding itself. A decision you can no
+   longer see is a decision nobody will revisit. The `reason` is required for exactly
+   that purpose — an acceptance with no reason cannot be told apart from a stray key,
+   so it is refused and warned about.
+
+### What you can declare
+
+| field | scope | why it helps |
+|---|---|---|
+| `description`, `notes` | stack and service | what a future reader needs and cannot work out from the compose file |
+| `owner`, `criticality` | stack and service | who to ask, and what breaks if it stops |
+| `links` | stack and service | admin UI, upstream docs, the runbook |
+| `dependencies` | stack and service | the off-fleet things it needs — a NAS share, a DNS resolver |
+| `data` | stack and service | what lives in the volumes, and whether it is backed up |
+| `auth` | service | authentication the scan cannot see, from the fixed mechanism list below |
+| `unauthenticated` | service | that reachable-without-auth is a decision, with the reason |
+| `expected.ingress` | service | a tripwire: the reachability you expect, checked against the scan |
+
+The `auth` mechanisms are a **fixed vocabulary of mechanisms, not products** —
+`app-local-accounts`, `app-ldap`, `app-oidc`, `app-saml`, `app-token`, `mtls`,
+`network-restricted`, `external-proxy`, `other`. Naming a product
+(`authentik-proxy`) is refused with the vocabulary quoted back, because a mechanism is
+observable and a vendor is an attribution — the same rule the scan holds itself to.
+`other` needs a `detail`, since on its own it says nothing.
+
+### Drift
+
+The failure mode a sidecar actually has is not a typo, it is going quietly out of
+date. So both of the checkable fields are checked on every scan, and a disagreement is
+reported as **drift** on the service, one entry per disagreement, with its own counter
+in the summary:
+
+- An acceptance the scan can see **no longer applies** — the port was withdrawn, the
+  route was removed — says so instead of sitting there implying a risk that is gone.
+- An `expected.ingress` that disagrees with the classification names the difference in
+  both directions: `expects ingress "traefik, lan"; the scan classified this service
+  as "traefik, internal" (missing: lan; unexpected: internal)`.
+
+The classification always stands. Drift is a report, never an override.
+
+### Safety
+
+- **Never put a secret in a `.labview`.** It is prose: it is shown as written, no
+  masking is applied to it, and there is no key-name heuristic that could apply.
+  Credentials embedded in a declared link URL are the one exception — those are
+  redacted — but that is a backstop, not a feature.
+- Every mistake in the file is a **warning, never a failure**. A malformed sidecar
+  costs you the fields it got wrong and nothing else; the scan completes. Unknown keys
+  are named rather than ignored, so a mistyped `descripton` is visible instead of
+  silently doing nothing.
+- The file is read from **inside the stack directory only**, with the same containment
+  rule as `env_file`, and every text field is length-capped.
 
 ---
 
@@ -727,8 +852,8 @@ were `string[]` in earlier versions, so this is a **breaking change** for any ex
 consumer. It was made instead of adding a second, parallel list so that why a match did
 not happen has one home rather than a name in one place and a reason in another.
 
-The **ingress vocabulary** is a third **breaking change**, and a pure rename — every
-value maps one-to-one onto the old one and nothing is classified differently:
+The **ingress vocabulary** is a third **breaking change**, in two steps. The first was
+a pure rename, every value mapping one-to-one onto the old one:
 
 | was | is |
 |---|---|
@@ -741,6 +866,35 @@ value maps one-to-one onto the old one and nothing is classified differently:
 
 The old `local` meant *proxy route*, which collided with the separate LAN concept —
 a stat tile reading "Local" for something that was not the LAN.
+
+The second step made **`service.ingress` an array** of independent tags, which is
+breaking in shape as well as in value:
+
+| was | is |
+|---|---|
+| `service.ingress: "public+lan"` | `["public", "lan", …]` |
+| `service.ingress: "public+traefik"` | `["public", "traefik", …]` |
+| `service.ingress: "traefik"` | `["traefik", …]` — plus `lan` if it also publishes a port |
+| `service.ingress: "internal"` | `["internal"]` **or** `["none"]`, depending on the evidence |
+| `expected.ingress` in a `.labview` | a single kind or a list of kinds |
+| — | `stats.noIngressServices` (new) |
+
+The two combined values are gone; nothing combines any more. Three consequences worth
+planning for if you consume the JSON:
+
+- **The five `stats.*Services` counters now overlap** and no longer sum to
+  `stats.services`. Only `noIngressServices` is exclusive.
+- **`internalServices` jumps**, because most services in a real fleet do share a
+  network with a neighbour. It is now the honest count of "reachable inside Docker";
+  the question the old value answered — *how many are reachable by nothing at all* —
+  is `noIngressServices`.
+- **A `traefik` service may also be `lan`.** Under the old vocabulary a proxied
+  service that published a port was classified `traefik` alone, and the LAN path was
+  a note only. The note is still there; the tag is new.
+
+No exposure or auth measure moved in either step: `exposedWithoutAuth` asks whether
+any of `public`, `traefik` or `lan` is present, which is exactly what
+`ingress !== "internal"` used to mean.
 
 `meta.authentik.applications` changed meaning in the same spirit, which is also
 **breaking**: it counts the applications the list endpoint withheld and LabView rebuilt

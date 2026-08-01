@@ -2,14 +2,23 @@ import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import type {
   AppStack,
+  AuthMethod,
   AuthentikSummary,
   ConnectionReport,
   IngressKind,
   Overview,
   Service,
+  TagFilter,
   TraefikSummary,
 } from "./model";
 import { declaredAuthLabel, phaseText, shouldBanner } from "./model";
+import {
+  EMPTY_TAG_FILTER,
+  cycleTag,
+  describeTagFilter,
+  matchesTagFilter,
+  tagFilterActive,
+} from "./model";
 import {
   diffIntegrations,
   diffStacks,
@@ -21,9 +30,9 @@ import {
   type ScanDiff,
 } from "./model";
 import { fetchOverview, rescan } from "./api";
-import { AUTH_META, INGRESS_META } from "./lib/palette";
+import { AUTH_META, INGRESS_META, authLabel, ingressLabel } from "./lib/palette";
 import { fmtTime, ingressSummary, qualifyRouter, serviceKey } from "./lib/format";
-import { StatTile, DistributionBar, type DistSegment } from "./components/stats";
+import { StatTile, DistributionBar, TagBars, type DistSegment } from "./components/stats";
 import { StackCard } from "./components/StackCard";
 import { AppDetail } from "./components/AppDetail";
 import { AuthentikDetail, TraefikDetail } from "./components/ApiDetail";
@@ -205,8 +214,14 @@ function App() {
 
   // Filters
   const [search, setSearch] = useState("");
-  const [ingressFilter, setIngressFilter] = useState<Set<string>>(new Set());
-  const [authFilter, setAuthFilter] = useState<Set<string>>(new Set());
+  /**
+   * Tri-state, because ingress is multi-valued: a chip is included, excluded, or
+   * neither, and the included set is combined with `Any` (OR) or `All` (AND). The
+   * semantics live in `model/filter.ts` — this holds only the state.
+   */
+  const [ingressFilter, setIngressFilter] = useState<TagFilter>(EMPTY_TAG_FILTER);
+  /** The same three states for auth, which stays on `any`: `auth.method` is one value. */
+  const [authFilter, setAuthFilter] = useState<TagFilter>(EMPTY_TAG_FILTER);
   const [exposedOnly, setExposedOnly] = useState(false);
   /**
    * Put the exposures someone has signed off on out of the way, so the list can be read
@@ -277,8 +292,12 @@ function App() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return flat.filter(({ stack, svc }) => {
-      if (ingressFilter.size && !ingressFilter.has(svc.ingress)) return false;
-      if (authFilter.size && !authFilter.has(svc.auth.method)) return false;
+      // Evaluated per service, against that service's own kinds. A stack survives when
+      // at least one of its services does, and shows only those — which is what makes
+      // "All: Public + LAN" mean one service carrying both, not a stack that has one of
+      // each.
+      if (!matchesTagFilter(svc.ingress, ingressFilter)) return false;
+      if (!matchesTagFilter([svc.auth.method], authFilter)) return false;
       if (exposedOnly && !svc.auth.exposedWithoutAuth) return false;
       if (hideAccepted && svc.declared?.unauthenticatedAccepted) return false;
       if (driftOnly && !svc.declared?.drift.length) return false;
@@ -320,8 +339,8 @@ function App() {
 
   const filtering =
     search.trim() !== "" ||
-    ingressFilter.size > 0 ||
-    authFilter.size > 0 ||
+    tagFilterActive(ingressFilter) ||
+    tagFilterActive(authFilter) ||
     exposedOnly ||
     hideAccepted ||
     driftOnly;
@@ -333,9 +352,14 @@ function App() {
     setExpanded(filtering ? new Set(groups.map((g) => g.stack.id)) : new Set());
   }, [search, ingressFilter, authFilter, exposedOnly]);
 
+  // One count per kind, each counted independently — a service tunnelled and proxied
+  // adds to both, so these overlap and do not sum to the number of services. `TagBars`
+  // draws them as separate gauges against the service count for exactly that reason.
   const ingressSegments = useMemo<DistSegment[]>(() => {
     const counts = new Map<IngressKind, number>();
-    for (const { svc } of flat) counts.set(svc.ingress, (counts.get(svc.ingress) ?? 0) + 1);
+    for (const { svc } of flat) {
+      for (const k of svc.ingress) counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
     return INGRESS_META.map((m) => ({ key: m.key, label: m.label, cssVar: m.cssVar, count: counts.get(m.key) ?? 0 }));
   }, [flat]);
 
@@ -344,12 +368,6 @@ function App() {
     return AUTH_META.map((m) => ({ key: m.key, label: m.label, cssVar: m.cssVar, count: counts[m.key] ?? 0 }));
   }, [ov]);
 
-  function toggle(set: Set<string>, setter: (s: Set<string>) => void, key: string) {
-    const next = new Set(set);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    setter(next);
-  }
 
   const selectedFlat = selected ? flat.find((f) => f.key === selected) : undefined;
 
@@ -570,12 +588,19 @@ function App() {
             correctly for a fleet whose tunnel or proxy is a different product. */}
         <StatTile label="Public" value={ov.stats.publicServices} sub="tunnel route" />
         <StatTile label="Traefik" value={ov.stats.traefikServices} sub="proxy route" />
+        {/* Every service with a published port, whether or not a proxy also fronts it —
+            the port answers on the LAN either way, which is the thing worth counting.
+            The tiles overlap by construction now: a tunnelled, proxied, port-publishing
+            service is in three of them. */}
         <StatTile
-          label="LAN only"
+          label="LAN"
           value={ov.stats.lanServices}
-          sub="no proxy in front"
+          sub="published port"
           alert={ov.stats.lanServices > 0}
         />
+        {/* The complement, and the only tile here that is exclusive: nothing reaches
+            these, not even another container. */}
+        <StatTile label="No ingress" value={ov.stats.noIngressServices} sub="nothing reaches it" />
         <StatTile label="Auth-protected" value={ov.stats.authProtected} />
         {/* The count is what the scan found and does not move when an exposure is
             accepted — the subtitle says how many were, and the alarm is driven by the
@@ -613,17 +638,19 @@ function App() {
       </div>
 
       <div class="dists">
-        <DistributionBar
+        <TagBars
           title="Ingress exposure"
           segments={ingressSegments}
-          active={ingressFilter}
-          onToggle={(k) => toggle(ingressFilter, setIngressFilter, k)}
+          total={ov.stats.services}
+          filter={ingressFilter}
+          onCycle={(k) => setIngressFilter((f) => cycleTag(f, k))}
+          onMode={(mode) => setIngressFilter((f) => ({ ...f, mode }))}
         />
         <DistributionBar
           title="Authentication method"
           segments={authSegments}
-          active={authFilter}
-          onToggle={(k) => toggle(authFilter, setAuthFilter, k)}
+          filter={authFilter}
+          onCycle={(k) => setAuthFilter((f) => cycleTag(f, k))}
         />
       </div>
 
@@ -677,8 +704,11 @@ function App() {
                 class="chip"
                 onClick={() => {
                   setSearch("");
-                  setIngressFilter(new Set());
-                  setAuthFilter(new Set());
+                  // All three parts of each expression, mode included: a cleared filter
+                  // that silently kept `All` would behave differently the next time a
+                  // second chip was clicked.
+                  setIngressFilter(EMPTY_TAG_FILTER);
+                  setAuthFilter(EMPTY_TAG_FILTER);
                   setExposedOnly(false);
                   setHideAccepted(false);
                   setDriftOnly(false);
@@ -686,6 +716,23 @@ function App() {
               >
                 Clear filters
               </button>
+            )}
+            {/* The expression in words. Three parts — a set, a mode and an exclusion —
+                cannot be read reliably off which chips look bright, and a filter a reader
+                misreads is a conclusion they draw wrongly. */}
+            {(tagFilterActive(ingressFilter) || tagFilterActive(authFilter)) && (
+              <span class="filter-readout">
+                {[
+                  tagFilterActive(ingressFilter)
+                    ? `ingress: ${describeTagFilter(ingressFilter, (k) => ingressLabel(k as IngressKind))}`
+                    : "",
+                  tagFilterActive(authFilter)
+                    ? `auth: ${describeTagFilter(authFilter, (m) => authLabel(m as AuthMethod))}`
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
             )}
             <button
               class="chip"

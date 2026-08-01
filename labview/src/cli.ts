@@ -23,11 +23,14 @@ if (summary) {
     for (const line of formatConnection(r)) console.log(`  ${line}`);
   }
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
-  // The four ingress situations, named rather than slash-packed: they are disjoint
-  // and they sum to `services`, so a reader can check the line against itself.
+  // The five ingress kinds, each counted independently. They **overlap** — a service
+  // behind the tunnel and the proxy is in both counts — so the line does not sum to
+  // `services` and says so rather than leaving a reader to add it up and doubt the
+  // scan. Only `none` is exclusive, by definition.
   console.log(
     `  by ingress:       public ${stats.publicServices}, traefik ${stats.traefikServices},` +
-      ` lan ${stats.lanServices}, internal ${stats.internalServices}`,
+      ` lan ${stats.lanServices}, internal ${stats.internalServices},` +
+      ` none ${stats.noIngressServices}  (a service can have several)`,
   );
   console.log(`  auth protected:   ${stats.authProtected}`);
   // The count is the scan's, unaltered; the parenthetical says how many of them somebody

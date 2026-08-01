@@ -98,12 +98,13 @@ function normalizeService(name: string, svc: any, ctx: Ctx): Service {
     dependsOn: normalizeDependsOn(svc.depends_on),
     networks: normalizeNetworks(svc.networks),
     ports: normalizePorts(svc.ports, notes),
+    expose: normalizeExpose(svc.expose),
     mounts: normalizeVolumes(svc.volumes),
     env: normalizeEnv(name, svc, ctx, notes),
     labels: normalizeKvMap(svc.labels),
     cloudflare: [],
     traefik: [],
-    ingress: "internal",
+    ingress: ["none"],
     auth: { method: "none", detail: "", evidence: [], confidence: "observed", exposedWithoutAuth: false },
     notes,
   };
@@ -211,6 +212,23 @@ function normalizePorts(ports: any, notes: string[]): PortMapping[] {
     out.push({ published, target, protocol, raw });
   }
   return out;
+}
+
+/**
+ * `expose:` entries, kept verbatim.
+ *
+ * Not parsed into `PortMapping` on purpose: these ports are never published, so there
+ * is no host side to split off, and a range (`3000-3005`) is a normal entry that a
+ * port parser would mangle. What the classifier needs is only whether the list is
+ * non-empty — a container port the operator declared for other containers — and what
+ * a reader needs is the string they wrote.
+ */
+function normalizeExpose(expose: any): string[] {
+  if (!Array.isArray(expose)) return [];
+  return expose
+    .filter((e) => typeof e === "string" || typeof e === "number")
+    .map((e) => String(e).trim())
+    .filter((e) => e !== "");
 }
 
 /* -------------------------------------------------------------------------- */

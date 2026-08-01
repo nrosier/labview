@@ -44,18 +44,19 @@
   --critical: #d03b3b;
 
   /* Semantic roles: ingress kind (identity).
-   * Bar order is public → public+lan → public+traefik → traefik → lan → internal.
-   * Each adjacent pair is a validated-distinct run in both light and dark
-   * (orange/violet, violet/aqua, aqua/blue, blue/magenta, magenta/neutral);
-   * violet and magenta mark the two "answers on the LAN, no proxy in front" kinds
-   * so they read as a family without colliding with the proxied hues. Every
-   * segment also carries its text label, so hue is never the only channel. */
+   * Five independent kinds — a service carries as many as apply — in the row order
+   * public → traefik → lan → internal → none. Each adjacent pair differs in hue and
+   * in lightness in both light and dark (orange/blue, blue/magenta, magenta/violet,
+   * violet/neutral). The two edge paths keep their established hues (orange for the
+   * tunnel, blue for the proxy, matching the graph hubs); internal takes violet now
+   * that it is a positive classification rather than the leftover bucket, and the
+   * recessive neutral belongs to the kind that really is an absence. Every badge and
+   * every bar row also carries its text label, so hue is never the only channel. */
   --ing-public:        var(--c2);  /* orange  */
-  --ing-publiclan:     var(--c7);  /* violet  */
-  --ing-publictraefik: var(--c3);  /* aqua    */
   --ing-traefik:       var(--c1);  /* blue    */
   --ing-lan:           var(--c5);  /* magenta */
-  --ing-internal:      var(--muted);
+  --ing-internal:      var(--c7);  /* violet  */
+  --ing-none:          var(--muted);
 
   /* Semantic roles: auth method (identity). Bar order groups the methods whose
    * provider was identified (blue, orange, aqua) ahead of those where only the
@@ -293,6 +294,47 @@ code, .mono {
 .legend .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .legend .count { color: var(--muted); font-variant-numeric: tabular-nums; }
 .legend .item.off { opacity: 0.4; }
+/* Excluded: the `¬` prefix and the strikethrough carry the state, never a colour —
+   the five hues already mean an ingress kind, and a filter state is not one. */
+.legend .item.neg .tlabel,
+.tagrow.neg .tlabel { text-decoration: line-through; }
+
+/* One gauge per tag, for a dimension a service can carry several of at once. Each
+   row is read against the same denominator, so the widths are comparable down the
+   column and never imply a share of a whole. */
+.disthead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.tagrows { display: grid; gap: 6px; }
+.tagrow {
+  display: grid;
+  grid-template-columns: 148px 1fr 2.5em;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.tagrow:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; }
+.tagrow.off { opacity: 0.4; }
+.tagrow .tagname { display: inline-flex; align-items: center; gap: 6px; }
+.tagrow .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.tagrow .bar { height: 10px; border-radius: 5px; }
+.tagrow .count { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+@media (max-width: 720px) { .tagrow { grid-template-columns: 120px 1fr 2.5em; } }
+
+/* Any / All: the OR/AND half of the ingress expression, beside the title it governs. */
+.modeswitch { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.modebtn {
+  appearance: none;
+  border: 0;
+  background: var(--surface);
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 9px;
+  cursor: pointer;
+}
+.modebtn.on { background: var(--surface-2); color: var(--ink); font-weight: 600; }
 
 /* ---- Filters --------------------------------------------------------- */
 
@@ -331,6 +373,8 @@ code, .mono {
 .chip[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); border-color: var(--baseline); }
 .chip .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .result-count { color: var(--muted); font-size: 12px; margin-left: auto; }
+/* The active filter expression in words, beside the chips it describes. */
+.filter-readout { color: var(--ink-2); font-size: 12px; }
 
 /* ---- Stack list ------------------------------------------------------ */
 

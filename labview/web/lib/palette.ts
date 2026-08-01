@@ -15,7 +15,9 @@ export interface RoleMeta<K extends string> {
 }
 
 /**
- * Ingress kinds in a fixed, meaningful order (most→least exposed).
+ * Ingress kinds in a fixed, meaningful order (most→least exposed) — the same order as
+ * `INGRESS_KINDS`, since a service carries several of these at once and the badges,
+ * bars and legend all have to list them the same way.
  *
  * `cssVar` is the one string here the compiler cannot check: a name with no
  * matching custom property in styles.css resolves to grey through the fallbacks
@@ -23,11 +25,10 @@ export interface RoleMeta<K extends string> {
  */
 export const INGRESS_META: RoleMeta<IngressKind>[] = [
   { key: "public", label: "Public", cssVar: "--ing-public" },
-  { key: "public+lan", label: "Public + LAN", cssVar: "--ing-publiclan" },
-  { key: "public+traefik", label: "Public + Traefik", cssVar: "--ing-publictraefik" },
   { key: "traefik", label: "Traefik", cssVar: "--ing-traefik" },
-  { key: "lan", label: "LAN (no proxy)", cssVar: "--ing-lan" },
+  { key: "lan", label: "LAN (published port)", cssVar: "--ing-lan" },
   { key: "internal", label: "Internal", cssVar: "--ing-internal" },
+  { key: "none", label: "No ingress", cssVar: "--ing-none" },
 ];
 
 /**

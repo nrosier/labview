@@ -626,8 +626,13 @@ export interface ServiceDeclaration extends Declaration {
    * was reviewed.
    */
   unauthenticatedAccepted?: { reason: string };
-  /** Declared expectation, compared against `Service.ingress` — never an override. */
-  expectedIngress?: IngressKind;
+  /**
+   * Declared expectation, compared against `Service.ingress` as a set — never an
+   * override. A list because the thing it is compared against is one: expecting
+   * `[public, traefik]` and finding `[public, lan]` is a disagreement about the
+   * proxy, and reporting it as "expected public, got public" would hide that.
+   */
+  expectedIngress?: IngressKind[];
   /**
    * Where this declaration and the scan disagree, in the operator's terms. Filled
    * by the analyzer, one entry per disagreement.
@@ -665,13 +670,24 @@ export interface Service {
   dependsOn: string[];
   networks: string[];
   ports: PortMapping[];
+  /**
+   * `expose:` entries verbatim (`"9000"`, `"9000/udp"`, a range). Container ports
+   * declared for other containers and *not* published to the host — which is what
+   * distinguishes them from `ports:`, and what makes them evidence of `internal`
+   * ingress rather than of exposure.
+   */
+  expose: string[];
   mounts: MountSpec[];
   env: EnvVar[];
   labels: Record<string, string>;
   cloudflare: CloudflareRoute[];
   traefik: TraefikRoute[];
-  /** How this service is reachable, derived from cloudflare + traefik + ports. */
-  ingress: IngressKind;
+  /**
+   * Every way this service was found to be reachable, from the tunnel routes, the
+   * proxy routes, `ports:`, `expose:` and shared networks. Never empty — see
+   * {@link IngressKind}.
+   */
+  ingress: IngressKind[];
   auth: AuthPosture;
   docker?: DockerState;
   /** Authentik applications this service was matched to, when the API was readable. */
@@ -729,7 +745,11 @@ export interface GraphNode {
   kind: "service" | "network" | "volume" | "external";
   /** For services: the stack it belongs to. */
   stack?: string;
-  /** Auth/ingress used for coloring. */
+  /**
+   * Auth/ingress used for coloring. Ingress is a single kind, not the service's whole
+   * set: a node has one fill, so it carries `primaryIngress` — the most exposed kind
+   * present. The full set is listed on the badges in the drawer.
+   */
   auth?: AuthMethod;
   ingress?: IngressKind;
   running?: boolean;
@@ -755,37 +775,45 @@ export interface Graph {
 }
 
 /**
- * How a service can be reached, in the four situations a fleet distinguishes:
- * `public` through a tunnel, `lan` at a published host port, `traefik` through the
- * reverse proxy, `internal` on the container network only.
+ * One way a service can be reached. A service carries a **set** of these, because
+ * they are independent facts and several are routinely true at once:
  *
- * **The kind names what is in *front* of the service, so a published host port is
- * named only when nothing proxies it.** `lan` is a service answerable directly at
- * `hostIP:port` with no proxy and therefore no proxy-level SSO in the path. A
- * proxied service that *also* publishes a port keeps its `traefik` /
- * `public+traefik` kind and gets a note instead — most services in a fleet publish
- * a port, so folding that into the kind would collapse the whole distribution into
- * one bucket.
+ *  - `public` — a tunnel publishes it to the internet.
+ *  - `traefik` — the reverse proxy routes to it.
+ *  - `lan` — a `ports:` entry publishes it at `hostIP:port`, answerable with no proxy
+ *    and therefore no proxy-level SSO in the path.
+ *  - `internal` — another container demonstrably can reach it: it declares `expose:`,
+ *    or it shares a docker network with another scanned service.
+ *  - `none` — none of the above. A worker, a cron job, a one-shot init container.
+ *
+ * **Nothing here is combined and nothing is a fallback.** A proxied service that also
+ * publishes a port is `traefik` *and* `lan`, and both are reported; `internal` is
+ * positive evidence of container-network reachability rather than "whatever was left
+ * over", which is what makes `none` a real, populated category worth filtering on.
+ *
+ * Build a set only through `normalizeIngress` (`model/ingress.ts`): deduped, in
+ * canonical order, never empty.
  */
-export type IngressKind =
-  | "public"
-  | "public+lan"
-  | "public+traefik"
-  | "traefik"
-  | "lan"
-  | "internal";
+export type IngressKind = "public" | "traefik" | "lan" | "internal" | "none";
 
 /** Aggregate counters for the dashboard header. */
 export interface OverviewStats {
   stacks: number;
   services: number;
   running: number;
+  /**
+   * The five ingress counters **overlap and do not sum to `services`**: one service
+   * behind the tunnel, behind the proxy and on a published port is counted in three
+   * of them, because all three are true of it. Anything presenting them as a
+   * part-to-whole split would be presenting a number that is not there — the
+   * dashboard draws them as five independent gauges for exactly this reason.
+   */
   publicServices: number;
-  /** Reached through the reverse proxy, with no tunnel route. */
   traefikServices: number;
-  /** Reachable only at a published host port (no proxy in front). */
   lanServices: number;
   internalServices: number;
+  /** Services nothing was found to reach, inside the container network or out. */
+  noIngressServices: number;
   authProtected: number;
   exposedWithoutAuth: number;
   byAuthMethod: Record<string, number>;

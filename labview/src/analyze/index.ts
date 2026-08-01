@@ -16,8 +16,16 @@ import {
   providerEnforces,
 } from "../labels/auth.js";
 import { declaredAuthSummary } from "../model/declarations.js";
+import {
+  diffIngress,
+  externalIngress,
+  formatIngress,
+  isExternallyReachable,
+  normalizeIngress,
+} from "../model/ingress.js";
 import { maskEnv } from "../secrets.js";
 import { buildGraph } from "./graph.js";
+import { realNetworks } from "./networks.js";
 import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.js";
 import { buildFleetIndex, lookupContainerAddress, resolveOrigins, serviceRefKey } from "./origins.js";
 import { matchAuthentik } from "./authentik.js";
@@ -87,10 +95,21 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   const snapshot = await snapshotDocker(cfg, { createDocker: deps.createDocker });
   const registry = buildMiddlewareRegistry(stacks, cfg.labels.traefik.prefix);
 
-  // Pass 1: parse routes, merge live docker state, classify ingress.
+  // Pass 1: parse routes and merge live docker state.
   for (const stack of stacks) {
     for (const svc of stack.services) {
       parseRoutes(stack, svc, snapshot, cfg);
+    }
+  }
+
+  // Ingress is classified after that loop rather than inside it, because `internal`
+  // is a statement about *other* containers: it needs every service's networks, and
+  // `realNetworks` prefers the live names that pass 1 has only just attached. A
+  // service classified mid-loop would be judged against a half-built fleet.
+  const shared = sharedNetworks(stacks);
+  for (const stack of stacks) {
+    for (const svc of stack.services) {
+      svc.ingress = classifyIngress(svc, stack, shared);
     }
   }
 
@@ -240,7 +259,7 @@ function isSpecificHint(name: string): boolean {
   return /[.\-_]/.test(name);
 }
 
-/** Pass 1: parse DockFlare/Traefik labels, merge docker state, classify ingress. */
+/** Pass 1: parse DockFlare/Traefik labels and merge docker state. */
 function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cfg: LabViewConfig): void {
   svc.cloudflare = parseDockflare(svc.labels, cfg.labels.dockflare.prefix);
   svc.traefik = parseTraefik(svc.labels, cfg.labels.traefik.prefix);
@@ -250,8 +269,6 @@ function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cf
     snapshot.byKey.get(composeKey(stack.projectName, svc.name)) ??
     snapshot.byKey.get(svc.containerName) ??
     undefined;
-
-  svc.ingress = classifyIngress(svc);
 }
 
 /** Pass 2: derive auth posture, finalize exposure, then mask secrets. */
@@ -271,9 +288,10 @@ function finalizeAuth(
   // A confirmed gate counts even when it has no `AuthMethod` to be reported as —
   // a SAML application is protected, and calling it exposed would be plainly wrong.
   const hasEdgeAuth = svc.auth.method !== "none" || hasCloudflareAccess || hasEnforcedAuthentikGate(svc);
-  // Anything other than `internal` is answerable by someone: via the tunnel, via
-  // the proxy, or straight at a published port on the LAN.
-  const reachable = svc.ingress !== "internal";
+  // Answerable by someone outside the container network: via the tunnel, via the
+  // proxy, or straight at a published port on the LAN. `internal` and `none` are
+  // not — a container reaching another container is not exposure.
+  const reachable = isExternallyReachable(svc.ingress);
   svc.auth.exposedWithoutAuth = reachable && !hasEdgeAuth;
 
   if (svc.auth.exposedWithoutAuth) {
@@ -282,7 +300,9 @@ function finalizeAuth(
     // reason attached, instead of a second note about the same fact.
     const declared = svc.declared;
     const accepted = declared?.unauthenticatedAccepted;
-    const base = `Reachable (${svc.ingress}) with no detected proxy/SSO authentication`;
+    // Only the kinds that make it reachable are named: `internal` alongside them
+    // would read as a reason it is exposed, which it is not.
+    const base = `Reachable (${formatIngress(externalIngress(svc.ingress))}) with no detected proxy/SSO authentication`;
     svc.notes.push(
       declared && accepted ? `${base} — accepted in ${declared.file}: ${accepted.reason}` : `${base}.`,
     );
@@ -307,30 +327,57 @@ function finalizeAuth(
 }
 
 /**
- * Classify reachability from the tunnel routes, the proxy routes, and published
- * host ports. A published port is real reachability: `ports: ["8096:8096"]` makes
- * the service answerable at `hostIP:8096` on the LAN, with no proxy and no SSO in
- * the path.
+ * Every way in, as a set of independent kinds. Each is decided on its own evidence
+ * and none excludes another: a container behind the tunnel, behind the proxy, and
+ * publishing a host port is all three things at once, and a reader who is told only
+ * the first of them has been told the least useful one.
  *
- * The kind names what is in *front* of the service, so `lan` is only reported when
- * nothing else fronts it. When Traefik does front it, the published port is a
- * *bypass* rather than the primary path, and is reported as a note by
- * `noteHostPortBypass` — most services in a typical fleet publish a port, so
- * folding that into the kind would flatten the whole distribution into one value.
+ *  - `public` — a tunnel route with a resolved hostname.
+ *  - `traefik` — a proxy route with hosts or a rule.
+ *  - `lan` — `ports:` is non-empty. Every entry there is host-published, which is
+ *    precisely what distinguishes it from `expose:`; a short form with no host side
+ *    (`ports: ["9100"]`) still publishes, just on an ephemeral port, so the presence
+ *    of the mapping is the signal rather than a parsed host port number. Reported
+ *    whether or not something else fronts the service — when the proxy does,
+ *    `noteHostPortBypass` additionally says the port answers without it.
+ *  - `internal` — another container can demonstrably reach it: a declared `expose:`
+ *    port, or a real network shared with another scanned service. Positive evidence,
+ *    never a fallback.
+ *  - `none` — supplied by `normalizeIngress` when nothing above holds.
+ *
+ * `internal` deliberately does not consider `depends_on`: a dependency across two
+ * disjoint networks is not reachability.
  */
-function classifyIngress(svc: Service): IngressKind {
-  const isPublic = svc.cloudflare.some((r) => r.hostname);
-  const isTraefik = svc.traefik.some((r) => r.hosts.length > 0 || r.rule);
-  // Every entry under `ports:` is host-published — that is precisely what
-  // distinguishes it from `expose:`. A short form with no host side
-  // (`ports: ["9100"]`) still publishes, just on an ephemeral host port, so the
-  // presence of the mapping is the signal rather than a parsed host port number.
-  const hasLanPort = svc.ports.length > 0;
-  if (isPublic && isTraefik) return "public+traefik";
-  if (isPublic) return hasLanPort ? "public+lan" : "public";
-  if (isTraefik) return "traefik";
-  if (hasLanPort) return "lan";
-  return "internal";
+function classifyIngress(svc: Service, stack: AppStack, shared: ReadonlySet<string>): IngressKind[] {
+  const kinds: IngressKind[] = [];
+  if (svc.cloudflare.some((r) => r.hostname)) kinds.push("public");
+  if (svc.traefik.some((r) => r.hosts.length > 0 || r.rule)) kinds.push("traefik");
+  if (svc.ports.length > 0) kinds.push("lan");
+  if (svc.expose.length > 0 || realNetworks(stack, svc).some((n) => shared.has(n))) kinds.push("internal");
+  return normalizeIngress(kinds);
+}
+
+/**
+ * Real network names carrying more than one scanned service — the fleet-wide half of
+ * the `internal` rule.
+ *
+ * Counted over `realNetworks`, not over `svc.networks`, so it sees what docker sees:
+ * the implicit `default` network compose gives a file that declares none (which is
+ * what makes two services in one stack mutually reachable without either saying so),
+ * an `external:` network under its verbatim name (which is what lets two *stacks*
+ * share one), and live names in preference to implied ones.
+ */
+function sharedNetworks(stacks: AppStack[]): Set<string> {
+  const count = new Map<string, number>();
+  for (const stack of stacks) {
+    for (const svc of stack.services) {
+      // Deduped per service: one service listing a network twice is not two services.
+      for (const name of new Set(realNetworks(stack, svc))) {
+        count.set(name, (count.get(name) ?? 0) + 1);
+      }
+    }
+  }
+  return new Set([...count].filter(([, n]) => n >= 2).map(([name]) => name));
 }
 
 /**
@@ -364,21 +411,33 @@ function noteDeclarations(svc: Service): void {
   // no longer reachable — in both cases the sidecar is describing something the scan
   // cannot see any more, and quietly ignoring it would leave the file looking correct.
   if (declared.unauthenticatedAccepted && !svc.auth.exposedWithoutAuth) {
-    const why =
-      svc.ingress === "internal"
-        ? "unreachable from outside the container network"
-        : "authenticated at the edge";
+    const why = !isExternallyReachable(svc.ingress)
+      ? "unreachable from outside the container network"
+      : "authenticated at the edge";
     declared.drift.push(
       `${declared.file} marks this service as intentionally unauthenticated, but the scan found it ${why} — the declaration no longer applies.`,
     );
   }
 
   // The expectation is a tripwire, never an override: the classification stands and the
-  // disagreement is reported.
-  if (declared.expectedIngress && declared.expectedIngress !== svc.ingress) {
-    declared.drift.push(
-      `${declared.file} expects ingress "${declared.expectedIngress}"; the scan classified this service as "${svc.ingress}".`,
-    );
+  // disagreement is reported. Compared as sets and reported in both directions, because
+  // expecting `public, traefik` and finding `public, lan` is a disagreement about the
+  // proxy — and diffing two lists by eye is exactly what the operator should not have
+  // to do to see that.
+  const expected = declared.expectedIngress;
+  if (expected) {
+    const { missing, unexpected } = diffIngress(expected, svc.ingress);
+    if (missing.length || unexpected.length) {
+      const detail = [
+        missing.length ? `missing: ${formatIngress(missing)}` : "",
+        unexpected.length ? `unexpected: ${formatIngress(unexpected)}` : "",
+      ]
+        .filter(Boolean)
+        .join("; ");
+      declared.drift.push(
+        `${declared.file} expects ingress "${formatIngress(expected)}"; the scan classified this service as "${formatIngress(svc.ingress)}" (${detail}).`,
+      );
+    }
   }
 }
 
@@ -388,7 +447,7 @@ function noteDeclarations(svc: Service): void {
  * overstate the posture.
  */
 function noteHostPortBypass(svc: Service): void {
-  if (svc.ingress !== "traefik" && svc.ingress !== "public+traefik") return;
+  if (!svc.ingress.includes("traefik")) return;
   if (svc.ports.length === 0) return;
   const list = svc.ports.map((p) => p.published ?? `(ephemeral)->${p.target}`).join(", ");
   const guard = svc.auth.method === "none" ? "the proxy" : `the proxy and its ${svc.auth.method} SSO`;
@@ -444,6 +503,7 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     traefikServices: 0,
     lanServices: 0,
     internalServices: 0,
+    noIngressServices: 0,
     authProtected: 0,
     exposedWithoutAuth: 0,
     byAuthMethod: {},
@@ -455,11 +515,13 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     for (const svc of stack.services) {
       stats.services++;
       if (svc.docker?.running) stats.running++;
-      if (svc.ingress === "public" || svc.ingress === "public+traefik" || svc.ingress === "public+lan")
-        stats.publicServices++;
-      else if (svc.ingress === "traefik") stats.traefikServices++;
-      else if (svc.ingress === "lan") stats.lanServices++;
-      else stats.internalServices++;
+      // Five independent counters, not a chain: a service tunnelled *and* proxied is
+      // counted in both, which is why these overlap and do not sum to `services`.
+      if (svc.ingress.includes("public")) stats.publicServices++;
+      if (svc.ingress.includes("traefik")) stats.traefikServices++;
+      if (svc.ingress.includes("lan")) stats.lanServices++;
+      if (svc.ingress.includes("internal")) stats.internalServices++;
+      if (svc.ingress.includes("none")) stats.noIngressServices++;
       if (svc.auth.method !== "none") stats.authProtected++;
       if (svc.auth.exposedWithoutAuth) stats.exposedWithoutAuth++;
       stats.byAuthMethod[svc.auth.method] = (stats.byAuthMethod[svc.auth.method] ?? 0) + 1;

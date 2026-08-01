@@ -1,0 +1,8 @@
+# Written when the service also published a host port, and never updated after the
+# port was withdrawn. Both differences have to be reported: the `lan` that is gone,
+# and the `internal` reachability that was always there and never written down.
+services:
+  api:
+    description: Internal API behind the proxy.
+    expected:
+      ingress: [traefik, lan]

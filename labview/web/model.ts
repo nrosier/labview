@@ -69,6 +69,36 @@ export { phaseText, shouldBanner } from "../src/model/connections";
  */
 export { declaredAuthLabel, declaredAuthSummary } from "../src/model/declarations";
 
+/**
+ * The ingress vocabulary and the operations on it, from the same module the analyzer
+ * classifies with — so the badge order, the bar order and the classification can never
+ * disagree about which kinds exist or which one is most exposed.
+ */
+export {
+  INGRESS_KINDS,
+  diffIngress,
+  externalIngress,
+  formatIngress,
+  isExternallyReachable,
+  isIngressKind,
+  normalizeIngress,
+  primaryIngress,
+} from "../src/model/ingress";
+
+/**
+ * The tri-state tag filter. In `src/` rather than here because the web bundle is never
+ * rendered by the smoke pass: what a reader sees after clicking three chips is decided
+ * by pure functions the test can call, and this module only holds the state.
+ */
+export {
+  EMPTY_TAG_FILTER,
+  cycleTag,
+  describeTagFilter,
+  matchesTagFilter,
+  tagFilterActive,
+} from "../src/model/filter";
+export type { TagFilter, TagMode } from "../src/model/filter";
+
 export { diffStacks, scanDiffText, scanDiffDetails } from "../src/model/changes";
 export { diffIntegrations, integrationDiffText, integrationDiffDetails } from "../src/model/changes";
 export type { ScanDiff, StackChange, IntegrationDiff, IntegrationChange } from "../src/model/changes";

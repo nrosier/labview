@@ -118,6 +118,17 @@ services:
     # on the handful of services where an accidental change would matter — put
     # `internal` on a database and you will hear about it the day a port appears.
     #
-    # One of: public | public+lan | public+traefik | traefik | lan | internal
+    # Any of: public | traefik | lan | internal | none
+    #
+    #   public    reachable from the internet through the tunnel
+    #   traefik   reachable through the reverse proxy
+    #   lan       a published host port — answers on the server's own address
+    #   internal  reachable by another container, and only by another container
+    #   none      nothing reaches it at all
+    #
+    # These are independent, and most services have several. Write the full set you
+    # expect: LabView reports both what is missing and what it found that you did not
+    # list, so a partial list drifts on purpose. A single kind can be written bare
+    # (`ingress: internal`) — the list form is only needed for more than one.
     expected:
-      ingress: public+traefik
+      ingress: [public, lan, internal]

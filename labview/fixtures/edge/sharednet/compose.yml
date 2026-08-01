@@ -1,0 +1,25 @@
+# Regression fixture: `internal` ingress from the network compose creates for free.
+#
+# Neither service declares a `networks:` key, publishes a port or declares an
+# `expose:` port. There is nothing in this file that names a network at all — and
+# yet both containers land on compose's implicit `default` network, which means
+# each can reach the other by service name. That is `internal` ingress, and it is
+# observable only by resolving the implied network (`<project>_default`) the way
+# docker does rather than by reading `networks:` off the service.
+#
+# The contrast is `interp/` and `ldapapp/`: single-service stacks with the same
+# empty shape, whose one implied network carries nobody else. They are `none`.
+# Together the two fixtures pin that `internal` is positive evidence rather than
+# the bucket everything unclassified falls into.
+services:
+  # A queue with no route, no published port and no declared network. Nothing
+  # outside the container network can reach it; the worker beside it can.
+  broker:
+    image: example/broker:1.2.0
+    container_name: sharednet-broker
+
+  worker:
+    image: example/worker:1.2.0
+    container_name: sharednet-worker
+    depends_on:
+      - broker

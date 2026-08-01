@@ -9,12 +9,8 @@ import type {
   IngressKind,
   ServiceDeclaration,
 } from "../model/types.js";
-import {
-  DECLARED_AUTH_MECHANISMS,
-  INGRESS_KINDS,
-  isDeclaredAuthMechanism,
-  isIngressKind,
-} from "../model/declarations.js";
+import { DECLARED_AUTH_MECHANISMS, isDeclaredAuthMechanism } from "../model/declarations.js";
+import { INGRESS_KINDS, isIngressKind, normalizeIngress } from "../model/ingress.js";
 import { redactUriCredentials } from "../secrets.js";
 import { resolveContained } from "./paths.js";
 import type { DiscoveredStack } from "./discover.js";
@@ -351,8 +347,16 @@ function readUnauthenticated(
   return { reason };
 }
 
-/** The declared expectation, which the analyzer compares against and never applies. */
-function readExpected(value: unknown, where: string, warnings: string[]): IngressKind | undefined {
+/**
+ * The declared expectation, which the analyzer compares against and never applies.
+ *
+ * `ingress` accepts either one kind or a list of them, because a service can have
+ * several at once and the expectation has to be able to say so — `ingress: lan` and
+ * `ingress: [public, traefik]` are both valid. A list with one bad entry keeps the
+ * good ones and warns about the rest, rather than discarding the whole expectation
+ * over a typo.
+ */
+function readExpected(value: unknown, where: string, warnings: string[]): IngressKind[] | undefined {
   if (value === undefined || value === null) return undefined;
   const at = `${where}.expected`;
   if (!isMapping(value)) {
@@ -360,14 +364,26 @@ function readExpected(value: unknown, where: string, warnings: string[]): Ingres
     return undefined;
   }
   warnUnknownKeys(value, ["ingress"] as const, where, at, warnings);
+  if (value.ingress === undefined || value.ingress === null) return undefined;
 
-  const kind = readText(value.ingress, `${at}.ingress`, warnings);
-  if (!kind) return undefined;
-  if (!isIngressKind(kind)) {
-    warnings.push(`${at}.ingress: "${kind}" is not one of ${INGRESS_KINDS.join(", ")}; ignored`);
-    return undefined;
+  // The list branch comes first: `readText` refuses anything that is not a scalar,
+  // so a list reaching it would be reported as the wrong type instead of read.
+  const entries = Array.isArray(value.ingress) ? value.ingress : [value.ingress];
+  const kinds: IngressKind[] = [];
+  for (const [i, entry] of entries.entries()) {
+    const label = Array.isArray(value.ingress) ? `${at}.ingress[${i}]` : `${at}.ingress`;
+    const kind = readText(entry, label, warnings);
+    if (!kind) continue;
+    if (!isIngressKind(kind)) {
+      warnings.push(`${label}: "${kind}" is not one of ${INGRESS_KINDS.join(", ")}; ignored`);
+      continue;
+    }
+    kinds.push(kind);
   }
-  return kind;
+  // Nothing survived: report no expectation at all rather than an empty one, which
+  // `normalizeIngress` would turn into an expectation of `none` nobody wrote.
+  if (!kinds.length) return undefined;
+  return normalizeIngress(kinds);
 }
 
 /* -------------------------------------------------------------------------- */

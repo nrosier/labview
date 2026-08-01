@@ -1,4 +1,4 @@
-import type { DeclaredAuth, DeclaredAuthMechanism, IngressKind } from "./types.js";
+import type { DeclaredAuth, DeclaredAuthMechanism } from "./types.js";
 
 /**
  * The runtime side of the declaration vocabulary: the values a `.labview` file may
@@ -46,24 +46,6 @@ export function declaredAuthLabel(mechanism: DeclaredAuthMechanism): string {
 
 export function isDeclaredAuthMechanism(value: string): value is DeclaredAuthMechanism {
   return (DECLARED_AUTH_MECHANISMS as readonly string[]).includes(value);
-}
-
-/**
- * The ingress kinds as a runtime list, for validating a declared expectation and for
- * the palette check. The union in `types.ts` stays the source of truth; this exists
- * because a YAML string has to be compared against something.
- */
-export const INGRESS_KINDS: readonly IngressKind[] = [
-  "public",
-  "public+lan",
-  "public+traefik",
-  "traefik",
-  "lan",
-  "internal",
-];
-
-export function isIngressKind(value: string): value is IngressKind {
-  return (INGRESS_KINDS as readonly string[]).includes(value);
 }
 
 /**

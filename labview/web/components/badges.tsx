@@ -7,13 +7,17 @@ import { IconCheck, IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWa
 /**
  * Ingress badge — colored swatch + icon + label (identity, not color alone).
  *
- * The icon answers "how far does this reach": a globe for the kinds a tunnel
- * publishes to the internet, the LAN glyph for the ones answerable only on the
- * server's own network, a server for the container network alone.
+ * One badge per kind, and a service usually wears several: the kinds are independent,
+ * so the caller maps over `svc.ingress` rather than asking this component to summarise
+ * a set into one word.
+ *
+ * The icon answers "how far does this reach": a globe for what a tunnel publishes to
+ * the internet, the LAN glyph for what is answerable on the server's own network, a
+ * server for the container network and for nothing at all.
  */
 export function IngressBadge({ kind }: { kind: IngressKind }) {
   const icon =
-    kind === "internal" ? (
+    kind === "internal" || kind === "none" ? (
       <IconServer />
     ) : kind === "traefik" || kind === "lan" ? (
       <IconLan />

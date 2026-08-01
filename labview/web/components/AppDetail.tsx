@@ -1,5 +1,5 @@
-import type { AppStack, AuthentikProviderKind, OriginTarget, Service } from "../model";
-import { declaredAuthLabel } from "../model";
+import type { AppStack, AuthentikProviderKind, IngressKind, OriginTarget, Service } from "../model";
+import { declaredAuthLabel, diffIngress } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
@@ -12,6 +12,16 @@ import { Section } from "./Section";
  * listed as evidence under the table, so this only has to say which of the four
  * conclusions was reached.
  */
+/**
+ * Whether a declared expectation and the classification agree, from the same diff the
+ * analyzer words its drift note with — so the pill and the note cannot disagree about
+ * whether the two match.
+ */
+function expectedMatches(expected: readonly IngressKind[], actual: readonly IngressKind[]): boolean {
+  const { missing, unexpected } = diffIngress(expected, actual);
+  return missing.length === 0 && unexpected.length === 0;
+}
+
 function originLabel(o: OriginTarget): string {
   switch (o.kind) {
     case "fleet-service":
@@ -115,7 +125,11 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
 
         <div class="dbody">
           <div class="badges" style="display:flex;gap:6px;flex-wrap:wrap;">
-            <IngressBadge kind={svc.ingress} />
+            {/* Every way in, one badge each: this is the one view with room to list
+                them, and the drawer is where a reader comes to see all of them. */}
+            {svc.ingress.map((k) => (
+              <IngressBadge key={k} kind={k} />
+            ))}
             <AuthBadge method={svc.auth.method} />
             {/* Detected first, declared second, and the detected posture is never
                 replaced: a service the operator says authenticates itself still shows
@@ -504,11 +518,15 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
                   <>
                     <dt>Expected ingress</dt>
                     <dd>
-                      {ingressLabel(declared.expectedIngress)}
-                      {declared.expectedIngress === svc.ingress ? (
+                      {declared.expectedIngress.map(ingressLabel).join(", ")}
+                      {/* Compared as sets, because the expectation and the scan are both
+                          lists now: agreement means the same kinds, in any order. */}
+                      {expectedMatches(declared.expectedIngress, svc.ingress) ? (
                         <span class="pill">matches the scan</span>
                       ) : (
-                        <span class="pill crit">scan says {ingressLabel(svc.ingress)}</span>
+                        <span class="pill crit">
+                          scan says {svc.ingress.map(ingressLabel).join(", ")}
+                        </span>
                       )}
                     </dd>
                   </>

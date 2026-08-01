@@ -27,6 +27,7 @@ import type {
   Service,
   TraefikLiveRouter,
 } from "../src/model/types.js";
+import type { TagFilter } from "../src/model/filter.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
@@ -72,6 +73,13 @@ const { matchTraefik } = await import("../src/analyze/traefik.js");
 const { MAX_AUTH_ENTRIES, MAX_LIST_ENTRIES, MAX_SIDECAR_BYTES, MAX_TEXT_CHARS, parseSidecar, readSidecar } =
   await import("../src/scan/sidecar.js");
 const { DECLARED_AUTH_MECHANISMS, declaredAuthLabel } = await import("../src/model/declarations.js");
+const { INGRESS_KINDS, normalizeIngress } = await import("../src/model/ingress.js");
+// The tri-state filter lives in `src/` rather than in the web bundle precisely so it
+// can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
+// that deserves better than being exercised by hand in a browser.
+const { EMPTY_TAG_FILTER, cycleTag, describeTagFilter, matchesTagFilter, tagFilterActive } = await import(
+  "../src/model/filter.js"
+);
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -100,6 +108,18 @@ function lookup(ov: Overview): (stackId: string, serviceName: string) => Service
 
 function envValue(s: Service, key: string): string | null | undefined {
   return s.env.find((e) => e.key === key)?.value;
+}
+
+/**
+ * A service's ingress as one comparable string, in canonical order.
+ *
+ * Compared as a joined string rather than element by element so a failing assertion
+ * prints both sets — `got "public, lan, internal"` against an expectation of
+ * `"public, traefik, lan, internal"` says which kind went missing, which is the whole
+ * question when a classification rule regresses.
+ */
+function ing(s: Service): string {
+  return s.ingress.join(", ");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -382,13 +402,17 @@ check("jellyfin has published port 8096", jf.ports.some((p) => p.published === "
 check("jellyfin media bind is read-only", jf.mounts.some((m) => m.target === "/media" && m.readOnly));
 
 console.log("\ningress classification");
-check("jellyfin is public+traefik", jf.ingress === "public+traefik", jf.ingress);
+// Four tags at once, which is the whole reason the field is a set: a tunnel route, a
+// proxy route, a published host port and a shared container network are four
+// independent facts about one service, and no single value could carry them.
+check("jellyfin carries all four reachability tags", ing(jf) === "public, traefik, lan, internal", ing(jf));
 check("jellyfin cloudflare hostname", jf.cloudflare[0]?.hostname === "jellyfin.example.com");
 check("jellyfin traefik host", jf.traefik[0]?.hosts.includes("jellyfin.example.com") ?? false);
 const emby = svc("emby", "emby");
 // Tunnel origin straight at the container, plus a published host port: public
-// via Cloudflare and directly answerable on the LAN, with no proxy either way.
-check("emby is public+lan (dockflare only, port published)", emby.ingress === "public+lan", emby.ingress);
+// via Cloudflare and directly answerable on the LAN, with no proxy either way —
+// so `traefik` is absent while the other three are present.
+check("emby is public+lan with no proxy tag", ing(emby) === "public, lan, internal", ing(emby));
 check("emby has no traefik route", emby.traefik.length === 0);
 
 console.log("\nauth posture");
@@ -506,7 +530,7 @@ const eSvc = lookup(edge);
 console.log("\n--- regression fixtures (fixtures/edge) ---");
 
 console.log("\nedge discovery");
-check("found 14 edge stacks", edge.stats.stacks === 14, `got ${edge.stats.stacks}`);
+check("found 17 edge stacks", edge.stats.stacks === 17, `got ${edge.stats.stacks}`);
 
 console.log("\ncredentials embedded in URL values");
 const api = eSvc("dbstack", "api");
@@ -550,10 +574,12 @@ check(
 console.log("\ndockflare enable flag");
 const staged = eSvc("cfdisabled", "app");
 check("dockflare.enable=false yields no route", staged.cloudflare.length === 0, String(staged.cloudflare.length));
-check("...so the service is internal", staged.ingress === "internal", staged.ingress);
+// It keeps `internal` — the sibling service shares the stack's implicit network —
+// but no external tag, which is the part the staged route must not grant.
+check("...so nothing external reaches it", ing(staged) === "internal", ing(staged));
 check("...and is not flagged exposed-without-auth", staged.auth.exposedWithoutAuth === false);
 const live = eSvc("cfdisabled", "live");
-check('dockflare.enable="TRUE" still enables the route', live.ingress === "public", live.ingress);
+check('dockflare.enable="TRUE" still enables the route', ing(live) === "public, internal", ing(live));
 
 console.log("\nLDAP attribution");
 const wiki = eSvc("ldapapp", "wiki");
@@ -592,34 +618,33 @@ check(
 console.log("\npublished host ports are LAN reachability");
 const media = eSvc("hostport", "media");
 check(
-  "tunnel origin at the container + published port -> public+lan",
-  media.ingress === "public+lan",
-  media.ingress,
+  "tunnel origin at the container + published port -> public and lan",
+  ing(media) === "public, lan, internal",
+  ing(media),
 );
 check("...and is flagged exposed without auth", media.auth.exposedWithoutAuth === true);
 
 const socketproxy = eSvc("hostport", "socketproxy");
 check(
-  "published port with nothing in front -> lan, not internal",
-  socketproxy.ingress === "lan",
-  socketproxy.ingress,
+  "published port with nothing in front -> lan",
+  ing(socketproxy) === "lan, internal",
+  ing(socketproxy),
 );
 check(
   "...and is flagged exposed without auth",
   socketproxy.auth.exposedWithoutAuth === true,
   `exposedWithoutAuth=${socketproxy.auth.exposedWithoutAuth}`,
 );
-// socketproxy, plus the two rival proxies in `tunnelorigin` — each publishes a
-// port with nothing in front of it — plus the two sidecar fixtures below, whose
-// published ports are what makes their declarations worth asserting about.
-check("lan-only services are counted", edge.stats.lanServices === 5, `got ${edge.stats.lanServices}`);
+// Every service with a published port, proxied or not — the counter no longer folds
+// the proxied ones away, which is what made "LAN 2" misleading in a fleet where a
+// dozen proxied services also answer on the host.
+check("every published port is counted as lan", edge.stats.lanServices === 7, `got ${edge.stats.lanServices}`);
 
-// The overlap rule: all four situations can be true of one service at once, but the
-// kind names what is in *front* of it. A proxied service that also publishes a port
-// is `traefik`, and the LAN path it also answers on is raised as a note — so neither
-// half of the truth is lost, and the distribution does not collapse into one bucket.
+// The overlap, now carried rather than collapsed: a proxied service that also
+// publishes a port holds `traefik` *and* `lan`, and the LAN path is still raised as a
+// note — the note explains the bypass, the tag makes it filterable.
 const hpApp = eSvc("hostport", "app");
-check("proxied service keeps its traefik kind", hpApp.ingress === "traefik", hpApp.ingress);
+check("a proxied service that publishes a port holds both tags", ing(hpApp) === "traefik, lan, internal", ing(hpApp));
 check(
   "cross-stack authentik@docker still resolves",
   hpApp.auth.method === "authentik-forward-auth",
@@ -635,22 +660,45 @@ check(
   hpApp.notes.some((n) => n.includes("bypassing") && n.includes("LAN")),
   hpApp.notes.join(" | "),
 );
-// The rule holds for the tunnelled half of the overlap too: `public+traefik` is
-// proxied, so its published port is a note rather than part of the kind. Without
-// this, only the `traefik` arm of the bypass guard is pinned and the other could be
-// dropped silently.
+// The bypass guard keys on the `traefik` tag being *present*, not on it being the
+// whole classification. A tunnelled and proxied service that also publishes a port
+// must get the same note, or the guard would only fire for the proxy-only case.
 check(
-  "a public+traefik service that publishes a port gets the same bypass note",
-  jf.ingress === "public+traefik" && jf.notes.some((n) => n.includes("8096") && n.includes("bypassing")),
-  `${jf.ingress}: ${jf.notes.join(" | ")}`,
+  "a tunnelled+proxied service that publishes a port gets the same bypass note",
+  jf.ingress.includes("traefik") && jf.notes.some((n) => n.includes("8096") && n.includes("bypassing")),
+  `${ing(jf)}: ${jf.notes.join(" | ")}`,
 );
 
 const hpWorker = eSvc("hostport", "worker");
-check("expose: does not publish -> stays internal", hpWorker.ingress === "internal", hpWorker.ingress);
+check("expose: does not publish -> no lan tag", ing(hpWorker) === "internal", ing(hpWorker));
 check(
-  "...and an internal service gets no bypass note",
+  "...and a service with no external tag gets no bypass note",
   hpWorker.notes.every((n) => !n.includes("bypassing")),
   hpWorker.notes.join(" | "),
+);
+
+// `internal` is positive evidence, and there are exactly two ways to earn it. Each
+// fixture isolates one, so dropping either arm of the rule fails a named assertion
+// here rather than quietly reclassifying a third of the fleet as unreachable.
+const shBroker = eSvc("sharednet", "broker");
+const shWorker = eSvc("sharednet", "worker");
+check(
+  "two services in one file share the implicit default network -> internal",
+  ing(shBroker) === "internal" && ing(shWorker) === "internal",
+  `${ing(shBroker)} / ${ing(shWorker)}`,
+);
+check("expose: on its own is internal", ing(eSvc("exposeonly", "cache")) === "internal", ing(eSvc("exposeonly", "cache")));
+// The contrast that makes the two above mean something: same empty shape, but one
+// service, so the implied network carries nobody and there is nothing to reach.
+check("a lone service with nothing declared is no-ingress", ing(eSvc("interp", "web")) === "none", ing(eSvc("interp", "web")));
+check("...and so is the other one", ing(eSvc("ldapapp", "wiki")) === "none", ing(eSvc("ldapapp", "wiki")));
+check("no-ingress services are counted", edge.stats.noIngressServices === 2, `got ${edge.stats.noIngressServices}`);
+// A published port is not a reason to assume a neighbour: this service publishes on
+// the LAN and is alone in its stack, so `lan` stands without `internal` beside it.
+check(
+  "a published port alone does not imply internal reachability",
+  ing(eSvc("accepted", "status")) === "lan",
+  ing(eSvc("accepted", "status")),
 );
 
 console.log("\nan unprovable tunnel origin stays unproven");
@@ -797,7 +845,7 @@ check(
 );
 check(
   "...and the detected-method distribution is unmoved",
-  edge.stats.byAuthMethod.none === 22 &&
+  edge.stats.byAuthMethod.none === 25 &&
     !DECLARED_AUTH_MECHANISMS.some((m) => m in edge.stats.byAuthMethod),
   JSON.stringify(edge.stats.byAuthMethod),
 );
@@ -866,7 +914,7 @@ check(
 
 // A sidecar's real failure mode is not a typo, it is going quietly out of date.
 const stale = eSvc("staledecl", "worker");
-check("a stale declaration does not move the posture", stale.ingress === "internal" && stale.auth.exposedWithoutAuth === false, `${stale.ingress}/${stale.auth.exposedWithoutAuth}`);
+check("a stale declaration does not move the posture", ing(stale) === "internal" && stale.auth.exposedWithoutAuth === false, `${ing(stale)}/${stale.auth.exposedWithoutAuth}`);
 check(
   "an acceptance the scan can see no longer applies is reported as drift",
   stale.declared?.drift.some((d) => d.includes("no longer applies")) === true,
@@ -877,12 +925,31 @@ check(
   stale.declared?.drift.some((d) => d.includes('expects ingress "lan"') && d.includes('"internal"')) === true,
   JSON.stringify(stale.declared?.drift),
 );
+// Two sets are not something an operator should have to diff by eye, so the drift
+// says which way each difference runs: `lan` was expected and is absent, `internal`
+// was found and was not expected.
+check(
+  "...and spells out which kinds are missing and which are unexpected",
+  stale.declared?.drift.some((d) => d.includes("missing: lan") && d.includes("unexpected: internal")) === true,
+  JSON.stringify(stale.declared?.drift),
+);
 check(
   "...one entry per disagreement, so fixing one does not hide the other",
   stale.declared?.drift.length === 2,
   String(stale.declared?.drift.length),
 );
-check("drift has its own counter too", edge.stats.declarationDrift === 1, `got ${edge.stats.declarationDrift}`);
+// The other half of the drift pair. `staledecl` disagrees about the primary kind as
+// well, so on its own it cannot tell a set comparison from a single-value one: this
+// service is `traefik, internal` against an expected `traefik, lan`, so the first kind
+// matches and everything after it does not.
+const pdApi = eSvc("partialdrift", "api");
+check(
+  "an expectation that agrees about the primary kind and nothing else still drifts",
+  ing(pdApi) === "traefik, internal" &&
+    pdApi.declared?.drift.some((d) => d.includes("missing: lan") && d.includes("unexpected: internal")) === true,
+  `${ing(pdApi)}: ${JSON.stringify(pdApi.declared?.drift)}`,
+);
+check("drift has its own counter too", edge.stats.declarationDrift === 2, `got ${edge.stats.declarationDrift}`);
 
 // Everything wrong with a sidecar is a warning; nothing about it fails a scan (I4).
 const badStack = edge.stacks.find((s) => s.id === "badsidecar")!;
@@ -1029,10 +1096,55 @@ check(
 );
 const badIngress = parseSidecar("services:\n  app:\n    expected:\n      ingress: everywhere\n", names, ".labview");
 check(
-  "an unknown expected ingress is refused with the six kinds listed",
+  "an unknown expected ingress is refused with the five kinds listed",
   badIngress.services.size === 0 &&
-    badIngress.warnings.some((w) => w.includes('"everywhere" is not one of') && w.includes("public+traefik")),
+    badIngress.warnings.some((w) => w.includes('"everywhere" is not one of') && w.includes("internal, none")),
   JSON.stringify(badIngress.warnings),
+);
+// A service can be reachable several ways, so an expectation has to be able to say
+// so. The scalar form stays valid — most services need exactly one kind, and a
+// sidecar that had to be rewritten as a list to keep working would be a needless
+// break.
+const listIngress = parseSidecar(
+  "services:\n  app:\n    expected:\n      ingress: [public, lan]\n",
+  names,
+  ".labview",
+);
+check(
+  "an expected ingress can be a list of kinds",
+  listIngress.services.get("app")?.expectedIngress?.join(", ") === "public, lan",
+  JSON.stringify(listIngress.services.get("app")?.expectedIngress),
+);
+const scalarIngress = parseSidecar("services:\n  app:\n    expected:\n      ingress: lan\n", names, ".labview");
+check(
+  "...and a bare scalar still parses, as one kind",
+  scalarIngress.services.get("app")?.expectedIngress?.join(", ") === "lan",
+  JSON.stringify(scalarIngress.services.get("app")?.expectedIngress),
+);
+// Per-entry validation, so one typo costs one kind rather than the whole
+// expectation — and the warning says which entry, since a list has no other handle.
+const mixedIngress = parseSidecar(
+  "services:\n  app:\n    expected:\n      ingress: [traefik, sideways]\n",
+  names,
+  ".labview",
+);
+check(
+  "...and one bad entry in a list keeps the good ones and names its index",
+  mixedIngress.services.get("app")?.expectedIngress?.join(", ") === "traefik" &&
+    mixedIngress.warnings.some((w) => w.includes("ingress[1]") && w.includes('"sideways"')),
+  JSON.stringify({ kinds: mixedIngress.services.get("app")?.expectedIngress, warnings: mixedIngress.warnings }),
+);
+// Written out of order and doubled, read back in the canonical most-to-least-exposed
+// order, so a drift message and a badge row can never disagree about sequence.
+const dupIngress = parseSidecar(
+  "services:\n  app:\n    expected:\n      ingress: [lan, public, lan]\n",
+  names,
+  ".labview",
+);
+check(
+  "...and the kinds are deduped and canonically ordered on the way in",
+  dupIngress.services.get("app")?.expectedIngress?.join(", ") === "public, lan",
+  JSON.stringify(dupIngress.services.get("app")?.expectedIngress),
 );
 const linkCred = parseSidecar("links:\n  - url: https://admin:hunter2@example.com/panel\n", names, ".labview");
 check(
@@ -1074,6 +1186,14 @@ check(
     skeleton.services.get("emby")?.unauthenticatedAccepted !== undefined &&
     skeleton.services.get("emby")?.expectedIngress !== undefined,
   JSON.stringify({ stack: skeleton.stack, emby: skeleton.services.get("emby") }),
+);
+// The skeleton is the only documentation most operators will read, so it has to
+// demonstrate the multi-kind form rather than describe it — and if the parser ever
+// stops accepting a list, the file shipped as an example is the first thing to break.
+check(
+  "...including the skeleton's own multi-kind expectation, parsed as three kinds",
+  skeleton.services.get("emby")?.expectedIngress?.join(", ") === "public, lan, internal",
+  JSON.stringify(skeleton.services.get("emby")?.expectedIngress),
 );
 // The size cap is I/O, so it is the one rule that needs a file — written to a temp
 // dir rather than committed, since the point is that it is larger than a sidecar
@@ -1352,10 +1472,10 @@ check(
 // port, so without them it reads as reachable by anyone.
 check(
   "an OIDC gate no file mentions is what stops a published port reading as exposed",
-  notebook.ingress === "lan" &&
+  notebook.ingress.includes("lan") &&
     notebook.auth.method === "authentik-oauth" &&
     notebook.auth.exposedWithoutAuth === false,
-  `${notebook.ingress}/${notebook.auth.method} exposed=${notebook.auth.exposedWithoutAuth}`,
+  `${ing(notebook)}/${notebook.auth.method} exposed=${notebook.auth.exposedWithoutAuth}`,
 );
 check(
   "...and an addressed tie is reported as confirmed",
@@ -1493,8 +1613,8 @@ check(
 );
 check(
   "...while still counting as a gate, so its published port does not read as exposed",
-  ledger.ingress === "lan" && ledger.auth.exposedWithoutAuth === false,
-  `${ledger.ingress} exposed=${ledger.auth.exposedWithoutAuth}`,
+  ledger.ingress.includes("lan") && ledger.auth.exposedWithoutAuth === false,
+  `${ing(ledger)} exposed=${ledger.auth.exposedWithoutAuth}`,
 );
 
 console.log("\na name too generic to identify anything matches nothing");
@@ -3098,6 +3218,10 @@ const edits: Array<[string, (s: Service) => void]> = [
   ["restart", (s) => void (s.restart = "no")],
   ["labels", (s) => void (s.labels = { ...s.labels, "smoke.marker": "1" })],
   ["ports", (s) => s.ports.push({ published: "19999", target: "80", protocol: "tcp", raw: "19999:80" })],
+  // `expose` is the newest of these and the one most likely to be forgotten: it is
+  // read off the compose file, it decides an ingress tag, and it is diffed only
+  // because nobody added it to `VOLATILE_SERVICE_FIELDS`.
+  ["expose", (s) => s.expose.push("19999")],
   ["networks", (s) => s.networks.push("smoke-net")],
   ["dependsOn", (s) => s.dependsOn.push("smoke-dep")],
   ["mounts", (s) => s.mounts.push({ type: "bind", source: "/tmp/smoke", target: "/smoke", readOnly: true, raw: "/tmp/smoke:/smoke:ro" })],
@@ -3184,7 +3308,7 @@ for (const s of liveOnly) {
     svc.docker = liveState;
     svc.traefikLive = [];
     svc.notes = [...svc.notes, "a note this pass happened to add"];
-    svc.ingress = svc.ingress === "internal" ? "traefik" : "internal";
+    svc.ingress = svc.ingress.includes("internal") ? ["traefik"] : ["internal"];
   }
 }
 check(
@@ -3583,6 +3707,82 @@ check(
   everyDiffLine,
 );
 
+console.log("\nthe ingress vocabulary normalizes on the way in");
+// `normalizeIngress` is the only constructor, so these three rules hold everywhere a
+// tag set exists — the classifier, the sidecar and any future source.
+const kinds = (...k: IngressKind[]): string => normalizeIngress(k).join(", ");
+check("duplicates collapse", kinds("lan", "lan", "public", "lan") === "public, lan", kinds("lan", "lan", "public", "lan"));
+check(
+  "order is canonical, most exposed first, whatever order they arrived in",
+  kinds("internal", "lan", "traefik", "public") === "public, traefik, lan, internal",
+  kinds("internal", "lan", "traefik", "public"),
+);
+// The invariant the whole model rests on: a service always carries at least one tag,
+// so no view has to render an empty cell and no filter has to special-case nothing.
+check("an empty set becomes no-ingress rather than staying empty", kinds() === "none", kinds());
+
+console.log("\nthe tag filter: OR, AND and NOT");
+// A truth table, because the UI is never rendered here and clicking three chips in a
+// browser is not a regression test.
+const F = (include: string[], exclude: string[] = [], mode: "any" | "all" = "any"): TagFilter => ({
+  include,
+  exclude,
+  mode,
+});
+check("no chips selected shows everything", matchesTagFilter(["internal"], EMPTY_TAG_FILTER));
+check("...and reports itself inactive, which is what dims nothing", !tagFilterActive(EMPTY_TAG_FILTER));
+check("one include is a plain membership test", matchesTagFilter(["public", "lan"], F(["lan"])));
+check("...and rejects a service without the tag", !matchesTagFilter(["internal"], F(["lan"])));
+check("`any` is OR: either tag will do", matchesTagFilter(["internal"], F(["lan", "internal"])));
+check(
+  "`all` is AND: both tags must be present",
+  matchesTagFilter(["public", "lan"], F(["public", "lan"], [], "all")) &&
+    !matchesTagFilter(["public"], F(["public", "lan"], [], "all")),
+);
+check("...and the same pair under `any` accepts the one-tag service", matchesTagFilter(["public"], F(["public", "lan"])));
+check("an exclude is AND-NOT", !matchesTagFilter(["public", "internal"], F([], ["internal"])));
+check("...and passes a service that lacks it", matchesTagFilter(["public"], F([], ["internal"])));
+// The one genuinely ambiguous case, decided in `matchesTagFilter` and pinned here:
+// a contradictory filter rejects rather than quietly dropping half of itself.
+check(
+  "exclusion beats an include of the same tag",
+  !matchesTagFilter(["lan"], F(["lan"], ["lan"])),
+);
+check(
+  "an exclude alone counts as filtering, so the untouched chips still dim",
+  tagFilterActive(F([], ["internal"])),
+);
+// Three clicks on one chip return to where they started; without that the only way
+// to clear one tag would be to clear the whole filter.
+const c1 = cycleTag(EMPTY_TAG_FILTER, "lan");
+const c2 = cycleTag(c1, "lan");
+const c3 = cycleTag(c2, "lan");
+check(
+  "a chip cycles include -> exclude -> off",
+  c1.include.join() === "lan" && c2.exclude.join() === "lan" && c2.include.length === 0 && !tagFilterActive(c3),
+  JSON.stringify([c1, c2, c3]),
+);
+// The readout exists because a mode and an exclusion cannot be read off which chips
+// look bright. If its wording drifts from the semantics above, the reader is misled
+// about what they are looking at, which is worse than a wrong colour.
+const up = (t: string): string => t.toUpperCase();
+check(
+  "the readout names the mode when more than one tag is included",
+  describeTagFilter(F(["public", "lan"], ["internal"], "all"), up) === "all of PUBLIC, LAN; not INTERNAL",
+  describeTagFilter(F(["public", "lan"], ["internal"], "all"), up),
+);
+check(
+  "...says `any of` for the other mode",
+  describeTagFilter(F(["public", "lan"]), up) === "any of PUBLIC, LAN",
+  describeTagFilter(F(["public", "lan"]), up),
+);
+check(
+  "...drops the mode for a single tag, where both modes mean the same thing",
+  describeTagFilter(F(["lan"]), up) === "LAN",
+  describeTagFilter(F(["lan"]), up),
+);
+check("...and says nothing at all when nothing is filtered", describeTagFilter(EMPTY_TAG_FILTER, up) === "");
+
 console.log("\nthe ingress palette and the stylesheet name the same variables");
 // Both halves of the colour lookup are strings the compiler never sees together:
 // `ingressVar` falls back to `--muted` for a kind it has no entry for, and
@@ -3600,13 +3800,12 @@ check(
   // The count guard matters as much as the emptiness one: a regex that stopped
   // matching would otherwise pass this by finding nothing to check.
   "every ingress colour the palette names is defined in styles.css",
-  paletteVars.length === 6 && missingVars.length === 0,
+  paletteVars.length === 5 && missingVars.length === 0,
   `${paletteVars.length} named, undefined: ${missingVars.join(", ") || "none"}`,
 );
-// The union is the source of truth. This list fails to *compile* if a member is
-// renamed, so unlike the strings above it cannot go stale quietly.
-const ALL_INGRESS: IngressKind[] = ["public", "public+lan", "public+traefik", "traefik", "lan", "internal"];
-const unstyled = ALL_INGRESS.filter((k) => !ingressBlock.includes(`key: "${k}"`));
+// The union is the source of truth, and `INGRESS_KINDS` is the union written down —
+// so this walks every kind there will ever be without a second list to keep in step.
+const unstyled = INGRESS_KINDS.filter((k) => !ingressBlock.includes(`key: "${k}"`));
 check(
   "and every ingress kind has a palette entry, so none falls back to grey",
   unstyled.length === 0,

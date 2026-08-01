@@ -1,4 +1,5 @@
 import type { AppStack, Service } from "../model";
+import { primaryIngress } from "../model";
 import { resolveVar, ingressVar } from "./palette";
 
 /**
@@ -155,7 +156,8 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
   const border = resolveVar("--baseline");
   const styleFor = (fill: string, text = "#ffffff") =>
     `fill:${fill},stroke:${border},color:${text},stroke-width:1px`;
-  lines.push(`  classDef svc ${styleFor(resolveVar(ingressVar(svc.ingress)))}`);
+  // One `classDef` means one colour, so the most exposed kind wins here too.
+  lines.push(`  classDef svc ${styleFor(resolveVar(ingressVar(primaryIngress(svc.ingress))))}`);
   lines.push(`  classDef cf ${styleFor(resolveVar("--hub-cloudflare"))}`);
   lines.push(`  classDef tf ${styleFor(resolveVar("--hub-traefik"))}`);
   lines.push(`  classDef auth ${styleFor(resolveVar("--hub-auth"))}`);

@@ -43,9 +43,11 @@ export function StackCard({
   const drift = services.reduce((n, s) => n + (s.declared?.drift.length ?? 0), 0);
 
   // Ordered by the shared palette metadata rather than by appearance, so the same
-  // set of postures always reads the same way across stacks.
+  // set of postures always reads the same way across stacks. The stack's ingress is
+  // the *union* of its services': one public service and one internal one make the
+  // stack both, which is the whole reason neither is reduced to a single verdict.
   const ingressKinds = INGRESS_META.map((m) => m.key).filter((k) =>
-    services.some((s) => s.ingress === k),
+    services.some((s) => s.ingress.includes(k)),
   );
   const authMethods = AUTH_META.map((m) => m.key).filter((k) =>
     services.some((s) => s.auth.method === k),
@@ -162,7 +164,9 @@ export function StackCard({
               <span class="name">{svc.name}</span>
               <span class="img mono">{shortImage(svc.image)}</span>
               <span class="badges">
-                <IngressBadge kind={svc.ingress} />
+                {svc.ingress.map((k) => (
+                  <IngressBadge key={k} kind={k} />
+                ))}
                 <AuthBadge method={svc.auth.method} />
                 {svc.auth.exposedWithoutAuth &&
                   (svc.declared?.unauthenticatedAccepted ? (

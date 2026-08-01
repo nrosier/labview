@@ -135,7 +135,8 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 3. Docker snapshot | `enrich/docker.ts` | `DockerSnapshot` keyed by `"project service"`, container name and short id |
 | — | each `enrich/*` client | a `ConnectionReport` per target, collected into `meta.connections` (§3.10) |
 | 4. Middleware registry | `analyze/middlewares.ts` | every Traefik middleware *defined* anywhere, by bare name |
-| 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker`, `svc.ingress` |
+| 5. Pass 1 — routes | `labels/dockflare.ts`, `labels/traefik.ts` | `svc.cloudflare`, `svc.traefik`, `svc.docker` |
+| 5b. Ingress classification | `sharedNetworks` + `classifyIngress` | `svc.ingress` — the set of kinds, over the whole fleet at once |
 | 6. Fleet index + origin resolution | `analyze/origins.ts` | `FleetIndex` (host ports, DNS names, container IPs, hostnames); `route.origin` — what each tunnel origin points at, and notes where it could not be told |
 | 7. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
 | 8. Reverse proxy API | `enrich/traefik.ts` | `TraefikSnapshot` — the routers the proxy is serving with their resolved middleware chains and backends, or a reason it is absent. Runs concurrently with step 7 |
@@ -146,7 +147,7 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 13. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
 | 14. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
-**Why two passes.** Steps 6–11 cannot run per-service inside step 5. Four
+**Why two passes.** Steps 5b–11 cannot run per-service inside step 5. Six
 conclusions are only available once the *whole* fleet is parsed:
 
 1. A Traefik middleware referenced as `authentik@docker` is usually defined in a
@@ -163,6 +164,11 @@ conclusions are only available once the *whole* fleet is parsed:
 5. A live proxy router names its backend by container address and its hosts by
    rule, neither of which is scoped to a stack, so tying it to a service needs that
    index too (step 11).
+6. The `internal` ingress kind is a claim about *other* containers — that one of
+   them shares a real network with this one — so it needs every service's networks
+   counted before any service is classified, and it needs the live names pass 1 has
+   only just attached (step 5b, after 5 and before the graph). A service classified
+   mid-loop would be judged against a half-built fleet.
 
 A change that needs fleet-wide knowledge belongs in a new pass or in step 4/9,
 not in a per-service function reaching for global state.
@@ -634,6 +640,42 @@ drawer. Two rules hold it together:
   stack with an internal database and a public UI is both at once; picking a "worst
   case" badge would misreport it.
 
+**The ingress filter is an expression, not a selection.** Because a service carries
+several kinds, one chip per kind with one on/off state cannot express what an
+operator actually wants to ask. So each legend chip is **tri-state** — clicking
+cycles it off → include → exclude → off — and a two-button `Any / All` control
+switches the
+included set between OR and AND. Exclusion is always AND-NOT and always wins over
+an include, which is the only ordering that makes `Public` + `¬ Internal` mean what
+it reads as. Three consequences:
+
+- **The expression is evaluated per service**, matching the rule above. `All of
+  Public, LAN` selects services that are *themselves* both, not stacks that happen
+  to contain one of each — the stack card then appears because one of its services
+  matched, showing only that service.
+- **The predicate is not in the component.** `matchesTagFilter` /
+  `describeTagFilter` / `cycleTag` live in
+  [model/filter.ts](labview/src/model/filter.ts), pure and generic over string
+  tags, because the web bundle has no test harness and a truth table for AND / OR /
+  NOT is exactly the thing that must be asserted (§8). Generic over tags rather
+  than over `IngressKind` so the auth dimension gets the same include/exclude chips
+  for free — `matchesTagFilter([svc.auth.method], authFilter)` — while only ingress
+  shows the `Any / All` switch, auth being single-valued.
+- **A three-part expression is read back, not inferred.** `describeTagFilter`
+  renders one line — `ingress: all of Public, LAN; not Internal` — beside
+  `Clear filters`, because which chips look bright is not a legible way to recover
+  what is being asked.
+
+**The ingress distribution is per-tag gauges, not a part-to-whole bar.** Once one
+service can carry two kinds, a stacked bar's segments sum past the total and every
+proportion in it is wrong; clicking a segment labelled `11` would return 26 rows.
+So `TagBars` renders one row per kind — label, a bar of `count / services`, the
+count — and the `OverviewStats` doc comment says outright that the five ingress
+counters **overlap**. The authentication bar stays `DistributionBar`, because
+`svc.auth.method` is still one value per service. Both take the same tri-state
+legend API, so the two dimensions filter identically even though they aggregate
+differently.
+
 `web/lib/palette.ts` is the single source of truth for categorical colour: every
 `IngressKind` and `AuthMethod` maps to a CSS custom property from the validated
 palette in `styles.css`. DOM nodes use `var(--…)` directly; canvas-based views
@@ -867,6 +909,78 @@ The cadence rule itself moved into `formatRescan`, out of `logScan`, so it can b
 asserted for the first time — and "quiet" now means *both* diffs. A rescan that
 found new applications is not quiet just because no file was edited.
 
+### 3.12 The declaration layer (`.labview`)
+
+Some things are true about a service and written nowhere a scanner can read. An
+application's own login is not a compose label. That a status page is *deliberately*
+open to the LAN is a decision, not a config value. So an optional YAML sidecar beside
+the `compose.yml` — `.labview`, or `.labview.yml` / `.labview.yaml`; the candidate
+list is `cfg.sidecarFilenames` and the first that exists wins, so a directory holding
+two can never half-apply one and then the other — carries what the operator knows:
+description, owner, criticality, links, dependencies, data, in-app authentication, and
+an accepted exposure.
+
+This is the one place LabView accepts input that is *not* observable evidence, so the
+whole design is about keeping it separable from what was proved. Read by
+`scan/sidecar.ts`, attached as `stack.declared` / `svc.declared`, and governed by two
+rules:
+
+- **A declaration never changes a detection.** Declared auth is `svc.declared.auth`,
+  not `svc.auth.method`, which stays `none`. The detected-method distribution does not
+  move, the declared mechanisms are counted only in `stats.declaredAuth`, and the UI
+  badges them *declared*. A reader can always tell what LabView proved from what it
+  was told — which is I1 (§4) surviving contact with an input that has no evidence
+  behind it.
+- **An accepted exposure is still an exposure.** A service reachable with no gate
+  stays in `exposedWithoutAuth` with `stats.exposureAccepted` counted beside it; the
+  alarm is driven by the *remainder*, so a reviewed fleet stops shouting without ever
+  understating what is reachable. `reason` is mandatory: an acceptance with no reason
+  cannot be told apart from a stray key, so it is refused and warned about.
+
+**The vocabulary is mechanisms, not products.** `DECLARED_AUTH_MECHANISMS` is
+`app-local-accounts`, `app-ldap`, `app-oidc`, `app-saml`, `app-token`, `mtls`,
+`network-restricted`, `external-proxy`, `other` — the same I3 line the scan holds
+itself to, applied to input. `authentik-proxy` is refused with the vocabulary quoted
+back, because a mechanism is checkable and a vendor is an attribution. `other`
+requires a `detail`, since alone it says nothing.
+
+**Drift, because the real failure mode is not a typo.** A sidecar's actual risk is
+going quietly out of date, so both checkable fields are re-checked on every scan and
+each disagreement is one entry in `svc.declared.drift`, counted in
+`stats.declarationDrift`:
+
+- an acceptance for a service the scan no longer finds reachable — tested with
+  `isExternallyReachable`, the same predicate `exposedWithoutAuth` uses, so the two
+  cannot disagree about one service (§5);
+- an `expected.ingress` that differs from the classification, reported through
+  `diffIngress` in **both** directions — `missing: lan; unexpected: internal` — because
+  a set compared by eye is exactly what the operator should not have to do.
+
+The classification always stands. Drift is a report, never an override.
+
+**Everything about reading the file is defensive.** It is operator input from inside
+the tree LabView already treats as untrusted (§7): resolved under the same containment
+rule as `env_file` so a symlink cannot reach outside the apps root (I8), size-capped at
+`MAX_SIDECAR_BYTES`, every text field length-capped, unknown keys **named** in a
+warning rather than ignored (a mistyped `descripton` that silently does nothing is the
+one failure mode an optional-everything format has), and every mistake a warning rather
+than a failure (I4) — a malformed sidecar costs the fields it got wrong and nothing
+else. Declared text is shown as written and no masking heuristic applies to prose, so
+the documentation says plainly: never put a secret in one. Credentials in a declared
+link URL are redacted as a backstop, which is also why the link label falls back to the
+*redacted* URL and never the raw one.
+
+`declared` is parsed from a file on disk, so it deliberately stays **off**
+`VOLATILE_SERVICE_FIELDS` — the deny-list default (§3.11) then makes an edited sidecar
+a reported change for free.
+
+---
+
+## 4. Invariants
+
+Eight rules that outrank convenience. A change that breaks one is wrong even if it
+passes every test.
+
 ### I1 — Documentation rests on observable evidence
 
 Every statement in the output must trace to a value read from a compose file, an
@@ -1090,35 +1204,54 @@ Its directory name is its id and its default compose project name.
 `svc:<stack>/<service>`; matched to a live container by
 `com.docker.compose.project`+`service` labels first, then by container name.
 
-**`ports:` vs `expose:`** — the whole basis of ingress classification.
-`ports:` publishes on the host; `expose:` does not. Any entry under `ports:` is
-reachability, including the short form with no host side (`ports: ["9100"]`),
-which still publishes — on an ephemeral host port. So the *presence* of a mapping
-is the signal, not a parsed host port number.
+**`ports:` vs `expose:`** — two different reachability claims, and both are read.
+`ports:` publishes on the host, so it is `lan`; `expose:` does not publish
+anything, it only records that the container listens, so it is `internal`. Any
+entry under `ports:` counts, including the short form with no host side
+(`ports: ["9100"]`), which still publishes — on an ephemeral host port. So for
+both keys the *presence* of an entry is the signal, never a parsed port number.
 
-**IngressKind** — the four network situations a fleet distinguishes: reachable
-from the internet (`public`), on the server's own network (`lan`), through the
-reverse proxy (`traefik`), or on the container network alone (`internal`).
+**IngressKind** — the network situations a fleet distinguishes. Five values,
+**independent**, ordered most → least exposed in
+[model/ingress.ts](labview/src/model/ingress.ts):
 
-| Kind | Meaning |
+| Kind | Evidence |
 |---|---|
-| `public` | a tunnel route exists |
-| `public+lan` | tunnel route, and it also publishes a host port |
-| `public+traefik` | tunnel route and a proxy route |
-| `traefik` | a proxy route only |
-| `lan` | publishes a host port with nothing in front of it |
-| `internal` | not reachable from outside its networks |
+| `public` | a Cloudflare tunnel route with a hostname |
+| `traefik` | a Traefik route with hosts or a rule |
+| `lan` | `ports:` is non-empty — published on the host |
+| `internal` | `expose:` is non-empty, **or** `realNetworks()` shares a name with another scanned service |
+| `none` | none of the above |
 
-**The kind names what is in *front* of the service, so `lan` is a fallback kind:**
-it is only reported when no proxy route exists. All four situations can be true of
-one service at once — a proxied service that *also* publishes a port keeps its
-`traefik` / `public+traefik` kind and gets a note from `noteHostPortBypass`
-instead. This is deliberate: most services in a typical fleet publish a port, so
-folding that into the kind would collapse the whole distribution into one bucket.
-The note is not cosmetic — it is the difference between "protected by SSO" and
-"protected by SSO unless you use the port". Both arms of that guard are asserted
-separately, `traefik` and `public+traefik`, because dropping either one leaves the
-other still covering half the rule.
+**A service carries a set, not a value.** `svc.ingress` is `IngressKind[]`, and a
+container behind the tunnel, behind the proxy, with a published port and a
+listening container port is all four things at once — each separately true, each
+its own tag. A stack carries the union of its services'. Nothing combines two
+kinds into a third; the only function that picks a winner is `primaryIngress`,
+and it exists solely because a graph node has one fill colour.
+
+Three consequences worth stating, because each one used to be the other way:
+
+- **`internal` is positive evidence, not a fallback.** It means another container
+  demonstrably can reach this one — a declared `expose:`, or a real network shared
+  with another scanned service. When neither holds, the answer is `none`, which is
+  a populated category rather than a curiosity. `realNetworks` is what makes this
+  honest: it materializes the implicit `default` network, resolves
+  `${project}_${key}`, and honours `external:` under its verbatim name, so two
+  services in one file are mutually reachable without either declaring a network
+  and two *stacks* on one external network are too. `depends_on` is deliberately
+  **not** evidence — a dependency across two disjoint networks is not
+  reachability.
+- **`lan` is no longer suppressed by a proxy route.** Any service with a `ports:`
+  mapping is tagged `lan` whether or not something sits in front of it, so the
+  count answers "how many publish a port" rather than "how many publish a port and
+  nothing else". A proxied service that also publishes one keeps `traefik` *and*
+  `lan` and still gets its note from `noteHostPortBypass`, which is the difference
+  between "protected by SSO" and "protected by SSO unless you use the port".
+- **The five counters overlap and do not sum to `services`.** That is the point,
+  and both the CLI and the dashboard say so: the ingress distribution is rendered
+  as one gauge per kind (`TagBars`), not as a part-to-whole bar, because segments
+  that sum past the total are a lie about a whole.
 
 `traefik` is the one place a **kind names a product**, which reads against I3
 (§8). It is admitted because the kind is derived from Traefik-format route labels,
@@ -1126,6 +1259,15 @@ so the name follows the evidence that produced it, and the graph already draws a
 hub node labelled `Traefik` on the same basis. Contrast `AuthMethod`, where the
 mechanism (`forward-auth`) is genuinely separable from the provider that
 implements it (`authentik-forward-auth`) and both are reported.
+
+Every question about a set goes through
+[model/ingress.ts](labview/src/model/ingress.ts) rather than being asked inline,
+so five callers cannot drift apart: `normalizeIngress` is the only constructor
+(deduped, canonically ordered, never empty), `isExternallyReachable` is the single
+definition of "someone outside the container network can answer" — used by both
+`exposedWithoutAuth` and the stale-acceptance check — `externalIngress` narrows a
+note to the kinds that make it reachable, and `diffIngress` reports a sidecar
+disagreement in both directions.
 
 **OriginTarget / OriginKind** — where a tunnel route's origin address was found to
 lead (§3.4). Attached to every `CloudflareRoute` whose `service` is non-empty, and
@@ -1269,10 +1411,20 @@ signals (`middleware x`, `env OIDC_ISSUER`, `forwardauth -> …`,
 `provider not identified from the scanned config`); `notes` are per-service
 warnings for a human (bypasses, refusals, unresolved references, inferences).
 
-**`exposedWithoutAuth`** — `ingress !== "internal"` and no auth detected (proxy
-gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an API-confirmed
-enforced gate). Note this counts a `lan`-only service as exposed, because it is —
-the LAN is outside the container network, and nothing gates the published port.
+**`exposedWithoutAuth`** — `isExternallyReachable(svc.ingress)` and no auth
+detected (proxy gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an
+API-confirmed enforced gate). Note this counts a `lan`-only service as exposed,
+because it is — the LAN is outside the container network, and nothing gates the
+published port.
+
+The test is `isExternallyReachable` and not "does the set contain `internal`",
+which are different questions now that the kinds are independent: a service can be
+`internal` *and* `lan` at once, and that service is exposed. `internal` and `none`
+are the two kinds that are not exposure, and the predicate is written as the
+positive `public | traefik | lan` so a sixth kind added later has to opt in rather
+than being counted as safe by omission. It lives in
+[model/ingress.ts](labview/src/model/ingress.ts) so this definition and the
+stale-acceptance check (§3.12) cannot disagree about the same service.
 
 **Middleware registry** — every `traefik.http.middlewares.<name>.<type>` label
 found in *any* stack, keyed by bare name (references carry a `@docker` /`@file`
@@ -1340,6 +1492,41 @@ compared. `counts` holds the signed deltas and is empty for anything but `moved`
 because nothing may be compared across a failed read. `appeared` and `disappeared`
 name the records that came and went — application slugs, router names — sorted.
 
+**Declaration / ServiceDeclaration** — what the operator wrote in a `.labview`,
+attached as `stack.declared` (the shared fields) and `svc.declared` (those plus the
+service-only ones) — see §3.12. Every field is optional and none of them is evidence,
+which is why they live in their own object rather than being merged into the fields the
+scan produced. `file` is the sidecar's name and never a full path, so a declared value
+is always attributable to the file that claimed it without leaking the layout of the
+host.
+
+**DeclaredAuth** — `{ mechanism, detail? }`, where `mechanism` is one of
+`DECLARED_AUTH_MECHANISMS`. Authentication the operator states the app performs for
+itself. Counted in `stats.declaredAuth` and badged *declared*; it never becomes
+`svc.auth.method`, and `other` requires a `detail`.
+
+**`unauthenticatedAccepted`** — `{ reason }` on a service declaration, present only
+when the sidecar said `intentional: true` **and** gave a reason. It does not remove the
+service from `exposedWithoutAuth`; it adds it to `stats.exposureAccepted` and puts the
+reason on the finding. An acceptance with no reason is indistinguishable from a typo,
+so it is refused with a warning rather than honoured.
+
+**`expectedIngress`** — the sidecar's `expected.ingress`, normalized to
+`IngressKind[]`. A list because the thing it is compared against is one: expecting
+`[public, traefik]` and finding `[public, lan]` is a disagreement about the proxy, and
+comparing only the first kind would report "expected public, got public".
+
+**`drift`** — `svc.declared.drift[]`, one string per disagreement between the sidecar
+and the scan, counted in `stats.declarationDrift`. Two cases: an acceptance for a
+service that is no longer externally reachable, and an `expectedIngress` that differs
+from the classified set (reported in both directions). Filled by the analyzer, and a
+report rather than an override.
+
+**TagFilter / TagMode** — the dashboard's tri-state filter (§3.9):
+`{ include, exclude, mode }` over string tags, with `exclude` always AND-NOT and
+`mode` switching `include` between OR (`any`) and AND (`all`). Lives in
+`model/filter.ts` rather than in the UI so its semantics are assertable (§8).
+
 ---
 
 ## 6. Configuration
@@ -1358,6 +1545,7 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | Env | Config | Notes |
 |---|---|---|
 | `LABVIEW_APPS_ROOT` | `appsRoot` | the scan root and the containment boundary (I8) |
+| `LABVIEW_SIDECAR_FILENAMES` | `sidecarFilenames` | comma-separated; the declaration sidecar's candidate names in probe order, defaulting to `.labview`, `.labview.yml`, `.labview.yaml`. First that exists wins (§3.12) |
 | `LABVIEW_DOCKER_HOST` / `DOCKER_HOST` | `docker.host` + `port` | `tcp://host:port`, `host:port`, `unix:///path` or `/path`. A socket form clears `host`. `LABVIEW_DOCKER_HOST` wins, being the more specific of the two |
 | `LABVIEW_DOCKER_SOCKET` | `docker.socketPath` | always wins and disables the TCP host |
 | `LABVIEW_DOCKER_ENABLED` | `docker.enabled` | `false` = config-only scan |
@@ -1482,7 +1670,16 @@ stacks:
 | `cfdisabled` | `dockflare.enable=false` yields no route (and truthy variants still do) |
 | `ldapapp` | LDAP against a non-Authentik directory stays generic |
 | `interp` | nested `${A:-${B:-lit}}` defaults, `$$`, unused-branch handling |
-| `hostport` | published ports are reachability; `expose:` is not; bypass notes |
+| `hostport` | published ports are reachability (`lan`) and `expose:` is not; the bypass note on a proxied service that also publishes |
+| `sharednet` | `internal` from the network compose creates for free: two services, no `networks:` key anywhere, both on the implied `<project>_default` — so the rule must resolve networks the way docker does rather than read `networks:` off the service |
+| `exposeonly` | `expose:` alone is `internal`. One service, so the shared-network arm cannot fire; the only stack that goes to `none` if that arm is dropped, since `hostport/worker` sits on a shared network too |
+| `declared` | the declaration layer's happy path: every stack-level field, a bare-string dependency, and in-app auth (`app-local-accounts` + `app-ldap`) shown as *declared* without moving `svc.auth.method` |
+| `accepted` | an exposure signed off with a reason: still counted in `exposedWithoutAuth`, badged accepted, reason shown |
+| `staledecl` | both checkable fields going stale at once — an acceptance for a listener that no longer exists, and an `expected.ingress` the scan disagrees with |
+| `partialdrift` | the same drift check against a set rather than a value: expected `[traefik, lan]`, scanned `[traefik, internal]` — same *first* kind, wrong in both directions. `staledecl` cannot catch a primary-only comparison; this can |
+| `badsidecar` | four mistakes in one file — a mistyped key, a product name where a mechanism belongs, a reasonless acceptance, a service the compose file does not define — each warned about, with two valid declarations in the same file that must survive them |
+| `sidecaryml` | the `.labview.yml` filename variant, and the shorthand `auth: [app-token]` form |
+| `escapedecl` | containment (I8): a symlink to a sidecar **outside** the apps root must be refused. The target is valid on purpose, so a regression shows up as leaked declarations rather than as different warning text |
 | `tunnelorigin` | an origin that cannot be resolved stays unresolved: a port nothing publishes, and a tie between two reachable claimants. Neither may invent a hop |
 | `otherprovider` | provider attribution needs proof, on both the env and the address path |
 | `authentik` | upstream's generic service names (`server`, `worker`) must not become fleet-wide hints — `isSpecificHint`. Doubles as the definition site for the cross-stack `authentik@docker` references |
@@ -1684,8 +1881,23 @@ palette names must be defined in the stylesheet, and every `IngressKind` must ha
 a palette entry. This is the only check on that pair, because both lookups fail
 soft to grey rather than erroring (§6). The first also pins the *count* of variables
 found, so a regex that stopped matching fails instead of passing vacuously. The
-kind list is typed `IngressKind[]`, so renaming a union member breaks the build
-rather than quietly skipping a kind.
+second enumerates `INGRESS_KINDS` itself rather than a list written out in the test,
+so adding a kind cannot be half-done: a new member with no palette entry fails
+immediately, and renaming one breaks the build.
+
+**The filter semantics are asserted as a truth table.** `matchesTagFilter`,
+`cycleTag` and `describeTagFilter` are called directly — OR, AND, exclusion as
+AND-NOT, exclusion beating an include, the empty filter matching everything, the
+three-click cycle returning to off, and the four wordings of the readout. The web
+bundle is never rendered by smoke, so this is the only coverage the filter can have,
+and it is the reason the predicate lives in `model/filter.ts` rather than inside a
+component (§3.9).
+
+**Ingress is asserted as a set, in canonical order, as a joined string.** `ing(svc)`
+returns `svc.ingress.join(", ")` so a failing assertion prints both sets — `got
+"public, lan, internal"` against an expected `"public, traefik, lan, internal"` names
+the kind that went missing, which is the whole question when a classification rule
+regresses. Element-by-element comparison would report only `false`.
 
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
@@ -1751,20 +1963,37 @@ Merging its PRs is manual — there is no auto-merge workflow.
 the start; the compiler will not catch the UI half.
 
 1. Add the member with a doc comment saying what evidence justifies it.
-2. Emit it — `classifyIngress` / `deriveAuth`. For an auth method, place it in the
-   precedence `order` array in `deriveAuth`: a proxy-level gate ranks first
-   because it is what actually stops a request at the edge.
-3. `computeStats` if it needs a counter (add the field to `OverviewStats`).
-4. `analyze/graph.ts` if it changes which hub a service hangs off (I3).
-5. `web/lib/palette.ts` — add a `RoleMeta` entry, keeping the ordering meaning
+2. For an ingress kind, add it to `INGRESS_KINDS` in `model/ingress.ts` **in its
+   place in the most→least-exposed order**, which is load-bearing three times over
+   (canonical order of a normalized set, `primaryIngress`'s priority, the dashboard
+   row order). Then decide the one question that module exists to force: is it
+   exposure? If yes it goes in `EXTERNAL_KINDS` too, and `exposedWithoutAuth`
+   changes with it. The list is written positively so a kind that is *not* added
+   there is not silently counted as safe.
+3. Emit it — `classifyIngress` / `deriveAuth`. An ingress kind is one more
+   independent `if` pushing onto the set; nothing needs to be made mutually
+   exclusive with it, and nothing may be combined with it into a compound value.
+   For an auth method, place it in the precedence `order` array in `deriveAuth`
+   instead: a proxy-level gate ranks first because it is what actually stops a
+   request at the edge.
+4. `computeStats` if it needs a counter (add the field to `OverviewStats`). For an
+   ingress kind that is an `includes()` counter, and it overlaps the others.
+5. `analyze/graph.ts` if it changes which hub a service hangs off (I3).
+6. `web/lib/palette.ts` — add a `RoleMeta` entry, keeping the ordering meaning
    (ingress: most→least exposed; auth: identified providers before generic ones).
-6. `web/styles.css` — define the CSS custom property in both themes, from the
-   validated palette; do not invent a colour.
-7. `web/components/badges.tsx` if the new member changes which icon reads right.
-8. `web/lib/mermaidDef.ts` if the static diagram labels it.
-9. A fixture and an assertion (§8). For an ingress kind, also extend the typed
-   `ALL_INGRESS` list and the expected variable count in the palette assertions —
-   they are what turn steps 5 and 6 from "remembered" into "enforced".
+7. `web/styles.css` — define the CSS custom property in both themes, from the
+   validated palette; do not invent a colour. For an ingress kind, check the new
+   entry against its **neighbours in the bar order** in both themes: adjacent rows
+   must differ in hue *and* lightness (§3.9).
+8. `web/components/badges.tsx` if the new member changes which icon reads right.
+9. `web/lib/mermaidDef.ts` if the static diagram labels it.
+10. A fixture and an assertion (§8). The palette assertions enumerate
+    `INGRESS_KINDS` directly, so step 6 is enforced by construction — but the
+    expected variable count is a literal and has to be raised, which is what turns
+    step 7 from "remembered" into "enforced". An ingress kind also needs a fixture
+    where it is the *only* evidence present, or a revert of step 3 will be covered
+    by whichever other kind the fixture also has (this is exactly why `exposeonly`
+    exists next to `hostport`).
 
 **Add a field to `Service` or `AppStack`.** The rescan diff (§3.11) compares
 whatever it finds, so ask one question about the new field: *does it come out of the
@@ -1993,8 +2222,15 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Decision | Rationale |
 |---|---|
 | Published ports are reachability, not metadata | `ports:` makes a service answerable at `hostIP:port` with no proxy and no SSO. Treating it as decoration under-reported exposure on real fleets. |
-| `lan` is a fallback kind, the bypass is a note | All four situations can hold at once, but most services publish a port, so folding that into the kind would flatten the distribution. The kind names what is *in front*; the LAN path a proxied service also answers on is a note. |
-| The ingress kinds are named `public` / `lan` / `traefik` / `internal` | These are the four situations an operator distinguishes, and the previous `local` (meaning *proxy route*) collided with the separate LAN concept — the tile said "Local" for something that was not the LAN. `traefik` names a product against I3, admitted because the kind is derived from Traefik-format labels, so the name follows its evidence. |
+| The ingress kinds are named `public` / `traefik` / `lan` / `internal` / `none` | These are the situations an operator distinguishes, and the previous `local` (meaning *proxy route*) collided with the separate LAN concept — the tile said "Local" for something that was not the LAN. `traefik` names a product against I3, admitted because the kind is derived from Traefik-format labels, so the name follows its evidence. |
+| `svc.ingress` is a **set** of independent kinds, and nothing is ever combined | A single-valued field forced the vocabulary to grow combinatorially, and it still could not express the fleet: a service that was tunnelled *and* proxied *and* published a port had no value at all, so the classifier silently dropped the LAN half. Compound values (`public+lan`) made the counters need folding to stay disjoint, which made "Traefik 2" true and useless in a fleet with 26 proxied services. Independent tags say each true thing once; the cost is that the counters overlap, which is stated rather than hidden. |
+| `internal` is positive evidence, not the leftover bucket | As a fallback it meant "nothing else applied", which is not a fact about the fleet — it conflated a database two containers talk to with a service nothing can reach at all. Now it requires proof another container can reach it (`expose:`, or a shared real network) and `none` is a populated category. It costs a much larger `internalServices`, and buys a `noIngressServices` that answers the question the old value only appeared to. |
+| `depends_on` is not evidence of reachability | It expresses start order, not a network path: two services in disjoint networks can depend on each other and never connect. Counting it would make `internal` true for pairs that cannot reach each other, which is the exact failure the change above was made to fix. |
+| `lan` is tagged whether or not a proxy is in front, and the bypass note stays | As a fallback kind, `lan` answered "publishes a port with nothing in front of it", so the count could not answer "how many publish a port" — the more useful question, since a published port is answerable with no proxy and no SSO in the path. Both are now available: the tag counts the port, and `noteHostPortBypass` still says the proxied service can be reached around its gate. That note is not cosmetic; it is the difference between "protected by SSO" and "protected by SSO unless you use the port". |
+| The ingress distribution is per-tag gauges, not a stacked bar | A part-to-whole bar whose segments sum past the total misstates every proportion in it, and clicking a segment labelled `11` would return 26 rows. The auth bar stays part-to-whole because `auth.method` is still single-valued. |
+| Filter chips are tri-state with an `Any`/`All` switch, exclusion always AND-NOT | Multi-valued tags make "which of these" ambiguous — a set, a mode and an exclusion are three different questions, and a single on/off chip can express none of them. The cycle puts NOT on the chip the operator already knows instead of a second control elsewhere. Exclusion wins over an include because it is the more specific statement, and because a filter that quietly ignored one of its own chips would be worse than one that returns nothing. |
+| The filter expression is evaluated **per service** | Same reason filtering is service-level at all (§3.9): `All of Public, LAN` has to mean one service that is both, not a stack containing one of each. A stack-level reading would answer a question nobody asked and would hide which service actually matched. |
+| The filter predicate lives in `model/filter.ts`, generic over string tags | The web bundle has no test harness, and AND/OR/NOT precedence is precisely the logic that must be asserted rather than eyeballed (§8). Generic rather than typed to `IngressKind` so the auth dimension reuses it unchanged. |
 | Generic `forward-auth` / `other-oauth` / `ldap` members | The mechanism is provable, the provider often is not. Without a generic member the classifier has to either guess a vendor or report "no auth" — both are wrong. |
 | Hints match at token boundaries | A substring match labelled `oauth.bigcorp.example.com` as Authentik on four shared letters. |
 | No `auth.` / `sso.` host convention in defaults | A convention is a guess about someone else's DNS. Real hostnames are discovered from the fleet instead. |
@@ -2060,6 +2296,11 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | A forced rescan may only be answered by a build that *started after it* | Joining any in-flight build is the one code path that can genuinely lose an edit: a scan takes seconds on a real fleet, and one that began before the operator saved the file read the old file. The operator sees a fresh `scanned` time and a payload that predates their edit — a wrong answer indistinguishable from a right one. Waiting for the in-flight build and then building again costs one extra sweep and cannot lose anything. |
 | Changes are compared over the parsed configuration, not file mtimes | The question is "did my edit take effect", not "did a file get written". An mtime moves for a `touch`, a `git checkout` that restores identical bytes, or a comment; it does not move for an `.env` edit that changes what a compose file interpolates to. Comparing what LabView actually parsed answers the operator's question and needs no filesystem access, which is what lets the same function run in the browser. |
 | The excluded fields are a deny-list, not an allow-list | The two mistakes are not equal. Forgetting to exclude a newly *derived* field produces a spurious "changed" line — loud, and fixed the first time anyone sees it. Forgetting to *include* a field parsed from the compose document produces an edit that is silently never reported, which is the failure the whole feature exists to prevent. So anything new is compared by default. |
+| Declared facts go in a parallel `declared` block, never into the detected fields | The sidecar is the one input with no evidence behind it, so the whole value of accepting it depends on it staying distinguishable from what was proved (I1). Merging declared auth into `svc.auth.method` would be one line and would make every auth number in the product unfalsifiable: a reader could no longer tell a middleware LabView resolved from a sentence somebody typed. Kept parallel, the operator gets credit for what they know and the scan keeps its own account intact. |
+| An accepted exposure stays counted, and the alarm watches the remainder | Subtracting it is the obvious design and it is wrong twice: a reviewed exposure is still reachable, and a decision that disappears from the UI is a decision nobody revisits when the reason expires. Counting it and marking it accepted keeps the fact and records the review. Driving the red off the *unaccepted* remainder is what stops a fully-reviewed fleet from shouting, so there is no incentive to clear the finding by deleting it. |
+| An acceptance without a `reason` is refused, not honoured | `intentional: true` alone is indistinguishable from a stray key or a half-finished edit, and it is the one declaration that changes how a security finding reads. Requiring the reason means the field cannot be set by accident, and it puts the justification where the next reader will be — on the finding, not in a commit message. |
+| Both checkable declarations are re-checked every scan, and drift is a report | A sidecar's real failure mode is not a typo, it is going quietly out of date — the port is withdrawn, the route is removed, and the file still asserts the old shape. So the two fields that *can* be checked are, on every scan. Drift never overrides the classification, because the operator's expectation being wrong is the finding; silently adopting it would delete the finding. |
+| The sidecar is parsed defensively and every mistake is a warning | It is operator input from inside a tree already treated as untrusted (§7), so it is contained like `env_file`, size-capped, length-capped per field, and its unknown keys are *named* — a mistyped `descripton` that silently does nothing is the one failure mode an optional-everything format has. Nothing in it can fail a scan (I4): a malformed sidecar costs the fields it got wrong. And because declared text is prose shown as written, with no key-name heuristic that could apply, the documentation says plainly never to put a secret in one; URL credentials are redacted as a backstop only, which is why a link's label falls back to the redacted URL. |
 | The diff is derived by the caller, not carried in the payload | It needs memory of the previous scan, and `buildOverview` is required to have none (I7). Both consumers already hold two payloads, so `diffStacks(prev, next)` as a pure function of them adds no API surface, no server state, and nothing to keep consistent between the log line and the topbar. |
 | "No config changes" is stated rather than left implied | A rescan that reports nothing is indistinguishable from a rescan that never ran, and `scanned <time>` moves either way. The commonest true answer to pressing the button is "I re-read everything and nothing in it differs" — which is only reassuring if it is said out loud. |
 | An unmatched entry carries the reason, not just the name | Both matchers already knew the difference between "nothing named this" and "two services named it" and threw it away at the `return`. Those are not one problem: the second is the operator's to settle with a label and the first is usually LabView's to explain, and a bare `string[]` reported them identically. The lists became objects rather than gaining a parallel array so the same fact cannot exist twice and drift — accepted as a **breaking change** to `/api/overview`, documented in both READMEs. |
