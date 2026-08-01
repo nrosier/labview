@@ -19,6 +19,12 @@ export type {
   AuthMethod,
   AuthConfidence,
   AuthPosture,
+  Declaration,
+  DeclaredAuth,
+  DeclaredAuthMechanism,
+  DeclaredDependency,
+  DeclaredLink,
+  ServiceDeclaration,
   AuthentikApplication,
   AuthentikMatch,
   AuthentikMatchStrength,
@@ -56,6 +62,13 @@ export { phaseText, shouldBanner } from "../src/model/connections";
  * re-runs the Authentik and Traefik exchanges. An API that answered differently is not an
  * edit, so the second is reported beside the first rather than inside it.
  */
+/**
+ * How a declared mechanism is worded, from the same module the analyzer's note is built
+ * from — so a badge and the note beside it cannot describe one `.labview` entry in two
+ * different ways.
+ */
+export { declaredAuthLabel, declaredAuthSummary } from "../src/model/declarations";
+
 export { diffStacks, scanDiffText, scanDiffDetails } from "../src/model/changes";
 export { diffIntegrations, integrationDiffText, integrationDiffDetails } from "../src/model/changes";
 export type { ScanDiff, StackChange, IntegrationDiff, IntegrationChange } from "../src/model/changes";

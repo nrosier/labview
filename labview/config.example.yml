@@ -14,6 +14,17 @@ composeFilenames:
   - docker-compose.yml
   - docker-compose.yaml
 
+# Optional sidecar file beside the compose file, where you declare what a scan
+# cannot observe: what the service is, that it authenticates internally, that it is
+# intentionally left open. See .labview.example for every field.
+#
+# Probed in this order; the first that exists wins, so two sidecars in one directory
+# can never half-apply. Nothing in a sidecar changes what LabView detected.
+sidecarFilenames:
+  - .labview
+  - .labview.yml
+  - .labview.yaml
+
 # Enrich compose config with live data from the Docker Engine when it is
 # reachable. Safe to leave on: if Docker is unreachable the scan degrades to
 # config-only automatically.

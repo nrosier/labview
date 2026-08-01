@@ -15,7 +15,8 @@
  *
  *   npx tsx scripts/smoke.ts
  */
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type {
@@ -66,6 +67,11 @@ const { buildFleetIndex, lookupAddress, lookupContainerAddress } = await import(
   "../src/analyze/origins.js"
 );
 const { matchTraefik } = await import("../src/analyze/traefik.js");
+// Likewise for the sidecar validator: the caps and the malformed-input rules would
+// otherwise need a committed 64 KiB file and a thousand-entry list to reach.
+const { MAX_AUTH_ENTRIES, MAX_LIST_ENTRIES, MAX_SIDECAR_BYTES, MAX_TEXT_CHARS, parseSidecar, readSidecar } =
+  await import("../src/scan/sidecar.js");
+const { DECLARED_AUTH_MECHANISMS, declaredAuthLabel } = await import("../src/model/declarations.js");
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -500,7 +506,7 @@ const eSvc = lookup(edge);
 console.log("\n--- regression fixtures (fixtures/edge) ---");
 
 console.log("\nedge discovery");
-check("found 8 edge stacks", edge.stats.stacks === 8, `got ${edge.stats.stacks}`);
+check("found 14 edge stacks", edge.stats.stacks === 14, `got ${edge.stats.stacks}`);
 
 console.log("\ncredentials embedded in URL values");
 const api = eSvc("dbstack", "api");
@@ -604,8 +610,9 @@ check(
   `exposedWithoutAuth=${socketproxy.auth.exposedWithoutAuth}`,
 );
 // socketproxy, plus the two rival proxies in `tunnelorigin` — each publishes a
-// port with nothing in front of it.
-check("lan-only services are counted", edge.stats.lanServices === 3, `got ${edge.stats.lanServices}`);
+// port with nothing in front of it — plus the two sidecar fixtures below, whose
+// published ports are what makes their declarations worth asserting about.
+check("lan-only services are counted", edge.stats.lanServices === 5, `got ${edge.stats.lanServices}`);
 
 // The overlap rule: all four situations can be true of one service at once, but the
 // kind names what is in *front* of it. A proxied service that also publishes a port
@@ -775,6 +782,317 @@ check(
   eSvc("hostport", "app").auth.method === "authentik-forward-auth",
   eSvc("hostport", "app").auth.method,
 );
+
+console.log("\noperator declarations (.labview)");
+// The one rule the whole declaration layer rests on: a statement in a sidecar is a
+// second source, not stronger evidence. Every assertion below is a way of saying
+// that — the detected posture, the exposure flag and the detection statistics all
+// have to read exactly as they would if the file were not there.
+const decl = eSvc("declared", "media");
+check("a declared mechanism leaves the detected method alone", decl.auth.method === "none", decl.auth.method);
+check(
+  "...and does not clear the exposure it cannot prove is handled",
+  decl.auth.exposedWithoutAuth === true,
+  `exposedWithoutAuth=${decl.auth.exposedWithoutAuth}`,
+);
+check(
+  "...and the detected-method distribution is unmoved",
+  edge.stats.byAuthMethod.none === 22 &&
+    !DECLARED_AUTH_MECHANISMS.some((m) => m in edge.stats.byAuthMethod),
+  JSON.stringify(edge.stats.byAuthMethod),
+);
+check(
+  "the declaration is attached beside the facts, tagged with the file it came from",
+  decl.declared?.file === ".labview" &&
+    decl.declared.auth.map((a) => a.mechanism).join(",") === "app-local-accounts,app-ldap",
+  JSON.stringify(decl.declared?.auth),
+);
+check(
+  "...counted only in its own statistic",
+  edge.stats.declaredAuth === 3,
+  `got ${edge.stats.declaredAuth}`,
+);
+check(
+  "...and reported to non-UI consumers as a note that names the file and disclaims detection",
+  decl.notes.some((n) => n.includes("declared in .labview") && n.includes("not detected by this scan")),
+  decl.notes.join(" | "),
+);
+check(
+  "...worded through the shared mechanism labels, so a note and a badge cannot disagree",
+  decl.notes.some((n) => n.includes(declaredAuthLabel("app-local-accounts")) && n.includes(declaredAuthLabel("app-ldap"))),
+  decl.notes.join(" | "),
+);
+const declStack = edge.stacks.find((s) => s.id === "declared")?.declared;
+check(
+  "stack-level fields are read for the directory, not for a service",
+  declStack?.owner === "platform-team" && declStack.criticality === "high" && declStack.description !== undefined,
+  JSON.stringify(declStack),
+);
+check(
+  "a link with no label falls back to its url rather than rendering blank",
+  declStack?.links[1]?.label === "https://example.com/docs",
+  JSON.stringify(declStack?.links),
+);
+check(
+  "a bare-string dependency is the same shape as the long form",
+  declStack?.dependencies[0]?.name === "Share mounted by the host" &&
+    declStack.dependencies[0].detail === undefined,
+  JSON.stringify(declStack?.dependencies),
+);
+
+const acc = eSvc("accepted", "status");
+check(
+  "an accepted exposure is still an exposure",
+  acc.auth.exposedWithoutAuth === true,
+  `exposedWithoutAuth=${acc.auth.exposedWithoutAuth}`,
+);
+check(
+  "...with the acceptance recorded separately",
+  acc.declared?.unauthenticatedAccepted?.reason === "Read-only status page, trusted VLAN only.",
+  JSON.stringify(acc.declared?.unauthenticatedAccepted),
+);
+check(
+  "...and the reason carried on the exposure note itself, where the finding is read",
+  acc.notes.some(
+    (n) => n.includes("no detected proxy/SSO authentication") && n.includes("accepted in .labview: Read-only status page"),
+  ),
+  acc.notes.join(" | "),
+);
+check(
+  "the accepted count is beside the exposure count, never subtracted from it",
+  edge.stats.exposureAccepted === 1 && edge.stats.exposedWithoutAuth === 11,
+  `${edge.stats.exposureAccepted} accepted of ${edge.stats.exposedWithoutAuth} exposed`,
+);
+
+// A sidecar's real failure mode is not a typo, it is going quietly out of date.
+const stale = eSvc("staledecl", "worker");
+check("a stale declaration does not move the posture", stale.ingress === "internal" && stale.auth.exposedWithoutAuth === false, `${stale.ingress}/${stale.auth.exposedWithoutAuth}`);
+check(
+  "an acceptance the scan can see no longer applies is reported as drift",
+  stale.declared?.drift.some((d) => d.includes("no longer applies")) === true,
+  JSON.stringify(stale.declared?.drift),
+);
+check(
+  "a declared expectation that disagrees with the scan is reported as drift, naming both",
+  stale.declared?.drift.some((d) => d.includes('expects ingress "lan"') && d.includes('"internal"')) === true,
+  JSON.stringify(stale.declared?.drift),
+);
+check(
+  "...one entry per disagreement, so fixing one does not hide the other",
+  stale.declared?.drift.length === 2,
+  String(stale.declared?.drift.length),
+);
+check("drift has its own counter too", edge.stats.declarationDrift === 1, `got ${edge.stats.declarationDrift}`);
+
+// Everything wrong with a sidecar is a warning; nothing about it fails a scan (I4).
+const badStack = edge.stacks.find((s) => s.id === "badsidecar")!;
+const badWarn = badStack.warnings.join(" | ");
+check("a sidecar full of mistakes reports every one of them", badStack.warnings.length === 4, badWarn);
+check("...a mistyped key is named rather than silently dropped", badWarn.includes('unknown key(s) "descripton"'), badWarn);
+check(
+  "...a mechanism named after a product is refused, with the vocabulary quoted back",
+  badWarn.includes('"authentik-proxy" is not a known mechanism') && badWarn.includes("app-local-accounts"),
+  badWarn,
+);
+check(
+  "...an acceptance with no reason is refused, because it cannot be told from a mistake",
+  badWarn.includes('needs a "reason"'),
+  badWarn,
+);
+check(
+  "...and a declaration for a service the compose file does not define is named",
+  badWarn.includes('declares service "ghost"'),
+  badWarn,
+);
+const bad = eSvc("badsidecar", "app");
+check(
+  "the refused acceptance leaves nothing behind",
+  bad.declared?.unauthenticatedAccepted === undefined,
+  JSON.stringify(bad.declared?.unauthenticatedAccepted),
+);
+check(
+  "the valid declarations in the same file are still read",
+  bad.declared?.auth.length === 1 &&
+    bad.declared.auth[0]?.mechanism === "app-token" &&
+    badStack.declared?.description?.startsWith("The valid half") === true,
+  JSON.stringify({ auth: bad.declared?.auth, stack: badStack.declared?.description }),
+);
+check("...and the scan itself completed", bad.image === "example/app:1.0.0", String(bad.image));
+
+const yml = eSvc("sidecaryml", "app");
+check(
+  "the .labview.yml spelling is probed too, and says which file it came from",
+  yml.declared?.file === ".labview.yml",
+  String(yml.declared?.file),
+);
+check(
+  "a bare mechanism name is accepted as shorthand for {mechanism}",
+  yml.declared?.auth[0]?.mechanism === "app-token" && yml.declared.auth[0].detail === undefined,
+  JSON.stringify(yml.declared?.auth),
+);
+
+// LabView builds the sidecar path itself, so a symlink is the only way out of the
+// tree — and a quiet one, since the contents would come back as a `description`.
+const escStack = edge.stacks.find((s) => s.id === "escapedecl")!;
+check(
+  "a sidecar symlinked outside the apps root is refused",
+  escStack.warnings.length === 1 && escStack.warnings[0]?.includes("outside the apps root") === true,
+  JSON.stringify(escStack.warnings),
+);
+check(
+  "...and nothing it declared is attached",
+  escStack.declared === undefined && eSvc("escapedecl", "app").declared === undefined,
+  JSON.stringify(escStack.declared),
+);
+// Both escape fixtures use the same marker, so this one comparison covers the
+// sidecar and the `env_file` path at once, anywhere in the served payload.
+check(
+  "...nor reachable anywhere in the overview",
+  !JSON.stringify(edge).includes("LEAKED_FROM_OUTSIDE_ROOT"),
+);
+
+console.log("\nsidecar validation, asserted directly");
+// The rules that would need a committed 64 KiB file or a thousand-entry list to
+// reach through the pipeline. `parseSidecar` is pure, so they are asserted on it.
+const names = ["app"];
+const yamlBad = parseSidecar("services:\n  app:\n   description: [unclosed\n", names, ".labview");
+check(
+  "malformed YAML is one warning and no declarations, not a failed scan",
+  yamlBad.warnings.length === 1 &&
+    yamlBad.warnings[0]?.includes("YAML parse error") === true &&
+    yamlBad.services.size === 0 &&
+    yamlBad.stack === undefined,
+  JSON.stringify(yamlBad.warnings),
+);
+const notMapping = parseSidecar("- a list where a mapping belongs\n", names, ".labview");
+check(
+  "a top level that is not a mapping is reported",
+  notMapping.warnings.length === 1 && notMapping.warnings[0]?.includes("expected a mapping at the top level") === true,
+  JSON.stringify(notMapping.warnings),
+);
+for (const [what, text] of [
+  ["an empty file", ""],
+  ["a file of comments only", "# nothing declared yet\n"],
+] as const) {
+  const empty = parseSidecar(text, names, ".labview");
+  check(
+    `${what} declares nothing and complains about nothing`,
+    empty.warnings.length === 0 && empty.services.size === 0 && empty.stack === undefined,
+    JSON.stringify(empty.warnings),
+  );
+}
+const long = parseSidecar(`description: ${"x".repeat(MAX_TEXT_CHARS + 500)}\n`, names, ".labview");
+check(
+  "an over-long string is truncated, marked, and reported",
+  long.stack?.description?.length === MAX_TEXT_CHARS + 1 &&
+    long.stack.description.endsWith("…") &&
+    long.warnings.some((w) => w.includes(`truncated to ${MAX_TEXT_CHARS}`)),
+  `${long.stack?.description?.length} chars | ${long.warnings.join(" | ")}`,
+);
+const listItems = (n: number, item: (i: number) => string): string =>
+  Array.from({ length: n }, (_, i) => item(i)).join("");
+const capped = parseSidecar(
+  `links:\n${listItems(MAX_LIST_ENTRIES + 3, (i) => `  - url: https://example.com/${i}\n`)}` +
+    `dependencies:\n${listItems(MAX_LIST_ENTRIES + 3, (i) => `  - dep-${i}\n`)}`,
+  names,
+  ".labview",
+);
+check(
+  "links and dependencies are capped, each reported separately",
+  capped.stack?.links.length === MAX_LIST_ENTRIES &&
+    capped.stack.dependencies.length === MAX_LIST_ENTRIES &&
+    capped.warnings.filter((w) => w.includes(`more than ${MAX_LIST_ENTRIES} entries`)).length === 2,
+  JSON.stringify(capped.warnings),
+);
+const manyAuth = parseSidecar(
+  `services:\n  app:\n    auth:\n${listItems(MAX_AUTH_ENTRIES + 2, () => "      - app-token\n")}`,
+  names,
+  ".labview",
+);
+check(
+  "declared mechanisms are capped too",
+  manyAuth.services.get("app")?.auth.length === MAX_AUTH_ENTRIES &&
+    manyAuth.warnings.some((w) => w.includes(`more than ${MAX_AUTH_ENTRIES} entries`)),
+  JSON.stringify({ n: manyAuth.services.get("app")?.auth.length, warnings: manyAuth.warnings }),
+);
+const other = parseSidecar(
+  "services:\n  app:\n    auth:\n      - other\n      - mechanism: other\n        detail: A hardware key at the door.\n",
+  names,
+  ".labview",
+);
+check(
+  '"other" says nothing on its own, so it is refused without a detail and kept with one',
+  other.services.get("app")?.auth.length === 1 &&
+    other.services.get("app")?.auth[0]?.detail === "A hardware key at the door." &&
+    other.warnings.some((w) => w.includes('mechanism "other" needs a "detail"')),
+  JSON.stringify({ auth: other.services.get("app")?.auth, warnings: other.warnings }),
+);
+const badIngress = parseSidecar("services:\n  app:\n    expected:\n      ingress: everywhere\n", names, ".labview");
+check(
+  "an unknown expected ingress is refused with the six kinds listed",
+  badIngress.services.size === 0 &&
+    badIngress.warnings.some((w) => w.includes('"everywhere" is not one of') && w.includes("public+traefik")),
+  JSON.stringify(badIngress.warnings),
+);
+const linkCred = parseSidecar("links:\n  - url: https://admin:hunter2@example.com/panel\n", names, ".labview");
+check(
+  "a password embedded in a declared url is redacted, since no mask reaches prose",
+  linkCred.stack?.links[0]?.url === "https://admin:***@example.com/panel" &&
+    !JSON.stringify(linkCred).includes("hunter2"),
+  JSON.stringify(linkCred.stack?.links),
+);
+// A mechanism with no label would render as `undefined` in a badge; the record is
+// exhaustive by type, so this catches a member added without wording.
+check(
+  "every declarable mechanism has wording a reader can use",
+  DECLARED_AUTH_MECHANISMS.every((m) => declaredAuthLabel(m).length > 2) &&
+    new Set(DECLARED_AUTH_MECHANISMS.map(declaredAuthLabel)).size === DECLARED_AUTH_MECHANISMS.length,
+  DECLARED_AUTH_MECHANISMS.map(declaredAuthLabel).join(" | "),
+);
+// The skeleton is the documentation. If it drifts from the validator, the first
+// thing an operator copies produces warnings — so it is parsed here as input.
+const skeleton = parseSidecar(
+  readFileSync(resolve(here, "..", ".labview.example"), "utf8"),
+  ["emby"],
+  ".labview.example",
+);
+check(
+  "the shipped skeleton parses with no warnings at all",
+  skeleton.warnings.length === 0,
+  JSON.stringify(skeleton.warnings),
+);
+check(
+  "...and every documented field actually lands somewhere",
+  skeleton.stack?.description !== undefined &&
+    skeleton.stack.owner !== undefined &&
+    skeleton.stack.criticality !== undefined &&
+    skeleton.stack.notes !== undefined &&
+    skeleton.stack.data !== undefined &&
+    skeleton.stack.links.length > 0 &&
+    skeleton.stack.dependencies.length > 0 &&
+    skeleton.services.get("emby")?.auth.length === 2 &&
+    skeleton.services.get("emby")?.unauthenticatedAccepted !== undefined &&
+    skeleton.services.get("emby")?.expectedIngress !== undefined,
+  JSON.stringify({ stack: skeleton.stack, emby: skeleton.services.get("emby") }),
+);
+// The size cap is I/O, so it is the one rule that needs a file — written to a temp
+// dir rather than committed, since the point is that it is larger than a sidecar
+// has any business being.
+const bigDir = mkdtempSync(resolve(tmpdir(), "labview-sidecar-"));
+writeFileSync(resolve(bigDir, ".labview"), `description: ${"y".repeat(MAX_SIDECAR_BYTES + 10)}\n`);
+const tooBig = readSidecar(
+  { id: "big", dir: bigDir, composeFile: resolve(bigDir, "compose.yml"), sidecarFile: resolve(bigDir, ".labview") },
+  bigDir,
+  ["app"],
+);
+check(
+  "a sidecar larger than the cap is refused unread, with its size said out loud",
+  tooBig.stack === undefined &&
+    tooBig.warnings.length === 1 &&
+    tooBig.warnings[0]?.includes(`exceeds the ${MAX_SIDECAR_BYTES}-byte limit`) === true,
+  JSON.stringify(tooBig.warnings),
+);
+rmSync(bigDir, { recursive: true, force: true });
 
 /* ========================================================================== */
 /* fixtures/authentik — the identity provider's own records                   */
@@ -2127,8 +2445,6 @@ const { createServer } = await import("node:net");
 // The unreadable-socket case is driven through `phaseForSocket` on a literal probe
 // rather than by chmod-ing a real one: a test running as root can open any socket
 // regardless of its mode, so the filesystem would refuse to reproduce the situation.
-const { mkdtempSync, writeFileSync } = await import("node:fs");
-const { tmpdir } = await import("node:os");
 
 console.log("\na transport failure names the stage, not just `fetch failed`");
 for (const [code, phase] of [
@@ -2809,6 +3125,38 @@ check(
   JSON.stringify(stackDiff.changed),
 );
 
+// A `.labview` is parsed off disk like the compose file beside it, so editing one is an
+// edit the operator made and expects Rescan to report. That comes for free from the
+// deny-list — `declared` is simply not in `VOLATILE_SERVICE_FIELDS` — which is exactly
+// why it is worth an assertion: adding it there would be a one-line, silent regression.
+const declAdded = clone(stacksA);
+declAdded[0]!.declared = {
+  file: ".labview",
+  description: "a sidecar the operator just wrote",
+  links: [],
+  dependencies: [],
+};
+check(
+  "a sidecar added at stack level is a changed stack",
+  diffStacks(stacksA, declAdded).changed[0]?.stackChanged === true,
+  JSON.stringify(diffStacks(stacksA, declAdded).changed),
+);
+const declSvcEdited = clone(stacksA);
+const declSvc = declSvcEdited[0]!.services[0]!;
+declSvc.declared = {
+  file: ".labview",
+  links: [],
+  dependencies: [],
+  auth: [{ mechanism: "app-ldap" }],
+  drift: [],
+};
+const declSvcDiff = diffStacks(stacksA, declSvcEdited);
+check(
+  "a declaration added to a service is that service, changed",
+  declSvcDiff.changed.length === 1 && declSvcDiff.changed[0]?.servicesChanged.join(",") === declSvc.name,
+  JSON.stringify(declSvcDiff.changed),
+);
+
 // Key order is a property of how the object was built, not of the configuration. Without
 // the sorted-key comparison every rescan would report every stack.
 const reversedKeys = <T extends object>(o: T): T => Object.fromEntries(Object.entries(o).reverse()) as T;
@@ -2947,6 +3295,30 @@ check(
     grownDiff.added[0]?.services === 1,
   JSON.stringify(grownDiff.added),
 );
+// The same again for a sidecar written next to a compose file that did not change: the
+// stack is reported, and it is reported as the *stack* having changed rather than any
+// of its services, because that is where a top-level declaration lives.
+writeFileSync(
+  resolve(tmpRoot, "zz-smoke-stack", ".labview"),
+  "description: a sidecar written after the first scan\nservices:\n  probe:\n    criticality: low\n",
+);
+const diskSidecar = await overviewFor(tmpRoot);
+const sidecarDiff = diffStacks(diskGrown.stacks, diskSidecar.stacks);
+check(
+  "a .labview written after a scan is reported by the next one",
+  sidecarDiff.changed.length === 1 &&
+    sidecarDiff.changed[0]?.id === "zz-smoke-stack" &&
+    sidecarDiff.changed[0]?.stackChanged === true &&
+    sidecarDiff.changed[0]?.servicesChanged.join(",") === "probe",
+  JSON.stringify(sidecarDiff.changed),
+);
+check(
+  "...and its declarations are what the scan now carries",
+  diskSidecar.stacks.find((s) => s.id === "zz-smoke-stack")?.declared?.description ===
+    "a sidecar written after the first scan",
+  JSON.stringify(diskSidecar.stacks.find((s) => s.id === "zz-smoke-stack")?.declared),
+);
+
 // Comparing the parsed configuration rather than the file has one visible consequence,
 // and this is it: a rescan after a comment-only edit reports nothing, because nothing
 // LabView documents moved. That is the intended answer, not a miss.
@@ -2955,7 +3327,7 @@ writeFileSync(composeFile, `# a comment nobody parses\n${readFileSync(composeFil
 const diskCommented = await overviewFor(tmpRoot);
 check(
   "a comment-only edit reports nothing — the parsed configuration is what is compared",
-  diffStacks(diskGrown.stacks, diskCommented.stacks).unchanged,
+  diffStacks(diskSidecar.stacks, diskCommented.stacks).unchanged,
 );
 
 console.log("\nthe rescan line says what moved, and says so when nothing did");

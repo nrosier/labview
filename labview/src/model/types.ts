@@ -536,6 +536,105 @@ export interface AuthPosture {
   exposedWithoutAuth: boolean;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Operator declarations (the `.labview` sidecar)                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Authentication a *service* performs for itself, which no scan can observe: a
+ * built-in user database, a directory bind the application makes on its own, a
+ * client-certificate requirement, a network restriction enforced somewhere LabView
+ * cannot see.
+ *
+ * **A declaration is a second source, not stronger evidence.** It lives here, in
+ * its own field, precisely so it can never be mistaken for something the scan
+ * proved: `AuthPosture` is derived only from observable config and API state
+ * (invariant I1) and is left untouched by everything in this section. A future
+ * change must not "simplify" this by folding a declared mechanism into
+ * `AuthPosture.method` or by adding a `declared` value to `AuthConfidence` —
+ * confidence measures how strong the *evidence* is, and there is no evidence here.
+ *
+ * Named by mechanism and never by product (invariant I3): the same fleet may run
+ * any application, and `app-local-accounts` is true of a hundred of them.
+ */
+export type DeclaredAuthMechanism =
+  /** The application has its own user database. */
+  | "app-local-accounts"
+  /** The application binds a directory itself. */
+  | "app-ldap"
+  /** The application performs its own OIDC/OAuth login. */
+  | "app-oidc"
+  /** The application performs its own SAML login. */
+  | "app-saml"
+  /** An API token or key is required. */
+  | "app-token"
+  /** Client certificates are required. */
+  | "mtls"
+  /** Reachable only from restricted networks (VPN, VLAN, firewall). */
+  | "network-restricted"
+  /** An authenticating proxy outside the scanned fleet. */
+  | "external-proxy"
+  /** Anything else; `detail` then carries the explanation. */
+  | "other";
+
+/** One declared authentication mechanism. */
+export interface DeclaredAuth {
+  mechanism: DeclaredAuthMechanism;
+  /** The operator's own words. Required for `other`, optional otherwise. */
+  detail?: string;
+}
+
+/** A named URL from the sidecar (admin UI, upstream docs, a ticket). */
+export interface DeclaredLink {
+  label: string;
+  url: string;
+}
+
+/** Something the service depends on that LabView cannot see at all. */
+export interface DeclaredDependency {
+  name: string;
+  detail?: string;
+}
+
+/**
+ * Fields a `.labview` file may declare at either level. Everything is optional:
+ * an absent or empty sidecar changes nothing about a scan.
+ */
+export interface Declaration {
+  /** Filename the declarations were read from, e.g. `.labview`. Never a full path. */
+  file: string;
+  description?: string;
+  owner?: string;
+  criticality?: string;
+  notes?: string;
+  /** Prose about what persists where, and what is backed up. */
+  data?: string;
+  links: DeclaredLink[];
+  dependencies: DeclaredDependency[];
+}
+
+/** A declaration attached to one service, with the service-only fields. */
+export interface ServiceDeclaration extends Declaration {
+  auth: DeclaredAuth[];
+  /**
+   * Present only when the sidecar said `intentional: true` **and** gave a reason.
+   * An acceptance with no reason is indistinguishable from a typo, so it is refused
+   * with a warning rather than honoured.
+   *
+   * This never clears `AuthPosture.exposedWithoutAuth`: the service is still
+   * reachable without authentication, which stays a fact. It records that the fact
+   * was reviewed.
+   */
+  unauthenticatedAccepted?: { reason: string };
+  /** Declared expectation, compared against `Service.ingress` — never an override. */
+  expectedIngress?: IngressKind;
+  /**
+   * Where this declaration and the scan disagree, in the operator's terms. Filled
+   * by the analyzer, one entry per disagreement.
+   */
+  drift: string[];
+}
+
 /** Live data merged from the Docker Engine (present only when the socket works). */
 export interface DockerState {
   id: string;
@@ -579,6 +678,11 @@ export interface Service {
   authentik?: AuthentikMatch;
   /** Live routers this service was matched to, when the Traefik API was readable. */
   traefikLive?: TraefikLiveRouter[];
+  /**
+   * What the operator declared about this service in the stack's `.labview` file.
+   * Deliberately beside `auth` rather than inside it — see `DeclaredAuthMechanism`.
+   */
+  declared?: ServiceDeclaration;
   /** Notes/warnings surfaced during analysis. */
   notes: string[];
 }
@@ -597,6 +701,11 @@ export interface AppStack {
   declaredNetworks: NetworkDecl[];
   /** Volumes declared at the top level of the compose file. */
   declaredVolumes: VolumeDecl[];
+  /**
+   * What the operator declared about the stack as a whole in its `.labview` file.
+   * Absent when there is no sidecar, or when it declared nothing at this level.
+   */
+  declared?: Declaration;
   /** Parse-level warnings for this stack. */
   warnings: string[];
 }
@@ -680,6 +789,18 @@ export interface OverviewStats {
   authProtected: number;
   exposedWithoutAuth: number;
   byAuthMethod: Record<string, number>;
+  /**
+   * The three declaration counters. All of them count what the *operator* stated in
+   * a `.labview` file, and none of them move a detection metric — `authProtected`,
+   * `exposedWithoutAuth` and `byAuthMethod` above stay derived from evidence alone,
+   * so a fleet with no sidecar anywhere reads exactly as it did before.
+   */
+  /** Services with at least one declared authentication mechanism. */
+  declaredAuth: number;
+  /** Services that are `exposedWithoutAuth` **and** carry an accepted declaration. */
+  exposureAccepted: number;
+  /** Services whose declaration disagrees with what the scan found. */
+  declarationDrift: number;
 }
 
 /** Metadata about the scan itself. */

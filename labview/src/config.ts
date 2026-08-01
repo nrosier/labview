@@ -4,6 +4,12 @@ import { parse as parseYaml } from "yaml";
 export interface LabViewConfig {
   appsRoot: string;
   composeFilenames: string[];
+  /**
+   * Sidecar filenames to look for in a stack directory, in priority order. The
+   * first one that exists is read; the rest are ignored, so two sidecars in one
+   * directory can never half-apply.
+   */
+  sidecarFilenames: string[];
   docker: {
     enabled: boolean;
     /** When set, connect over TCP (the docker-socket-proxy). Takes precedence
@@ -108,6 +114,9 @@ export const DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock";
 const DEFAULTS: LabViewConfig = {
   appsRoot: "/data/apps",
   composeFilenames: ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"],
+  // `.labview` first, since that is the documented name. The suffixed variants are
+  // the same file under a name editors recognise as YAML.
+  sidecarFilenames: [".labview", ".labview.yml", ".labview.yaml"],
   // Default to the conventional local socket, the one endpoint that needs no
   // naming assumption about the host. A TCP endpoint — typically a
   // docker-socket-proxy, as in compose.yml — is opted into by setting
@@ -213,6 +222,12 @@ function parseDockerTarget(value: string): { host?: string; port?: number; socke
 function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   const env = process.env;
   if (env.LABVIEW_APPS_ROOT) cfg.appsRoot = env.LABVIEW_APPS_ROOT;
+  if (env.LABVIEW_SIDECAR_FILENAMES) {
+    const names = env.LABVIEW_SIDECAR_FILENAMES.split(",")
+      .map((n) => n.trim())
+      .filter(Boolean);
+    if (names.length) cfg.sidecarFilenames = names;
+  }
   // LABVIEW_DOCKER_HOST selects a TCP endpoint; a socket-style value clears host
   // so socketPath is used instead. DOCKER_HOST is the standard variable every
   // other Docker client already reads, so honour it too — LABVIEW_DOCKER_HOST

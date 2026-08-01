@@ -1,0 +1,14 @@
+# Regression fixture: a sidecar symlinked out of the apps root.
+#
+# LabView builds the sidecar path itself, so `../../` cannot appear in it — a symlink
+# is the only way out of the tree, and it is a quiet one: whatever the link points at
+# would be parsed and echoed back as a service `description` on /api/overview.
+# `.labview` here links to ../../outside-root.labview, which holds declarations that
+# are valid on purpose, so dropping the containment check produces those declarations
+# rather than some other warning.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: escapedecl-app
+    expose:
+      - "8080"

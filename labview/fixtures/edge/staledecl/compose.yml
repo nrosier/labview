@@ -1,0 +1,13 @@
+# Regression fixture: a declaration that has gone stale.
+#
+# `expose:` does not publish, so this service is reachable only from the container
+# network. Its sidecar still says it is deliberately open on the LAN — written when
+# it was, and never updated. That is the failure mode a sidecar actually has, so the
+# scan has to say so: two drift entries, one per disagreement, and no change to the
+# posture itself.
+services:
+  worker:
+    image: example/worker:1.0.0
+    container_name: staledecl-worker
+    expose:
+      - "9000"

@@ -30,8 +30,22 @@ if (summary) {
       ` lan ${stats.lanServices}, internal ${stats.internalServices}`,
   );
   console.log(`  auth protected:   ${stats.authProtected}`);
-  console.log(`  EXPOSED, no auth: ${stats.exposedWithoutAuth}`);
+  // The count is the scan's, unaltered; the parenthetical says how many of them somebody
+  // declared intentional. Never subtracted — an accepted exposure is still reachable.
+  console.log(
+    `  EXPOSED, no auth: ${stats.exposedWithoutAuth}` +
+      (stats.exposureAccepted > 0 ? `  (${stats.exposureAccepted} accepted in a sidecar)` : ""),
+  );
   console.log(`  by auth method:   ${JSON.stringify(stats.byAuthMethod)}`);
+  // Silent for a fleet with no sidecar, which is most of them — and the drift line is
+  // the one worth printing loudly, since a stale declaration is the failure mode a
+  // sidecar actually has.
+  if (stats.declaredAuth > 0) {
+    console.log(`  declared auth:    ${stats.declaredAuth}  (stated in a sidecar, not detected)`);
+  }
+  if (stats.declarationDrift > 0) {
+    console.log(`  ! declaration drift: ${stats.declarationDrift} service(s) disagree with their sidecar`);
+  }
   for (const w of meta.warnings) console.log(`  ! ${w}`);
 } else {
   console.log(JSON.stringify(overview, null, 2));

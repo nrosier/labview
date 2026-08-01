@@ -1,0 +1,12 @@
+# Deliberately OUTSIDE fixtures/edge (the apps root used by the edge-case smoke
+# pass). fixtures/edge/escapedecl/.labview is a symlink to this file; the scanner
+# must refuse to read it. Valid on purpose: if containment regresses, the failure
+# shows up as these declarations appearing in the overview, not as a differently
+# worded warning.
+description: LEAKED_FROM_OUTSIDE_ROOT — this must never be read.
+services:
+  app:
+    description: LEAKED_FROM_OUTSIDE_ROOT — this must never be read.
+    auth:
+      - mechanism: app-token
+        detail: LEAKED_FROM_OUTSIDE_ROOT

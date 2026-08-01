@@ -1,7 +1,8 @@
-import type { AuthMethod, DockerState, IngressKind } from "../model";
+import type { AuthMethod, DeclaredAuth, DockerState, IngressKind } from "../model";
+import { declaredAuthLabel, declaredAuthSummary } from "../model";
 import { authLabel, authVar, ingressLabel, ingressVar } from "../lib/palette";
 import { statusView } from "../lib/format";
-import { IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
+import { IconCheck, IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
 
 /**
  * Ingress badge — colored swatch + icon + label (identity, not color alone).
@@ -48,6 +49,50 @@ export function ExposedBadge() {
         <IconWarning />
       </span>
       Exposed, no auth
+    </span>
+  );
+}
+
+/**
+ * The same finding as `ExposedBadge`, stated as reviewed rather than as an alarm.
+ *
+ * Shown when the operator declared the exposure intentional. The service is still
+ * exposed and still counted as exposed — only the alarm styling is dropped, because an
+ * exposure someone decided on does not need to compete for attention with the ones
+ * nobody has looked at yet. The reason is the tooltip, so the badge never asks the
+ * reader to open the drawer to find out why.
+ */
+export function AcceptedBadge({ reason, file }: { reason: string; file: string }) {
+  return (
+    <span class="badge declared" title={`Exposure declared intentional in ${file}: ${reason}`}>
+      <span class="icon">
+        <IconCheck />
+      </span>
+      Exposed, accepted
+    </span>
+  );
+}
+
+/**
+ * Authentication the operator declared and this scan did not detect.
+ *
+ * Deliberately colourless: hue in this UI means a *detected* category, and a
+ * declaration is a statement rather than an observation, so it is marked out by a
+ * dashed outline and by saying so in words. It appears next to the detected
+ * `AuthBadge` — usually next to "No proxy auth" — and the pair is the honest report:
+ * the scan found nothing, the operator says otherwise.
+ */
+export function DeclaredAuthBadge({ auth, file }: { auth: DeclaredAuth[]; file: string }) {
+  if (!auth.length) return null;
+  return (
+    <span
+      class="badge declared"
+      title={`Declared in ${file} — not detected by this scan:\n${declaredAuthSummary(auth)}`}
+    >
+      <span class="icon">
+        <IconLock />
+      </span>
+      Declared: {auth.map((a) => declaredAuthLabel(a.mechanism)).join(" + ")}
     </span>
   );
 }

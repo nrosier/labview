@@ -1,5 +1,5 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { basename, resolve, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type {
   AppStack,
@@ -11,6 +11,8 @@ import type {
   VolumeDecl,
 } from "../model/types.js";
 import { parseEnvFile, interpolate } from "./env.js";
+import { resolveContained } from "./paths.js";
+import { readSidecar } from "./sidecar.js";
 import type { DiscoveredStack } from "./discover.js";
 
 /**
@@ -48,6 +50,16 @@ export function parseStack(disc: DiscoveredStack, appsRoot: string): AppStack {
     services.push(normalizeService(name, svc, { dir, appsRoot, projectName, lookup, warnings }));
   }
 
+  // The operator's `.labview`, read last because it is validated against the service
+  // names this file defines. Declarations are attached beside the parsed facts and
+  // never merged into them — see src/scan/sidecar.ts.
+  const sidecar = readSidecar(disc, appsRoot, services.map((s) => s.name));
+  warnings.push(...sidecar.warnings);
+  for (const svc of services) {
+    const declared = sidecar.services.get(svc.name);
+    if (declared) svc.declared = declared;
+  }
+
   return {
     id: disc.id,
     name: disc.id,
@@ -58,6 +70,7 @@ export function parseStack(disc: DiscoveredStack, appsRoot: string): AppStack {
     services,
     declaredNetworks: normalizeDeclared(doc.networks) as NetworkDecl[],
     declaredVolumes: normalizeDeclared(doc.volumes) as VolumeDecl[],
+    declared: sidecar.stack,
     warnings,
   };
 }
@@ -315,39 +328,6 @@ function toEnvFileList(v: any): string[] {
     else if (item && typeof item === "object" && typeof item.path === "string") out.push(item.path);
   }
   return out;
-}
-
-/**
- * Resolve `ref` relative to `dir` and return it only if it stays inside `root`.
- * Returns null when the reference escapes the boundary, either lexically
- * (`../../etc/passwd`) or through a symlink pointing out of the tree.
- *
- * Both the literal and the fully-resolved form of the root are accepted, because
- * an apps root is often reached through a symlink (a TrueNAS dataset under
- * `/mnt/.ix-apps`, a bind mount) and a real path must not be rejected just
- * because it does not textually match the configured one.
- */
-function resolveContained(dir: string, root: string, ref: string): string | null {
-  const lexicalRoot = resolve(root);
-  const roots = [lexicalRoot, realpathOrNull(lexicalRoot) ?? lexicalRoot];
-  const within = (p: string): boolean => roots.some((r) => p === r || p.startsWith(r + sep));
-
-  const target = resolve(dir, ref);
-  // Lexical escape: `../..` climbing out of the tree.
-  if (!within(target)) return null;
-  // Symlink escape: a link inside the tree pointing outside it. Only checkable
-  // when the file exists; if it does not there is nothing to read either way.
-  const real = realpathOrNull(target);
-  if (real !== null && !within(real)) return null;
-  return target;
-}
-
-function realpathOrNull(p: string): string | null {
-  try {
-    return realpathSync(p);
-  } catch {
-    return null;
-  }
 }
 
 function sanitizeProject(id: string): string {

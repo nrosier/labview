@@ -1,0 +1,26 @@
+# Four deliberate mistakes, and two valid declarations that must survive them.
+
+# 1. A mistyped key. Silently dropping this is the one failure mode an
+#    optional-everything format has: the operator believes it took effect.
+descripton: |
+  Meant to say "description".
+description: The valid half of this file, which must still be read.
+
+services:
+  app:
+    auth:
+      # 2. A product name, not a mechanism. The vocabulary is deliberately about
+      #    who enforces the login, not which vendor supplies it.
+      - mechanism: authentik-proxy
+        detail: Rejected — names a provider rather than a mechanism.
+      # Valid, and must still be parsed despite its neighbour.
+      - mechanism: app-token
+        detail: An API key is required on every request.
+    # 3. An acceptance with no reason, which cannot be told apart from a stray key.
+    unauthenticated:
+      intentional: true
+
+  # 4. A service this compose file does not define — usually a rename nobody
+  #    carried over here.
+  ghost:
+    description: No such service.

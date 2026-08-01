@@ -54,6 +54,13 @@ export const IconWarning = ({ size = 13, ...r }: P) => (
   </svg>
 );
 
+/** A reviewed decision, as opposed to `IconWarning`'s unreviewed finding. */
+export const IconCheck = ({ size = 13, ...r }: P) => (
+  <svg {...base(size)} {...r}>
+    <path d="M2.6 8.4l3.4 3.4L13.4 4.4" />
+  </svg>
+);
+
 export const IconServer = ({ size = 13, ...r }: P) => (
   <svg {...base(size)} {...r}>
     <rect x="2" y="2.4" width="12" height="4.4" rx="1" />

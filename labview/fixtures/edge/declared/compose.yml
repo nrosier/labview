@@ -1,0 +1,14 @@
+# Regression fixture: a declaration is a second source, never stronger evidence.
+#
+# This service publishes a host port and has no proxy, no DockFlare route and no
+# Authentik application, so the scan can only conclude "reachable, no detected
+# authentication" — and it must keep concluding exactly that after the operator
+# declares the app's own login in `.labview`. If a declared mechanism ever leaks
+# into `auth.method` or into `byAuthMethod`, an unverifiable statement has been
+# promoted to a detection and the exposure count silently drops.
+services:
+  media:
+    image: example/media:1.2.0
+    container_name: declared-media
+    ports:
+      - 18096:8096

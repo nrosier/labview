@@ -9,7 +9,7 @@ import type {
   Service,
   TraefikSummary,
 } from "./model";
-import { phaseText, shouldBanner } from "./model";
+import { declaredAuthLabel, phaseText, shouldBanner } from "./model";
 import {
   diffIntegrations,
   diffStacks,
@@ -208,6 +208,14 @@ function App() {
   const [ingressFilter, setIngressFilter] = useState<Set<string>>(new Set());
   const [authFilter, setAuthFilter] = useState<Set<string>>(new Set());
   const [exposedOnly, setExposedOnly] = useState(false);
+  /**
+   * Put the exposures someone has signed off on out of the way, so the list can be read
+   * down to zero. Off by default and offered only when there is something to hide — an
+   * acceptance is a decision to be able to see, not a way to make the count look better.
+   */
+  const [hideAccepted, setHideAccepted] = useState(false);
+  /** The other direction: only the services whose `.labview` disagrees with the scan. */
+  const [driftOnly, setDriftOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /**
@@ -272,13 +280,22 @@ function App() {
       if (ingressFilter.size && !ingressFilter.has(svc.ingress)) return false;
       if (authFilter.size && !authFilter.has(svc.auth.method)) return false;
       if (exposedOnly && !svc.auth.exposedWithoutAuth) return false;
+      if (hideAccepted && svc.declared?.unauthenticatedAccepted) return false;
+      if (driftOnly && !svc.declared?.drift.length) return false;
       if (q) {
+        // Declared prose is searchable too: "who owns this" and "which of these is the
+        // media stack" are questions the sidecar answers and the compose file does not.
+        const declared = svc.declared;
         const hay = [
           svc.name,
           stack.name,
           svc.image ?? "",
           svc.containerName,
           ingressSummary(svc),
+          declared?.description ?? stack.declared?.description ?? "",
+          declared?.owner ?? stack.declared?.owner ?? "",
+          declared?.criticality ?? stack.declared?.criticality ?? "",
+          declared?.auth.map((a) => `${a.mechanism} ${declaredAuthLabel(a.mechanism)}`).join(" ") ?? "",
         ]
           .join(" ")
           .toLowerCase();
@@ -286,7 +303,7 @@ function App() {
       }
       return true;
     });
-  }, [flat, search, ingressFilter, authFilter, exposedOnly]);
+  }, [flat, search, ingressFilter, authFilter, exposedOnly, hideAccepted, driftOnly]);
 
   // Group the surviving services back under their stacks. `filtered` is already
   // ordered by stack then service, and a Map keeps insertion order, so the stacks
@@ -301,7 +318,13 @@ function App() {
     return [...byStack.values()];
   }, [filtered]);
 
-  const filtering = search.trim() !== "" || ingressFilter.size > 0 || authFilter.size > 0 || exposedOnly;
+  const filtering =
+    search.trim() !== "" ||
+    ingressFilter.size > 0 ||
+    authFilter.size > 0 ||
+    exposedOnly ||
+    hideAccepted ||
+    driftOnly;
 
   // A match must never hide behind a click, so an active filter opens the stacks it
   // matched, and clearing the filter collapses them again. Keyed on the filter
@@ -554,12 +577,39 @@ function App() {
           alert={ov.stats.lanServices > 0}
         />
         <StatTile label="Auth-protected" value={ov.stats.authProtected} />
+        {/* The count is what the scan found and does not move when an exposure is
+            accepted — the subtitle says how many were, and the alarm is driven by the
+            remainder, so a fleet where every exposure has been reviewed stops shouting
+            without ever understating what is reachable. */}
         <StatTile
           label="Exposed, no auth"
           value={ov.stats.exposedWithoutAuth}
-          alert={ov.stats.exposedWithoutAuth > 0}
-          sub={ov.stats.exposedWithoutAuth > 0 ? "⚠ review" : "none"}
+          alert={ov.stats.exposedWithoutAuth - ov.stats.exposureAccepted > 0}
+          sub={
+            ov.stats.exposedWithoutAuth === 0
+              ? "none"
+              : ov.stats.exposureAccepted > 0
+                ? `${ov.stats.exposureAccepted} accepted`
+                : "⚠ review"
+          }
         />
+        {/* Only when there is something to report: a fleet with no sidecar anywhere sees
+            the same tiles it always did. */}
+        {ov.stats.declaredAuth > 0 && (
+          <StatTile
+            label="Declared auth"
+            value={ov.stats.declaredAuth}
+            sub="from .labview"
+          />
+        )}
+        {ov.stats.declarationDrift > 0 && (
+          <StatTile
+            label="Declaration drift"
+            value={ov.stats.declarationDrift}
+            alert
+            sub="⚠ stale .labview"
+          />
+        )}
       </div>
 
       <div class="dists">
@@ -602,6 +652,26 @@ function App() {
             >
               ⚠ Exposed, no auth
             </button>
+            {ov.stats.exposureAccepted > 0 && (
+              <button
+                class="chip"
+                aria-pressed={hideAccepted}
+                title="Hide the exposures declared intentional in a .labview file"
+                onClick={() => setHideAccepted((v) => !v)}
+              >
+                Hide accepted ({ov.stats.exposureAccepted})
+              </button>
+            )}
+            {ov.stats.declarationDrift > 0 && (
+              <button
+                class="chip"
+                aria-pressed={driftOnly}
+                title="Only services whose .labview declaration disagrees with the scan"
+                onClick={() => setDriftOnly((v) => !v)}
+              >
+                ⚠ Declaration drift ({ov.stats.declarationDrift})
+              </button>
+            )}
             {filtering && (
               <button
                 class="chip"
@@ -610,6 +680,8 @@ function App() {
                   setIngressFilter(new Set());
                   setAuthFilter(new Set());
                   setExposedOnly(false);
+                  setHideAccepted(false);
+                  setDriftOnly(false);
                 }}
               >
                 Clear filters

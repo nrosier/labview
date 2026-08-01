@@ -1,0 +1,8 @@
+# Also the shorthand form of `auth`: a bare mechanism name, for when there is
+# nothing to add beyond which mechanism it is.
+description: Declared in the .labview.yml variant.
+services:
+  app:
+    description: Found without a bare .labview in the directory.
+    auth:
+      - app-token

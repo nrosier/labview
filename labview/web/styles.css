@@ -367,6 +367,17 @@ code, .mono {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.stack-title .metaline .pill { margin: 0 0 0 6px; font-size: 11px; }
+/* The operator's own description of the stack. One line, clipped: the full text is in
+   the drawer, and a card that grows with the prose stops being scannable. */
+.stack-title .stack-desc {
+  color: var(--ink-2);
+  font-size: 12.5px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .stack-head .badges { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; flex: none; max-width: 45%; }
 
 .svc-list { border-top: 1px solid var(--border); }
@@ -415,6 +426,22 @@ code, .mono {
 .badge .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
 .badge.soft { background: var(--surface-2); color: var(--ink); }
 .badge .icon { display: inline-flex; }
+
+/* A badge for something the operator declared in a `.labview` file rather than
+   something LabView observed.
+
+   Colourless on purpose. Every hue in this UI is a detected category — an ingress kind,
+   an auth method, an exposure — and a declaration is a claim, not an observation, so it
+   is marked out by a dashed outline and by saying so in words instead of borrowing a
+   colour that would make it look like a finding. The dashes are the whole signal: same
+   size, same weight, same neutral surface as `.badge.soft`, drawn as an outline that is
+   not quite solid. */
+.badge.declared {
+  background: transparent;
+  color: var(--ink-2);
+  border: 1px dashed var(--baseline);
+  font-weight: 500;
+}
 
 .status-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
 .exposed {

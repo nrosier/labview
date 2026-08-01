@@ -1,0 +1,11 @@
+# Regression fixture: the `.labview.yml` filename variant is probed too.
+#
+# Editors and linters treat a bare `.labview` as an unknown file type, so the `.yml`
+# spelling is the one many operators will reach for. There is no bare `.labview`
+# here, so a discovery that only looks for the first configured name finds nothing.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: sidecaryml-app
+    expose:
+      - "8080"

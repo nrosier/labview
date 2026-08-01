@@ -1,0 +1,29 @@
+# The declaration side of the fixture beside it: authentication the application
+# performs for itself, which no scan can observe. Also exercises every stack-level
+# field, including a bare-string dependency.
+description: |
+  Streaming front end for the household library.
+owner: platform-team
+criticality: high
+notes: |
+  Hardware transcoding needs the iGPU passed through.
+data: |
+  Library metadata lives in the config volume; the media itself is on the share.
+links:
+  - label: Admin UI
+    url: https://media.edge.example.com/web
+  - url: https://example.com/docs
+dependencies:
+  - Share mounted by the host
+  - name: Off-fleet directory
+    detail: not visible to this scan
+
+services:
+  media:
+    description: The app that answers on the published port.
+    criticality: normal
+    auth:
+      - mechanism: app-local-accounts
+        detail: Built-in user database, local accounts only.
+      - mechanism: app-ldap
+        detail: LDAP bind against the directory for staff accounts.

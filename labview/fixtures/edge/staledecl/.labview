@@ -1,0 +1,10 @@
+# Both halves are out of date on purpose: the acceptance no longer applies (the
+# service is not reachable), and the expected ingress disagrees with the scan.
+services:
+  worker:
+    description: Background worker, no listener published any more.
+    unauthenticated:
+      intentional: true
+      reason: Was published on the LAN when this was written.
+    expected:
+      ingress: lan

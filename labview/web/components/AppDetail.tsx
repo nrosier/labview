@@ -1,7 +1,9 @@
 import type { AppStack, AuthentikProviderKind, OriginTarget, Service } from "../model";
+import { declaredAuthLabel } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
+import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
-import { AuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
+import { AcceptedBadge, AuthBadge, DeclaredAuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
 import { Mermaid } from "./Mermaid";
 import { Section } from "./Section";
 
@@ -37,9 +39,64 @@ function originEvidence(svc: Service): string[] {
   return [...new Set(svc.cloudflare.map((r) => r.origin?.evidence).filter(Boolean))] as string[];
 }
 
+/**
+ * A declared value together with where it came from: this service's own sidecar entry,
+ * or the stack's.
+ *
+ * The fallback is the drawer's alone — the model keeps the two levels apart, and
+ * nothing in the scan or the stats inherits. It exists because a reader who opens one
+ * service should not have to go back to the stack card to find out who owns it, and
+ * the marker exists because an inherited value must never read as if it had been
+ * written about this service specifically.
+ */
+function declaredValue<T>(own: T | undefined, fromStack: T | undefined): { value: T; inherited: boolean } | null {
+  if (own !== undefined) return { value: own, inherited: false };
+  if (fromStack !== undefined) return { value: fromStack, inherited: true };
+  return null;
+}
+
+/** `declaredValue` for the list-valued fields, where empty means absent. */
+function declaredList<T>(own: T[] | undefined, fromStack: T[] | undefined): { value: T[]; inherited: boolean } | null {
+  return declaredValue(own?.length ? own : undefined, fromStack?.length ? fromStack : undefined);
+}
+
+/**
+ * Whether a declared criticality is one of the values worth marking.
+ *
+ * The field is free text, so this recognises the two conventional words that mean "look
+ * here first" and leaves everything else plain — better than inventing a scale the
+ * operator never agreed to.
+ */
+function criticalHint(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  return v === "critical" || v === "high";
+}
+
+/** "from the stack", when it was. */
+function InheritedMark({ shown }: { shown: boolean }) {
+  return shown ? (
+    <span class="pill" title="Declared for the stack, not for this service">
+      from the stack
+    </span>
+  ) : null;
+}
+
 export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Service; onClose: () => void }) {
   const s = statusView(svc.docker);
   const def = buildServiceMermaid(svc, stack);
+  const declared = svc.declared;
+  const accepted = declared?.unauthenticatedAccepted;
+  // The stack's own declarations, used only as the fallback for a field this service
+  // did not declare itself.
+  const stackDecl = stack.declared;
+  const declaredFile = declared?.file ?? stackDecl?.file;
+  const description = declaredValue(declared?.description, stackDecl?.description);
+  const owner = declaredValue(declared?.owner, stackDecl?.owner);
+  const criticality = declaredValue(declared?.criticality, stackDecl?.criticality);
+  const data = declaredValue(declared?.data, stackDecl?.data);
+  const notes = declaredValue(declared?.notes, stackDecl?.notes);
+  const links = declaredList(declared?.links, stackDecl?.links);
+  const dependencies = declaredList(declared?.dependencies, stackDecl?.dependencies);
 
   return (
     <>
@@ -60,13 +117,26 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
           <div class="badges" style="display:flex;gap:6px;flex-wrap:wrap;">
             <IngressBadge kind={svc.ingress} />
             <AuthBadge method={svc.auth.method} />
-            {svc.auth.exposedWithoutAuth && <ExposedBadge />}
+            {/* Detected first, declared second, and the detected posture is never
+                replaced: a service the operator says authenticates itself still shows
+                "No proxy auth" beside the declaration, because that is what the scan
+                found and it stays true. */}
+            {svc.auth.exposedWithoutAuth &&
+              (declared && accepted ? (
+                <AcceptedBadge reason={accepted.reason} file={declared.file} />
+              ) : (
+                <ExposedBadge />
+              ))}
+            {declared && <DeclaredAuthBadge auth={declared.auth} file={declared.file} />}
           </div>
 
           {svc.notes.length > 0 && (
             <div style="margin-top:12px;">
+              {/* An accepted exposure drops the alarm styling and keeps the note: the
+                  finding is unchanged, but it no longer competes for attention with the
+                  exposures nobody has looked at yet. */}
               {svc.notes.map((note) => (
-                <div class={`note${svc.auth.exposedWithoutAuth ? " crit" : ""}`}>{note}</div>
+                <div class={`note${svc.auth.exposedWithoutAuth && !accepted ? " crit" : ""}`}>{note}</div>
               ))}
             </div>
           )}
@@ -380,6 +450,142 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               </ul>
             )}
           </Section>
+
+          {/* Placed after Authentication on purpose: the evidence is read first, and this
+              is read as what the operator says about the same service. Nothing in here
+              was observed, and nothing in here changed anything above it. */}
+          {declaredFile && (
+            <Section title={`Declared by the operator (${declaredFile})`}>
+              {/* Where the file and the scan disagree, first — a stale declaration is
+                  worth more attention than the declaration itself. */}
+              {declared?.drift.map((d) => (
+                <div class="note crit">{d}</div>
+              ))}
+              <dl class="kv">
+                {description && (
+                  <>
+                    <dt>Description</dt>
+                    <dd>
+                      {description.value}
+                      <InheritedMark shown={description.inherited} />
+                    </dd>
+                  </>
+                )}
+                {declared && declared.auth.length > 0 && (
+                  <>
+                    <dt>Authentication</dt>
+                    <dd>
+                      {declared.auth.map((a) => (
+                        <div>
+                          <span class="pill">{declaredAuthLabel(a.mechanism)}</span>
+                          {a.detail && <span> {a.detail}</span>}
+                        </div>
+                      ))}
+                      <div class="muted-inline">
+                        Declared here, not detected by the scan — the posture above is what
+                        LabView could observe.
+                      </div>
+                    </dd>
+                  </>
+                )}
+                {accepted && (
+                  <>
+                    <dt>Unauthenticated</dt>
+                    <dd>
+                      Intentional — {accepted.reason}
+                      <div class="muted-inline">
+                        Still counted as exposed. The acceptance records that it was
+                        reviewed, and lets the "hide accepted" filter put it aside.
+                      </div>
+                    </dd>
+                  </>
+                )}
+                {declared?.expectedIngress && (
+                  <>
+                    <dt>Expected ingress</dt>
+                    <dd>
+                      {ingressLabel(declared.expectedIngress)}
+                      {declared.expectedIngress === svc.ingress ? (
+                        <span class="pill">matches the scan</span>
+                      ) : (
+                        <span class="pill crit">scan says {ingressLabel(svc.ingress)}</span>
+                      )}
+                    </dd>
+                  </>
+                )}
+                {owner && (
+                  <>
+                    <dt>Owner</dt>
+                    <dd>
+                      {owner.value}
+                      <InheritedMark shown={owner.inherited} />
+                    </dd>
+                  </>
+                )}
+                {criticality && (
+                  <>
+                    <dt>Criticality</dt>
+                    <dd>
+                      <span class={`pill${criticalHint(criticality.value) ? " crit" : ""}`}>
+                        {criticality.value}
+                      </span>
+                      <InheritedMark shown={criticality.inherited} />
+                    </dd>
+                  </>
+                )}
+                {data && (
+                  <>
+                    <dt>Data</dt>
+                    <dd>
+                      {data.value}
+                      <InheritedMark shown={data.inherited} />
+                    </dd>
+                  </>
+                )}
+                {dependencies && (
+                  <>
+                    <dt>Dependencies</dt>
+                    <dd>
+                      {dependencies.value.map((d) => (
+                        <div>
+                          {d.name}
+                          {d.detail && <span class="muted-inline"> — {d.detail}</span>}
+                        </div>
+                      ))}
+                      <InheritedMark shown={dependencies.inherited} />
+                    </dd>
+                  </>
+                )}
+                {links && (
+                  <>
+                    <dt>Links</dt>
+                    <dd>
+                      {links.value.map((l) => (
+                        <div>
+                          {/* rel is not optional here: these URLs come from a file LabView
+                              does not control, and a target=_blank without it hands the
+                              opened page a handle on this one. */}
+                          <a href={l.url} target="_blank" rel="noopener noreferrer">
+                            {l.label}
+                          </a>
+                        </div>
+                      ))}
+                      <InheritedMark shown={links.inherited} />
+                    </dd>
+                  </>
+                )}
+                {notes && (
+                  <>
+                    <dt>Notes</dt>
+                    <dd>
+                      {notes.value}
+                      <InheritedMark shown={notes.inherited} />
+                    </dd>
+                  </>
+                )}
+              </dl>
+            </Section>
+          )}
 
           {svc.authentik && svc.authentik.applications.length > 0 && (
             <Section title="Identity provider — Authentik (from its API)">

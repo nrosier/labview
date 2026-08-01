@@ -1,0 +1,12 @@
+# Regression fixture: a sidecar full of mistakes must degrade, never fail (I4).
+#
+# Its `.labview` carries four separate errors — a mistyped key, a mechanism named
+# after a product, a declaration for a service that does not exist, and an
+# acceptance with no reason. Every one is reported, none is fatal, and the valid
+# declarations in the same file are still read.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: badsidecar-app
+    expose:
+      - "8080"

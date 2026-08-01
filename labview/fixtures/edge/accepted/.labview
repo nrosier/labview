@@ -1,0 +1,8 @@
+# An exposure the operator has signed off on, with the reason the acceptance is
+# required to carry.
+services:
+  status:
+    description: Read-only status page.
+    unauthenticated:
+      intentional: true
+      reason: Read-only status page, trusted VLAN only.

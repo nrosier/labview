@@ -15,6 +15,7 @@ import {
   isAuthMiddlewareRef,
   providerEnforces,
 } from "../labels/auth.js";
+import { declaredAuthSummary } from "../model/declarations.js";
 import { maskEnv } from "../secrets.js";
 import { buildGraph } from "./graph.js";
 import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.js";
@@ -276,7 +277,15 @@ function finalizeAuth(
   svc.auth.exposedWithoutAuth = reachable && !hasEdgeAuth;
 
   if (svc.auth.exposedWithoutAuth) {
-    svc.notes.push(`Reachable (${svc.ingress}) with no detected proxy/SSO authentication.`);
+    // An accepted exposure is still an exposure — the flag above is not cleared. What
+    // changes is only the sentence a reader gets: the same finding, with the operator's
+    // reason attached, instead of a second note about the same fact.
+    const declared = svc.declared;
+    const accepted = declared?.unauthenticatedAccepted;
+    const base = `Reachable (${svc.ingress}) with no detected proxy/SSO authentication`;
+    svc.notes.push(
+      declared && accepted ? `${base} — accepted in ${declared.file}: ${accepted.reason}` : `${base}.`,
+    );
   }
   // An inferred posture rests on a name, not on a definition this scan could read.
   // Say so on the service rather than presenting it as an established fact.
@@ -285,6 +294,7 @@ function finalizeAuth(
       `Auth posture (${svc.auth.method}) inferred from a middleware name — its definition was not found in any scanned stack, so it could not be confirmed.`,
     );
   }
+  noteDeclarations(svc);
   noteHostPortBypass(svc);
   noteAuthentikGaps(svc);
   noteTraefikLive(svc, key, live);
@@ -321,6 +331,55 @@ function classifyIngress(svc: Service): IngressKind {
   if (isTraefik) return "traefik";
   if (hasLanPort) return "lan";
   return "internal";
+}
+
+/**
+ * Report what the operator declared in a `.labview` sidecar, and where that
+ * declaration and the scan disagree.
+ *
+ * The only place in the analyzer that reads a declaration, and deliberately the least
+ * powerful one: it appends a note and fills `declared.drift`, and touches no field of
+ * `AuthPosture` — not `method`, not `confidence`, not `exposedWithoutAuth`. A
+ * declaration is a second source, not stronger evidence (invariant I1), so it is
+ * reported beside the detected posture and never folded into it. The note names the
+ * file it came from and says outright that the scan did not detect it, so the
+ * distinction survives into the CLI and any non-UI consumer of the payload.
+ *
+ * The two drift checks exist because a declaration is the one input here that can go
+ * stale silently: the compose file changes, the sidecar does not, and an acceptance
+ * written for last year's setup would otherwise keep excusing a service that has
+ * since moved.
+ */
+function noteDeclarations(svc: Service): void {
+  const declared = svc.declared;
+  if (!declared) return;
+
+  if (declared.auth.length) {
+    svc.notes.push(
+      `Authentication declared in ${declared.file} (not detected by this scan): ${declaredAuthSummary(declared.auth)}.`,
+    );
+  }
+
+  // An acceptance that no longer applies. Either the service is now protected or it is
+  // no longer reachable — in both cases the sidecar is describing something the scan
+  // cannot see any more, and quietly ignoring it would leave the file looking correct.
+  if (declared.unauthenticatedAccepted && !svc.auth.exposedWithoutAuth) {
+    const why =
+      svc.ingress === "internal"
+        ? "unreachable from outside the container network"
+        : "authenticated at the edge";
+    declared.drift.push(
+      `${declared.file} marks this service as intentionally unauthenticated, but the scan found it ${why} — the declaration no longer applies.`,
+    );
+  }
+
+  // The expectation is a tripwire, never an override: the classification stands and the
+  // disagreement is reported.
+  if (declared.expectedIngress && declared.expectedIngress !== svc.ingress) {
+    declared.drift.push(
+      `${declared.file} expects ingress "${declared.expectedIngress}"; the scan classified this service as "${svc.ingress}".`,
+    );
+  }
 }
 
 /**
@@ -388,6 +447,9 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     authProtected: 0,
     exposedWithoutAuth: 0,
     byAuthMethod: {},
+    declaredAuth: 0,
+    exposureAccepted: 0,
+    declarationDrift: 0,
   };
   for (const stack of stacks) {
     for (const svc of stack.services) {
@@ -401,6 +463,13 @@ function computeStats(stacks: AppStack[]): OverviewStats {
       if (svc.auth.method !== "none") stats.authProtected++;
       if (svc.auth.exposedWithoutAuth) stats.exposedWithoutAuth++;
       stats.byAuthMethod[svc.auth.method] = (stats.byAuthMethod[svc.auth.method] ?? 0) + 1;
+      // Declarations are counted separately from all of the above, and none of the
+      // detection counters above consults `svc.declared` — a fleet with no sidecar
+      // anywhere reads exactly as it did before the feature existed.
+      const declared = svc.declared;
+      if (declared?.auth.length) stats.declaredAuth++;
+      if (svc.auth.exposedWithoutAuth && declared?.unauthenticatedAccepted) stats.exposureAccepted++;
+      if (declared?.drift.length) stats.declarationDrift++;
     }
   }
   return stats;

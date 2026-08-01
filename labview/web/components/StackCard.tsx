@@ -1,7 +1,7 @@
 import type { AppStack, AuthMethod, IngressKind, Service } from "../model";
 import { ingressSummary, shortImage } from "../lib/format";
 import { AUTH_META, INGRESS_META } from "../lib/palette";
-import { AuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
+import { AcceptedBadge, AuthBadge, DeclaredAuthBadge, ExposedBadge, IngressBadge, StatusDot } from "./badges";
 
 /**
  * One stack, the unit a compose fleet is actually organised in: a directory with a
@@ -33,8 +33,14 @@ export function StackCard({
   const hidden = stack.services.length - services.length;
   const running = services.filter((s) => s.docker?.running).length;
   const liveKnown = services.some((s) => s.docker);
-  const exposed = services.filter((s) => s.auth.exposedWithoutAuth).length;
+  const exposedServices = services.filter((s) => s.auth.exposedWithoutAuth);
+  const exposed = exposedServices.length;
+  // Split rather than netted off: the roll-up still says how many are exposed, and says
+  // separately how many of those someone has already signed off on.
+  const accepted = exposedServices.filter((s) => s.declared?.unauthenticatedAccepted).length;
   const hosts = [...new Set(services.map(ingressSummary).filter(Boolean))].join(", ");
+  const declared = stack.declared;
+  const drift = services.reduce((n, s) => n + (s.declared?.drift.length ?? 0), 0);
 
   // Ordered by the shared palette metadata rather than by appearance, so the same
   // set of postures always reads the same way across stacks.
@@ -77,9 +83,27 @@ export function StackCard({
               ))}
             </span>
           </div>
-          {hosts && (
+          {/* What the operator says this stack is, when they said so. One line: the full
+              text is in the drawer, and a card that grows with the prose stops being
+              scannable, which is the only thing the collapsed view is for. */}
+          {declared?.description && (
+            <div class="stack-desc" title={declared.description}>
+              {declared.description}
+            </div>
+          )}
+          {(hosts || declared?.owner || declared?.criticality) && (
             <div class="metaline" title={hosts}>
-              🔗 {hosts}
+              {hosts && <>🔗 {hosts}</>}
+              {declared?.owner && (
+                <span class="pill" title={`Owner declared in ${declared.file}`}>
+                  {declared.owner}
+                </span>
+              )}
+              {declared?.criticality && (
+                <span class="pill" title={`Criticality declared in ${declared.file}`}>
+                  {declared.criticality}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -90,9 +114,21 @@ export function StackCard({
           {authMethods.map((m) => (
             <AuthBadge key={m} method={m as AuthMethod} />
           ))}
-          {exposed > 0 && (
+          {exposed - accepted > 0 && (
             <span class="badge exposed" title="Reachable with no detected proxy/SSO auth">
-              ⚠ {exposed} exposed, no auth
+              ⚠ {exposed - accepted} exposed, no auth
+            </span>
+          )}
+          {/* Beside the alarm, never subtracted from it: both counts are shown, so the
+              stack's total exposure is still readable off the card. */}
+          {accepted > 0 && (
+            <span class="badge declared" title="Reachable with no detected auth, declared intentional">
+              {accepted} exposed, accepted
+            </span>
+          )}
+          {drift > 0 && (
+            <span class="badge declared" title="A declaration in this stack disagrees with the scan">
+              ⚠ {drift} declaration drift
             </span>
           )}
         </div>
@@ -100,6 +136,14 @@ export function StackCard({
 
       {expanded && (
         <div class="svc-list">
+          {/* Warnings about this stack's own files — a compose document that would not
+              parse, an env var that resolved to nothing, a mistyped key in `.labview`.
+              They live on the stack rather than in the top banner because that is where
+              the file they are about is, and because hoisting them would bury the
+              fleet-wide warnings the banner exists for. */}
+          {stack.warnings.map((w) => (
+            <div class="note">{w}</div>
+          ))}
           {services.map((svc) => (
             <div
               key={svc.name}
@@ -120,7 +164,16 @@ export function StackCard({
               <span class="badges">
                 <IngressBadge kind={svc.ingress} />
                 <AuthBadge method={svc.auth.method} />
-                {svc.auth.exposedWithoutAuth && <ExposedBadge />}
+                {svc.auth.exposedWithoutAuth &&
+                  (svc.declared?.unauthenticatedAccepted ? (
+                    <AcceptedBadge
+                      reason={svc.declared.unauthenticatedAccepted.reason}
+                      file={svc.declared.file}
+                    />
+                  ) : (
+                    <ExposedBadge />
+                  ))}
+                {svc.declared && <DeclaredAuthBadge auth={svc.declared.auth} file={svc.declared.file} />}
               </span>
             </div>
           ))}

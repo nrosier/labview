@@ -7,6 +7,13 @@ export interface DiscoveredStack {
   dir: string;
   composeFile: string;
   envFile?: string;
+  /**
+   * The operator's `.labview` sidecar, if the directory has one. Probed like the
+   * compose file: first name in `sidecarFilenames` that exists wins, so a directory
+   * holding both `.labview` and `.labview.yml` can never half-apply one and then the
+   * other.
+   */
+  sidecarFile?: string;
 }
 
 /**
@@ -40,6 +47,7 @@ export function discoverStacks(cfg: LabViewConfig): DiscoveredStack[] {
       dir,
       composeFile,
       envFile: existsSync(envCandidate) ? envCandidate : undefined,
+      sidecarFile: cfg.sidecarFilenames.map((f) => join(dir, f)).find((p) => existsSync(p)),
     });
   }
 

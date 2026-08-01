@@ -1,0 +1,123 @@
+# .labview — operator-declared context for one stack.
+#
+# Copy this file to `.labview` in a stack directory, beside its compose.yml, and keep
+# only the lines you actually want. Every field is optional; an absent or empty file
+# changes nothing. `.labview.yml` and `.labview.yaml` are also recognised (the first
+# one that exists wins, so do not keep two).
+#
+# What this file is for: the things a scan cannot observe. LabView reports only what
+# it can prove from your compose files, the Docker socket and the Authentik/Traefik
+# APIs — so an app that keeps its own user database looks unauthenticated to it, and a
+# status page you deliberately left open looks like an oversight. Say so here.
+#
+# Two rules worth knowing before you write anything:
+#
+#   1. Nothing here changes what LabView detected. Declarations are stored, counted
+#      and rendered separately, and every one of them is labelled with the name of
+#      this file. A service you declare as internally authenticated still reads
+#      "No proxy auth" from the scan — with your declaration shown beside it.
+#   2. No secrets. Every value below is served verbatim on /api/overview and shown in
+#      the UI. Only the password inside a `links` URL is redacted, and only because
+#      that is the one place a credential plausibly lands by accident.
+#
+# A typo is reported rather than ignored: an unknown key, an unknown mechanism, or a
+# service name your compose file does not define each produce a scan warning, so a
+# declaration that silently did nothing is not a failure mode you have to watch for.
+
+
+# ── Stack level ───────────────────────────────────────────────────────────────
+# These describe the directory as a whole and appear on the stack card.
+
+description: |
+  Media server for the house. Transcodes and streams the library on the NAS.
+
+owner: platform-team                 # free text: a person, a team, an email
+criticality: high                    # free text; critical|high|normal|low get a colour
+
+notes: |
+  Free-form prose shown on the stack. Anything a future reader should know and
+  cannot work out from the compose file.
+
+data: |
+  Library metadata in the config volume, backed up nightly. The media itself lives
+  on the NAS share and is not backed up.
+
+links:                               # up to 32
+  - label: Admin UI
+    url: https://media.example.com/web
+  - label: Upstream docs
+    url: https://example.com/docs
+
+dependencies:                        # things LabView cannot see at all; up to 32
+  - name: NAS SMB share
+    detail: off-fleet, mounted by the host
+  - the household DNS resolver        # a bare string works when there is no detail
+
+
+# ── Service level ─────────────────────────────────────────────────────────────
+# Keys are compose service names, exactly as they appear under `services:` in your
+# compose.yml. All of the stack-level fields above may be repeated here; a service
+# value wins over the stack value, and the UI says when it inherited one.
+
+services:
+  emby:
+    description: The streaming front end.
+    owner: me                        # overrides the stack value
+    criticality: normal
+
+    notes: |
+      Hardware transcoding needs the iGPU device passed through.
+
+    data: |
+      /config holds the user database.
+
+    links:
+      - label: Dashboard
+        url: https://media.example.com/web/index.html#!/dashboard
+
+    # ── Authentication the application performs for itself ───────────────────
+    # This is the field most worth filling in: a login LabView has no way to see,
+    # because it is enforced inside the app rather than by a proxy or by Authentik.
+    #
+    # `mechanism` names the mechanism and never the product, so this reads the same
+    # whatever you run. List as many as apply (up to 8); `detail` is free text.
+    #
+    #   app-local-accounts   the app has its own user database
+    #   app-ldap             the app binds a directory itself
+    #   app-oidc             the app performs its own OIDC/OAuth login
+    #   app-saml             the app performs its own SAML login
+    #   app-token            an API token or key is required
+    #   mtls                 client certificates are required
+    #   network-restricted   reachable only from restricted networks (VPN, VLAN, firewall)
+    #   external-proxy       an authenticating proxy outside the scanned fleet
+    #   other                anything else — `detail` is then required
+    #
+    # Shorthand: `auth: [app-local-accounts, app-ldap]` when there is nothing to add.
+    auth:
+      - mechanism: app-local-accounts
+        detail: Built-in user database, local accounts only.
+      - mechanism: app-ldap
+        detail: LDAP bind against the directory for staff accounts.
+
+    # ── An exposure you have accepted ────────────────────────────────────────
+    # Declare that reachable-without-authentication is a decision rather than an
+    # oversight. The service still counts as exposed — that is deliberate, because a
+    # decision you can no longer see is a decision nobody will revisit. What changes
+    # is that the KPI reads "12 (1 accepted)", the badge says "Exposed, accepted",
+    # your reason is shown, and a "hide accepted" filter can put it out of the way.
+    #
+    # `reason` is REQUIRED. An acceptance with no reason cannot be told apart from a
+    # stray key, so LabView refuses it and warns instead of quieting a real finding.
+    unauthenticated:
+      intentional: true
+      reason: Read-only status page, trusted VLAN only.
+
+    # ── What you expect the exposure to be ───────────────────────────────────
+    # A tripwire, not an override. LabView compares this against what it classified
+    # and reports the disagreement; the classification itself always stands. Useful
+    # on the handful of services where an accidental change would matter — put
+    # `internal` on a database and you will hear about it the day a port appears.
+    #
+    # One of: public | public+lan | public+traefik | traefik | lan | internal
+    expected:
+      ingress: public+traefik

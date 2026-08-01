@@ -1,0 +1,13 @@
+# Regression fixture: an accepted exposure is still an exposure.
+#
+# The port is published with nothing in front of it, so `exposedWithoutAuth` is
+# true. Declaring the exposure intentional must not clear that flag — it may only
+# add the acceptance beside it. A revert that lets the declaration quiet the
+# finding would hide every open service anybody ever signed off on, including the
+# ones whose reason stopped being true.
+services:
+  status:
+    image: example/status:1.0.0
+    container_name: accepted-status
+    ports:
+      - 18110:80
