@@ -26,6 +26,8 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/web/dist ./web/dist
 COPY package.json ./
 COPY config.example.yml ./
+# The passwd format, in the image, because that is where `node dist/hashpw.js` runs.
+COPY passwd.example ./
 
 # Container defaults. Only paths LabView owns are set here: the Docker endpoint
 # is deliberately left unset, because any default TCP host would be a guess about

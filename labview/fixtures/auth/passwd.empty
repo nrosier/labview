@@ -1,0 +1,8 @@
+# A passwd file an operator mounted and has not filled in yet.
+#
+# This pins "open unless configured": comments only means no usable entry, which means
+# no password login, which means LabView enforces nothing and says so once in the log.
+# A file like this must never produce a login screen nobody can get past.
+#
+# Add a line with:
+#   docker exec -it labview node dist/hashpw.js alice

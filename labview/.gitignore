@@ -4,3 +4,6 @@ web/dist/
 *.log
 .DS_Store
 config.local.yml
+# What compose.yml mounts into /config: a real config, a real passwd file, and the
+# secret files beside them. None of it belongs in a repository.
+config/

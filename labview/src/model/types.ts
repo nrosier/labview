@@ -933,3 +933,91 @@ export interface Overview {
   stacks: AppStack[];
   graph: Graph;
 }
+
+/* ------------------------------------------------------------------------- *
+ * LabView's own access control.
+ *
+ * A second contract with the UI, independent of `Overview`: the login screen has
+ * to render before there is anything to scan, and after a 401 there is no
+ * `Overview` at all.
+ *
+ * Nothing here is related to {@link AuthMethod}'s `basic-auth`, which says a
+ * *scanned service* asks for HTTP Basic. This block is about who may read
+ * LabView itself, and shares no vocabulary with it on purpose.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A way of signing in to LabView.
+ *
+ *  - `passwd` — a login form checked against the `user:hash` file in
+ *    `auth.passwd.file`, verified with bcrypt.
+ *  - `oidc` — a redirect to an OpenID Connect provider (Authentik, in the fleet
+ *    this was built against).
+ *
+ * Both are optional and independent; an operator may run either, both, or
+ * neither.
+ */
+export type LoginMethod = "passwd" | "oidc";
+
+/**
+ * Why a sign-in attempt did not produce a session.
+ *
+ * A closed set of codes rather than a message, for two reasons. It crosses a
+ * redirect — the OIDC callback can only hand the UI a query parameter — and a
+ * message built at the failure site is exactly how a credential or an internal
+ * URL ends up on someone's screen (**I6**). The wording lives in
+ * `loginFailureText` and nowhere else.
+ *
+ * `credentials` deliberately covers *both* an unknown user and a wrong password.
+ * Distinguishing them tells an attacker which usernames exist.
+ */
+export type LoginFailureReason =
+  | "credentials"
+  | "throttled"
+  | "method-unavailable"
+  | "session-expired"
+  | "oidc-state"
+  | "oidc-provider"
+  | "oidc-token"
+  | "oidc-identity";
+
+/**
+ * Which sign-in methods are live, and therefore whether the API is gated at all.
+ *
+ * Resolved by `resolveAccessMode` from configuration plus the state of the passwd
+ * file — never from scanned data, so what LabView reads about the fleet can never
+ * change who may read LabView (**I5**).
+ */
+export interface AccessMode {
+  /**
+   * Whether `/api/*` requires a session.
+   *
+   * False when nothing is configured, which is the default and is deliberate:
+   * LabView behaves exactly as it did before it had a login, so pulling a new
+   * image can never lock an operator out of a running deployment. It becomes
+   * true the moment a method is usable.
+   */
+  enforced: boolean;
+  /** The usable methods, in the order the login screen offers them. */
+  methods: LoginMethod[];
+  /**
+   * A method that is switched on but not usable — an empty passwd file, an
+   * issuer with no client id. One line each, for the log and the login screen.
+   *
+   * Never a filesystem path and never a count: this reaches an unauthenticated
+   * visitor through {@link SessionInfo}.
+   */
+  notes: string[];
+}
+
+/** The payload served at /api/session — the one API route a visitor may read. */
+export interface SessionInfo {
+  /** See {@link AccessMode.enforced}. When false, everything is readable. */
+  enforced: boolean;
+  methods: LoginMethod[];
+  notes: string[];
+  /** Present only while signed in. */
+  user?: { name: string; via: LoginMethod };
+  /** What to label the OIDC button, when `methods` includes `oidc`. */
+  oidcLabel?: string;
+}

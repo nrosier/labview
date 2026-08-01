@@ -33,10 +33,21 @@ export interface HttpResponse {
   headers?: { get(name: string): string | null };
 }
 
-/** The subset of `fetch` these modules use. The global `fetch` satisfies it. */
+/**
+ * The subset of `fetch` these modules use. The global `fetch` satisfies it.
+ *
+ * `method` and `body` are optional and were added for the OIDC token exchange, the
+ * one POST in the codebase. Optional so every existing stub — which only ever
+ * received a URL and a signal — still satisfies the type.
+ */
 export type FetchLike = (
   url: string,
-  init?: { headers?: Record<string, string>; signal?: AbortSignal },
+  init?: {
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+    method?: string;
+    body?: string;
+  },
 ) => Promise<HttpResponse>;
 
 export interface JsonResult {
@@ -96,10 +107,55 @@ export interface GetJsonOptions {
 
 /** One GET, with a timeout and no way to throw. */
 export async function getJson(doFetch: FetchLike, url: string, opts: GetJsonOptions): Promise<JsonResult> {
+  return requestJson(doFetch, url, opts);
+}
+
+/**
+ * One `application/x-www-form-urlencoded` POST, same rules as {@link getJson}: it
+ * cannot throw, it names the stage that failed, and nothing it puts in `error` came
+ * from the request.
+ *
+ * The OIDC token exchange is the only POST LabView makes — the sole request in the
+ * whole program that is not a read — and it is here rather than in `auth/oidc.ts` so
+ * that it inherits the timeout, the phase mapping and the not-JSON case instead of
+ * reimplementing them. A token endpoint behind an SSO gate answers with an HTML login
+ * page exactly like every other gated endpoint, and `protocol` is already the right
+ * word for it.
+ *
+ * **The form body is never echoed.** It carries the client secret and the
+ * authorization code, and `requestJson` only ever reports a status or a transport
+ * code.
+ */
+export async function postForm(
+  doFetch: FetchLike,
+  url: string,
+  form: Record<string, string>,
+  opts: GetJsonOptions,
+): Promise<JsonResult> {
+  const body = new URLSearchParams(form).toString();
+  return requestJson(doFetch, url, {
+    ...opts,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...opts.headers,
+    },
+    method: "POST",
+    body,
+  });
+}
+
+async function requestJson(
+  doFetch: FetchLike,
+  url: string,
+  opts: GetJsonOptions & { method?: string; body?: string },
+): Promise<JsonResult> {
   try {
     const res = await doFetch(url, {
       headers: opts.headers ?? { Accept: "application/json" },
       signal: AbortSignal.timeout(opts.timeoutMs),
+      ...(opts.method ? { method: opts.method } : {}),
+      ...(opts.body !== undefined ? { body: opts.body } : {}),
     });
     const setCookie = res.headers?.get("set-cookie") ?? undefined;
     if (!res.ok) {

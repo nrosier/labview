@@ -45,6 +45,10 @@ export type {
   ConnectionPhase,
   ConnectionAttempt,
   ConnectionReport,
+  AccessMode,
+  LoginFailureReason,
+  LoginMethod,
+  SessionInfo,
 } from "../src/model/types";
 
 /**
@@ -107,6 +111,23 @@ export {
   tagFilterActive,
 } from "../src/model/filter";
 export type { TagFilter, TagMode } from "../src/model/filter";
+
+/**
+ * The wording of LabView's own access control, from the same module the server logs and
+ * the routes redirect through — so a failure code cannot mean one thing in a log line and
+ * another on the login screen, and the closed set of codes is validated in one place.
+ *
+ * `parseLoginFailure` matters most: the OIDC callback can only hand the UI a query
+ * parameter, so `?login_error=…` is attacker-supplied by definition and is checked
+ * against the union here rather than rendered.
+ */
+export {
+  isValidUsername,
+  loginFailureText,
+  methodLabel,
+  oidcButtonLabel,
+  parseLoginFailure,
+} from "../src/model/access";
 
 export { diffStacks, scanDiffText, scanDiffDetails } from "../src/model/changes";
 export { diffIntegrations, integrationDiffText, integrationDiffDetails } from "../src/model/changes";

@@ -187,10 +187,13 @@ and drop the `dockerproxy` network.
 
 ### Put it behind your own edge (recommended)
 
-LabView has **no built-in authentication** — it exposes your topology and
-(masked) config, so don't publish it raw. Expose it the same way as your other
-apps by adding labels; [`compose.yml`](compose.yml) has a ready-to-adapt example
-for **Traefik + Authentik forward-auth** and/or **DockFlare**:
+LabView exposes your topology and (masked) config, so don't publish it raw. It has a
+login of its own — off until you configure it, see [Access control](#access-control) —
+and an edge is still the recommendation: it gets you the same SSO, the same audit trail
+and the same certificate as everything else in the fleet, and the two are complementary
+rather than alternatives. Expose it the same way as your other apps by adding labels;
+[`compose.yml`](compose.yml) has a ready-to-adapt example for
+**Traefik + Authentik forward-auth** and/or **DockFlare**:
 
 ```yaml
     labels:
@@ -377,6 +380,229 @@ an error message.
 Every failure here is soft too: nothing answering, a rejected credential, a timeout
 or a shape the parser doesn't recognize leaves the posture exactly as the labels
 described it, with the reason in `meta.traefik.error`.
+
+---
+
+## Access control
+
+LabView can require a login of its own — a password form backed by `/config/passwd`,
+OIDC against your provider, or both. It is **off until you configure it**, so pulling a
+newer image never locks you out of a running deployment, and an existing setup behind
+Traefik + Authentik keeps behaving exactly as it did.
+
+Whichever posture applies, LabView says so in one line at startup:
+
+```text
+LabView access control: none — the HTTP surface is open to anyone who can reach it, relying on your edge
+LabView access control: password login (3 users) — /api requires a session
+LabView access control: password login (3 users) + OIDC (authentik.example.com) — /api requires a session
+```
+
+Counts, never names: a user list in a log file is an inventory of accounts to try. The
+line is re-printed when it changes, so creating `/config/passwd` on a running LabView
+tells you it was picked up instead of leaving you to guess.
+
+### The three postures
+
+| Posture | How you get it | What happens |
+|---|---|---|
+| **Open** | the default — no passwd entries, no OIDC issuer | Every route answers as it always has. Nothing is gated |
+| **Password** | a `/config/passwd` with at least one usable entry | `/api` needs a session; the UI renders a login card |
+| **OIDC** | `auth.oidc.issuer` **and** `auth.oidc.clientId` set | Same, with a "Sign in with …" button. Both methods can be live at once |
+
+A method that is switched on but unusable — `passwd.enabled: true` with an empty file, an
+issuer with no client id — is a **warning in the log, never a lock-out**. Enforcement
+turns on only when at least one method can actually let someone in.
+
+**What is gated.** Everything under `/api/` needs a session, except four exact paths:
+`/api/healthz`, `/api/session`, `/api/login` and `/api/logout`. The SPA itself —
+`index.html`, `styles.css`, `app.js` — stays public and renders the login card, which is
+safe because those files carry nothing about your fleet: they are the same bytes in every
+deployment. Nothing describing a stack, a host or a container is served before you sign
+in.
+
+The allowlist is an exact match on a normalised path, not a prefix — `/api/healthz/../overview`
+and `/api/sessionx` are both gated, which the obvious `startsWith` version would not be.
+
+### Users in `/config/passwd`
+
+One `user:hash` per line, `#` comments and blank lines ignored — `/etc/shadow`'s and
+`htpasswd`'s format, with the algorithm named by the hash's own `$id$` prefix:
+
+```text
+# /config/passwd
+alice:$2b$12$…      # 60 characters in full: $2b$, the cost, then salt+digest
+bob:$2y$12$…
+```
+
+- **bcrypt** (`$2a$`, `$2b$`, `$2y$`) is what LabView verifies — what `htpasswd -nbB`
+  writes and what Traefik's own basicauth takes.
+- Any other prefix (`$5$`, `$6$`, `$argon2id$`) is **skipped with a warning naming the
+  algorithm**, never the hash.
+- A line with no `$` prefix is a plaintext password. It is skipped; LabView never accepts
+  one.
+- A username may contain letters, digits and `. _ @ -`, up to 64 characters — narrow
+  because a username reaches log lines and the topbar.
+- On a duplicate username the **first line wins** and the duplicate is warned about.
+- One bad line never breaks the file: every other user still signs in.
+
+The file is **re-read when it changes** (size, mtime, inode), so adding a user needs no
+restart. [`passwd.example`](passwd.example) is the annotated version of the above, with a
+line you can copy the shape from.
+
+Three ways to make a line:
+
+```bash
+# in the container — prompts with echo off, prints one line to stdout
+docker exec -it labview node dist/hashpw.js alice >> ./config/passwd
+
+# from a checkout
+npm run hashpw -- alice
+
+# with apache2-utils, if you have it
+htpasswd -nbB alice '<password>'
+```
+
+The first two never take the password as an argument, because `ps`, `/proc` and your
+shell history can all read a command line; `htpasswd` does, which is worth knowing before
+you use it. `--cost N` (default 12) sets how slow verification is — every sign-in pays
+it, and 12 is roughly 250 ms on a homelab CPU.
+
+**Failed sign-ins are throttled per username**: `auth.maxFailedAttempts` (5) within
+`auth.lockoutSeconds` (60) and the next attempt gets a `429` with `Retry-After`, even if
+the password is right. Keyed on the username rather than the address, because behind a
+tunnel and a reverse proxy every request shares one source address — keying on the
+address would let one wrong password lock out the fleet. An unknown username and a wrong
+password produce the same message in the same amount of time, so the form is not a way to
+enumerate accounts.
+
+### Sessions
+
+A signed cookie, `labview_session` by default, and nothing stored server-side: a restart
+signs everyone out, which is a better trade for a dashboard than a session database. Two
+replicas behind the same proxy work with no shared state beyond `auth.session.secret`.
+
+- `HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age` from `auth.session.ttlMinutes` (720).
+- `Secure` when the request arrived over https. `auth.session.secure: auto` reads
+  `X-Forwarded-Proto`; set `"true"`/`"false"` only if your proxy does not send it. A
+  `Secure` cookie over plain http is never stored, and the symptom is a login form that
+  takes the password and comes straight back with nothing in any log.
+- Signing out revokes the token rather than merely dropping the browser's copy.
+- Every POST is checked for a matching `Origin` while enforcing, on top of `SameSite`. A
+  **missing** `Origin` is allowed, so `curl` and health checkers still work; a present one
+  from another host gets a `403`.
+
+Set **`auth.session.secret`** (or `LABVIEW_SESSION_SECRET_FILE`) if you would rather a
+restart did not sign everyone out. With it unset, LabView generates one at startup and
+says so.
+
+### OIDC with Authentik
+
+Ten minutes, and the last two steps are the ones people miss.
+
+1. **A signing key must be RSA or EC.** In Authentik, *Applications → Providers → Create
+   → OAuth2/OpenID Provider*, and set **Signing Key** to a certificate (the built-in
+   *authentik Self-signed Certificate* is fine). Leave it empty and Authentik signs ID
+   tokens with **HS256** using the client secret — LabView refuses every HMAC algorithm,
+   deliberately, because a symmetric alg beside a published JWKS is a known key-confusion
+   vector. The log says `signed with HS256, which LabView does not accept` if you hit it.
+2. **Client type: Confidential.** Public works too (PKCE is used either way), but
+   confidential is one fewer thing to reason about for a server-side app.
+3. **Redirect URI — strict.** Set *Redirect URIs/Origins* to `Strict` with exactly:
+
+   ```text
+   https://labview.example.com/auth/oidc/callback
+   ```
+
+   The path is fixed. Use the hostname a browser actually types, not the container name.
+4. **Scopes**: `openid`, `profile`, `email` — the default set. `openid` is sent whatever
+   you configure; `profile` is what carries `preferred_username`.
+5. **Create the Application** (*Applications → Applications → Create*), give it a
+   **slug** — say `labview` — and assign the provider you just made.
+6. **Copy the issuer, client id and secret.** The provider page shows them; the issuer is
+   the app slug's OIDC base:
+
+   ```text
+   https://authentik.example.com/application/o/labview/
+   ```
+
+   LabView checks that the discovery document's own `issuer` equals this exactly (a
+   trailing slash either way is forgiven, nothing else is) — the standard mix-up defence.
+7. **Restrict who may sign in.** An Application with no policy binding is launchable by
+   every authenticated user. Bind a group: *the Application → Policy/Group/User Bindings →
+   Bind existing group*. LabView has no roles of its own — everyone who gets in sees the
+   same read-only overview — so this binding is the whole authorization story.
+8. **Configure LabView** and restart it:
+
+   ```yaml
+   environment:
+     LABVIEW_OIDC_ISSUER: https://authentik.example.com/application/o/labview/
+     LABVIEW_OIDC_CLIENT_ID: <client id>
+     LABVIEW_OIDC_CLIENT_SECRET_FILE: /run/secrets/labview_oidc_secret
+     LABVIEW_OIDC_REDIRECT_URI: https://labview.example.com/auth/oidc/callback
+   volumes:
+     - ./config/oidc-secret:/run/secrets/labview_oidc_secret:ro
+   ```
+
+   `LABVIEW_OIDC_CLIENT_SECRET` works and is visible in `docker inspect`; prefer the file
+   form. `LABVIEW_OIDC_REDIRECT_URI` may be omitted — LabView then derives it from the
+   request, honouring `X-Forwarded-Proto`/`-Host`, which is right behind a single proxy and
+   wrong as soon as two hostnames reach the same LabView.
+
+The button reads *Sign in with authentik.example.com* by default, which tells a visitor
+who has not signed in yet what your provider's hostname is. Set `auth.oidc.label` to
+`"Sign in with SSO"` if you would rather it did not.
+
+What LabView checks on the way back, all of it non-negotiable: `state` against the signed
+transient cookie, the ID token's signature against `jwks_uri` (asymmetric algorithms
+only, one JWKS refetch on an unknown `kid` for key rotation), `iss` exactly, `aud`
+containing the client id, `azp` when present, `exp`/`iat` within 60 s, and `nonce`
+matching this attempt. The username comes from `auth.oidc.usernameClaim`, falling back
+`preferred_username` → `email` → `sub`.
+
+### When a sign-in fails
+
+The browser is told a **code**; the reason goes to the log. That split is deliberate — a
+provider's complaint can name an endpoint or a claim value, and the login screen is not
+the place for either.
+
+| Code | Means | Where to look |
+|---|---|---|
+| `credentials` | Wrong password, or no such user — one message for both | The log names the username that was tried |
+| `throttled` | Too many failed attempts for that username | Wait out `Retry-After`; the log gives the seconds |
+| `method-unavailable` | The method used is not live — an OIDC start with no issuer, a login POST with an empty passwd file | The startup line says which methods are live |
+| `session-expired` | A gated request 401'd mid-session: the TTL passed, or LabView restarted with a generated secret | Set `auth.session.secret` to survive restarts |
+| `oidc-state` | The callback did not match a sign-in attempt — the 5-minute window passed, cookies were blocked, or a stale bookmark was opened | Start again from `/` |
+| `oidc-provider` | Discovery failed, or the provider refused the sign-in | The log gives the stage: resolve, connect, authenticate, path, timeout — or the provider's own code, e.g. `access_denied` from a policy binding |
+| `oidc-token` | The token exchange or the ID-token check failed | The log names the check: client credentials, redirect URI, signature, `iss`, `aud`, `nonce`, algorithm |
+| `oidc-identity` | The ID token had no usable username | Add the `profile` or `email` scope, or set `auth.oidc.usernameClaim` |
+
+Failures redirect to `/?login_error=<code>`, and the code is validated against that
+closed set before anything is rendered — a crafted `?login_error=` cannot put text on the
+login screen.
+
+### If your edge already does SSO
+
+You may not want any of this. When LabView sits behind Traefik with an
+`authentik@docker` forward-auth middleware, the request has already been authenticated
+before it reaches the container, and LabView's own login is a second password to manage
+for no gain. Leave it unconfigured — the default — and the startup line will say the
+surface is open, relying on your edge, which is the accurate description of that setup.
+
+The case for switching it on anyway is narrow and real: a published host port bypasses
+the middleware entirely (LabView will tell you so about itself, with a `lan` tag), a
+tunnel origin pointed at the container instead of at the proxy does the same, and neither
+is visible from the browser. A passwd file is the backstop for the day one of those is
+misconfigured.
+
+To turn the password form off explicitly — because you want OIDC only, or your edge only —
+set `auth.passwd.enabled: false` (or `LABVIEW_AUTH_PASSWD_ENABLED=false`). The file is
+then not read at all.
+
+There is deliberately **no trusted-header mode**: LabView will not take
+`X-Forwarded-User` or `X-authentik-username` as proof of identity, because trusting a
+header is only safe when the edge is guaranteed to strip it, and LabView cannot verify
+that. If you trust your edge that much, the open posture is what you want.
 
 ---
 
@@ -728,7 +954,13 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `LABVIEW_TRAEFIK_PASSWORD` is in the always-masked key list, so LabView scanning
   its own stack cannot print its own credential, and no credential is interpolated
   into any error string.
-- No built-in auth — put it behind your own edge (see above).
+- **LabView's own login is off until configured, and gates the data when it is.** With a
+  `/config/passwd` entry or an OIDC issuer, `/api` needs a session; the SPA shell stays
+  public because it carries nothing fleet-specific. Passwords are bcrypt, failed attempts
+  are throttled per username, sessions are `HttpOnly` signed cookies with an `Origin`
+  check on every POST, and there is no trusted-header mode — see
+  [Access control](#access-control). Unconfigured, the surface is open and the startup log
+  says so: put it behind your own edge (see above).
 
 ---
 
@@ -887,11 +1119,22 @@ The classification always stands. Drift is a report, never an override.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/overview` | GET | The full analyzed model (JSON) |
-| `/api/rescan` | POST | Re-read the apps root and return the rebuilt overview |
+| `/api/overview` | GET | **Needs a session.** The full analyzed model (JSON) |
+| `/api/rescan` | POST | **Needs a session.** Re-read the apps root and return the rebuilt overview |
 | `/api/healthz` | GET | Liveness probe |
+| `/api/session` | GET | The posture and who you are: `{enforced, methods, notes, user?, oidcLabel?}` |
+| `/api/login` | POST | `{username, password}` → a session cookie. `401 {error:"credentials"}`, or `429 {error:"throttled", retryAfterSeconds}` |
+| `/api/logout` | POST | Revokes the session and clears the cookie |
+| `/auth/oidc/start` | GET | 302 to the provider's authorize URL |
+| `/auth/oidc/callback` | GET | The provider's redirect target; 302 to `/`, or to `/?login_error=<code>` |
 
-The web UI is a static SPA served from the same origin.
+"Needs a session" applies only while [access control](#access-control) is configured. With
+none configured, every route answers as it always has. A gated request with no valid
+session gets `401 {"error":"unauthorized"}` and `Cache-Control: no-store`; the four public
+`/api` paths are an exact-match allowlist, not a prefix.
+
+The web UI is a static SPA served from the same origin, and stays readable without a
+session — it is what renders the login card.
 
 One field shape matters if you read that JSON yourself.
 `meta.authentik.unmatchedApplications` and `meta.traefik.unmatchedRouters` are

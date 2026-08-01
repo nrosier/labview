@@ -1,0 +1,18 @@
+# A well-formed passwd file, for the smoke pass.
+#
+# Cost 4 on purpose: three verifies per run at cost 12 would add most of a second to
+# the test for nothing. `hashpw` defaults to 12, and this file is not a template —
+# see passwd.example for that.
+#
+# The three bcrypt ids that exist in the wild are all here, because "the algorithm is
+# whatever the hash says it is" is the rule this whole format rests on, and a file
+# written by `htpasswd` may carry any of them.
+
+# alice-secret
+alice:$2b$04$sK3S6P7sLdjrSBK2CFWuT.R0m6ib.r6OntwB9eIfJ.P3XgExAyIia
+
+# bob-secret, as an older tool would have written it
+bob:$2a$04$YL9hQg1GXsIEZ1CAp6AKBeviDpJNhy7xQ2hb9M5Ix4qKsqG.E9HoW
+
+# carol-secret, the prefix a PHP-era tool emits
+carol:$2y$04$XiBQgLIZplH8kyzKWJwPxu2w1RHuwH7v5wPTlqDqml3GcgHP5mxji

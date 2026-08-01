@@ -6,12 +6,14 @@ import type {
   AuthentikSummary,
   ConnectionReport,
   IngressKind,
+  LoginFailureReason,
   Overview,
   Service,
+  SessionInfo,
   TagFilter,
   TraefikSummary,
 } from "./model";
-import { declaredAuthLabel, formatExposureCount, phaseText, shouldBanner } from "./model";
+import { declaredAuthLabel, formatExposureCount, parseLoginFailure, phaseText, shouldBanner } from "./model";
 import {
   EMPTY_TAG_FILTER,
   cycleTag,
@@ -29,7 +31,8 @@ import {
   type IntegrationDiff,
   type ScanDiff,
 } from "./model";
-import { fetchOverview, rescan } from "./api";
+import { UnauthorizedError, fetchOverview, fetchSession, logout, rescan } from "./api";
+import { Login } from "./components/Login";
 import { AUTH_META, INGRESS_META, authLabel, ingressLabel } from "./lib/palette";
 import { fmtTime, ingressSummary, qualifyRouter, serviceKey } from "./lib/format";
 import { StatTile, DistributionBar, TagBars, type DistSegment } from "./components/stats";
@@ -194,6 +197,25 @@ function ConnectionBanner({ reports }: { reports: ConnectionReport[] | undefined
   );
 }
 
+/**
+ * The failure code a redirect left in the address bar, taken once and removed.
+ *
+ * The OIDC routes can only report a failure by redirecting, so `?login_error=…` is how
+ * that arrives. Validated through `parseLoginFailure` because the value is
+ * attacker-supplied by definition, and stripped with `replaceState` so a reload or a
+ * shared link does not resurrect an error about an attempt that is long over.
+ */
+function readLoginError(): LoginFailureReason | undefined {
+  const params = new URLSearchParams(location.search);
+  const reason = parseLoginFailure(params.get("login_error"));
+  if (params.has("login_error")) {
+    params.delete("login_error");
+    const query = params.toString();
+    history.replaceState(null, "", `${location.pathname}${query ? `?${query}` : ""}${location.hash}`);
+  }
+  return reason;
+}
+
 function applyTheme(theme: Theme) {
   const el = document.documentElement;
   if (theme === "auto") el.removeAttribute("data-theme");
@@ -203,6 +225,15 @@ function applyTheme(theme: Theme) {
 function App() {
   const [ov, setOv] = useState<Overview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Who may read this LabView, from `/api/session` — the one API route a visitor may
+   * read. `null` until it answers, which is why the overview fetch waits on it: when
+   * LabView is enforcing there is no overview to fetch yet, and asking first would put a
+   * 401 in the console of every cold load.
+   */
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  /** A failure code from a redirect or from a session that ran out mid-visit. */
+  const [loginError, setLoginError] = useState<LoginFailureReason | undefined>(readLoginError);
   const [busy, setBusy] = useState(false);
   // What the last rescan found, held until the next one. The initial load has nothing to
   // compare against, so both stay null and the notes are absent rather than empty.
@@ -246,11 +277,47 @@ function App() {
     applyTheme(theme);
   }, [theme]);
 
+  /**
+   * Whether the fleet may be read: either nothing is enforced — the default, and how
+   * LabView behaved before it had a login — or there is a session.
+   */
+  const mayRead = session !== null && (!session.enforced || session.user !== undefined);
+
   useEffect(() => {
-    fetchOverview()
-      .then(setOv)
+    fetchSession()
+      .then(setSession)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
+
+  // Second, and only once reading is allowed. Signing in flips `mayRead` and this fires,
+  // so the card hands straight over to the overview without a reload.
+  useEffect(() => {
+    if (!mayRead) return;
+    fetchOverview().then(setOv).catch(loadFailed);
+  }, [mayRead]);
+
+  /**
+   * A failed read of the fleet.
+   *
+   * A 401 is not an error to report — it means the session went away (expired, revoked, or
+   * a restart with a generated secret), so the fleet comes off the screen and the card
+   * comes back saying which. Anything else is the red box it always was.
+   *
+   * A session re-read that itself fails keeps the previous snapshot rather than raising:
+   * the visitor needs the card, and the card's own submit path is what reports an
+   * unreachable server, in the words of the thing they just tried to do.
+   */
+  function loadFailed(e: unknown): void {
+    if (e instanceof UnauthorizedError) {
+      setOv(null);
+      setLoginError("session-expired");
+      fetchSession()
+        .then(setSession)
+        .catch(() => undefined);
+      return;
+    }
+    setError(e instanceof Error ? e.message : String(e));
+  }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -278,9 +345,26 @@ function App() {
       setDiff(before ? diffStacks(before.stacks, next.stacks) : null);
       setApiDiff(before ? diffIntegrations(before, next) : null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      loadFailed(e);
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * Sign out, then reload.
+   *
+   * The reload is the point, not a shortcut: an open drawer, a filter and a selected
+   * service all describe a fleet this browser may no longer read, and clearing them one
+   * by one is a list that grows every time the UI does. Coming back through a cold load
+   * shows whatever the server now says, which after a successful sign-out is the card.
+   */
+  async function doSignOut() {
+    setBusy(true);
+    try {
+      await logout();
+    } finally {
+      location.reload();
     }
   }
 
@@ -386,6 +470,25 @@ function App() {
       else next.add(stackId);
       return next;
     });
+  }
+
+  // Before the error box on purpose: a visitor who has to sign in is shown how to, even
+  // if a read failed on the way here — the card carries the reason, and its own submit
+  // path is what reports a server that cannot be reached.
+  if (session && session.enforced && !session.user) {
+    return (
+      <Login
+        info={session}
+        initialError={loginError}
+        onSignedIn={() => {
+          setLoginError(undefined);
+          setError(null);
+          fetchSession()
+            .then(setSession)
+            .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+        }}
+      />
+    );
   }
 
   if (error && !ov) {
@@ -548,6 +651,17 @@ function App() {
           )}
         </div>
         <div class="spacer" />
+        {/* Only while enforcing — with nothing configured there is no session to name and
+            no way to end one, and a "signed in as" line would be a fiction. */}
+        {session?.user && (
+          <span class="who">
+            signed in as <strong>{session.user.name}</strong>
+            {" · "}
+            <button class="linkbtn" onClick={doSignOut} disabled={busy}>
+              Sign out
+            </button>
+          </span>
+        )}
         <button
           class="btn"
           onClick={() => {

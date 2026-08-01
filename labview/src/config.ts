@@ -98,6 +98,56 @@ export interface LabViewConfig {
     /** Per-request timeout. The whole exchange is three GETs. */
     timeoutMs: number;
   };
+  /**
+   * LabView's own access control — a login screen in front of its API, distinct from
+   * the authentication it *reports* about the services it scans.
+   *
+   * **`enabled` here means "allowed", not "on".** Both methods stay dormant until they
+   * are also usable: `passwd` needs a file with at least one entry, `oidc` needs an
+   * issuer and a client id. With nothing configured LabView behaves exactly as it did
+   * before this block existed — open, relying on the operator's edge — and says so once
+   * in the log. That way pulling a new image can never lock anyone out of a running
+   * deployment, and turning the login on is a deliberate act.
+   */
+  auth: {
+    passwd: {
+      /** `false` is the explicit off switch for operators who use a provider instead. */
+      enabled: boolean;
+      /** `user:hash` per line. The hash names its own algorithm; bcrypt is verified. */
+      file: string;
+    };
+    oidc: {
+      enabled: boolean;
+      /** e.g. `https://authentik.example.com/application/o/labview/`. Empty = off. */
+      issuer: string;
+      clientId: string;
+      /** Prefer `clientSecretFile`. Empty means a public client authenticating by PKCE. */
+      clientSecret: string;
+      /** Path to a file holding the secret. Wins over `clientSecret`. */
+      clientSecretFile: string;
+      /** Registered with the provider. Empty = derive it from the request. */
+      redirectUri: string;
+      scopes: string[];
+      /** Claim to take the username from, before falling back to email and sub. */
+      usernameClaim: string;
+      /** Button text. Empty = "Sign in with <issuer host>". */
+      label: string;
+      timeoutMs: number;
+    };
+    session: {
+      /** HMAC key for the session cookie. Empty = a random one per start. */
+      secret: string;
+      /** Path to a file holding the secret. Wins over `secret`. */
+      secretFile: string;
+      ttlMinutes: number;
+      cookieName: string;
+      /** `auto` follows the effective scheme; `true`/`false` force it. */
+      secure: "auto" | "true" | "false";
+    };
+    /** Failed attempts per username before a lockout. */
+    maxFailedAttempts: number;
+    lockoutSeconds: number;
+  };
   cacheTtlSeconds: number;
   server: { host: string; port: number };
 }
@@ -135,7 +185,12 @@ const DEFAULTS: LabViewConfig = {
     // LabView's own credentials are already caught by the TOKEN and PASS patterns,
     // but they are named explicitly so that editing keyPatterns cannot expose
     // them: a fleet that runs LabView from inside appsRoot scans its own stack.
-    keysAlways: ["LABVIEW_AUTHENTIK_TOKEN", "LABVIEW_TRAEFIK_PASSWORD"],
+    keysAlways: [
+      "LABVIEW_AUTHENTIK_TOKEN",
+      "LABVIEW_TRAEFIK_PASSWORD",
+      "LABVIEW_OIDC_CLIENT_SECRET",
+      "LABVIEW_SESSION_SECRET",
+    ],
     keysNever: ["PUBLIC_KEY_URL", "KEYCLOAK_REALM"],
     redactUriCredentials: true,
   },
@@ -170,6 +225,28 @@ const DEFAULTS: LabViewConfig = {
     password: "",
     passwordFile: "",
     timeoutMs: 5000,
+  },
+  auth: {
+    // Both methods allowed and both dormant: the passwd path does not exist until an
+    // operator mounts one, and the issuer is empty. See the interface above.
+    passwd: { enabled: true, file: "/config/passwd" },
+    oidc: {
+      enabled: true,
+      issuer: "",
+      clientId: "",
+      clientSecret: "",
+      clientSecretFile: "",
+      redirectUri: "",
+      scopes: ["openid", "profile", "email"],
+      usernameClaim: "preferred_username",
+      label: "",
+      timeoutMs: 5000,
+    },
+    // Twelve hours: long enough that a dashboard left open all day does not sign itself
+    // out, short enough that a stolen cookie is not indefinite.
+    session: { secret: "", secretFile: "", ttlMinutes: 720, cookieName: "labview_session", secure: "auto" },
+    maxFailedAttempts: 5,
+    lockoutSeconds: 60,
   },
   cacheTtlSeconds: 60,
   server: { host: "0.0.0.0", port: 8080 },
@@ -274,6 +351,49 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_TRAEFIK_TIMEOUT) {
     const n = Number(env.LABVIEW_TRAEFIK_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.traefik.timeoutMs = Math.floor(n);
+  }
+  // Access control. `!== "false"` rather than `=== "true"` matches every other boolean
+  // here: the variable being present at all means the operator meant something by it.
+  if (env.LABVIEW_AUTH_PASSWD_ENABLED) cfg.auth.passwd.enabled = env.LABVIEW_AUTH_PASSWD_ENABLED !== "false";
+  if (env.LABVIEW_AUTH_PASSWD_FILE) cfg.auth.passwd.file = env.LABVIEW_AUTH_PASSWD_FILE;
+  if (env.LABVIEW_OIDC_ENABLED) cfg.auth.oidc.enabled = env.LABVIEW_OIDC_ENABLED !== "false";
+  if (env.LABVIEW_OIDC_ISSUER) cfg.auth.oidc.issuer = env.LABVIEW_OIDC_ISSUER;
+  if (env.LABVIEW_OIDC_CLIENT_ID) cfg.auth.oidc.clientId = env.LABVIEW_OIDC_CLIENT_ID;
+  if (env.LABVIEW_OIDC_CLIENT_SECRET) cfg.auth.oidc.clientSecret = env.LABVIEW_OIDC_CLIENT_SECRET;
+  if (env.LABVIEW_OIDC_CLIENT_SECRET_FILE) cfg.auth.oidc.clientSecretFile = env.LABVIEW_OIDC_CLIENT_SECRET_FILE;
+  if (env.LABVIEW_OIDC_REDIRECT_URI) cfg.auth.oidc.redirectUri = env.LABVIEW_OIDC_REDIRECT_URI;
+  if (env.LABVIEW_OIDC_SCOPES) {
+    const scopes = env.LABVIEW_OIDC_SCOPES.split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (scopes.length) cfg.auth.oidc.scopes = scopes;
+  }
+  if (env.LABVIEW_OIDC_USERNAME_CLAIM) cfg.auth.oidc.usernameClaim = env.LABVIEW_OIDC_USERNAME_CLAIM;
+  if (env.LABVIEW_OIDC_LABEL) cfg.auth.oidc.label = env.LABVIEW_OIDC_LABEL;
+  if (env.LABVIEW_OIDC_TIMEOUT) {
+    const n = Number(env.LABVIEW_OIDC_TIMEOUT);
+    if (Number.isFinite(n) && n > 0) cfg.auth.oidc.timeoutMs = Math.floor(n);
+  }
+  if (env.LABVIEW_SESSION_SECRET) cfg.auth.session.secret = env.LABVIEW_SESSION_SECRET;
+  if (env.LABVIEW_SESSION_SECRET_FILE) cfg.auth.session.secretFile = env.LABVIEW_SESSION_SECRET_FILE;
+  if (env.LABVIEW_SESSION_TTL_MINUTES) {
+    const n = Number(env.LABVIEW_SESSION_TTL_MINUTES);
+    if (Number.isFinite(n) && n >= 1) cfg.auth.session.ttlMinutes = Math.floor(n);
+  }
+  if (env.LABVIEW_SESSION_COOKIE_NAME) cfg.auth.session.cookieName = env.LABVIEW_SESSION_COOKIE_NAME;
+  // Anything other than the three known values leaves the default in place, because
+  // guessing wrong here produces a login form that silently never sets a cookie.
+  if (env.LABVIEW_AUTH_COOKIE_SECURE) {
+    const v = env.LABVIEW_AUTH_COOKIE_SECURE;
+    if (v === "auto" || v === "true" || v === "false") cfg.auth.session.secure = v;
+  }
+  if (env.LABVIEW_AUTH_MAX_FAILED_ATTEMPTS) {
+    const n = Number(env.LABVIEW_AUTH_MAX_FAILED_ATTEMPTS);
+    if (Number.isFinite(n) && n >= 1) cfg.auth.maxFailedAttempts = Math.floor(n);
+  }
+  if (env.LABVIEW_AUTH_LOCKOUT_SECONDS) {
+    const n = Number(env.LABVIEW_AUTH_LOCKOUT_SECONDS);
+    if (Number.isFinite(n) && n >= 1) cfg.auth.lockoutSeconds = Math.floor(n);
   }
   if (env.LABVIEW_PORT) cfg.server.port = Number(env.LABVIEW_PORT);
   if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;

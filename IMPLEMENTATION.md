@@ -48,6 +48,16 @@ SSO provider. Each is listed with where it is satisfied.
 | **R7** | Serve the documentation from a built-in webserver, itself exposable through the same tunnel/proxy/SSO chain | [server/server.ts](labview/src/server/server.ts), labelled example in `labview/compose.yml` |
 | **R8** | Be generic: the above is an *example* of a fleet, never a description of one | §4 I1–I3, enforced by the fixtures in §8 |
 | **R9** | When one of those optional reads does not work, say which stage failed and what to change — for every target, present and future | [model/connections.ts](labview/src/model/connections.ts); §3.10, surfaced in the startup log, `--summary`, `meta.connections` and a banner |
+| **R10** | Be able to require a login of its own — a password form over `/config/passwd`, optionally switched off, plus optional OIDC — without changing the behaviour of a deployment that configures neither | [model/access.ts](labview/src/model/access.ts) + [src/auth/](labview/src/auth/) + [server/auth.ts](labview/src/server/auth.ts); §3.13 |
+
+R10 arrived after R7 and partly reverses the posture R7 assumed. R7 says the
+dashboard is exposable *through* the operator's tunnel/proxy/SSO chain, and that
+remains the recommended deployment; R10 says LabView must not *depend* on that chain,
+because the two ways it is bypassed — a published host port, a tunnel origin pointed at
+the container instead of the proxy — are exactly the mistakes LabView reports in other
+people's stacks. The reconciliation is **open unless configured** (§3.13): configure
+nothing and the surface is as open as R7 always left it, with one line in the log
+saying so.
 
 ### 2.1 What must not be assumed
 
@@ -60,6 +70,10 @@ following are **not** available to the code and must never be hard-coded:
 - That a naming convention identifies a role (`auth.*` is not Authentik, `db` is
   not a database, `proxy` is not Traefik).
 - That the Docker Engine is reachable, or reachable at a particular address.
+- That the edge in front of LabView authenticates anything, or that a request
+  carrying `X-Forwarded-User`, `X-authentik-username` or any similar header has been
+  authenticated by it. A header is proof only if the edge is guaranteed to strip an
+  inbound copy, which LabView cannot verify — so it is never read as identity (§3.13).
 
 Anything derived from the operator's fleet is *discovered at scan time* from that
 fleet, not configured in advance. The only names that ship as defaults are ones
@@ -83,6 +97,8 @@ labview/
     model/types.ts    THE contract between backend and frontend
     model/connections.ts  connection-report wording, hints, log/banner rules (pure)
     model/changes.ts  what changed between two scans, and its wording (pure)
+    model/access.ts   access-control vocabulary: posture line, failure text, username rule (pure, web-safe)
+    hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
       discover.ts     appsRoot -> stack directories
       compose.ts      compose YAML -> normalized AppStack/Service
@@ -105,8 +121,16 @@ labview/
       docker.ts       Docker Engine snapshot (never throws)
       authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
       traefik.ts      Traefik runtime-API snapshot (never throws; all network I/O)
+    auth/
+      hash.ts         modular-crypt dispatch over bcryptjs (`$2a$`/`$2b$`/`$2y$`)
+      passwd.ts       parsePasswd (pure) + readPasswd (fs, re-read on stat change)
+      session.ts      signed session cookie, revocations, Origin/scheme rules (now injected)
+      oidc.ts         discovery, PKCE, token exchange, ID-token verification (now + fetch injected)
+      throttle.ts     failed sign-ins per username (now injected)
+      index.ts        resolveAccessMode, isPublicPath, requiresSession, config resolution
     server/cache.ts   scan cache: TTL, coalescing, force semantics (§3.11)
-    server/server.ts  Fastify: /api/* + static UI, with a TTL cache
+    server/auth.ts    the gate: one onRequest hook, one onSend hook, five routes (§3.13)
+    server/server.ts  Fastify: buildApp() -> /api/* + static UI, with a TTL cache
   web/                Preact UI (see §3.9)
   scripts/
     build-web.mjs     esbuild bundle
@@ -595,6 +619,13 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
 - It must stay free of Node-only imports — the web build imports it directly.
 - `web/model.ts` re-exports it so UI files have one import surface. Add new
   exported types there too.
+- [model/access.ts](labview/src/model/access.ts) is under the same rule and for a
+  sharper reason: the login screen imports it, `tsconfig.web.json` compiles `web/` with
+  `types: []`, so a stray `node:crypto` there is a compile error rather than a bundle
+  that breaks in a browser. Everything needing a hash, a file or a socket lives in
+  `src/auth/`, and none of it is reachable from `web/`. `SessionInfo`, `LoginMethod`,
+  `LoginFailureReason` and `AccessMode` are in `model/types.ts` with the rest of the
+  contract; the *wording* for them is in `model/access.ts`.
 - Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
   **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
   a colour and a label, and an unmapped member silently renders grey. For
@@ -603,14 +634,29 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
 
 ### 3.8 Serving
 
-Fastify with three routes and a static mount:
+Fastify with a static mount and eight routes, three of them the data API and five the
+gate's (§3.13):
 
-| Route | Behaviour |
-|---|---|
-| `GET /api/overview` | cached scan; rebuilds when older than `cacheTtlSeconds` |
-| `POST /api/rescan` | forces a rebuild that re-reads the apps root, and returns it (§3.11) |
-| `GET /api/healthz` | `{ok: true}`, no scan |
-| `GET /*` | the built UI from `web/dist`, SPA-style fallback to `index.html`; a 404 under `/api/` stays JSON |
+| Route | Needs a session | Behaviour |
+|---|---|---|
+| `GET /api/overview` | yes | cached scan; rebuilds when older than `cacheTtlSeconds` |
+| `POST /api/rescan` | yes | forces a rebuild that re-reads the apps root, and returns it (§3.11) |
+| `GET /api/healthz` | no | `{ok: true}`, no scan |
+| `GET /api/session` | no | `SessionInfo`: the posture, the live methods, and the signed-in user if any |
+| `POST /api/login` | no | username + password → a session cookie |
+| `POST /api/logout` | no | revokes the token and clears the cookie |
+| `GET /auth/oidc/start` | no | 302 to the provider's authorize URL |
+| `GET /auth/oidc/callback` | no | code → a session cookie → 302 `/`, or 302 `/?login_error=<code>` |
+| `GET /*` | no | the built UI from `web/dist`, SPA-style fallback to `index.html`; a 404 under `/api/` stays JSON |
+
+"Needs a session" is conditional on enforcement being on; with none configured every
+route answers as it did before R10.
+
+`startServer` is split into **`buildApp(cfg, opts) → {app, scan}`** and a `startServer`
+that calls it and listens. The split exists for the tests: the hooks in §3.13 are the one
+part of that feature no unit test can reach, and `app.inject()` drives them without a
+socket. Anything registered on the instance must therefore be registered inside
+`buildApp`, not in `startServer`.
 
 Concurrent requests during a rebuild share one in-flight promise, so a burst of
 traffic cannot start N scans — **except** a forced one, which may only be answered
@@ -1043,6 +1089,207 @@ on another network) would be reported as an edit to a sidecar nobody touched, wh
 the exact false positive the deny-list exists to prevent. The exclusion is narrow: an
 edit to the prose in the same block is still a change.
 
+### 3.13 Access control
+
+LabView's own login (R10). Two methods — a password form over a passwd file, and OIDC —
+and one posture rule that decides whether either applies.
+
+**The naming hazard, first.** `AuthMethod` already contains **`basic-auth`**, meaning *a
+scanned service* uses HTTP basic auth, and `--auth-basic` exists in the CLI palette. This
+feature is a different thing entirely and shares no vocabulary with it: it is **access
+control**, its methods are **`passwd`** and **`oidc`**, and no symbol in it contains the
+word `basic`. A future reader merging the two would produce a dashboard that reports its
+own login as a property of someone else's container.
+
+#### Open unless configured
+
+`resolveAccessMode(inputs)` in [auth/index.ts](labview/src/auth/index.ts) is pure and
+returns `{enforced, methods, notes}`. Enforcement is on **iff at least one method is
+live**:
+
+| Method | Live when |
+|---|---|
+| `passwd` | `auth.passwd.enabled` **and** the file parsed to ≥ 1 usable entry |
+| `oidc` | `auth.oidc.enabled` **and** `issuer` and `clientId` are both non-empty |
+
+`enabled` means *allowed*, not *on*. A method switched on but unusable — an empty passwd
+file, an issuer with no client id — produces a **note and a `warn`**, never an error and
+never a lock-out (I4). This is the whole reason the default is what it is: a new image
+pull must not be able to lock an operator out of a running deployment, and an operator
+who has never heard of this feature must see exactly the behaviour they had before.
+
+The posture is re-resolved on request, cached for `POSTURE_TTL_MS`, and the summary line
+is re-logged only when it changes — the cadence `changedConnections` uses (§3.10), and
+the reason an operator who creates the passwd file on a running LabView is told it was
+picked up. `accessModeSummary()` lives in `model/access.ts` so the startup line and the
+UI cannot drift, and it reports **counts, never names**: a user list in a log file is an
+inventory of accounts to try.
+
+#### The gate
+
+One `onRequest` hook, one `onSend` hook, five routes, all in
+[server/auth.ts](labview/src/server/auth.ts). Three rules the file holds to:
+
+- **The gate never consults scanned data.** Whether a request is allowed depends on the
+  config, the passwd file and the cookie — never on an overview, a container or anything
+  an enrichment read returned. A Docker endpoint that goes away must not be able to
+  change who may sign in. Concretely: no `getOverview()` call may appear in
+  `server/auth.ts`.
+- **A reply says less than the log.** The browser gets a code from `LoginFailureReason`;
+  the reason, the path and the provider's complaint go to the log (I6).
+- **A username is sanitised before it is logged.** It arrives in a request body or an ID
+  token; `sanitizeUsername` returns `"?"` for anything outside `[A-Za-z0-9._@-]{1,64}`
+  rather than a scrubbed copy, because a partially-sanitised name is a way to smuggle
+  content into a log line.
+
+`isPublicPath` is an **exact-match allowlist** over a normalised path — query and
+fragment stripped, `//` collapsed, any `..` segment refused — holding `/api/healthz`,
+`/api/session`, `/api/login` and `/api/logout`. Written as a rule because the obvious
+`startsWith` version makes `/api/healthz/../overview` public and `/api/sessionx` a
+bypass; both cases are asserted.
+
+**Scope: gate the data, not the shell.** Everything under `/api/` needs a session;
+`index.html`, `styles.css` and `app.js` stay public and render the login card. That is
+sound only because of **I2** — shipped artifacts contain no fleet-specific identifiers by
+construction — so serving the bundle before a login discloses nothing about the fleet. If
+I2 is ever weakened, this decision has to be revisited with it.
+
+`/auth/oidc/*` sits **off `/api`** deliberately: the redirect URI is typed into a
+provider by a human and appears in browser history, and keeping it outside `/api` keeps
+the allowlist to four exact paths instead of six. Registered routes take precedence over
+`setNotFoundHandler`, so the SPA fallback is unaffected.
+
+`onSend` adds `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and
+`X-Frame-Options: DENY` unconditionally — they cost nothing, so they are never
+conditional — and `Cache-Control: no-store` on `/api/*` while enforcing. **No CSP**:
+mermaid and cytoscape both inject styles at runtime, and a policy that breaks the graph
+tab is worse than none.
+
+#### Passwd file
+
+`user:hash`, one per line, `#` comments and blank lines ignored — `/etc/shadow`'s and
+`htpasswd`'s format, with the algorithm named by the hash's own `$id$` prefix rather than
+by a config key, which is what lets a file written by `htpasswd -nbB` work unchanged.
+bcrypt (`$2a$`, `$2b$`, `$2y$`) is verified through `bcryptjs`; any other id is skipped
+with a warning naming **the algorithm only**; a value with no `$` prefix is a plaintext
+password and is never accepted.
+
+Two rules shape [auth/passwd.ts](labview/src/auth/passwd.ts):
+
+- **A warning never contains a hash.** It names the line, the user and the algorithm.
+  Warnings reach logs, and logs reach issues and pastebins.
+- **A bad line is skipped, never fatal.** A file with one mistyped entry still signs in
+  every other user (I4). Only a file with *no* usable entry turns enforcement off, and
+  that is reported as such.
+
+Split into a pure `parsePasswd(text)` and an I/O `readPasswd(path)` for the reason
+`scan/sidecar.ts` gives — every validation rule is then assertable without a fixture —
+with caps `MAX_PASSWD_BYTES` (64 KiB), `MAX_PASSWD_ENTRIES` (1000) and
+`MAX_PASSWORD_CHARS` (1024, so a large body cannot be turned into hashing work). Reads
+are cached on size + mtime + inode, so adding a user needs no restart and an editor that
+replaces the file is picked up as well as one that writes in place. `readPasswd`
+distinguishes `ENOENT` (nothing configured — silent), a **directory** at the path (what
+Docker creates at a bind-mount source it cannot find, and the single most common way this
+goes wrong), over-size, and `EACCES` — which gets its own sentence naming the cause,
+since the image runs unprivileged by design and a root-owned mode-600 file is unreadable
+however correct its contents are.
+
+Verification never discloses whether a username exists: an unknown name is verified
+against a **decoy hash generated lazily from `randomBytes`** at the file's own prevailing
+cost and the result thrown away, so the response time is not a list of valid accounts.
+The decoy is generated rather than committed — a constant hash in the repository is a
+credential-shaped artifact that secret scanners flag and that someone eventually tries to
+"fix". Both outcomes return one message.
+
+**The throttle is keyed on the sanitised username, not the address.** Behind a tunnel
+plus a reverse proxy every request shares one source address, so address keying would let
+one wrong password lock out the fleet. `maxFailedAttempts` within `lockoutSeconds` → `429`
+with `retryAfterSeconds` **regardless of whether the password was right**, which is what
+makes the lockout mean anything; the counter resets on success; the key is
+case-folded, so `BOB` and `bob` share a bucket; the map is capped and evicts oldest.
+
+#### Sessions
+
+`v1.<b64url(payload)>.<b64url(hmac-sha256)>`, payload `{u, via, iat, exp, jti}`, verified
+in the order the checks cost: shape → MAC → expiry → revocation. Expiry *after* the
+signature on purpose — an unsigned token's claimed `exp` is not worth reading, and
+reporting `expired` for one tells a forger their guess was parsed. The MAC is compared
+through `safeEqual`, which hashes both sides so the comparison is fixed-width and
+`timingSafeEqual` cannot throw on a length mismatch (the same helper guards the OIDC
+`state`, where the length is not fixed).
+
+No session store, deliberately: a dashboard that degrades to "sign in again" after a
+restart is a better trade than a database, and two replicas behind one proxy work with no
+shared state beyond `auth.session.secret`. The one piece of server state is the
+revocation set, so signing out invalidates the token rather than merely dropping the
+browser's copy; it is bounded twice (pruned by `exp`, capped with oldest-first eviction)
+and a restart clears it along with every session it could apply to.
+
+Cookie: `HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age` from `ttlMinutes`. `Lax` rather
+than `Strict` because `Strict` withholds the cookie on a cross-site *navigation*, which
+is exactly what returning from an identity provider is — the callback would arrive with
+no session and loop. `Secure` follows the **effective** scheme (`X-Forwarded-Proto`
+first), because a `Secure` cookie over plain HTTP is never stored and the symptom is a
+login form that takes the password and comes straight back with nothing in any log.
+
+CSRF: `SameSite=Lax` plus an `Origin` check on every POST while enforcing, ordered
+*before* the session check so a cross-site POST is refused whether or not it carried a
+cookie, and returning no `Set-Cookie`. A **missing** `Origin` passes — browsers send it on
+every cross-site POST, so its absence means the request did not come from a page and has
+no ambient cookie to abuse.
+
+Cookie handling is written out rather than delegated to `@fastify/cookie`, for the reason
+`cookiePairs` in `enrich/http.ts` gives: this is `split(";")` and a header string, and a
+dependency for it would have to be audited, updated and shipped.
+
+#### OIDC
+
+Authorization code with PKCE S256, in [auth/oidc.ts](labview/src/auth/oidc.ts). The HTTP
+goes through `enrich/http.ts`, which already guarantees what a login flow needs: a
+request never throws, a credential never reaches an error string, and a failure names its
+stage — a token endpoint sitting behind an SSO gate answers with an HTML login page
+exactly like every other gated endpoint, and `getJson` already has a word for that.
+Everything that can be pure is pure and takes `now`: the PKCE derivation, the authorize
+URL, the discovery validation, the ID-token check. `OidcClient` is only the part holding
+a cache and a `fetch`.
+
+Discovery is cached for `DISCOVERY_TTL_MS`, and the document's own `issuer` must equal
+the configured one (trailing slashes forgiven, nothing else) — the standard mix-up
+defence, without which a redirect to an attacker's authorization server would be followed
+by a token exchange at their token endpoint against their keys. Every endpoint in the
+document must be **https**, loopback excepted for a local stub issuer, so a downgraded
+document cannot turn the exchange into a cleartext one.
+
+`/auth/oidc/start` puts `{state, nonce, verifier, exp}` in a **signed transient cookie**
+scoped to `Path=/auth/oidc` with a five-minute window — signed rather than stored, so
+nothing is kept server-side and a restart mid-login fails cleanly. The window is
+re-checked from the payload rather than trusted to `Max-Age`, because a browser that
+keeps sending an old cookie is not a threat model to delegate to the client.
+
+The ID-token check, in this order and non-negotiable: signature **before** any claim is
+believed; then `iss` exactly, `aud` containing the client id, `azp` equal to it when
+present, `exp`/`iat` within `CLOCK_SKEW_SECONDS`, and `nonce` equal to this attempt's.
+**Asymmetric algorithms only** — `alg: none` is not a signature, and every HMAC alg is
+refused because a symmetric alg beside a published JWKS is a known confusion vector: a
+verifier accepting both can be handed a token signed with the public key as the HMAC
+secret. There is no configuration to turn that back on. An unknown `kid` triggers
+**exactly one** JWKS refetch (key rotation, without letting a crafted `kid` make LabView
+hammer the provider). The username comes from `usernameClaim` → `preferred_username` →
+`email` → `sub`, and must satisfy `isValidUsername`, because a claim from an identity
+provider is still untrusted input.
+
+Every failure redirects to `/?login_error=<code>` with a code from `LoginFailureReason`,
+never a raw error string (I6), and the UI validates it against that closed set before
+rendering — a crafted `?login_error=` cannot put text on the login screen.
+
+#### Non-goals
+
+No roles or per-user authorization: every signed-in user sees the same read-only
+overview, so the provider's own group binding is the whole authorization story. No
+trusted-header mode (§2.1). No persistence. No rate limiting beyond the login route. And
+no change to any scanning, enrichment or rendering behaviour — this feature adds a gate in
+front of the API and touches nothing behind it.
+
 ---
 
 ## 4. Invariants
@@ -1223,6 +1470,13 @@ endpoint, and needs no privileged access:
   it.
 - The image runs as `USER node`.
 - Its own compose example publishes **no `ports:`** — see §7.
+- **Its own login is read-only too.** LabView authenticates people; it authorizes
+  nobody, because there is nothing to authorize — every signed-in user gets the same
+  read-only overview. No route added by §3.13 writes anything outside memory, and the
+  only file it reads is the passwd file, under the same containment thinking as the
+  rest: a path from the config, size-capped, never followed anywhere. A change that
+  adds a *write* to LabView's own state (a user-management route, a persisted session
+  store) is a change to this invariant, not a feature.
 
 ### I6 — Secrets never reach the API
 
@@ -1241,6 +1495,20 @@ values while the API never sees them. Two independent mechanisms, both in
 A new field that could carry a secret must be routed through `maskEnv` or given
 equivalent treatment. Note that `labels` are **not** masked — they are routing
 metadata by design; if a future label carries a credential it needs handling.
+
+LabView's own credentials fall under this too, in three places (§3.13):
+
+- `LABVIEW_OIDC_CLIENT_SECRET` and `LABVIEW_SESSION_SECRET` join
+  `LABVIEW_AUTHENTIK_TOKEN` and `LABVIEW_TRAEFIK_PASSWORD` in **`keysAlways`**, for the
+  reason already written above that list: a fleet that runs LabView from inside `appsRoot`
+  scans its own stack, and editing `keyPatterns` must not be able to expose them.
+- **No password hash, session token or client secret is ever an API field or a log
+  value.** A passwd warning names the line, the user and the algorithm, never the hash;
+  `/api/session` is unauthenticated and therefore carries no username, no user count, no
+  file path and no reason — the detail is in the log, which only the operator reads.
+- A login failure reaches the browser as a **code** from `LoginFailureReason`. The
+  provider's own complaint, the endpoint it came from and the check that failed go to the
+  log.
 
 ### I7 — Determinism
 
@@ -1276,6 +1544,22 @@ root is often reached through a symlink or bind mount and a legitimate path must
 not be rejected for failing to match textually.
 
 **Any future directive that reads a path must go through `resolveContained`.**
+
+The passwd file is not contained the same way, and the difference is the point: it is a
+path from LabView's *own* config, not from a scanned document, and it is meant to sit at
+`/config/passwd` — outside the apps root by design. What replaces containment there is
+that nothing scanned can influence it (see below), plus a size cap, an entry cap and a
+refusal to follow anything but a regular file (§3.13).
+
+**The gate never consults scanned data.** This is a new rule and belongs beside I8 rather
+than inside §3.13, because it is a constraint on future changes anywhere in the codebase:
+no decision in `src/auth/` or `src/server/auth.ts` may read an `Overview`, a compose
+document, a container label or an API response about the fleet. The reason is direct — the
+scan's whole input is untrusted (§7), so a gate that read it would let a compose file in
+`appsRoot` participate in deciding who may see `appsRoot`. It also keeps the two halves
+independently assertable: the gate is a function of config, the request and the clock, and
+smoke drives it with no fleet at all. The one apparent exception is not one: `/api/overview`
+is *behind* the gate, so the payload is produced only after the decision.
 
 ---
 
@@ -1613,6 +1897,98 @@ which is why it and `authAgreement` are excluded from the change comparison (§3
 `mode` switching `include` between OR (`any`) and AND (`all`). Lives in
 `model/filter.ts` rather than in the UI so its semantics are assertable (§8).
 
+The rest of §5 is LabView's **own** access control (§3.13), which shares no vocabulary
+with the `AuthMethod` union above: that one describes how a *scanned service*
+authenticates its visitors, this one describes how *LabView* authenticates its own. The
+overlap is a hazard, not a relationship — see the naming note opening §3.13.
+
+**LoginMethod** — `passwd | oidc`. How a session was obtained, and equally which
+mechanisms a visitor may choose from. Deliberately not `basic` in any spelling, so a
+grep for LabView's own login can never land on a scanned service's `basic-auth`.
+
+**AccessMode** — `{ enforced, methods, notes, summary }`, the answer to "is the surface
+gated, and by what". Returned by `resolveAccessMode` from config plus the parsed passwd
+state, and re-resolved on a short TTL rather than captured at startup so that adding the
+first user to the passwd file switches enforcement on without a restart. `enforced` is
+`methods.length > 0`: there is no separate switch, because a switch that could be on
+with no usable method is a lock-out (§3.13).
+
+**`enabled` (in `auth.*`)** — *allowed*, not *on*. `auth.passwd.enabled: true` with no
+readable file leaves the method dead and writes a note; `false` means the file is never
+read at all. The same distinction the `authentik` and `traefik` blocks use, kept because
+an operator who has configured one integration should not have to learn a second rule.
+
+**`notes` (on AccessMode)** — why a method that is switched on is not live: no passwd
+file, no usable entry in it, an issuer with no client id. Counts and conditions only, and
+the only shape in which they reach a browser is `/api/session` — which is readable
+without a session, so a note may never name a path, a username or a reason for a specific
+failure (I6, §3.13).
+
+**SessionInfo** — the `GET /api/session` body: `{ enforced, methods, user?, oidcLabel? }`.
+What a visitor needs to choose a method and what a signed-in browser needs to draw
+"signed in as …", and nothing else — no counts, no notes about a *particular* user, no
+paths. `user` is `{ name, via }`; its absence while `enforced` is what makes the SPA
+render the login card instead of the overview.
+
+**LoginFailureReason** — the eight codes `credentials`, `throttled`,
+`method-unavailable`, `session-expired`, `oidc-state`, `oidc-provider`, `oidc-token`,
+`oidc-identity`. A closed union rather than a message because a failure crosses two
+boundaries: a JSON body from `POST /api/login`, and a `?login_error=` query parameter on
+the OIDC redirect. The wording lives in `LOGIN_FAILURE_TEXT` in `model/access.ts`, so the
+browser renders text the server never composed — which is how an upstream provider's
+error string is kept out of the page (I6). `credentials` is one code for both an unknown
+user and a wrong password, on purpose.
+
+**`loginFailureText` / `parseLoginFailure`** — the two directions across that boundary.
+`parseLoginFailure` accepts only a member of the union and returns `undefined` for
+anything else, so `?login_error=<attacker's sentence>` cannot be reflected into the login
+card.
+
+**`isValidUsername` / `sanitizeUsername`** — `USERNAME_RE = /^[A-Za-z0-9._@-]{1,64}$/`,
+and the fallback `"?"`. Every username is validated at each of the three places one can
+enter — a passwd line, a login form, an OIDC claim — and sanitized before it reaches a
+log line, so neither a crafted passwd file nor a provider claim can inject a newline into
+the log or an identifier into an artifact (I2).
+
+**`accessModeSummary`** — the one-line startup summary, in `model/access.ts` beside
+`formatConnection` and `formatRescan` for the same reason: the log line and the UI must
+not drift. Reports counts and the issuer host, never usernames (§3.13).
+
+**Passwd entry** — `user:hash`, the hash self-identifying its algorithm through its
+modular-crypt `$id$` prefix exactly as `/etc/shadow` and `htpasswd -nbB` do it. Only
+`$2a$`/`$2b$`/`$2y$` are honoured; any other `$id$` is skipped with a warning naming the
+**id alone**, and a line with no `$` is skipped rather than treated as a plaintext
+password. Duplicates are first-wins (§3.13).
+
+**`unreadable(path, code)`** — `readPasswd`'s four distinguishable read failures
+(`ENOENT`, `EISDIR`, `EACCES`, over-size) as one shape, because the operator's next
+action differs for each and "could not read the passwd file" would not tell them which.
+`EISDIR` gets its own message: a `:ro` bind whose host file did not exist before `up`
+makes Docker create a directory there, and that is the most likely first-run failure.
+
+**Decoy hash** — the bcrypt hash an unknown username is compared against, so that a
+missing user costs the same as a wrong password and enumeration learns nothing from
+timing. Generated lazily from `randomBytes(32)` per cost and memoized, never a committed
+constant: a constant in the repository is a published verifier that also tells anyone
+reading the source which comparison path they are on.
+
+**LoginThrottle** — failed sign-ins per **username**, case-folded, with `now` injected.
+Keyed on the name rather than the address because behind a tunnel and a reverse proxy
+every request shares one source address, so address keying would let one wrong password
+lock out the fleet. Exceeding `maxFailedAttempts` within `lockoutSeconds` answers `429`
+with `Retry-After` whether or not the password was right (§3.13).
+
+**Session token** — `v1.<b64url(payload)>.<b64url(hmac-sha256)>` over
+`{ u, via, iat, exp, jti }`. Signed, not encrypted, because nothing in it is a secret —
+what must be impossible is *changing* it. Checked shape → MAC → expiry → revoked, in that
+order, with the expiry deliberately after the signature (§3.13). There is no session
+store; the only server state is the bounded revocation set, so signing out invalidates
+the token rather than merely dropping the browser's copy.
+
+**`safeEqual`** — a constant-time compare that hashes both sides first, so it tolerates a
+length difference without leaking one. Used on the MAC, where the width is fixed anyway,
+and on the OIDC `state`, where it is not.
+
 ---
 
 ## 6. Configuration
@@ -1651,6 +2027,30 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it |
 | `LABVIEW_TRAEFIK_ENABLED` | `traefik.enabled` | `false` = never contact the proxy. Unlike Authentik this stage is on by default, because it needs no credential |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
+| `LABVIEW_AUTH_PASSWD_ENABLED` | `auth.passwd.enabled` | `false` = the password form is off and the file is not read at all. The explicit off switch for an operator who wants only OIDC, or only their edge |
+| `LABVIEW_AUTH_PASSWD_FILE` | `auth.passwd.file` | `user:hash` lines. One usable entry is what turns enforcement on (§3.13) |
+| `LABVIEW_AUTH_MAX_FAILED_ATTEMPTS` | `auth.maxFailedAttempts` | failed sign-ins per **username** before a `429`; keyed on the name, not the address |
+| `LABVIEW_AUTH_LOCKOUT_SECONDS` | `auth.lockoutSeconds` | the window, and the `Retry-After` value |
+| `LABVIEW_AUTH_COOKIE_SECURE` | `auth.session.secure` | `auto` (follow `X-Forwarded-Proto`), `true` or `false`. Override only if the proxy does not send that header |
+| `LABVIEW_OIDC_ENABLED` | `auth.oidc.enabled` | `false` = never contact the provider, whatever else is set |
+| `LABVIEW_OIDC_ISSUER` | `auth.oidc.issuer` | with a client id, this is what turns OIDC on. The discovery document's own `issuer` must equal it |
+| `LABVIEW_OIDC_CLIENT_ID` | `auth.oidc.clientId` | |
+| `LABVIEW_OIDC_CLIENT_SECRET_FILE` | `auth.oidc.clientSecretFile` | preferred over the env var, which `docker inspect` exposes. Wins over `clientSecret`. Both empty = a public client; PKCE is used either way |
+| `LABVIEW_OIDC_CLIENT_SECRET` | `auth.oidc.clientSecret` | in `secrets.keysAlways` (I6) |
+| `LABVIEW_OIDC_REDIRECT_URI` | `auth.oidc.redirectUri` | what the provider has registered. Empty derives it from the request, honouring `X-Forwarded-Proto`/`-Host` — right behind one proxy, wrong as soon as two hostnames reach the same LabView |
+| `LABVIEW_OIDC_SCOPES` | `auth.oidc.scopes` | comma-separated; `openid` is sent whether or not it is listed |
+| `LABVIEW_OIDC_USERNAME_CLAIM` | `auth.oidc.usernameClaim` | tried first, then `preferred_username`, `email`, `sub` |
+| `LABVIEW_OIDC_LABEL` | `auth.oidc.label` | the button's text. Empty names the issuer host, which tells a visitor who has not signed in what your provider is |
+| `LABVIEW_OIDC_TIMEOUT` | `auth.oidc.timeoutMs` | per request, for discovery, the token exchange and the JWKS |
+| `LABVIEW_SESSION_SECRET_FILE` | `auth.session.secretFile` | preferred over the env var. Wins over `secret` |
+| `LABVIEW_SESSION_SECRET` | `auth.session.secret` | in `secrets.keysAlways` (I6). Unset generates one per start, so restarts sign everyone out — said once in the log, and only when there are sessions to lose |
+| `LABVIEW_SESSION_TTL_MINUTES` | `auth.session.ttlMinutes` | also the cookie's `Max-Age` |
+| `LABVIEW_SESSION_COOKIE_NAME` | `auth.session.cookieName` | the OIDC transient cookie is this plus `_oidc` |
+
+The `auth` block follows the `authentik`/`traefik` shape on purpose — `enabled`, a value,
+a `*File` variant that wins over it, a `timeoutMs` — so an operator who has configured one
+integration already knows the vocabulary. `enabled` means **allowed, not on**: what turns
+a method on is having something usable (§3.13).
 
 **Docker endpoint resolution order:** explicit socket → configured/env TCP host →
 default socket path. The default is the conventional local socket, the one
@@ -1678,10 +2078,28 @@ connection and a reason string. `LABVIEW_TRAEFIK_ENABLED=false` opts out entirel
 
 **Trust boundaries.** Compose files, `.env` files and container labels are
 untrusted input parsed with no code execution. The Docker Engine is trusted but
-reached read-only through a proxy. The HTTP surface is trusted to the extent the
-operator's own edge makes it so — LabView has no authentication of its own, by
-design; it is deployed behind the same tunnel/proxy/SSO chain as the rest of the
-fleet, which is exactly what it documents.
+reached read-only through a proxy. The HTTP surface has **two** possible guards, and
+which of them applies is the operator's choice, not an assumption LabView makes: the
+edge it is deployed behind — the same tunnel/proxy/SSO chain as the rest of the fleet,
+which is exactly what it documents — and, since R10, a login of its own (§3.13).
+
+**Why the login is off until configured, and why that is not "no authentication".** An
+image that started refusing requests after a pull would lock an operator out of a running
+deployment, and one whose only guard is an edge it cannot inspect is exactly the wrong
+default for a page listing every hostname and unauthenticated service in the fleet. So
+enforcement follows what is configured: one usable entry in `/config/passwd`, or an OIDC
+issuer with a client id, and the surface is gated; neither, and it is open with one line
+in the log saying so (§3.13). The unconfigured posture is what §7 previously described as
+permanent — it is now the *floor*, and an operator who does nothing is no worse off than
+before, while one who mounts a passwd file needs nothing from their proxy.
+
+The distinction that matters is **authentication, not authorization**: LabView proves who
+a visitor is and then shows every one of them the same read-only overview. There is no
+role, no per-user scope and nothing to write (I5). Nor is there a trusted-header mode:
+`X-Forwarded-User` and `X-authentik-username` are never read as identity, because
+trusting a header is only safe when the edge is guaranteed to strip it and LabView cannot
+verify that — the operator who has such an edge is already covered by leaving the login
+unconfigured.
 
 **Why LabView's own compose example publishes no `ports:`.** A published host port
 answers directly at `<host-ip>:<port>`, bypassing the reverse proxy and therefore
@@ -1692,13 +2110,21 @@ tunnel origin at the reverse proxy rather than at the container, so the request
 still traverses the auth middleware. LabView reports this class of mistake in
 other people's stacks; it must not ship one.
 
+That bypass is also the clearest case for the login of its own: a published port and a
+tunnel pointed straight at the container are the two ways a request reaches LabView
+without passing the middleware the operator believes protects it, and neither is visible
+from inside the container. A configured passwd file holds in both.
+
 **Handled:** path traversal and symlink escape via `env_file` (I8); secret
 exposure via key patterns and URI credentials (I6); privileged Docker access
 (socket proxy, read-only endpoints, `USER node`); denial by malformed input (I4);
-scan stampede (in-flight coalescing).
+scan stampede (in-flight coalescing); credential stuffing against the login (bcrypt,
+a per-username throttle, one message for both halves of a wrong guess — §3.13); CSRF on
+the two POST routes (`SameSite=Lax` plus an `Origin` check that runs *before* the session
+check, so a rejection sets no cookie).
 
-**The outbound calls, and their rules.** Two stages initiate a connection outside
-the Docker socket, and both carry the same constraints (I5): `GET` only; no
+**The outbound calls, and their rules.** Two *scanning* stages initiate a connection
+outside the Docker socket, and both carry the same constraints (I5): `GET` only; no
 TLS-verification bypass; the credential readable from a file so it need not sit in
 the environment; and a discovered endpoint probed on an unauthenticated path
 *before* any credential is sent, because a discovered address is a guess and a guess
@@ -1715,15 +2141,29 @@ must never be handed a credential.
   reported as a note on the proxy service — LabView's own read is evidence about how
   the API is exposed, and saying so is more useful than staying quiet about it.
 
-Neither credential can appear in output: `LABVIEW_AUTHENTIK_TOKEN` and
-`LABVIEW_TRAEFIK_PASSWORD` are both in `secrets.keysAlways`, so a fleet that includes
-LabView's own stack masks them like any other secret, and no error string in either
-client interpolates a credential.
+A third stage reaches outward only when OIDC is configured, and it is not part of a
+scan: discovery, the token exchange and the JWKS, to the one issuer the operator named
+(§3.13). It shares the timeout and file-backed-credential rules, and adds two of its own —
+the discovery document's `issuer` must equal the configured one, and every endpoint taken
+from that document must be https or loopback, so a compromised or mistyped discovery
+response cannot redirect the token exchange somewhere plaintext. It is also the only
+outbound `POST` in the codebase; `GET`-only remains the rule everywhere a scan reads.
 
-**Deliberate non-goals:** no authentication, authorization or rate limiting in
-LabView itself; no TLS termination (the proxy does it); no persistence, so
-nothing to leak at rest; no writes of any kind; no outbound network calls beyond
-the two reads above.
+No credential can appear in output: `LABVIEW_AUTHENTIK_TOKEN`,
+`LABVIEW_TRAEFIK_PASSWORD`, `LABVIEW_OIDC_CLIENT_SECRET` and `LABVIEW_SESSION_SECRET` are
+all in `secrets.keysAlways`, so a fleet that includes LabView's own stack masks them like
+any other secret, and no error string in any client interpolates a credential. Nothing
+derived from one leaves either: no password hash, session token or signing secret reaches
+an API field or a log value, and a login failure crosses to the browser as a code from a
+closed union (I6).
+
+**Deliberate non-goals:** no authorization — every signed-in visitor sees the same
+read-only overview, and there is nothing to write; no trusted-header identity; no rate
+limiting beyond the login route; no CSP, because mermaid and cytoscape both inject styles
+at runtime and a policy that breaks the graph tab is worse than none; no TLS termination
+(the proxy does it); no persistence, so nothing to leak at rest — which also means
+sessions do not survive a restart (§11); no writes of any kind; and no outbound network
+calls beyond the two scan reads above and, when configured, the one issuer.
 
 ---
 
@@ -1991,6 +2431,57 @@ complements the per-service ones: over every service in both roots, no set carri
 that are `internal` alone — so a stack added later, or a fourth external kind, is
 covered without anyone remembering to extend a list.
 
+**Access control** (§3.13) is asserted at the end of the file and at length — 221 of the
+236 of the 756 checks — because it is the only part of LabView where a silent regression is a security
+hole rather than a wrong label. `fixtures/auth/` is not a fifth scan root: it holds three
+passwd files, and nothing in the section reads a compose document. The modules are
+imported locally at the bottom, for the reason `node:net` is, so the sections above do not
+pay for minting keys and reading files.
+
+`passwd.ok` carries a `$2b$`, a `$2a$` and a `$2y$` entry at cost 4, so the suite stays
+fast while `hashpw` defaults to 12 — and one assertion pins that the fixtures' cost is
+*not* the default, since a fixture quietly becoming the product's setting is how a cost
+gets lowered for everyone. `passwd.messy` holds one line per way a line can be wrong
+(duplicate, `$5$`, plaintext, over-long username, no colon, empty hash) and each must
+produce its own warning; `passwd.empty` is comments only, which is what pins
+open-unless-configured: it must leave enforcement **off**.
+
+The groups, each pinning rules the revert contract can break: hash dispatch and
+round-trip, including the decoy's cost and its memoization · `parsePasswd` order,
+first-wins and every warning · `readPasswd` across `ENOENT`, `EISDIR`, `EACCES`
+(`chmodSync` on a real temporary file) and the size cap, plus the stat-keyed re-read ·
+session sign/verify with each segment tampered in turn, expiry, wrong secret, revoked
+`jti` · the cookie attribute matrix, including that `Secure` follows the effective scheme ·
+the throttle, with an injected clock, keyed case-folded on the username · `resolveAccessMode`
+over every configuration and the exact wording of its summary · `isPublicPath` including
+`/api/healthz/../overview` and `/api/sessionx` · OIDC authorize-URL parameters and the S256
+derivation, issuer mismatch, non-https endpoints, the stubbed token exchange, and ID-token
+accept/reject for tampered, expired, wrong `aud`, wrong `iss`, wrong `nonce`, `alg: none`,
+an HMAC alg and an unknown `kid`. The ID tokens are signed with an RSA keypair
+**generated at test time**, so no private key is committed and no secret scanner has
+anything to find.
+
+Three properties are pinned deliberately, because each is the kind of rule that reads like
+a simplification:
+
+- **Both postures run end to end.** The gate is driven through `app.inject()` — real
+  hooks, real routes, real headers, no socket — first with a passwd file and then with
+  none. Everything a unit test cannot see is here: a hook that decides correctly and
+  forgets to reply, an allowlist consulted after routing instead of before it, a `401`
+  that arrives with the body still attached. The open pass lets a real `/api/overview`
+  through, so it runs against a fixture root with Docker and both integrations off — an
+  operator's exported Authentik URL must not turn a test into a request to their own lab.
+- **A refusal says less than the log does.** `/api/session` without a cookie is checked
+  for the *absence* of a username, of the file's path and of the user count; the `401`
+  body is asserted to be exactly `{"error":"unauthorized"}`; a wrong password and an
+  unknown user get one indistinguishable answer; and a rejected `Origin` is asserted to
+  carry no `Set-Cookie`, because the check runs before the session check.
+- **The environment cannot reach it.** Every `LABVIEW_AUTH_*`, `LABVIEW_OIDC_*` and
+  `LABVIEW_SESSION_*` variable is deleted at startup alongside the integration ones: an
+  operator with a real `LABVIEW_SESSION_SECRET` exported would otherwise have the suite
+  assert against their own credential, and a real `LABVIEW_AUTH_PASSWD_FILE` would put
+  their users' hashes in front of assertions that print what they compared.
+
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
@@ -2013,7 +2504,13 @@ npm run smoke       # pipeline assertions over the fixtures
 npm run build       # esbuild web bundle + tsc server -> dist/
 npm run dev         # build web once, then tsx watch on the server
 npm run scan        # one-shot JSON to stdout; --summary for the digest
+npm run hashpw -- <user>   # prompt for a password, print one `user:hash` line
 ```
+
+`hashpw` is the second entry point in `dist/`, so the same tool exists in the image as
+`node dist/hashpw.js <user>` — which is how an operator hashes a password without
+installing Node on the host. The password is prompted with echo off or read from stdin and
+**never taken from argv**, because `ps` shows argv to every user on the box.
 
 `tsc` runs with `strict` and `noUncheckedIndexedAccess`; the web tsconfig uses
 `moduleResolution: Bundler` since esbuild resolves. **All three** projects must
@@ -2307,6 +2804,33 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   drift detection or change log.
 - **The Docker snapshot lists all containers**, including ones with no compose
   file under `appsRoot`; those simply do not match a service and are not reported.
+- **Sessions do not survive a restart.** There is no session store, and the revocation
+  set is in memory beside it — so a restart, a redeploy or an image pull signs everyone
+  out. With `auth.session.secret` unset it is stricter still: the secret is minted per
+  start, so every existing cookie is invalid rather than merely forgotten. Setting the
+  secret makes cookies survive a restart, and makes two replicas behind one proxy
+  interchangeable, but the revocations do not: a token signed out just before a restart
+  becomes valid again for the remainder of its TTL. The bound on that is
+  `auth.session.ttlMinutes`, which is the knob to lower if it matters.
+- **Everyone who signs in sees everything.** Authentication without authorization
+  (§7): there are no roles, no per-stack scoping and no read-only-vs-detail distinction,
+  because there is nothing to write and the whole page is one inventory. A fleet that
+  needs some people to see only some stacks needs a second LabView with a narrower
+  `appsRoot`, not a permission model.
+- **The login is a gate in front of the API, not a filter inside it.** `index.html`,
+  `styles.css` and `app.js` are served to anyone who asks, which is safe only because
+  I2 holds — the bundle carries no fleet-specific identifier by construction. If a
+  future change puts anything fleet-derived into a shipped artifact, the gate's scope
+  becomes wrong, and that is a change to I2 before it is a change to §3.13.
+- **The passwd file is read, never written.** There is no password change, no reset and
+  no user management in the UI; `hashpw` plus an editor is the whole administrative
+  interface, and it is deliberate (I5). Nor is there any lockout state on disk: the
+  throttle is in memory, so a restart clears it along with the sessions.
+- **OIDC is one provider, and group membership is the provider's business.** A single
+  issuer is supported, LabView reads no groups or roles from the ID token, and every
+  successful sign-in is equal — so *who may sign in* is decided entirely by the policy
+  or group binding on the provider's side (§3.13). ID tokens must be signed with an
+  asymmetric algorithm; a provider that only offers HMAC cannot be used.
 
 ---
 
@@ -2413,3 +2937,17 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Reachability is decided before any count is compared | An unreachable read reports zeros, so a count comparison across it announces `-40 applications`: a claim about Authentik's *contents* from a scan that never reached Authentik, and the clearest possible I1 violation. `started` and `stopped` therefore carry no numbers at all, and two failed reads in a row produce no entry — the banner and the connection line already state a standing failure, and repeating it as a change every rescan would make it read as news. |
 | The counts are compared, but the diff is still not the connection line | `read` stays out of `changedConnections`'s signature: a count that moves on every scan must not log three connection lines a minute, and that trade is still right. The difference is that a *rescan* is an event somebody asked about, so stating what the read returned there costs one line per press instead of one line per minute. |
 | The matched side is derived in the browser, not duplicated into `ScanMeta` | Every matched pair is already on `svc.authentik` / `svc.traefikLive`, so adding a roll-up to the payload would mean two representations of one join, kept in step by nothing. A `useMemo` over `ov.stacks` reads the same source the service drawer reads, which is also what makes a row in the panel able to open that drawer. The unmatched side has no such home — it is by definition attached to no service — so that half genuinely lives on `meta`. |
+| LabView gets a login of its own, reversing the §7 non-goal | The original posture assumed the deployment LabView documents: always behind a tunnel, a proxy and an SSO gate. It is a fair assumption about *this* fleet and a bad default for the product, because the two ways a request reaches LabView without traversing that gate — a published host port, and a tunnel origin pointed at the container — are invisible from inside the container, and what is served past them is the fleet's whole inventory. The non-goal is therefore replaced rather than narrowed, and §7 says so instead of accumulating a caveat. What is *not* reversed is authorization: there are still no roles and nothing to write. |
+| Enforcement follows what is configured, rather than a switch | An `auth.enabled` an operator could set with no usable method is a lock-out, and a default-on gate would lock people out of a running deployment on an image pull. So `enforced` is `methods.length > 0` and each method is live only when it is usable — one entry in the passwd file, or an issuer with a client id. `enabled: false` remains as the explicit *off* switch the feature was asked for, and the unconfigured posture is exactly today's behaviour plus one line in the log saying the surface is open (I4). |
+| The posture is re-resolved on a TTL, not captured at startup | Adding the first user to `/config/passwd` is the moment an operator expects the gate to close, and a startup-only read makes that require a restart of the thing they are trying to protect. The file is stat-keyed and cached, so the steady state costs one `stat` per window, and `POSTURE_TTL_MS` bounds how stale the answer can be. It also makes the failure recoverable in the direction that matters: a passwd file fixed after a bad edit takes effect on its own. |
+| `bcryptjs` rather than `argon2` or `node:crypto`'s `scrypt` | The hash format has to be the one operators already have: `htpasswd -nbB` emits `$2y$`, Traefik's own basicauth takes it, and every homelab has one lying around. Of the bcrypt implementations, `bcryptjs` is pure JavaScript with no transitive dependencies and its own types — so the alpine multi-arch image needs no build toolchain and `npm audit --omit=dev` is unaffected. `scrypt` would have meant inventing a serialization nobody's tooling writes; a native argon2 binding would have meant a compiler in the image for a dashboard's login. The modular-crypt prefix is what makes the choice survivable: adding an algorithm later is a new `$id$` branch, not a migration. |
+| The gate covers the data, not the shell | `index.html`, `styles.css` and `app.js` are public and render a login card; `/api/*` needs a session. Gating the bundle too would mean serving a `401` to a browser that has no way to display it, or a second login page in server-rendered HTML — a whole second UI for the case the SPA already handles. It is safe *only* because I2 holds: the shipped artifacts carry no fleet-specific identifier by construction, so a pre-login visitor gets the same bytes as any other install. That coupling is stated in §11, because a future change that bakes anything fleet-derived into a bundle invalidates this row. |
+| `isPublicPath` is an exact-match allowlist over a normalized path | The obvious `startsWith("/api/healthz")` makes `/api/healthz/../overview` public and `/api/sessionx` a bypass, and both read as harmless while doing the opposite of what the list is for. Four exact paths over a path with the query stripped, `//` collapsed and any `..` segment refused is a rule that can be enumerated in a test — and it is, including both traps. |
+| `/auth/oidc/*` sits off `/api` | The redirect URI is typed into the provider by a human and appears in browser history and in the provider's logs, so it wants to read like a page, not an API call. Keeping it out of `/api` also keeps the allowlist at four entries instead of six, which matters because every entry is a path the gate is asked to let through. |
+| Cookies are handled by hand, not by `@fastify/cookie` | It is `split("; ")` on the way in and a header string on the way out, which `cookiePairs` in `enrich/http.ts` already established as not worth a dependency: one more package to audit, update and ship, in the request path of the one feature where a supply-chain problem is a security problem. Both directions are asserted, including the full attribute matrix. |
+| ID tokens must be signed asymmetrically; `alg: none` and every HMAC are refused | A symmetric algorithm beside a JWKS is a known confusion vector — the verifier can be talked into using a public key as an HMAC secret — and there is no benefit to accepting one, since every provider worth using offers RSA or EC. The practical cost is worth naming: Authentik signs with HS256 using the client secret when no signing key is selected on the provider, so the walkthrough in the README leads with choosing an RSA key. A refusal with a clear code is much better than a verifier that can be argued out of verifying. |
+| The throttle is keyed on the username, case-folded, not on the address | Behind a tunnel and a reverse proxy every request arrives from one address, so address keying means one attacker locks out the fleet, and `X-Forwarded-For` is a header LabView has already decided not to trust for identity. A username key bounds the damage to the account being guessed, and folding case stops `BOB` and `bob` from being two budgets. It answers `429` whether or not the password was right, because branching on correctness at the throttle would turn the lockout into an oracle. |
+| An unknown user is compared against a decoy hash, minted per cost at runtime | Returning early on an unknown username makes the response time an existence oracle, which is the whole enumeration attack against a small fleet's user list. The decoy is generated from `randomBytes` and memoized per cost rather than committed: a constant in the repository is a published verifier, and it also tells anyone reading the source which comparison path a given timing belongs to. |
+| No CSP | Mermaid and cytoscape both inject styles at runtime, so any policy tight enough to be worth setting breaks the graph tab, and one loose enough to work (`style-src 'unsafe-inline'`) buys nothing. The three headers that cost nothing — `nosniff`, `Referrer-Policy: same-origin`, `X-Frame-Options: DENY` — are set unconditionally instead. Revisit if the graph libraries gain a nonce-friendly mode. |
+| The `Origin` check runs before the session check | Both orders refuse the request; only this one refuses it without having looked at the cookie, so a cross-site POST cannot learn from the difference between `403` and `401` whether the visitor has a session — and a rejection carries no `Set-Cookie`. A missing `Origin` passes, because browsers always send it on a cross-site POST: its absence means the request did not come from a page, and `curl` has no ambient cookie to abuse. |
+| A login failure crosses the boundary as a code, never a message | The failure has to survive two trips — a JSON body, and a `?login_error=` query parameter on a redirect from the provider — and text in a query parameter is text an attacker can put on the login page. So the union is closed, `parseLoginFailure` refuses anything outside it, and the wording lives in `model/access.ts` where the browser composes it and smoke asserts it (I6). It is also what keeps a provider's raw error string off the page. |

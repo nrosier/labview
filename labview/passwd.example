@@ -1,0 +1,35 @@
+# LabView users — one `user:hash` per line.
+#
+# Copy to ./config/passwd next to your compose file (it is mounted at
+# /config/passwd, read-only) and append a line per person. Blank lines and lines
+# starting with `#` are ignored, and an empty file simply means no password login:
+# LabView then serves everything openly, or falls back to OIDC if you configured
+# it. The file is re-read when it changes, so adding a user needs no restart.
+#
+# The format is /etc/shadow's and htpasswd's: the algorithm is the hash's own
+# `$id$` prefix. LabView accepts bcrypt — `$2a$`, `$2b$`, `$2y$` — which is what
+# every tool below writes. Any other prefix is skipped with a warning naming the
+# id, and a plaintext password is never accepted.
+#
+# Three ways to make a line:
+#
+#   docker exec -it labview node dist/hashpw.js alice
+#   npm run hashpw -- alice                        # from a checkout
+#   htpasswd -nbB alice '<password>'               # apache2-utils
+#
+# The first two prompt with echo off and print only the finished line to stdout,
+# so `docker exec ... >> ./config/passwd` appends exactly one line. Note that
+# `htpasswd` takes the password on the command line, where `ps` and your shell
+# history can see it.
+#
+# A username may contain letters, digits and `. _ @ -`, up to 64 characters. On a
+# duplicate username the first line wins, and the duplicate is warned about.
+#
+# The cost (the `$12$` below) is how slow verification is, deliberately. 12 is the
+# default and takes ~250ms on a homelab CPU; raise it with `--cost` if you like,
+# but every sign-in pays it.
+
+# A structurally valid line, to show the shape. The hash is of a random string that
+# was never recorded, so nobody can sign in as `demo` — an example file with a
+# working password in it is a credential that ends up in production by accident.
+demo:$2b$12$XHw7RQ.exSaTgJ0khWyZt.k6PCSwn3VjezjxsXipgCVKV/00rkIiK

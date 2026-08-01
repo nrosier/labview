@@ -141,12 +141,15 @@ docker run --rm -p 8459:8080 \
   niqck/labview:latest
 ```
 
-That `-p` publishes LabView on your LAN with no authentication, which is fine for
-a look but not for a permanent install. For a real deployment — live Docker state
-via [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy),
-behind Traefik + Authentik with no published port — see
+That `-p` publishes LabView on your LAN, and with nothing mounted at
+`/config/passwd` it answers anyone who reaches the port — fine for a look, not for a
+permanent install. For a real deployment — live Docker state via
+[docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy), behind
+Traefik + Authentik with no published port — see
 [labview/README.md](labview/README.md#deploy-on-truenas-scale) and
-[labview/compose.yml](labview/compose.yml).
+[labview/compose.yml](labview/compose.yml). If a published port is what you want,
+give it a login of its own:
+[Access control](labview/README.md#access-control).
 
 ---
 
@@ -169,11 +172,18 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Traefik API base URL, e.g. `http://traefik:8080`. Only needed when the proxy is outside `appsRoot`, or when discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through a hostname Authentik gates: an Authentik user, or the reserved `goauthentik.io/token`. An unauthenticated endpoint is used with no credential |
 | `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
+| `LABVIEW_AUTH_PASSWD_FILE` | `/config/passwd` | `user:hash` lines. One usable entry turns LabView's own login on; no file means it stays off |
+| `LABVIEW_AUTH_PASSWD_ENABLED` | `true` | `false` switches the password form off entirely — the file is then not read |
+| `LABVIEW_OIDC_ISSUER` | *(unset)* | e.g. `https://authentik.example.com/application/o/labview/`. With a client id, this turns OIDC login on |
+| `LABVIEW_OIDC_CLIENT_ID` | *(unset)* | The provider's client id |
+| `LABVIEW_OIDC_CLIENT_SECRET_FILE` | *(unset)* | Path to a file holding the client secret. Empty for a public client — PKCE is used either way |
+| `LABVIEW_SESSION_SECRET_FILE` | *(unset)* | Path to a file holding the session-cookie HMAC key. Unset generates one at startup, so restarts sign everyone out |
 
 The full table — including `LABVIEW_HOST`, `LABVIEW_DOCKER_PORT`,
-`LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_DOCKER_TIMEOUT`, `LABVIEW_CONFIG` and
-the rest of the `LABVIEW_AUTHENTIK_*` and `LABVIEW_TRAEFIK_*` sets — plus the
-secret patterns, label prefixes and Authentik hints, is documented in
+`LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_DOCKER_TIMEOUT`, `LABVIEW_CONFIG`, the
+rest of the `LABVIEW_AUTHENTIK_*`, `LABVIEW_TRAEFIK_*`, `LABVIEW_OIDC_*` and
+`LABVIEW_SESSION_*` sets — plus the secret patterns, label prefixes and Authentik
+hints, is documented in
 [labview/README.md](labview/README.md#configuration).
 
 ### When something doesn't connect
@@ -297,11 +307,21 @@ See [labview/README.md](labview/README.md#how-it-works) for the details, and
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/overview` | GET | The full analyzed model (JSON) |
-| `/api/rescan` | POST | Re-read the apps root and return the rebuilt overview |
+| `/api/overview` | GET | **Needs a session.** The full analyzed model (JSON) |
+| `/api/rescan` | POST | **Needs a session.** Re-read the apps root and return the rebuilt overview |
 | `/api/healthz` | GET | Liveness probe |
+| `/api/session` | GET | The access posture, and who you are signed in as |
+| `/api/login` | POST | `{username, password}` → a session cookie |
+| `/api/logout` | POST | Revokes the session and clears the cookie |
+| `/auth/oidc/start` | GET | 302 to the provider's authorize URL |
+| `/auth/oidc/callback` | GET | The provider's redirect target |
 
-The UI is a static SPA served from the same origin. The JSON contract is
+**Gated** applies only while [access control](labview/README.md#access-control) is
+configured; with none configured every route answers as before. A gated request without
+a session gets `401 {"error":"unauthorized"}`.
+
+The UI is a static SPA served from the same origin, readable without a session because
+it is what renders the login card. The JSON contract is
 [labview/src/model/types.ts](labview/src/model/types.ts), imported directly by
 both backend and frontend.
 
@@ -426,10 +446,19 @@ output is sensitive.
   enabled. Prefer `LABVIEW_TRAEFIK_PASSWORD_FILE`; `LABVIEW_TRAEFIK_PASSWORD` is in
   the always-masked key list, so LabView scanning its own stack will not print its
   own credential, and no credential is ever interpolated into an error message.
-- **No built-in authentication.** LabView exposes your topology and (masked)
-  config, so **do not publish it raw.** Put it behind your own edge — the compose
-  example includes ready-to-adapt Traefik + Authentik forward-auth labels, and it
-  deliberately publishes no host port for the same reason.
+- **Its own login: off until configured, gating the data when it is.** LabView
+  exposes your topology and (masked) config, so **do not publish it raw.** The primary
+  answer is still your edge — the compose example includes ready-to-adapt Traefik +
+  Authentik forward-auth labels, and deliberately publishes no host port. LabView can
+  also require a login itself: put a `user:hash` line in `/config/passwd`, or point it
+  at an OIDC provider, and `/api` stops answering without a session. Passwords are
+  bcrypt with a per-username throttle, sessions are signed `HttpOnly` cookies with an
+  `Origin` check on every POST, and there is no trusted-header mode — a header is only
+  proof of identity if the edge is guaranteed to strip it, which LabView cannot verify.
+  Configure nothing and the behaviour is unchanged from earlier versions, with one
+  startup line saying the surface is open. Full walkthrough, including the Authentik
+  provider setup:
+  [labview/README.md](labview/README.md#access-control).
 - **Non-root container.** The image runs as the `node` user.
 
 CI runs on every push and PR touching `labview/**`, plus a daily scheduled sweep:

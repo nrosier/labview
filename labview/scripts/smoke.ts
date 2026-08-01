@@ -27,18 +27,25 @@ import type {
   IngressKind,
   Overview,
   Service,
+  SessionInfo,
   TraefikLiveRouter,
 } from "../src/model/types.js";
 import type { TagFilter } from "../src/model/filter.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
+// Type-only, so importing it here does not load the module before the environment below
+// is set — the same reason every value import in this file is a dynamic one.
+import type { SessionCheck } from "../src/auth/session.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appsRoot = resolve(here, "..", "fixtures", "apps");
 const edgeRoot = resolve(here, "..", "fixtures", "edge");
 const authentikRoot = resolve(here, "..", "fixtures", "authentik");
 const traefikRoot = resolve(here, "..", "fixtures", "traefik");
+// Not a fleet: three passwd files for LabView's own login. They are files rather than
+// stack directories because that is what the feature reads — see the section at the end.
+const authRoot = resolve(here, "..", "fixtures", "auth");
 
 // Configure via env BEFORE importing config.
 process.env.LABVIEW_DOCKER_ENABLED = "false";
@@ -60,6 +67,29 @@ delete process.env.LABVIEW_TRAEFIK_URL;
 delete process.env.LABVIEW_TRAEFIK_USERNAME;
 delete process.env.LABVIEW_TRAEFIK_PASSWORD;
 delete process.env.LABVIEW_TRAEFIK_PASSWORD_FILE;
+// LabView's own access control, cleared for both reasons at once. An operator with a
+// real `LABVIEW_SESSION_SECRET` or OIDC client secret exported would otherwise have this
+// test assert against their credentials, and a real `LABVIEW_AUTH_PASSWD_FILE` would
+// make the enforcement assertions depend on a file that is not in this repository.
+delete process.env.LABVIEW_AUTH_PASSWD_ENABLED;
+delete process.env.LABVIEW_AUTH_PASSWD_FILE;
+delete process.env.LABVIEW_AUTH_MAX_FAILED_ATTEMPTS;
+delete process.env.LABVIEW_AUTH_LOCKOUT_SECONDS;
+delete process.env.LABVIEW_AUTH_COOKIE_SECURE;
+delete process.env.LABVIEW_OIDC_ENABLED;
+delete process.env.LABVIEW_OIDC_ISSUER;
+delete process.env.LABVIEW_OIDC_CLIENT_ID;
+delete process.env.LABVIEW_OIDC_CLIENT_SECRET;
+delete process.env.LABVIEW_OIDC_CLIENT_SECRET_FILE;
+delete process.env.LABVIEW_OIDC_REDIRECT_URI;
+delete process.env.LABVIEW_OIDC_SCOPES;
+delete process.env.LABVIEW_OIDC_USERNAME_CLAIM;
+delete process.env.LABVIEW_OIDC_LABEL;
+delete process.env.LABVIEW_OIDC_TIMEOUT;
+delete process.env.LABVIEW_SESSION_SECRET;
+delete process.env.LABVIEW_SESSION_SECRET_FILE;
+delete process.env.LABVIEW_SESSION_TTL_MINUTES;
+delete process.env.LABVIEW_SESSION_COOKIE_NAME;
 
 const { loadConfig } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
@@ -4229,6 +4259,1195 @@ check(
   unstyled.length === 0,
   `no entry for: ${unstyled.join(", ") || "none"}`,
 );
+
+// ---------------------------------------------------------------------------------
+// Access control (fixtures/auth)
+//
+// LabView's own login, which is a different subject from every section above: nothing
+// here reads a compose file or a fleet. It is asserted in this file anyway, and at this
+// length, because it is the only part of LabView where a silent regression is a security
+// hole rather than a wrong label — an allowlist that admits one path too many, a nonce
+// nobody checks, a hash id nobody refuses. Each group below pins one such rule, and the
+// revert contract applies: undo the rule in `src/` and a check here must go red.
+//
+// Imported locally, at the end, for the reason `node:net` is below: the modules under
+// test read files and mint keys, and the sections above must not pay for that.
+// ---------------------------------------------------------------------------------
+console.log("\n--- access control (fixtures/auth) ---");
+
+const { chmodSync } = await import("node:fs");
+const { createHmac, generateKeyPairSync, sign: signWithKey } = await import("node:crypto");
+const {
+  DEFAULT_COST,
+  SUPPORTED_HASH_IDS,
+  decoyHash,
+  hashAlgorithmId,
+  hashAlgorithmName,
+  hashCost,
+  hashPassword,
+  isSupportedHash,
+  passwordTruncates,
+  verifyPassword,
+} = await import("../src/auth/hash.js");
+const { MAX_PASSWD_ENTRIES, clearPasswdCache, parsePasswd, readPasswd, verifyLogin } = await import(
+  "../src/auth/passwd.js"
+);
+const {
+  CLOCK_SKEW_SECONDS,
+  OidcClient,
+  buildAuthorizeUrl,
+  createVerifier,
+  isSecureUrl,
+  parseDiscovery,
+  pkceChallenge,
+  redirectUriFor,
+  scopeString,
+  usernameFromClaims,
+  verifyIdToken,
+} = await import("../src/auth/oidc.js");
+const {
+  SessionRevocations,
+  effectiveHost,
+  effectiveProtocol,
+  issueSession,
+  originAllowed,
+  readCookie,
+  safeEqual,
+  serializeCookie,
+  shouldSecureCookie,
+  signPayload,
+  verifySession,
+} = await import("../src/auth/session.js");
+const { LoginThrottle } = await import("../src/auth/throttle.js");
+const { isPublicPath, readAccess, requiresSession, resolveAccessMode, resolveOidc, resolveSessionSecret } =
+  await import("../src/auth/index.js");
+const { accessModeSummary, isValidUsername, loginFailureText, oidcButtonLabel, sanitizeUsername } = await import(
+  "../src/model/access.js"
+);
+
+const passwdOk = resolve(authRoot, "passwd.ok");
+const passwdMessy = resolve(authRoot, "passwd.messy");
+const passwdEmpty = resolve(authRoot, "passwd.empty");
+
+console.log("\nthe algorithm is whatever the hash says it is");
+{
+  const okFile = readPasswd(passwdOk);
+  // Read out of the fixture rather than repeated here: a hash literal in this file would
+  // be a second copy to keep in step, and one more string a future reader has to satisfy
+  // themselves is not a credential.
+  const alice = okFile.entries.get("alice")?.hash ?? "";
+  const bob = okFile.entries.get("bob")?.hash ?? "";
+  const carol = okFile.entries.get("carol")?.hash ?? "";
+
+  check("a bcrypt hash's id is read off its prefix", hashAlgorithmId(alice) === "2b", hashAlgorithmId(alice));
+  check(
+    "the two older bcrypt prefixes are the same function, and are accepted",
+    hashAlgorithmId(bob) === "2a" && hashAlgorithmId(carol) === "2y" && SUPPORTED_HASH_IDS.length === 3,
+  );
+  check("a value with no $ has no algorithm — in a passwd file that means plaintext", hashAlgorithmId("hunter2") === undefined);
+  check("a foreign id is named, so a refusal can say what it refused", hashAlgorithmName("6") === "sha512-crypt");
+  check("...an unknown one is quoted back as itself rather than guessed at", hashAlgorithmName("zz9") === "$zz9$");
+  check("...and every supported id is called bcrypt", SUPPORTED_HASH_IDS.every((id) => hashAlgorithmName(id) === "bcrypt"));
+
+  check("a well-formed hash is verifiable", isSupportedHash(alice) && isSupportedHash(bob) && isSupportedHash(carol));
+  check(
+    "a truncated one is not, which is what turns a copy-paste into a warning instead of a user who can never sign in",
+    !isSupportedHash(alice.slice(0, 40)),
+  );
+  check("...nor is a hash of an algorithm LabView cannot compute", !isSupportedHash("$6$rounds=5000$abc$def"));
+  check("the cost comes out of the hash itself", hashCost(alice) === 4 && hashCost("nonsense") === undefined);
+
+  // The three passwords are in the fixture's comments. They are strings only these
+  // assertions ever use, hashed at cost 4 so this stays fast.
+  check("each of the three prefixes verifies its own password", (await Promise.all([
+    verifyPassword("alice-secret", alice),
+    verifyPassword("bob-secret", bob),
+    verifyPassword("carol-secret", carol),
+  ])).every(Boolean));
+  check("a wrong password does not", (await verifyPassword("alice-secretx", alice)) === false);
+  check(
+    "an unusable hash is a wrong password, not an error — a caller that could tell them apart could probe the file",
+    (await verifyPassword("hunter2", "hunter2")) === false && (await verifyPassword("x", alice.slice(0, 40))) === false,
+  );
+
+  const minted = await hashPassword("round-trip", 4);
+  check(
+    "a freshly hashed password round-trips, at $2b$ and the cost it was asked for",
+    hashAlgorithmId(minted) === "2b" && hashCost(minted) === 4 && (await verifyPassword("round-trip", minted)),
+  );
+  check("the default cost is what `hashpw` will use, not what the fixtures use", DEFAULT_COST === 12);
+  check("a cost below bcrypt's own floor is clamped rather than rejected", hashCost(await hashPassword("x", 1)) === 4);
+  check(
+    "bcrypt's 72-byte limit is reported where it can still be acted on",
+    !passwordTruncates("a".repeat(72)) && passwordTruncates("a".repeat(73)) && passwordTruncates(`${"€".repeat(24)}x`),
+  );
+
+  const decoy = await decoyHash(4);
+  check(
+    "the unknown-user decoy is a real bcrypt hash at the file's own cost, so the unknown path costs what the known one does",
+    isSupportedHash(decoy) && hashCost(decoy) === 4,
+  );
+  check("...and is minted once per cost, not per attempt", (await decoyHash(4)) === decoy);
+  check("...and differs per cost, because that is the point of it", (await decoyHash(5)) !== decoy);
+}
+
+console.log("\na passwd file names its own mistakes");
+{
+  const ok = parsePasswd(readFileSync(passwdOk, "utf8"));
+  check("comments and blank lines are not entries", ok.entries.size === 3 && ok.warnings.length === 0);
+  check(
+    "the entries keep the file's order, which is the order a duplicate is judged in",
+    [...ok.entries.keys()].join(",") === "alice,bob,carol",
+  );
+
+  const messy = parsePasswd(readFileSync(passwdMessy, "utf8"));
+  const w = (i: number): string => messy.warnings[i] ?? "";
+  check(
+    "one warning per bad line, and one usable entry left over",
+    messy.warnings.length === 7 && messy.entries.size === 1 && messy.entries.has("frank"),
+    `${messy.warnings.length} warnings, ${messy.entries.size} entries`,
+  );
+  // The line numbers are asserted, not just the wording: a warning that points at the
+  // wrong line is worse than none, and off-by-one is exactly what a refactor breaks.
+  check("a line with no separator is named by number, and not echoed", w(0) === 'passwd line 10: no "user:hash" separator — entries look like alice:$2b$12$…', w(0));
+  check(
+    "a username over 64 characters is refused, without echoing it",
+    w(1) === "passwd line 13: username is not usable — letters, digits and . _ @ - only, up to 64 characters",
+    w(1),
+  );
+  check("a separator with nothing after it names the user", w(2) === 'passwd line 16: user "bob" has no hash', w(2));
+  check(
+    "a plaintext password is refused, and the operator is told how to make a hash",
+    w(3) ===
+      'passwd line 19: user "carol" has a plaintext password, not a hash — LabView never accepts one; run `npm run hashpw`',
+    w(3),
+  );
+  check(
+    "a foreign algorithm is named rather than called unsupported",
+    w(4) ===
+      'passwd line 23: user "dave" uses sha256-crypt, which LabView cannot verify — rehash with bcrypt (`npm run hashpw` or `htpasswd -nbB`)',
+    w(4),
+  );
+  check(
+    "a truncated bcrypt hash says what a complete one looks like",
+    w(5) === 'passwd line 26: user "erin" has a malformed bcrypt hash — a complete one is 60 characters',
+    w(5),
+  );
+  check(
+    "a repeated username is warned about, and the first entry is the one that stands",
+    w(6) === 'passwd line 33: user "frank" is already defined above — the first entry wins',
+    w(6),
+  );
+  check(
+    "no warning ever carries a hash, however malformed the line was",
+    messy.warnings.every((line) => !line.includes("$04$")),
+  );
+
+  // First-wins, proven by behaviour and not only by the warning: the duplicate line
+  // hashes a *different* password, so the second entry taking effect would show up here.
+  const messyFile = readPasswd(passwdMessy);
+  check("the first entry is the one that verifies", await verifyLogin(messyFile, "frank", "other-secret"));
+  check("...and the shadowed duplicate's password is not accepted", (await verifyLogin(messyFile, "frank", "long-secret")) === false);
+
+  const empty = parsePasswd(readFileSync(passwdEmpty, "utf8"));
+  check("a file of nothing but comments yields no users and no complaints", empty.entries.size === 0 && empty.warnings.length === 0);
+
+  const okFile = readPasswd(passwdOk);
+  check("an unknown username is refused", (await verifyLogin(okFile, "nobody", "alice-secret")) === false);
+  check("...as is a username the format would not allow at all", (await verifyLogin(okFile, "al ice", "alice-secret")) === false);
+  check("...and an absurd password is refused without being hashed", (await verifyLogin(okFile, "alice", "x".repeat(2000))) === false);
+  check("a known username with its own password is accepted", await verifyLogin(okFile, "alice", "alice-secret"));
+  check("...with surrounding whitespace forgiven on the name, never on the password", await verifyLogin(okFile, "  alice  ", "alice-secret"));
+
+  const aliceHash = ok.entries.get("alice")?.hash ?? "";
+  const spaced = parsePasswd(`  alice  :  ${aliceHash}  \n`);
+  check("whitespace around either half of an entry is trimmed", spaced.entries.size === 1 && spaced.entries.has("alice"));
+  check(
+    "only the first colon separates, so a third field is part of the hash and refused rather than quietly dropped",
+    parsePasswd(`alice:${aliceHash}:extra`).entries.size === 0,
+  );
+  check(
+    "the username character set is the same one every log line is sanitised against",
+    isValidUsername("a.b_c@d-e") && !isValidUsername("a b") && !isValidUsername("a\nb") && !isValidUsername(""),
+  );
+  check("...and an unusable name collapses to a single harmless token", sanitizeUsername("a\nb") === "?" && sanitizeUsername("alice") === "alice");
+
+  // The cap needs a thousand entries to reach, which is why it is built here rather than
+  // committed as a fixture.
+  const many = parsePasswd(Array.from({ length: MAX_PASSWD_ENTRIES + 5 }, (_, i) => `u${i}:${aliceHash}`).join("\n"));
+  check(
+    "the entry count is capped, and says so once rather than per ignored line",
+    many.entries.size === MAX_PASSWD_ENTRIES &&
+      many.warnings.length === 1 &&
+      many.warnings[0] === `passwd: stopped at ${MAX_PASSWD_ENTRIES} users; later lines were ignored`,
+    `${many.entries.size} entries, ${many.warnings.length} warnings`,
+  );
+}
+
+console.log("\nreading the file, including the ways it goes wrong");
+{
+  const dir = mkdtempSync(resolve(tmpdir(), "labview-passwd-"));
+  const file = resolve(dir, "passwd");
+  const hash = readPasswd(passwdOk).entries.get("alice")?.hash ?? "";
+  clearPasswdCache();
+
+  writeFileSync(file, `alice:${hash}\n`);
+  const first = readPasswd(file);
+  check("a readable file parses", first.state === "ok" && first.entries.size === 1);
+  check("an unchanged file is not parsed twice", readPasswd(file) === first);
+  writeFileSync(file, `alice:${hash}\nbob:${hash}\n`);
+  const second = readPasswd(file);
+  check(
+    "a changed file is re-read, so adding a user needs no restart",
+    second !== first && second.entries.size === 2,
+    `${second.entries.size} entries`,
+  );
+
+  const missing = readPasswd(resolve(dir, "not-there"));
+  check(
+    "a file that is not there is the unconfigured default, not a fault: no state, no warning",
+    missing.state === "missing" && missing.entries.size === 0 && missing.warnings.length === 0,
+  );
+
+  const asDir = readPasswd(dir);
+  check(
+    "a directory at the path names the Docker bind-mount cause, which is how this actually goes wrong",
+    asDir.state === "unreadable" &&
+      (asDir.warnings[0] ?? "").includes("is a directory, not a file — Docker creates one at a bind-mount path"),
+    asDir.warnings[0],
+  );
+
+  const big = resolve(dir, "huge");
+  writeFileSync(big, "#\n".repeat(40_000));
+  const oversize = readPasswd(big);
+  check(
+    "something other than a passwd file mounted at the path is refused by size, and the limit is stated",
+    oversize.state === "unreadable" && (oversize.warnings[0] ?? "").includes("over the 65536-byte limit for a passwd file"),
+    oversize.warnings[0],
+  );
+
+  // Root can read a mode-000 file, so this cannot be produced there. Skipped out loud
+  // rather than passed quietly: a ✓ for something that was not tested is a lie.
+  if (typeof process.getuid === "function" && process.getuid() !== 0) {
+    chmodSync(file, 0o000);
+    clearPasswdCache();
+    const denied = readPasswd(file);
+    chmodSync(file, 0o600);
+    check(
+      "a file the container's user cannot read says so, and says why that is expected",
+      denied.state === "unreadable" && (denied.warnings[0] ?? "").includes("LabView runs unprivileged"),
+      denied.warnings[0],
+    );
+  } else {
+    console.log("  – skipped: an unreadable file cannot be produced as root");
+  }
+
+  rmSync(dir, { recursive: true, force: true });
+  clearPasswdCache();
+}
+
+// A fixed clock for everything below, so a session's lifetime and a lockout's window are
+// arithmetic rather than a race against the test's own runtime.
+const T0 = new Date("2024-06-01T12:00:00Z");
+const at = (seconds: number): Date => new Date(T0.getTime() + seconds * 1000);
+const epoch = (d: Date): number => Math.floor(d.getTime() / 1000);
+/** Not a credential: an HMAC key this file mints for itself. */
+const SESSION_KEY = "smoke-session-key-not-a-secret";
+/**
+ * Why a token was refused, or `""` when it was not.
+ *
+ * `SessionCheck` is a discriminated union, so `.reason` exists only on the failing arm.
+ * Asserting the reason rather than the boolean is the point — "refused" is satisfied by a
+ * verifier that refuses everything — and this is what lets a check read
+ * `why(...) === "expired"` without narrowing at each call site.
+ */
+const why = (check: SessionCheck): string => (check.ok ? "" : check.reason);
+
+console.log("\na session token is signed, dated and revocable");
+{
+  const issued = issueSession("alice", "passwd", SESSION_KEY, 720, T0);
+  const good = verifySession(issued.token, SESSION_KEY, T0);
+  check(
+    "a fresh token verifies, carrying the user and the method that signed them in",
+    good.ok && good.payload.u === "alice" && good.payload.via === "passwd",
+  );
+  check("...and lasts exactly the configured ttl", issued.payload.exp - issued.payload.iat === 720 * 60);
+  check("...and two tokens for the same user are distinguishable, so one can be revoked", issueSession("alice", "passwd", SESSION_KEY, 720, T0).payload.jti !== issued.payload.jti);
+  check("a token one second past its expiry is refused", why(verifySession(issued.token, SESSION_KEY, at(720 * 60 + 1))) === "expired");
+  check("a token issued by another key is refused", why(verifySession(issued.token, `${SESSION_KEY}x`, T0)) === "signature");
+
+  const parts = issued.token.split(".");
+  const body = parts[1] ?? "";
+  const mac = parts[2] ?? "";
+  check(
+    "rewriting the payload invalidates the signature, which is the whole point of signing it",
+    why(
+      verifySession(
+        `v1.${Buffer.from(JSON.stringify({ ...issued.payload, u: "root" }), "utf8").toString("base64url")}.${mac}`,
+        SESSION_KEY,
+        T0,
+      ),
+    ) === "signature",
+  );
+  // The *first* character, and to a value it demonstrably is not. Appending a chosen
+  // letter in place of the last one is the obvious way to write this and is wrong twice
+  // over: one run in sixteen the MAC already ends in that letter and the "tampered" token
+  // is the original, and the final base64url character of a 32-byte digest carries only
+  // two significant bits, so a change there can decode to the same bytes.
+  const flipped = `${mac.startsWith("A") ? "B" : "A"}${mac.slice(1)}`;
+  check("flipping the signature is refused", flipped !== mac && why(verifySession(`v1.${body}.${flipped}`, SESSION_KEY, T0)) === "signature");
+  check("a token claiming another version is refused", verifySession(`v2.${body}.${mac}`, SESSION_KEY, T0).ok === false);
+  check("a token of the wrong shape is refused before anything is parsed", why(verifySession(`${body}.${mac}`, SESSION_KEY, T0)) === "malformed");
+  check("...as is an empty cookie value", why(verifySession("", SESSION_KEY, T0)) === "malformed");
+  // Signed by the right key and still refused: the payload has to be a session, so a
+  // future field with a wider type cannot smuggle in a method that no longer exists.
+  check(
+    "a correctly signed token whose method is not one LabView has is refused, not trusted",
+    why(verifySession(signPayload({ u: "alice", via: "basic", iat: epoch(T0), exp: epoch(T0) + 60, jti: "x" }, SESSION_KEY), SESSION_KEY, T0)) ===
+      "malformed",
+  );
+  check(
+    "...and one whose username could forge a log line is refused",
+    why(
+      verifySession(
+        signPayload({ u: "alice\nWARN: fake", via: "passwd", iat: epoch(T0), exp: epoch(T0) + 60, jti: "x" }, SESSION_KEY),
+        SESSION_KEY,
+        T0,
+      ),
+    ) === "malformed",
+  );
+
+  const revocations = new SessionRevocations();
+  check("a live token is not revoked", verifySession(issued.token, SESSION_KEY, T0, revocations).ok);
+  revocations.revoke(issued.payload.jti, issued.payload.exp, T0);
+  check("signing out refuses the token it was holding", why(verifySession(issued.token, SESSION_KEY, T0, revocations)) === "revoked");
+  check("...and only that token", verifySession(issueSession("alice", "passwd", SESSION_KEY, 720, T0).token, SESSION_KEY, T0, revocations).ok);
+
+  const bounded = new SessionRevocations(2);
+  bounded.revoke("a", epoch(at(10)), T0);
+  bounded.revoke("b", epoch(at(20)), T0);
+  bounded.revoke("c", epoch(at(30)), T0);
+  check(
+    "the revocation set is bounded, dropping the entry closest to expiring anyway",
+    bounded.size === 2 && !bounded.has("a") && bounded.has("c"),
+  );
+  bounded.prune(at(25));
+  check("...and forgets a revocation once the token could no longer be used", bounded.size === 1 && bounded.has("c"));
+
+  check("comparing two equal strings is true", safeEqual("abc", "abc"));
+  check("...two different ones false, and a length mismatch does not throw", !safeEqual("abc", "abd") && !safeEqual("abc", "abcd"));
+}
+
+console.log("\nthe cookie that carries it");
+{
+  const set = serializeCookie({ name: "labview_session", value: "tok", maxAgeSeconds: 43_200, secure: false, path: "/" });
+  check(
+    "a session cookie is HttpOnly and SameSite=Lax, with the configured lifetime",
+    set === "labview_session=tok; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax",
+    set,
+  );
+  check(
+    "Secure is added only when the browser's request was https, or it would be dropped on a LAN address",
+    serializeCookie({ name: "s", value: "t", maxAgeSeconds: 60, secure: true, path: "/" }).endsWith("; Secure"),
+  );
+  check(
+    "signing out sends the same cookie with no value and no lifetime",
+    serializeCookie({ name: "labview_session", value: "", maxAgeSeconds: 0, secure: false, path: "/" }).startsWith(
+      "labview_session=; Path=/; Max-Age=0",
+    ),
+  );
+  check("a negative lifetime cannot produce a cookie that outlives its intent", serializeCookie({ name: "s", value: "", maxAgeSeconds: -5, secure: false, path: "/" }).includes("Max-Age=0"));
+
+  check("one cookie is read out of several", readCookie("theme=dark; labview_session=tok; tz=CET", "labview_session") === "tok");
+  check("a cookie that is not there is undefined rather than empty", readCookie("theme=dark", "labview_session") === undefined);
+  check("no Cookie header at all is the same answer", readCookie(undefined, "labview_session") === undefined);
+  check("a repeated cookie takes the first, as a browser sends it", readCookie("s=first; s=second", "s") === "first");
+  // The transient OIDC cookie's name is the session cookie's name plus a suffix, so a
+  // prefix match here would hand the session verifier the wrong value entirely.
+  check("a name that is a prefix of another is not mistaken for it", readCookie("labview_session_oidc=t; labview_session=real", "labview_session") === "real");
+
+  check("the browser's scheme comes from the proxy's header when it set one", effectiveProtocol("https", "http") === "https");
+  check("...from the first hop of a chained one", effectiveProtocol("https, http", "http") === "https");
+  check("...and from the socket when nothing set it", effectiveProtocol(undefined, "HTTP") === "http");
+  check(
+    "the host is read the same way, since the redirect URI is built from it",
+    effectiveHost("LabView.Example.com", "internal:8080") === "labview.example.com" && effectiveHost(undefined, "Internal:8080") === "internal:8080",
+  );
+  check(
+    "a cookie is Secure on https, never on http, and the operator can override both ways",
+    shouldSecureCookie("auto", "https") && !shouldSecureCookie("auto", "http") && shouldSecureCookie("true", "http") && !shouldSecureCookie("false", "https"),
+  );
+
+  check("a POST with no Origin is allowed, so curl and a health checker still work", originAllowed(undefined, "labview.example.com"));
+  check(
+    "an Origin naming this host is allowed whatever its scheme, because a TLS-terminating proxy makes them differ",
+    originAllowed("https://labview.example.com", "labview.example.com") && originAllowed("http://labview.example.com", "labview.example.com"),
+  );
+  check("a foreign Origin is refused", !originAllowed("https://evil.example", "labview.example.com"));
+  check("...and `Origin: null` is refused rather than read as absent", !originAllowed("null", "labview.example.com"));
+}
+
+console.log("\nfailed sign-ins are counted per username, not per address");
+{
+  const th = new LoginThrottle(2, 60);
+  const key = LoginThrottle.key(sanitizeUsername("Alice"));
+  check("the bucket is case-insensitive, so capitalisation alone does not multiply the allowance", key === "alice");
+  check("asking does not consume an attempt", th.check(key, T0).allowed && th.size === 0);
+  th.fail(key, T0);
+  check("one failure short of the limit still allows an attempt", th.check(key, at(1)).allowed);
+  const locked = th.fail(key, at(50));
+  check("the limit locks, with a wait the route can put in Retry-After", !locked.allowed && locked.retryAfterSeconds === 60, JSON.stringify(locked));
+  // Anchored to the latest failure: anchoring to the first would let an attacker pace
+  // their guesses to the window boundary and never be locked out at all.
+  check("the window runs from the most recent failure", th.check(key, at(100)).retryAfterSeconds === 10);
+  check("...and opens again after that much quiet, dropping the bucket with it", th.check(key, at(111)).allowed && th.size === 0);
+
+  th.fail(key, at(200));
+  th.fail(key, at(201));
+  const beforeSuccess = th.check(key, at(202)).allowed;
+  th.succeed(key);
+  check("a correct password clears the count, ending the lockout", !beforeSuccess && th.check(key, at(202)).allowed);
+
+  const pruned = new LoginThrottle(1, 30);
+  pruned.fail("stale", T0);
+  pruned.fail("recent", at(20));
+  pruned.prune(at(31));
+  check("pruning drops only the buckets whose window has closed", pruned.size === 1 && pruned.check("stale", at(31)).allowed && !pruned.check("recent", at(31)).allowed);
+
+  // A script posting a million distinct usernames must be a lockout, not a memory leak.
+  const capped = new LoginThrottle(1, 600, 2);
+  capped.fail("first", T0);
+  capped.fail("second", at(1));
+  capped.fail("third", at(2));
+  check(
+    "at the cap the least recently failed bucket is evicted — a spray of usernames costs a lockout, never memory",
+    capped.size === 2 && capped.check("first", at(3)).allowed && !capped.check("second", at(3)).allowed && !capped.check("third", at(3)).allowed,
+  );
+  check("every junk username shares one bucket, because a script spraying names is one attacker", LoginThrottle.key(sanitizeUsername("a\nb")) === LoginThrottle.key(sanitizeUsername("c d")));
+}
+
+console.log("\nopen unless configured");
+{
+  const off = { passwdEnabled: true, passwdUsers: 0, oidcEnabled: true, oidcIssuer: "", oidcClientId: "" };
+  check(
+    "nothing configured enforces nothing, which is what makes a new image safe to pull",
+    resolveAccessMode(off).enforced === false && resolveAccessMode(off).methods.length === 0,
+  );
+  check("...and says nothing, because there is no login card to explain", resolveAccessMode(off).notes.length === 0);
+  const withUsers = resolveAccessMode({ ...off, passwdUsers: 3 });
+  check("one usable entry turns the gate on", withUsers.enforced && withUsers.methods.join(",") === "passwd");
+  const disabled = resolveAccessMode({ ...off, passwdEnabled: false, passwdUsers: 3 });
+  check(
+    "...unless password sign-in was switched off, which is the off switch an external-provider setup wants",
+    !disabled.enforced && disabled.methods.length === 0,
+  );
+  const oidcOnly = resolveAccessMode({ ...off, oidcIssuer: "https://idp.example.com/application/o/labview/", oidcClientId: "cid" });
+  check("an issuer and a client id turn it on with no passwd file at all", oidcOnly.enforced && oidcOnly.methods.join(",") === "oidc");
+  check(
+    "half-configured OIDC never enforces on its own",
+    !resolveAccessMode({ ...off, oidcIssuer: "https://idp.example.com" }).enforced && !resolveAccessMode({ ...off, oidcClientId: "cid" }).enforced,
+  );
+  const both = resolveAccessMode({ ...off, passwdUsers: 2, oidcIssuer: "https://idp.example.com", oidcClientId: "cid" });
+  check("with both live, password comes first — the local account is what works when the provider is broken", both.methods.join(",") === "passwd,oidc");
+  const halfWhileEnforcing = resolveAccessMode({ ...off, passwdUsers: 2, oidcIssuer: "https://idp.example.com" });
+  check(
+    "a method that is on but unusable is a note while enforcing, never a failure",
+    halfWhileEnforcing.enforced && halfWhileEnforcing.notes.join("|") === "Single sign-on is configured but not available.",
+    halfWhileEnforcing.notes.join("|"),
+  );
+  check(
+    "...and the same is said of a passwd file that lost its users",
+    resolveAccessMode({ ...off, oidcIssuer: "https://idp.example.com", oidcClientId: "cid" }).notes.join("|") ===
+      "Password sign-in is configured but not available.",
+  );
+
+  check(
+    "the open posture says so in one line, and names what is holding the door",
+    accessModeSummary(resolveAccessMode(off), { users: 0, oidcHost: "" }) ===
+      "LabView access control: none — the HTTP surface is open to anyone who can reach it, relying on your edge",
+  );
+  check(
+    "the enforcing line counts users and pluralises",
+    accessModeSummary(withUsers, { users: 1, oidcHost: "" }) === "LabView access control: password login (1 user) — /api requires a session" &&
+      accessModeSummary(withUsers, { users: 3, oidcHost: "" }) === "LabView access control: password login (3 users) — /api requires a session",
+  );
+  check(
+    "...and names the provider's host, since that is what an operator recognises",
+    accessModeSummary(both, { users: 2, oidcHost: "idp.example.com" }) ===
+      "LabView access control: password login (2 users) + OIDC (idp.example.com) — /api requires a session",
+  );
+  check(
+    "a log line is a count, never a list of accounts to try",
+    !accessModeSummary(both, { users: 2, oidcHost: "idp.example.com" }).includes("alice"),
+  );
+  check("an unparseable issuer degrades the label rather than the line", oidcButtonLabel("", "not a url") === "Sign in with your provider" && oidcButtonLabel(" SSO ", "https://idp.example.com") === "SSO");
+  check("every failure code has wording a visitor can act on", loginFailureText("credentials") === "Invalid username or password." && loginFailureText("oidc-state").length > 0);
+}
+
+console.log("\nthe posture comes from the file, read as configured");
+{
+  const cfgFor = (env: Record<string, string | undefined>): ReturnType<typeof loadConfig> => {
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    return loadConfig();
+  };
+
+  clearPasswdCache();
+  const okSnap = readAccess(cfgFor({ LABVIEW_AUTH_PASSWD_FILE: passwdOk }));
+  check(
+    "a good file enforces, with a user count and nothing to fix",
+    okSnap.mode.enforced && okSnap.users === 3 && okSnap.warnings.length === 0 && okSnap.hints.length === 0,
+  );
+  const emptySnap = readAccess(cfgFor({ LABVIEW_AUTH_PASSWD_FILE: passwdEmpty }));
+  check("a file of comments leaves the surface open, and does not complain about it", !emptySnap.mode.enforced && emptySnap.users === 0 && emptySnap.warnings.length === 0);
+  const messySnap = readAccess(cfgFor({ LABVIEW_AUTH_PASSWD_FILE: passwdMessy }));
+  check("a messy file enforces on what it can use and reports the rest", messySnap.mode.enforced && messySnap.users === 1 && messySnap.warnings.length === 7);
+  const missingSnap = readAccess(cfgFor({ LABVIEW_AUTH_PASSWD_FILE: resolve(authRoot, "passwd.absent") }));
+  check(
+    "a missing file is a hint naming where LabView looked, not a warning",
+    !missingSnap.mode.enforced && missingSnap.warnings.length === 0 && missingSnap.hints.some((h) => h.includes("passwd.absent")),
+    missingSnap.hints.join("|"),
+  );
+  const disabledSnap = readAccess(cfgFor({ LABVIEW_AUTH_PASSWD_FILE: passwdOk, LABVIEW_AUTH_PASSWD_ENABLED: "false" }));
+  check(
+    "switching password sign-in off does not read the file at all",
+    !disabledSnap.mode.enforced && disabledSnap.users === 0 && disabledSnap.passwd.state === "missing",
+  );
+  const halfSnap = readAccess(
+    cfgFor({ LABVIEW_AUTH_PASSWD_ENABLED: undefined, LABVIEW_OIDC_ISSUER: "https://idp.example.com/application/o/labview/" }),
+  );
+  check(
+    "an issuer with no client id is a warning that names the setting to fix",
+    halfSnap.warnings.some((warning) => warning.includes("auth.oidc.clientId is empty")),
+    halfSnap.warnings.join("|"),
+  );
+  const bothOff = readAccess(cfgFor({ LABVIEW_OIDC_ISSUER: undefined, LABVIEW_AUTH_PASSWD_ENABLED: "false", LABVIEW_OIDC_ENABLED: "false" }));
+  check(
+    "with both methods switched off, the hint says LabView will never ask — so an open surface is never a surprise",
+    bothOff.hints.some((hint) => hint.includes("LabView will not ask for a sign-in")),
+    bothOff.hints.join("|"),
+  );
+
+  const generated = resolveSessionSecret(cfgFor({ LABVIEW_AUTH_PASSWD_ENABLED: undefined, LABVIEW_OIDC_ENABLED: undefined }), () => "minted");
+  check(
+    "no configured secret mints one and says restarts will sign everyone out — degrade, never refuse to start",
+    generated.generated && generated.secret === "minted" && generated.notes.some((n) => n.includes("restart signs everyone out")),
+  );
+  const configured = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET: SESSION_KEY }), () => "minted");
+  check("a configured secret is used as-is", !configured.generated && configured.secret === SESSION_KEY && configured.notes.length === 0);
+
+  const secretDir = mkdtempSync(resolve(tmpdir(), "labview-secret-"));
+  const secretFile = resolve(secretDir, "session.key");
+  writeFileSync(secretFile, "  from-a-file\n");
+  const fromFile = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET_FILE: secretFile }), () => "minted");
+  check("a secret file beats an inline value and is trimmed", fromFile.secret === "from-a-file" && !fromFile.generated);
+  const badFile = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET_FILE: resolve(secretDir, "gone") }), () => "minted");
+  check(
+    "an unreadable secret file falls back to the inline value with a note, rather than failing the start-up",
+    badFile.secret === SESSION_KEY && badFile.notes.length === 1,
+    badFile.notes.join("|"),
+  );
+  check("...and the note does not echo the secret it could not replace", badFile.notes.every((n) => !n.includes(SESSION_KEY)));
+
+  const noOidc = resolveOidc(cfgFor({ LABVIEW_SESSION_SECRET: undefined, LABVIEW_SESSION_SECRET_FILE: undefined }));
+  check("no issuer means no OIDC client is built", noOidc.settings === undefined && noOidc.notes.length === 0);
+  writeFileSync(secretFile, "  file-client-secret\n");
+  const oidcCfg = resolveOidc(
+    cfgFor({
+      LABVIEW_OIDC_ISSUER: " https://idp.example.com/application/o/labview/ ",
+      LABVIEW_OIDC_CLIENT_ID: " labview ",
+      LABVIEW_OIDC_CLIENT_SECRET: "inline-client-secret",
+      LABVIEW_OIDC_CLIENT_SECRET_FILE: secretFile,
+    }),
+  );
+  check(
+    "a configured issuer trims what an operator pasted, and the secret file beats the inline value",
+    oidcCfg.settings?.issuer === "https://idp.example.com/application/o/labview/" &&
+      oidcCfg.settings?.clientId === "labview" &&
+      oidcCfg.settings?.clientSecret === "file-client-secret",
+    JSON.stringify({ issuer: oidcCfg.settings?.issuer, clientId: oidcCfg.settings?.clientId }),
+  );
+  const publicClient = resolveOidc(cfgFor({ LABVIEW_OIDC_CLIENT_SECRET: undefined, LABVIEW_OIDC_CLIENT_SECRET_FILE: undefined }));
+  check("no secret at all is a public client authenticating by PKCE, not an error", publicClient.settings !== undefined && publicClient.settings.clientSecret === "" && publicClient.notes.length === 0);
+
+  rmSync(secretDir, { recursive: true, force: true });
+  cfgFor({ LABVIEW_OIDC_ISSUER: undefined, LABVIEW_OIDC_CLIENT_ID: undefined, LABVIEW_AUTH_PASSWD_FILE: undefined });
+  clearPasswdCache();
+}
+
+console.log("\nwhat may be read without a session");
+{
+  for (const path of ["/api/healthz", "/api/session", "/api/login", "/api/logout"]) {
+    check(`${path} is reachable without one, since a login flow could not start otherwise`, isPublicPath(path) && !requiresSession(path));
+  }
+  check("the fleet itself is not", requiresSession("/api/overview") && !isPublicPath("/api/overview"));
+  check("...nor is a rescan", requiresSession("/api/rescan"));
+  check("...nor an /api path that does not exist, so the gate answers before routing does", requiresSession("/api/nope") && requiresSession("/api"));
+  // The three ways the prefix version of this allowlist would leak, spelled out.
+  check("a dot-segment cannot walk out of a public path", requiresSession("/api/healthz/../overview"));
+  check("a name that merely starts with a public one is not public", requiresSession("/api/sessionx") && requiresSession("/api/loginx"));
+  check("a doubled slash does not evade the gate", requiresSession("//api/overview") && requiresSession("/api//overview"));
+  check("nor does case", requiresSession("/API/OVERVIEW"));
+  check("a query string or fragment does not make a public path private", isPublicPath("/api/session?x=1") && isPublicPath("/api/healthz#frag"));
+  check("...and does not make a private one public", requiresSession("/api/overview?x=/api/session"));
+  check(
+    "the SPA shell, its bundle and its stylesheet stay public — nothing in them is fleet-specific",
+    !requiresSession("/") && !requiresSession("/app.js") && !requiresSession("/styles.css") && !requiresSession("/graph"),
+  );
+  check("the OIDC round trip is never gated, because it is how a session is obtained", !requiresSession("/auth/oidc/start") && !requiresSession("/auth/oidc/callback"));
+}
+
+console.log("\nsingle sign-on: the parts that are pure arithmetic");
+{
+  // The RFC 7636 appendix B vector, so the derivation is pinned against the spec rather
+  // than against itself — a `pkceChallenge` that hashed the wrong thing consistently
+  // would satisfy any round-trip test written from it.
+  check(
+    "the S256 challenge matches the RFC's own test vector",
+    pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") === "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+    pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+  );
+  const verifier = createVerifier();
+  check("a verifier is 43 base64url characters, which is what the RFC allows", verifier.length === 43 && /^[A-Za-z0-9_-]+$/.test(verifier));
+  check("...and two are not the same", createVerifier() !== verifier);
+
+  check("openid is sent whether or not it was configured", scopeString(["profile", "email"]) === "openid profile email" && scopeString([]) === "openid");
+  check("...and never twice, however it was written down", scopeString([" openid ", "profile", "profile"]) === "openid profile");
+  check("a configured redirect URI is used verbatim, because the provider matches it exactly", redirectUriFor(" https://labview.example.com/auth/oidc/callback ", "http", "10.0.0.5:8080") === "https://labview.example.com/auth/oidc/callback");
+  check("...and one is derived from the request when it was not configured, so a first attempt on a LAN address works", redirectUriFor("", "http", "10.0.0.5:8080") === "http://10.0.0.5:8080/auth/oidc/callback");
+  check("https is required of a provider endpoint", isSecureUrl("https://idp.example.com/x") && !isSecureUrl("http://idp.example.com/x") && !isSecureUrl("nonsense"));
+  check("...with loopback excepted, which is what makes a local stub issuer testable", isSecureUrl("http://localhost:9000/x") && isSecureUrl("http://127.0.0.1:9000/x"));
+}
+
+console.log("\nsingle sign-on: the provider's documents");
+{
+  const ISSUER = "https://idp.example.com/application/o/labview/";
+  const doc = {
+    issuer: ISSUER,
+    authorization_endpoint: "https://idp.example.com/application/o/authorize/",
+    token_endpoint: "https://idp.example.com/application/o/token/",
+    jwks_uri: "https://idp.example.com/application/o/labview/jwks/",
+  };
+
+  const parsed = parseDiscovery(doc, ISSUER);
+  check("a complete discovery document parses", parsed.ok && parsed.doc.tokenEndpoint === doc.token_endpoint);
+  check(
+    "a trailing slash either side is forgiven, because that is what an operator's copy-paste does to an issuer",
+    parseDiscovery(doc, ISSUER.replace(/\/$/, "")).ok && parseDiscovery({ ...doc, issuer: ISSUER.replace(/\/$/, "") }, ISSUER).ok,
+  );
+  const mixUp = parseDiscovery({ ...doc, issuer: "https://evil.example/" }, ISSUER);
+  check(
+    "a document naming another issuer is refused — the mix-up defence, and it names the setting to check",
+    !mixUp.ok && mixUp.detail.includes("does not match the configured issuer — check auth.oidc.issuer"),
+    mixUp.ok ? "accepted" : mixUp.detail,
+  );
+  const noToken = parseDiscovery({ ...doc, token_endpoint: "" }, ISSUER);
+  check("a document missing an endpoint says which one", !noToken.ok && noToken.detail === "the discovery document has no token_endpoint", noToken.ok ? "accepted" : noToken.detail);
+  const downgraded = parseDiscovery({ ...doc, token_endpoint: "http://idp.example.com/token/" }, ISSUER);
+  check(
+    "a plain-http endpoint is refused, so a downgraded document cannot turn the exchange into a cleartext one",
+    !downgraded.ok && downgraded.detail.includes("token_endpoint is not an https URL"),
+    downgraded.ok ? "accepted" : downgraded.detail,
+  );
+  check("something that is not a document at all is refused without throwing", !parseDiscovery("<html>", ISSUER).ok && !parseDiscovery(null, ISSUER).ok);
+
+  const settings = {
+    issuer: ISSUER,
+    clientId: "labview",
+    clientSecret: "",
+    redirectUri: "https://labview.example.com/auth/oidc/callback",
+    scopes: ["openid", "profile", "email"],
+    usernameClaim: "preferred_username",
+    timeoutMs: 500,
+  };
+  const authorize = new URL(
+    buildAuthorizeUrl(
+      { issuer: ISSUER, authorizationEndpoint: doc.authorization_endpoint, tokenEndpoint: doc.token_endpoint, jwksUri: doc.jwks_uri },
+      settings,
+      settings.redirectUri,
+      { state: "the-state", nonce: "the-nonce", verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" },
+    ),
+  );
+  const param = (name: string): string => authorize.searchParams.get(name) ?? "";
+  check("the authorize URL asks for a code, as this client id, back at this redirect URI", param("response_type") === "code" && param("client_id") === "labview" && param("redirect_uri") === settings.redirectUri);
+  check("...with the scopes, the state and the nonce this attempt generated", param("scope") === "openid profile email" && param("state") === "the-state" && param("nonce") === "the-nonce");
+  check(
+    "...and the PKCE challenge, by S256 — never the verifier itself, which would defeat the exercise",
+    param("code_challenge") === "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" &&
+      param("code_challenge_method") === "S256" &&
+      !authorize.search.includes("dBjftJeZ"),
+  );
+}
+
+console.log("\nsingle sign-on: an ID token is not believed until it verifies");
+{
+  const ISSUER = "https://idp.example.com/application/o/labview/";
+  const CLIENT = "labview";
+  const NONCE = "the-nonce-of-this-attempt";
+  // Generated per run rather than committed: a private key in a repository is a private
+  // key, whatever the comment beside it says.
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwk = publicKey.export({ format: "jwk" });
+  const jwks = { keys: [{ ...jwk, kid: "smoke-1", use: "sig", alg: "RS256" }] };
+  const b64 = (value: unknown): string => Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  const jwt = (header: Record<string, unknown>, claims: unknown, sign: (data: Buffer) => Buffer): string => {
+    const signing = `${b64(header)}.${b64(claims)}`;
+    return `${signing}.${sign(Buffer.from(signing, "utf8")).toString("base64url")}`;
+  };
+  const rsa = (data: Buffer): Buffer => signWithKey("sha256", data, privateKey);
+  const claims = { iss: ISSUER, aud: CLIENT, sub: "8f14e45f", exp: epoch(at(300)), iat: epoch(T0), nonce: NONCE, preferred_username: "alice" };
+  const token = (over: Record<string, unknown> = {}): string => jwt({ alg: "RS256", kid: "smoke-1", typ: "JWT" }, { ...claims, ...over }, rsa);
+  const opts = { issuer: ISSUER, clientId: CLIENT, nonce: NONCE, now: T0 };
+
+  const accepted = verifyIdToken(token(), jwks, opts);
+  check("a well-formed token from the configured provider verifies", accepted.ok && accepted.claims.preferred_username === "alice" && accepted.kid === "smoke-1", accepted.ok ? "" : accepted.detail);
+
+  const parts = token().split(".");
+  const swapped = `${parts[0] ?? ""}.${b64({ ...claims, sub: "root", preferred_username: "root" })}.${parts[2] ?? ""}`;
+  const tamper = verifyIdToken(swapped, jwks, opts);
+  check("a payload swapped under a real signature is refused", !tamper.ok && tamper.detail === "the ID token's signature did not verify", tamper.ok ? "accepted" : tamper.detail);
+
+  // The order is the rule: reading `exp` off an unverified token and reporting it is how
+  // a verifier ends up acting on attacker-supplied JSON.
+  const expiredAndForged = `${parts[0] ?? ""}.${b64({ ...claims, exp: epoch(at(-9999)) })}.${parts[2] ?? ""}`;
+  const ordered = verifyIdToken(expiredAndForged, jwks, opts);
+  check("the signature is checked before any claim is believed", !ordered.ok && ordered.detail.includes("signature"), ordered.ok ? "accepted" : ordered.detail);
+
+  const unsigned = verifyIdToken(jwt({ alg: "none" }, claims, () => Buffer.alloc(0)), jwks, opts);
+  check("an unsigned token is refused by algorithm, before a key is even looked for", !unsigned.ok && unsigned.detail === "the ID token is signed with none, which LabView does not accept", unsigned.ok ? "accepted" : unsigned.detail);
+
+  // The classic confusion: sign with the *public* key as an HMAC secret and hope the
+  // verifier picks its algorithm from the token instead of from its own policy.
+  const pem = publicKey.export({ format: "pem", type: "spki" }).toString();
+  const hmac = verifyIdToken(jwt({ alg: "HS256", kid: "smoke-1" }, claims, (data) => createHmac("sha256", pem).update(data).digest()), jwks, opts);
+  check("an HMAC-signed token beside an asymmetric JWKS is refused, and the algorithm is named so the provider setting can be fixed", !hmac.ok && hmac.detail === "the ID token is signed with HS256, which LabView does not accept", hmac.ok ? "accepted" : hmac.detail);
+
+  const rotated = verifyIdToken(jwt({ alg: "RS256", kid: "rotated" }, claims, rsa), jwks, opts);
+  check("a token naming a key the JWKS does not have reports the kid, which is the one recoverable failure", !rotated.ok && rotated.unknownKid === "rotated", rotated.ok ? "accepted" : rotated.detail);
+  const encOnly = verifyIdToken(token(), { keys: [{ ...jwk, kid: "smoke-1", use: "enc" }] }, opts);
+  check("a key marked for encryption is not a signing key", !encOnly.ok, encOnly.ok ? "accepted" : encOnly.detail);
+  check("a token that is not a three-part JWT is refused", !verifyIdToken("nope", jwks, opts).ok && !verifyIdToken("a.b", jwks, opts).ok);
+
+  const cases: [string, string, string][] = [
+    ["another issuer is refused", token({ iss: "https://evil.example/" }), "the ID token's iss is not the configured issuer"],
+    ["a token for another client is refused", token({ aud: "someone-else" }), "the ID token's aud does not include this client id"],
+    ["...and so is one authorized to another party", token({ aud: [CLIENT, "other"], azp: "other" }), "the ID token's azp is another client"],
+    ["an expired token is refused", token({ exp: epoch(at(-CLOCK_SKEW_SECONDS - 1)) }), "the ID token has expired"],
+    ["a token from the future is refused, and the clocks are blamed", token({ iat: epoch(at(CLOCK_SKEW_SECONDS + 1)) }), "the ID token was issued in the future — check the clocks"],
+    ["a token from another sign-in attempt is refused", token({ nonce: "some-other-attempt" }), "the ID token's nonce does not match this sign-in attempt"],
+    ["...as is one with no nonce at all", token({ nonce: undefined }), "the ID token's nonce does not match this sign-in attempt"],
+  ];
+  for (const [name, value, detail] of cases) {
+    const got = verifyIdToken(value, jwks, opts);
+    check(name, !got.ok && got.detail === detail, got.ok ? "accepted" : got.detail);
+  }
+  check("an audience list containing this client is accepted", verifyIdToken(token({ aud: ["other", CLIENT] }), jwks, opts).ok);
+  check("...and an azp naming this client is what it should be", verifyIdToken(token({ aud: [CLIENT, "other"], azp: CLIENT }), jwks, opts).ok);
+  check(
+    "a token just inside the clock skew is accepted, because two machines are never in step",
+    verifyIdToken(token({ exp: epoch(at(-CLOCK_SKEW_SECONDS + 1)) }), jwks, opts).ok &&
+      verifyIdToken(token({ iat: epoch(at(CLOCK_SKEW_SECONDS - 1)) }), jwks, opts).ok,
+  );
+
+  const base = { iss: ISSUER, aud: CLIENT, sub: "8f14e45f", exp: epoch(at(300)), iat: epoch(T0) };
+  check("the configured claim is preferred", usernameFromClaims({ ...base, nickname: "nick", preferred_username: "pref" }, "nickname") === "nick");
+  check("...then preferred_username", usernameFromClaims({ ...base, preferred_username: "pref", email: "a@b.example" }, "nickname") === "pref");
+  check("...then the email address", usernameFromClaims({ ...base, email: "a@b.example" }, "nickname") === "a@b.example");
+  check("...and finally sub, the only claim a provider must send", usernameFromClaims(base, "nickname") === "8f14e45f");
+  check(
+    "a claim a log line could not survive is skipped in favour of the next candidate",
+    usernameFromClaims({ ...base, preferred_username: "two words", email: "a@b.example" }, "") === "a@b.example",
+  );
+  check("...and if none is usable, none is invented", usernameFromClaims({ ...base, sub: "a b" }, "") === undefined);
+}
+
+console.log("\nsingle sign-on: the token exchange, against a stubbed provider");
+{
+  const ISSUER = "https://idp.example.com/application/o/labview/";
+  const CLIENT = "labview";
+  const NONCE = "the-nonce-of-this-attempt";
+  /** Not a credential: a string the stub demands back, so it can be asserted. */
+  const CLIENT_SECRET = "smoke-oidc-client-secret";
+  const DISCOVERY_URL = "https://idp.example.com/application/o/labview/.well-known/openid-configuration";
+  const doc = {
+    issuer: ISSUER,
+    authorization_endpoint: "https://idp.example.com/application/o/authorize/",
+    token_endpoint: "https://idp.example.com/application/o/token/",
+    jwks_uri: "https://idp.example.com/application/o/labview/jwks/",
+  };
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const jwks = { keys: [{ ...publicKey.export({ format: "jwk" }), kid: "smoke-1", use: "sig", alg: "RS256" }] };
+  const b64 = (value: unknown): string => Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  const idToken = (over: Record<string, unknown> = {}, kid = "smoke-1"): string => {
+    const signing = `${b64({ alg: "RS256", kid, typ: "JWT" })}.${b64({
+      iss: ISSUER,
+      aud: CLIENT,
+      sub: "8f14e45f",
+      exp: epoch(at(300)),
+      iat: epoch(T0),
+      nonce: NONCE,
+      preferred_username: "alice",
+      ...over,
+    })}`;
+    return `${signing}.${signWithKey("sha256", Buffer.from(signing, "utf8"), privateKey).toString("base64url")}`;
+  };
+
+  interface StubOpts {
+    discovery?: unknown;
+    tokenStatus?: number;
+    tokenBody?: unknown;
+  }
+  /** A provider that answers the three requests a login makes, and records them. */
+  function providerStub(opts: StubOpts = {}): { doFetch: FetchLike; calls: string[]; bodies: string[] } {
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    const doFetch: FetchLike = async (url, init) => {
+      calls.push(url);
+      if (init?.body !== undefined) bodies.push(init.body);
+      if (url === DISCOVERY_URL) return reply(200, opts.discovery ?? doc);
+      if (url === doc.jwks_uri) return reply(200, jwks);
+      if (url === doc.token_endpoint) return reply(opts.tokenStatus ?? 200, opts.tokenBody ?? { id_token: idToken(), token_type: "Bearer" });
+      return reply(404, { detail: "no such endpoint" });
+    };
+    return { doFetch, calls, bodies };
+  }
+  const settings = {
+    issuer: ISSUER,
+    clientId: CLIENT,
+    clientSecret: CLIENT_SECRET,
+    redirectUri: "https://labview.example.com/auth/oidc/callback",
+    scopes: ["openid", "profile", "email"],
+    usernameClaim: "preferred_username",
+    timeoutMs: 500,
+  };
+  const transient = { state: "the-state", nonce: NONCE, verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", exp: epoch(at(300)) };
+
+  const happy = providerStub();
+  const redeemed = await new OidcClient(settings, happy.doFetch).redeem("the-code", settings.redirectUri, transient, T0);
+  check("a code is exchanged and the identity in the ID token comes back", redeemed.ok && redeemed.username === "alice", redeemed.ok ? "" : redeemed.failure.detail);
+  check(
+    "the exchange carries the PKCE verifier and the client secret, as a confidential client",
+    (happy.bodies[0] ?? "").includes("grant_type=authorization_code") &&
+      (happy.bodies[0] ?? "").includes(`code_verifier=${transient.verifier}`) &&
+      (happy.bodies[0] ?? "").includes(`client_secret=${CLIENT_SECRET}`),
+    happy.bodies[0]?.replace(CLIENT_SECRET, "…"),
+  );
+  check("...and it reaches the token endpoint the document named, not a guessed one", happy.calls.includes(doc.token_endpoint) && happy.calls[0] === DISCOVERY_URL);
+
+  const publicClient = providerStub();
+  await new OidcClient({ ...settings, clientSecret: "" }, publicClient.doFetch).redeem("the-code", settings.redirectUri, transient, T0);
+  check("a public client sends no secret and still sends its verifier", !(publicClient.bodies[0] ?? "").includes("client_secret") && (publicClient.bodies[0] ?? "").includes("code_verifier="));
+
+  const cached = providerStub();
+  const client = new OidcClient(settings, cached.doFetch);
+  await client.redeem("code-1", settings.redirectUri, transient, T0);
+  await client.redeem("code-2", settings.redirectUri, transient, at(60));
+  check(
+    "a second login inside the TTL re-uses the discovery document and the keys, so signing in is one request",
+    cached.calls.filter((u) => u === DISCOVERY_URL).length === 1 && cached.calls.filter((u) => u === doc.jwks_uri).length === 1,
+    cached.calls.join(" "),
+  );
+
+  const rotated = providerStub({ tokenBody: { id_token: idToken({}, "rotated") } });
+  const rotatedResult = await new OidcClient(settings, rotated.doFetch).redeem("the-code", settings.redirectUri, transient, T0);
+  check(
+    "an unknown key id refetches the JWKS exactly once, so key rotation recovers and a bogus kid cannot be used to hammer the provider",
+    !rotatedResult.ok && rotated.calls.filter((u) => u === doc.jwks_uri).length === 2,
+    `${rotated.calls.filter((u) => u === doc.jwks_uri).length} jwks fetches`,
+  );
+
+  const refused: [string, StubOpts, string, string][] = [
+    ["a document naming another issuer stops the login at the provider", { discovery: { ...doc, issuer: "https://evil.example/" } }, "provider", "does not match the configured issuer"],
+    ["a refused exchange names the stage and what to check", { tokenStatus: 400 }, "token", "check the client id, secret and the redirect URI"],
+    ["a response with no ID token says the openid scope may be missing", { tokenBody: { access_token: "opaque" } }, "token", "the provider may not have the openid scope enabled"],
+    ["a token from another attempt is refused at the token stage", { tokenBody: { id_token: idToken({ nonce: "another" }) } }, "token", "nonce does not match this sign-in attempt"],
+    ["a token with no usable username fails on identity, naming the claims that were tried", { tokenBody: { id_token: idToken({ preferred_username: undefined, email: undefined, sub: "a b" }) } }, "identity", "add the profile or email scope"],
+  ];
+  for (const [name, stubOpts, stage, detail] of refused) {
+    const stub = providerStub(stubOpts);
+    const got = await new OidcClient(settings, stub.doFetch).redeem("the-code", settings.redirectUri, transient, T0);
+    check(name, !got.ok && got.failure.stage === stage && got.failure.detail.includes(detail), got.ok ? "accepted" : `${got.failure.stage}: ${got.failure.detail}`);
+    check(`...and that failure carries no credential (${stage})`, got.ok || !got.failure.detail.includes(CLIENT_SECRET));
+  }
+}
+
+console.log("\nthe gate itself, driven through real requests");
+{
+  // The one part of this feature no unit test can reach. Every rule above is a function
+  // of its arguments, and each of them can be right while the server is wrong: a hook
+  // that decides correctly and forgets to reply, an allowlist consulted after routing
+  // instead of before it, a cookie set on the wrong path, a 401 that arrives with the
+  // body still attached. So these go through `app.inject()` — real hooks, real routes,
+  // real headers, no socket.
+  //
+  // Both postures run, because "open unless configured" is a promise about what happens
+  // when an operator changes nothing, and an untested promise is a comment.
+  const { buildApp } = await import("../src/server/server.js");
+
+  // The open pass lets a real `/api/overview` through, so the fleet behind it has to be
+  // a fixture and the integrations have to stay off: an operator's exported Authentik URL
+  // would otherwise turn this section into an outbound request to their own lab.
+  process.env.LABVIEW_APPS_ROOT = appsRoot;
+  process.env.LABVIEW_DOCKER_ENABLED = "false";
+  process.env.LABVIEW_TRAEFIK_ENABLED = "false";
+  delete process.env.LABVIEW_TRAEFIK_URL;
+  delete process.env.LABVIEW_AUTHENTIK_URL;
+  delete process.env.LABVIEW_AUTHENTIK_TOKEN;
+  // Every refusal below is logged, and a hundred pino lines through the middle of this
+  // section would bury the ✓ and ✗ it exists to print. Restored afterwards, so a reader
+  // does not have to know that running these checks changes a global.
+  const priorLogLevel = process.env.LABVIEW_LOG_LEVEL;
+  process.env.LABVIEW_LOG_LEVEL = "silent";
+
+  const HOST = "labview.example.com";
+  type App = Awaited<ReturnType<typeof buildApp>>["app"];
+  /** GET and POST against one app, always with a host, so `Origin` can be judged. */
+  function driver(app: App) {
+    return {
+      get: (url: string, extra: Record<string, string> = {}) =>
+        app.inject({ method: "GET", url, headers: { host: HOST, ...extra } }),
+      post: (url: string, payload: Record<string, unknown>, extra: Record<string, string> = {}) =>
+        app.inject({ method: "POST", url, payload, headers: { host: HOST, ...extra } }),
+    };
+  }
+
+  /** `Set-Cookie` as a list, whatever Node made of a repeated header. */
+  const cookies = (raw: unknown): string[] =>
+    Array.isArray(raw) ? raw.map(String) : raw === undefined ? [] : [String(raw)];
+  const cookieNamed = (list: string[], name: string): string => list.find((c) => c.startsWith(`${name}=`)) ?? "";
+  const cookieValue = (list: string[], name: string): string => {
+    const one = cookieNamed(list, name);
+    const eq = one.indexOf("=");
+    return eq < 0 ? "" : (one.slice(eq + 1).split(";", 1)[0] ?? "");
+  };
+  /** The three headers that cost nothing and are therefore never conditional. */
+  const hardened = (h: Record<string, unknown>): boolean =>
+    h["x-content-type-options"] === "nosniff" &&
+    h["referrer-policy"] === "same-origin" &&
+    h["x-frame-options"] === "DENY";
+
+  const COOKIE = "labview_session";
+
+  // ---- enforcing: one passwd file with three users --------------------------------
+  process.env.LABVIEW_AUTH_PASSWD_FILE = passwdOk;
+  clearPasswdCache();
+  const strict = await buildApp(loadConfig(), { now: () => T0 });
+  const on = driver(strict.app);
+
+  const anon = await on.get("/api/session");
+  const anonInfo = anon.json() as SessionInfo;
+  check(
+    "a visitor with no cookie is told what to do: enforcement is on and a password is the way in",
+    anon.statusCode === 200 && anonInfo.enforced && anonInfo.methods.join(",") === "passwd" && anonInfo.user === undefined,
+    `${anon.statusCode} ${JSON.stringify(anonInfo)}`,
+  );
+  check(
+    "...and told nothing else — no username, no count, no path to the file",
+    !anon.body.includes("alice") && !anon.body.includes("passwd.ok") && !anon.body.includes("3"),
+    anon.body,
+  );
+
+  const denied = await on.get("/api/overview");
+  check(
+    "the data is refused without a session, which is the whole point of the feature",
+    denied.statusCode === 401 && denied.body === '{"error":"unauthorized"}',
+    // Truncated on purpose: when this one goes red the body is a whole overview, and a
+    // failing assertion should print what went wrong rather than the thing it leaked.
+    `${denied.statusCode} ${denied.body.slice(0, 60)}`,
+  );
+  check(
+    "...and that refusal is not cached by anything between here and the browser",
+    denied.headers["cache-control"] === "no-store" && hardened(denied.headers),
+    String(denied.headers["cache-control"]),
+  );
+
+  const health = await on.get("/api/healthz");
+  check(
+    "healthz stays open, so a container health check does not need a credential",
+    health.statusCode === 200 && health.body === '{"ok":true}',
+    `${health.statusCode} ${health.body}`,
+  );
+
+  const shell = await on.get("/");
+  check(
+    "the SPA shell is served without a session — it is what renders the login card",
+    shell.statusCode === 200 && String(shell.headers["content-type"]).includes("text/html") && hardened(shell.headers),
+    `${shell.statusCode} ${String(shell.headers["content-type"])}`,
+  );
+  // Whatever caching the static plugin asks for is left alone — asserted as "not
+  // no-store" rather than as an exact value, because the shell is served by
+  // `@fastify/static` when `web/dist` has been built and by a one-line fallback route
+  // when it has not, and those two disagree about `Cache-Control` for good reasons of
+  // their own. The rule here is only that the gate does not reach outside `/api`.
+  check(
+    "...and the gate does not mark it no-store: the shell carries nothing about the fleet, so it is the one thing worth caching",
+    !String(shell.headers["cache-control"] ?? "").includes("no-store"),
+    String(shell.headers["cache-control"]),
+  );
+  // Not asserted as a 200: `web/dist` is built by `npm run build:web` and CI runs this
+  // suite without it. What matters is that the bundle is never the thing that 401s.
+  const bundle = await on.get("/app.js");
+  check("the bundle is never gated, however this suite was run", bundle.statusCode !== 401, String(bundle.statusCode));
+
+  const unknownPath = await on.get("/api/nope");
+  check(
+    "an unrouted API path is refused before routing, so a 404 cannot be used to map the surface",
+    unknownPath.statusCode === 401,
+    String(unknownPath.statusCode),
+  );
+
+  const wrongPassword = await on.post("/api/login", { username: "carol", password: "not-carols" });
+  const noSuchUser = await on.post("/api/login", { username: "nobody", password: "not-carols" });
+  check(
+    "a wrong password and a name that does not exist are the same 401, byte for byte",
+    wrongPassword.statusCode === 401 && noSuchUser.statusCode === 401 && wrongPassword.body === noSuchUser.body,
+    `${wrongPassword.statusCode} ${wrongPassword.body} / ${noSuchUser.statusCode} ${noSuchUser.body}`,
+  );
+  check("...and that one body says only which of the two things was wrong: neither", wrongPassword.body === '{"error":"credentials"}', wrongPassword.body);
+
+  const signedIn = await on.post("/api/login", { username: "alice", password: "alice-secret" });
+  const issued = cookies(signedIn.headers["set-cookie"]);
+  const token = cookieValue(issued, COOKIE);
+  check(
+    "the right password signs in and says who signed in",
+    signedIn.statusCode === 200 && signedIn.body === '{"ok":true,"user":{"name":"alice","via":"passwd"}}',
+    `${signedIn.statusCode} ${signedIn.body}`,
+  );
+  check(
+    "...on a cookie script cannot read, that a cross-site form cannot send, scoped to the whole app",
+    cookieNamed(issued, COOKIE).includes("HttpOnly") &&
+      cookieNamed(issued, COOKIE).includes("SameSite=Lax") &&
+      cookieNamed(issued, COOKIE).includes("Path=/") &&
+      cookieNamed(issued, COOKIE).includes("Max-Age=43200"),
+    cookieNamed(issued, COOKIE),
+  );
+  check(
+    "...and not marked Secure over plain http, because a Secure cookie there is never stored and the symptom is a login that silently loops",
+    !cookieNamed(issued, COOKIE).includes("Secure") && token.startsWith("v1."),
+    cookieNamed(issued, COOKIE),
+  );
+
+  const withCookie = { cookie: `${COOKIE}=${token}` };
+  const allowed = await on.get("/api/overview", withCookie);
+  check(
+    "the same request with that cookie is answered",
+    allowed.statusCode === 200 && Array.isArray((allowed.json() as Overview).stacks),
+    String(allowed.statusCode),
+  );
+  const mine = (await on.get("/api/session", withCookie)).json() as SessionInfo;
+  check("...and the session names the user and how they got here", mine.user?.name === "alice" && mine.user?.via === "passwd", JSON.stringify(mine));
+
+  const tampered = await on.get("/api/overview", { cookie: `${COOKIE}=${token.split(".").slice(0, 2).join(".")}.${Buffer.from("not-the-mac").toString("base64url")}` });
+  check("a cookie with a forged signature is no cookie at all", tampered.statusCode === 401, String(tampered.statusCode));
+
+  const crossSite = await on.post("/api/login", { username: "alice", password: "alice-secret" }, { origin: "https://evil.example" });
+  check(
+    "a POST from another origin is refused before the credentials are even looked at",
+    crossSite.statusCode === 403 && crossSite.body === '{"error":"forbidden"}',
+    `${crossSite.statusCode} ${crossSite.body}`,
+  );
+  check("...and no session comes back from it, correct password or not", cookies(crossSite.headers["set-cookie"]).length === 0);
+  const sameSite = await on.post("/api/login", { username: "alice", password: "alice-secret" }, { origin: `http://${HOST}` });
+  check("...while this host's own form still works, which is the point of checking the host and not the header's presence", sameSite.statusCode === 200, String(sameSite.statusCode));
+
+  const signedOut = await on.post("/api/logout", {}, withCookie);
+  check(
+    "signing out clears the cookie",
+    signedOut.statusCode === 200 && cookieNamed(cookies(signedOut.headers["set-cookie"]), COOKIE).includes("Max-Age=0"),
+    cookieNamed(cookies(signedOut.headers["set-cookie"]), COOKIE),
+  );
+  const revoked = await on.get("/api/overview", withCookie);
+  check(
+    "...and revokes it, so a copy taken before the sign-out is dead too — the token is still valid and still refused",
+    revoked.statusCode === 401,
+    String(revoked.statusCode),
+  );
+
+  const attempts: number[] = [];
+  for (let i = 0; i < 6; i++) attempts.push((await on.post("/api/login", { username: "bob", password: "not-bobs" })).statusCode);
+  check("five wrong passwords for one name are each answered", attempts.slice(0, 5).every((c) => c === 401), attempts.join(" "));
+  check("...and the sixth is not answered at all", attempts[5] === 429, attempts.join(" "));
+  const locked = await on.post("/api/login", { username: "bob", password: "bob-secret" });
+  check(
+    "the right password does not end a lockout, which is what stops the count being a way to test passwords",
+    locked.statusCode === 429 && locked.body === '{"error":"throttled","retryAfterSeconds":60}',
+    `${locked.statusCode} ${locked.body}`,
+  );
+  check("...and the wait is in a header a client can act on", locked.headers["retry-after"] === "60", String(locked.headers["retry-after"]));
+  const capitalised = await on.post("/api/login", { username: "BOB", password: "bob-secret" });
+  check("...and capitalising the name does not buy five more attempts", capitalised.statusCode === 429, String(capitalised.statusCode));
+  const bystander = await on.post("/api/login", { username: "alice", password: "alice-secret" });
+  check(
+    "a lockout belongs to the username, not the caller — behind a tunnel and a proxy every request shares one address",
+    bystander.statusCode === 200,
+    String(bystander.statusCode),
+  );
+
+  // OIDC is not configured in this pass, so both halves of the flow must land on the
+  // login card with a code it can render — never a stack trace, and never a 500.
+  const oidcStart = await on.get("/auth/oidc/start");
+  const oidcCallback = await on.get("/auth/oidc/callback?code=x&state=y");
+  check(
+    "a sign-in through a provider nobody configured redirects to the login card with a reason",
+    oidcStart.statusCode === 302 &&
+      oidcStart.headers.location === "/?login_error=method-unavailable" &&
+      oidcCallback.statusCode === 302 &&
+      oidcCallback.headers.location === "/?login_error=method-unavailable",
+    `${oidcStart.statusCode} ${String(oidcStart.headers.location)} / ${oidcCallback.statusCode} ${String(oidcCallback.headers.location)}`,
+  );
+
+  await strict.app.close();
+
+  // ---- open: a passwd file with nothing usable in it ------------------------------
+  //
+  // The regression this pass exists to catch is the worst one this feature could ship: an
+  // operator who pulls a new image and finds a login screen nobody has a password for.
+  process.env.LABVIEW_AUTH_PASSWD_FILE = passwdEmpty;
+  clearPasswdCache();
+  const open = await buildApp(loadConfig(), { now: () => T0 });
+  const off = driver(open.app);
+
+  const openSession = (await off.get("/api/session")).json() as SessionInfo;
+  check(
+    "a file with no usable entry enforces nothing and offers no method",
+    openSession.enforced === false && openSession.methods.length === 0,
+    JSON.stringify(openSession),
+  );
+  const openData = await off.get("/api/overview");
+  check(
+    "the overview is served to a caller with no cookie, exactly as it was before this feature existed",
+    openData.statusCode === 200 && Array.isArray((openData.json() as Overview).stacks),
+    String(openData.statusCode),
+  );
+  check(
+    "...uncached only in the sense that it is not marked no-store, while the free headers stay on",
+    openData.headers["cache-control"] === undefined && hardened(openData.headers),
+    String(openData.headers["cache-control"]),
+  );
+  const openLogin = await off.post("/api/login", { username: "alice", password: "alice-secret" });
+  check(
+    "signing in is refused as unavailable rather than accepted against a file with no users",
+    openLogin.statusCode === 400 && openLogin.body === '{"error":"method-unavailable"}',
+    `${openLogin.statusCode} ${openLogin.body}`,
+  );
+  const openCrossSite = await off.post("/api/login", { username: "alice", password: "alice-secret" }, { origin: "https://evil.example" });
+  check(
+    "the CSRF check applies only while there is a session to forge, so an open LabView is not made stricter than it was",
+    openCrossSite.statusCode === 400,
+    String(openCrossSite.statusCode),
+  );
+  const openMissing = await off.get("/api/nope");
+  check("an unknown API path is a 404 again once nothing is enforced", openMissing.statusCode === 404, String(openMissing.statusCode));
+
+  await open.app.close();
+
+  delete process.env.LABVIEW_AUTH_PASSWD_FILE;
+  clearPasswdCache();
+  if (priorLogLevel === undefined) delete process.env.LABVIEW_LOG_LEVEL;
+  else process.env.LABVIEW_LOG_LEVEL = priorLogLevel;
+}
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

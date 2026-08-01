@@ -1,0 +1,33 @@
+# One of every mistake this parser can name, one per line and in the order the checks
+# run. Line numbers count comments and blank lines, because a warning has to point at
+# what the operator sees in their editor — so the numbers are asserted too.
+#
+# Nothing here is a working credential. The two well-formed hashes are of throwaway
+# strings that only this file's assertions ever use.
+
+# No separator at all. Usually a password typed where the hash belongs, which is why
+# the warning does not echo the line.
+alice$2b$04$sK3S6P7sLdjrSBK2CFWuT.R0m6ib.r6OntwB9eIfJ.P3XgExAyIia
+
+# A username one character over the 64 the format allows.
+uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu:$2b$04$sK3S6P7sLdjrSBK2CFWuT.R0m6ib.r6OntwB9eIfJ.P3XgExAyIia
+
+# A separator and nothing after it.
+bob:
+
+# A password in clear. Never accepted, however convenient it would be.
+carol:hunter2
+
+# sha256-crypt: a real hash of an algorithm LabView cannot verify, so the warning has
+# to name the algorithm rather than call it unsupported.
+dave:$5$rounds=656000$aBcDeFgHiJkLmNoP$Xy9Zq2iQ1sT4uV6wX8yZ0aB2cD4eF6gH8iJ0kL2mN4o
+
+# A bcrypt hash that lost its tail to a copy-paste.
+erin:$2b$04$sK3S6P7sLdjrSBK2CFWuT
+
+# The one usable entry in the file. Its password is `other-secret`.
+frank:$2b$04$BYIdVgkJARACMeBZoSkhgObeGwhXVE1hFaA9MQijDaLU1AQVvexRu
+
+# The same name again, hashed from a different password (`long-secret`). The first
+# entry wins, so this hash is never used — which smoke proves by trying it.
+frank:$2b$04$e2ChsPeZyon330ZJIjfKc.GfOSYevb4.QdDe4ueTp9bMgNJdKWBt.

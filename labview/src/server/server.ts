@@ -1,4 +1,4 @@
-import Fastify, { type FastifyBaseLogger } from "fastify";
+import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -14,13 +14,28 @@ import {
 } from "../model/connections.js";
 import { diffIntegrations, diffStacks, formatRescan, formatScanTotals } from "../model/changes.js";
 import { createScanCache } from "./cache.js";
+import { registerAccessControl, type AccessControlOptions } from "./auth.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // dist/server -> project root -> web/dist
 const webRoot = join(here, "..", "..", "web", "dist");
 
-export async function startServer(cfg: LabViewConfig): Promise<void> {
+/**
+ * The whole application, wired but not listening.
+ *
+ * Separate from {@link startServer} so the gate can be driven with `app.inject()`: a
+ * hook that forgets to reply, or an allowlist that accidentally admits
+ * `/api/overview`, is invisible to a unit test and is exactly the kind of thing that
+ * regresses quietly. Everything else about the two paths is identical — there is no
+ * "test mode" branch anywhere below.
+ */
+export async function buildApp(cfg: LabViewConfig, access: AccessControlOptions = {}): Promise<BuiltApp> {
   const app = Fastify({ logger: { level: process.env.LABVIEW_LOG_LEVEL ?? "info" } });
+
+  // Before the API routes, so the hooks it installs apply to them, and before the
+  // scanning line, so the startup block opens with who may read this LabView.
+  registerAccessControl(app, cfg, access);
+
   // What each target's last logged outcome was. A long-running server rescans on a
   // timer and on demand, so repeating identical connection lines every time would bury
   // the one that changed — which is the only one worth a reader's attention.
@@ -58,12 +73,30 @@ export async function startServer(cfg: LabViewConfig): Promise<void> {
     });
   }
 
+  return { app, scan: getOverview };
+}
+
+/**
+ * The application and the handle that starts a scan.
+ *
+ * `scan` is returned rather than run by `buildApp` because building the app must not
+ * touch the filesystem or the Docker socket: a test that injects one request would
+ * otherwise start a real scan of whatever `appsRoot` points at.
+ */
+export interface BuiltApp {
+  app: FastifyInstance;
+  scan: (force: boolean) => Promise<Overview>;
+}
+
+export async function startServer(cfg: LabViewConfig): Promise<void> {
+  const { app, scan } = await buildApp(cfg);
+
   // Said before the scan starts rather than after the listener is up, so the connection
   // lines the scan produces read as its result instead of arriving before it is announced.
   app.log.info(`LabView scanning ${cfg.appsRoot}`);
 
   // Warm the cache in the background so the first page load is instant.
-  getOverview(true).catch((err) => app.log.error(err, "initial scan failed"));
+  scan(true).catch((err) => app.log.error(err, "initial scan failed"));
 
   await app.listen({ host: cfg.server.host, port: cfg.server.port });
 }

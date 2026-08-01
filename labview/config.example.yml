@@ -236,3 +236,79 @@ cacheTtlSeconds: 60
 server:
   host: 0.0.0.0
   port: 8080
+
+# ---------------------------------------------------------------------------
+# LabView's own sign-in.
+#
+# Open unless configured. `enabled: true` below means *allowed*, not *on*: LabView
+# asks for a sign-in only once a method is also usable — a passwd file with at
+# least one entry, or an OIDC issuer plus client id. An unconfigured LabView serves
+# everything exactly as it did before it had a login, and says so in one startup
+# line. That is deliberate: pulling a new image must never lock you out of a
+# running deployment.
+#
+# While enforcing, `/api/*` needs a session. The page itself, its stylesheet and
+# its bundle stay public and render the sign-in card — they contain nothing about
+# your fleet, by construction.
+#
+# Nothing here has anything to do with the `basic-auth` you may see reported
+# against a scanned service. That describes a service asking *its* visitors for a
+# password; this is about who may read LabView.
+#
+# The whole block is commented out because these are the defaults.
+#auth:
+#  passwd:
+#    # false turns the password form off entirely — for an operator who wants only
+#    # OIDC, or only their edge's SSO. The file is then not read at all.
+#    enabled: true
+#    # `user:hash` per line, `#` comments and blank lines ignored, first entry wins
+#    # on a duplicate username. The algorithm is the hash's own `$2a$`/`$2b$`/`$2y$`
+#    # prefix — bcrypt, as `htpasswd -nbB` writes it. Make a line with:
+#    #   docker exec -it labview node dist/hashpw.js alice
+#    #   htpasswd -nbB alice '<password>'
+#    # Re-read on change, so adding a user needs no restart.
+#    file: /config/passwd
+#
+#  oidc:
+#    enabled: true
+#    # Authentik: https://authentik.example.com/application/o/<app-slug>/
+#    # The discovery document's own `issuer` must equal this exactly.
+#    issuer: ""
+#    clientId: ""
+#    # Prefer clientSecretFile. A value here sits in this file; a value in
+#    # LABVIEW_OIDC_CLIENT_SECRET shows up in `docker inspect`. Leave both empty for
+#    # a public client — PKCE is used either way.
+#    clientSecret: ""
+#    clientSecretFile: ""
+#    # Registered with the provider. Leave empty to derive it from the request
+#    # (honouring X-Forwarded-Proto/Host), which is right behind a single proxy;
+#    # set it when several hostnames reach the same LabView.
+#    redirectUri: ""
+#    scopes: ["openid", "profile", "email"]
+#    # Which claim names the user. Falls back to preferred_username, then email,
+#    # then sub — the first that is a usable username wins.
+#    usernameClaim: preferred_username
+#    # The button's text. Empty means "Sign in with <issuer host>", which tells a
+#    # visitor who has not signed in yet what your provider's hostname is; set a
+#    # label like "Sign in with SSO" if you would rather it did not.
+#    label: ""
+#    timeoutMs: 5000
+#
+#  session:
+#    # HMAC key for the session cookie. Unset means one is generated at startup, so
+#    # every restart signs everyone out. Prefer secretFile.
+#    secret: ""
+#    secretFile: ""
+#    ttlMinutes: 720
+#    cookieName: labview_session
+#    # auto marks the cookie Secure when the request arrived over https (reading
+#    # X-Forwarded-Proto). Override with "true"/"false" only if your proxy does not
+#    # set that header — a Secure cookie over plain http is never stored, and the
+#    # symptom is a login form that accepts the password and comes straight back.
+#    secure: auto
+#
+#  # Failed sign-ins per username within the window, then a 429. Keyed on the
+#  # username rather than the address: behind a tunnel and a reverse proxy every
+#  # request shares one source address, so keying on it would lock out the fleet.
+#  maxFailedAttempts: 5
+#  lockoutSeconds: 60

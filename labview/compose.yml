@@ -23,7 +23,7 @@ services:
       # LABVIEW_DOCKER_ENABLED=false to run config-only.
       LABVIEW_DOCKER_HOST: tcp://dockerproxy:2375
       LABVIEW_PORT: "8080"
-      # LABVIEW_CONFIG: /config/config.yml   # optional: mount a tuned config
+      LABVIEW_CONFIG: /config/config.yml
       #
       # Per-request timeout for the Docker endpoint, in ms (default 5000). Raise it
       # only for a genuinely slow host: it is socket inactivity, not total time, so
@@ -67,20 +67,60 @@ services:
       # work, see config.example.yml. Prefer the _FILE form.
       # LABVIEW_TRAEFIK_USERNAME: labview
       # LABVIEW_TRAEFIK_PASSWORD_FILE: /run/secrets/traefik_password
+      #
+      # --- Optional: LabView's own login ---
+      # Nothing here is required. LabView asks for a sign-in only once a method is
+      # usable: a `./config/passwd` holding at least one `user:hash` line, or an
+      # OIDC issuer plus client id. Until then the HTTP surface is open exactly as
+      # it was before, and the startup log says so in one line.
+      #
+      # Make a line with `docker exec labview node dist/hashpw.js alice` (or
+      # `htpasswd -nbB alice <password>`) and append it to ./config/passwd.
+      #
+      # Set a session key, or every restart signs everyone out. Prefer the _FILE
+      # form, for the reason given above about `docker inspect`:
+      # LABVIEW_SESSION_SECRET_FILE: /run/secrets/labview_session
+      #
+      # Turn the password form off if you would rather rely only on OIDC or on
+      # your edge:
+      # LABVIEW_AUTH_PASSWD_ENABLED: "false"
+      #
+      # OIDC — see "Access control" in README.md for the Authentik walkthrough.
+      # The redirect URI you register there is
+      # https://labview.example.com/auth/oidc/callback
+      # LABVIEW_OIDC_ISSUER: https://authentik.example.com/application/o/labview/
+      # LABVIEW_OIDC_CLIENT_ID: <client id>
+      # LABVIEW_OIDC_CLIENT_SECRET_FILE: /run/secrets/labview_oidc
     volumes:
+      # LabView's own config and users, read-only, from ./config next to this file.
+      #
+      # Both host files must exist before `up`: Docker creates a **directory** at a
+      # bind source it cannot find, and a directory here means a config that silently
+      # falls back to defaults and a passwd file LabView warns about. `touch
+      # ./config/passwd` is enough — an empty file simply means no password login.
+      #
+      # A single-file bind also does not follow an inode replacement, and most editors
+      # replace rather than rewrite: edit these in place (`>>` appends fine), or mount
+      # `./config:/config:ro` as a directory if your editor insists.
+      - ./config/config.yml:/config/config.yml:ro
+      - ./config/passwd:/config/passwd:ro
       # Your per-container stacks, read-only.
       - /mnt/apps:/data/apps:ro
-      # Optional tuned config:
-      # - /mnt/apps/labview/config.yml:/config/config.yml:ro
       # Optional Authentik token, mounted as a file rather than passed as an env var:
       # - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
       # Optional Traefik app password, mounted the same way and for the same reason:
       # - /mnt/apps/labview/traefik-password:/run/secrets/traefik_password:ro
+      # Optional session key and OIDC client secret, same reasoning:
+      # - ./config/session-secret:/run/secrets/labview_session:ro
+      # - ./config/oidc-secret:/run/secrets/labview_oidc:ro
     # No `ports:` on purpose. A published host port answers directly at
     # <host-ip>:<port>, bypassing the reverse proxy and therefore bypassing any
-    # SSO middleware on it — for a dashboard that lists your whole topology that
-    # is exactly the wrong default. Reach it through the proxy instead.
-    # Uncomment only if you need direct access while setting it up:
+    # SSO middleware on it. LabView's own login covers that gap when you have
+    # configured one — but an unconfigured LabView is open, so for a dashboard
+    # that lists your whole topology this stays the default. Reach it through the
+    # proxy instead.
+    # Uncomment only if you need direct access while setting it up, or if you are
+    # relying on the login above:
     # ports:
     #   - "8459:8080"   # 8080 is very common on a homelab; publish somewhere quiet
     networks:
