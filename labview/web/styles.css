@@ -44,17 +44,17 @@
   --critical: #d03b3b;
 
   /* Semantic roles: ingress kind (identity).
-   * Bar order is public → public+host-port → public+local → local → host-port →
-   * internal. Each adjacent pair is a validated-distinct run in both light and
-   * dark (orange/violet, violet/aqua, aqua/blue, blue/magenta, magenta/neutral);
-   * violet and magenta mark the two "answers on a host port, no proxy in front"
-   * kinds so they read as a family without colliding with the proxied hues. Every
+   * Bar order is public → public+lan → public+traefik → traefik → lan → internal.
+   * Each adjacent pair is a validated-distinct run in both light and dark
+   * (orange/violet, violet/aqua, aqua/blue, blue/magenta, magenta/neutral);
+   * violet and magenta mark the two "answers on the LAN, no proxy in front" kinds
+   * so they read as a family without colliding with the proxied hues. Every
    * segment also carries its text label, so hue is never the only channel. */
   --ing-public:        var(--c2);  /* orange  */
-  --ing-publichostport: var(--c7); /* violet  */
-  --ing-publiclocal:   var(--c3);  /* aqua    */
-  --ing-local:         var(--c1);  /* blue    */
-  --ing-hostport:      var(--c5);  /* magenta */
+  --ing-publiclan:     var(--c7);  /* violet  */
+  --ing-publictraefik: var(--c3);  /* aqua    */
+  --ing-traefik:       var(--c1);  /* blue    */
+  --ing-lan:           var(--c5);  /* magenta */
   --ing-internal:      var(--muted);
 
   /* Semantic roles: auth method (identity). Bar order groups the methods whose

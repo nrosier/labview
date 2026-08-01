@@ -589,9 +589,11 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
 - It must stay free of Node-only imports — the web build imports it directly.
 - `web/model.ts` re-exports it so UI files have one import surface. Add new
   exported types there too.
-- Adding a member to a union (`AuthMethod`, `IngressKind`) is a **breaking UI
-  change**: the palette in `web/lib/palette.ts` maps every member to a colour and
-  a label, and an unmapped member silently renders grey. See §10.
+- Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
+  **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
+  a colour and a label, and an unmapped member silently renders grey. For
+  `IngressKind` two smoke assertions catch that (§8); `AuthMethod` has no
+  equivalent yet. See §10.
 
 ### 3.8 Serving
 
@@ -637,6 +639,12 @@ drawer. Two rules hold it together:
 palette in `styles.css`. DOM nodes use `var(--…)` directly; canvas-based views
 (cytoscape, mermaid) call `resolveVar()` so both follow the light/dark toggle from
 one definition.
+
+The `cssVar` strings are the one part of that mapping no compiler checks, and both
+lookups fail soft — `ingressVar` returns `--muted` for an unmapped kind, and
+`resolveVar` returns `#888888` for a property the stylesheet never defines. A
+variable renamed in one file only therefore turns grey rather than erroring, so
+smoke asserts the two files agree (§8).
 
 **Integration panels.** The topbar states each API integration as a count —
 `authentik: 13 apps · 9 matched` — which is an outcome with two questions behind it:
@@ -1088,24 +1096,36 @@ reachability, including the short form with no host side (`ports: ["9100"]`),
 which still publishes — on an ephemeral host port. So the *presence* of a mapping
 is the signal, not a parsed host port number.
 
-**IngressKind**
+**IngressKind** — the four network situations a fleet distinguishes: reachable
+from the internet (`public`), on the server's own network (`lan`), through the
+reverse proxy (`traefik`), or on the container network alone (`internal`).
 
 | Kind | Meaning |
 |---|---|
 | `public` | a tunnel route exists |
-| `public+host-port` | tunnel route, and it also publishes a host port |
-| `public+local` | tunnel route and a proxy route |
-| `local` | a proxy route only |
-| `host-port` | publishes a host port with nothing in front of it |
+| `public+lan` | tunnel route, and it also publishes a host port |
+| `public+traefik` | tunnel route and a proxy route |
+| `traefik` | a proxy route only |
+| `lan` | publishes a host port with nothing in front of it |
 | `internal` | not reachable from outside its networks |
 
-`host-port` is a **fallback kind**: it is only reported when no proxy route
-exists. A proxied service that *also* publishes a port keeps its `local` /
-`public+local` kind and gets a note from `noteHostPortBypass` instead. This is
-deliberate — most services in a typical fleet publish a port, so folding that into
-the kind would collapse the whole distribution into one bucket. The note is not
-cosmetic: it is the difference between "protected by SSO" and "protected by SSO
-unless you use the port".
+**The kind names what is in *front* of the service, so `lan` is a fallback kind:**
+it is only reported when no proxy route exists. All four situations can be true of
+one service at once — a proxied service that *also* publishes a port keeps its
+`traefik` / `public+traefik` kind and gets a note from `noteHostPortBypass`
+instead. This is deliberate: most services in a typical fleet publish a port, so
+folding that into the kind would collapse the whole distribution into one bucket.
+The note is not cosmetic — it is the difference between "protected by SSO" and
+"protected by SSO unless you use the port". Both arms of that guard are asserted
+separately, `traefik` and `public+traefik`, because dropping either one leaves the
+other still covering half the rule.
+
+`traefik` is the one place a **kind names a product**, which reads against I3
+(§8). It is admitted because the kind is derived from Traefik-format route labels,
+so the name follows the evidence that produced it, and the graph already draws a
+hub node labelled `Traefik` on the same basis. Contrast `AuthMethod`, where the
+mechanism (`forward-auth`) is genuinely separable from the provider that
+implements it (`authentik-forward-auth`) and both are reported.
 
 **OriginTarget / OriginKind** — where a tunnel route's origin address was found to
 lead (§3.4). Attached to every `CloudflareRoute` whose `service` is non-empty, and
@@ -1251,8 +1271,8 @@ warnings for a human (bypasses, refusals, unresolved references, inferences).
 
 **`exposedWithoutAuth`** — `ingress !== "internal"` and no auth detected (proxy
 gate, OIDC/LDAP, basic-auth, a Cloudflare Access policy, or an API-confirmed
-enforced gate). Note this counts a `host-port`-only service as exposed, because it
-is.
+enforced gate). Note this counts a `lan`-only service as exposed, because it is —
+the LAN is outside the container network, and nothing gates the published port.
 
 **Middleware registry** — every `traefik.http.middlewares.<name>.<type>` label
 found in *any* stack, keyed by bare name (references carry a `@docker` /`@file`
@@ -1619,7 +1639,8 @@ merged away:
 **The scan cache and the rescan diff** (§3.11) are asserted the same way, and for
 the same reason: the race *is* the behaviour, so it is driven through the injected
 clock and a build only the assertion can settle — no server, no timers, no sleeping
-on a real deadline. Seven properties are pinned:
+on a real deadline. Seven properties are pinned (an eighth, on the palette, follows
+them but needs no fixtures):
 
 - **A forced request is never answered by a build that started before it.** Two
   concurrent passive gets coalesce into one build; a forced get arriving during a
@@ -1656,6 +1677,15 @@ on a real deadline. Seven properties are pinned:
 - **The cadence is asserted, now that it lives in `formatRescan`.** Quiet on both
   sides and unforced returns nothing; forced answers on both halves; an API that
   moved speaks even though no file was edited.
+
+**The ingress palette agrees with the stylesheet.** Two assertions read
+`web/lib/palette.ts` and `web/styles.css` as text: every `--ing-*` variable the
+palette names must be defined in the stylesheet, and every `IngressKind` must have
+a palette entry. This is the only check on that pair, because both lookups fail
+soft to grey rather than erroring (§6). The first also pins the *count* of variables
+found, so a regex that stopped matching fails instead of passing vacuously. The
+kind list is typed `IngressKind[]`, so renaming a union member breaks the build
+rather than quietly skipping a kind.
 
 `fixtures/outside-root.env` sits outside all four roots on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
@@ -1730,8 +1760,11 @@ the start; the compiler will not catch the UI half.
    (ingress: most→least exposed; auth: identified providers before generic ones).
 6. `web/styles.css` — define the CSS custom property in both themes, from the
    validated palette; do not invent a colour.
-7. `web/lib/mermaidDef.ts` if the static diagram labels it.
-8. A fixture and an assertion (§8).
+7. `web/components/badges.tsx` if the new member changes which icon reads right.
+8. `web/lib/mermaidDef.ts` if the static diagram labels it.
+9. A fixture and an assertion (§8). For an ingress kind, also extend the typed
+   `ALL_INGRESS` list and the expected variable count in the palette assertions —
+   they are what turn steps 5 and 6 from "remembered" into "enforced".
 
 **Add a field to `Service` or `AppStack`.** The rescan diff (§3.11) compares
 whatever it finds, so ask one question about the new field: *does it come out of the
@@ -1960,7 +1993,8 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Decision | Rationale |
 |---|---|
 | Published ports are reachability, not metadata | `ports:` makes a service answerable at `hostIP:port` with no proxy and no SSO. Treating it as decoration under-reported exposure on real fleets. |
-| `host-port` is a fallback kind, the bypass is a note | Most services publish a port; folding that into the kind would flatten the distribution. The distinction that matters is whether anything is *in front*. |
+| `lan` is a fallback kind, the bypass is a note | All four situations can hold at once, but most services publish a port, so folding that into the kind would flatten the distribution. The kind names what is *in front*; the LAN path a proxied service also answers on is a note. |
+| The ingress kinds are named `public` / `lan` / `traefik` / `internal` | These are the four situations an operator distinguishes, and the previous `local` (meaning *proxy route*) collided with the separate LAN concept — the tile said "Local" for something that was not the LAN. `traefik` names a product against I3, admitted because the kind is derived from Traefik-format labels, so the name follows its evidence. |
 | Generic `forward-auth` / `other-oauth` / `ldap` members | The mechanism is provable, the provider often is not. Without a generic member the classifier has to either guess a vendor or report "no auth" — both are wrong. |
 | Hints match at token boundaries | A substring match labelled `oauth.bigcorp.example.com` as Authentik on four shared letters. |
 | No `auth.` / `sso.` host convention in defaults | A convention is a guess about someone else's DNS. Real hostnames are discovered from the fleet instead. |

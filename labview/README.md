@@ -10,7 +10,7 @@ It understands a specific, common TrueNAS Scale pattern:
 
 - **Public ingress via a Cloudflare tunnel**, configured with **DockFlare**
   labels (`dockflare.hostname`, `dockflare.service`, …).
-- **Local ingress via Traefik**, configured with `traefik.*` labels (routers,
+- **Proxy ingress via Traefik**, configured with `traefik.*` labels (routers,
   rules, entrypoints, TLS, middlewares) — and, when its API answers, checked
   against the runtime config Traefik actually built from them.
 - **SSO via Authentik** — as a Traefik **forward-auth** middleware
@@ -205,9 +205,9 @@ for **Traefik + Authentik forward-auth** and/or **DockFlare**:
 ```
 
 Two things LabView will tell you about itself once it is running: if you publish
-a host port it appears as `host-port` / `public+host-port` exposure, and if you
-point a tunnel origin straight at a container it shows up with no auth even
-though the Traefik route looks protected.
+a host port it appears as `lan` / `public+lan` exposure, and if you point a tunnel
+origin straight at a container it shows up with no auth even though the Traefik
+route looks protected.
 
 ---
 
@@ -474,14 +474,18 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `tunnel → proxy → service`; where nothing proves one, the direct edge stays and
   the service says why the hop is unknown. No image, vendor or naming convention is
   consulted.
-- **Ingress** is classified `public` / `public+host-port` / `public+local` /
-  `local` / `host-port` / `internal`. A `ports:` entry publishes on the host
-  (unlike `expose:`), so the service answers at `<host-ip>:<port>` with no proxy
-  and no SSO in the path — that is real reachability and it is classified as such.
-  `host-port` is reported when nothing else fronts the service; when Traefik
-  *does* front it, the kind is unchanged and the bypass is raised as a note
-  instead, since most services in a fleet publish a port and folding that into
-  the kind would flatten the whole distribution.
+- **Ingress** is classified as one of the four network situations — `public`
+  (reachable from the internet through the tunnel), `lan` (answerable on the
+  server's own network at a published port), `traefik` (reached through the reverse
+  proxy), `internal` (the container network only) — plus `public+lan` and
+  `public+traefik` where the tunnel is one of two paths. A `ports:` entry publishes
+  on the host (unlike `expose:`), so the service answers at `<host-ip>:<port>` with
+  no proxy and no SSO in the path — real reachability, classified as such.
+  **The kind names what is in *front* of the service**, so `lan` is reported when
+  nothing else fronts it; when Traefik *does* front it, the kind stays `traefik`
+  and the LAN bypass is raised as a note instead, since most services in a fleet
+  publish a port and folding that into the kind would flatten the whole
+  distribution.
 - **Auth posture** resolves to one of `authentik-forward-auth`,
   `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`,
   `basic-auth`, or `none`, each with the evidence that produced it.
@@ -654,9 +658,9 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   service rather than read, both for lexical `..` escapes and for symlinks
   pointing out of the tree.
 - **Published host ports are treated as real exposure.** A service with a
-  `ports:` mapping and no proxy in front is `host-port`, counted in its own stat
-  tile, and flagged exposed-without-auth — it answers on the LAN whatever your
-  Traefik config says. When a proxy *is* in front, the service keeps its kind and
+  `ports:` mapping and no proxy in front is `lan`, counted in its own stat tile,
+  and flagged exposed-without-auth — it answers on the LAN whatever your Traefik
+  config says. When a proxy *is* in front, the service keeps its `traefik` kind and
   gains an explicit note that the published port bypasses the proxy and its SSO.
 - The **Authentik API token is optional and read-only** (`view_application`,
   `view_provider`, `view_outpost` on a groupless service account — LabView only
@@ -723,6 +727,21 @@ were `string[]` in earlier versions, so this is a **breaking change** for any ex
 consumer. It was made instead of adding a second, parallel list so that why a match did
 not happen has one home rather than a name in one place and a reason in another.
 
+The **ingress vocabulary** is a third **breaking change**, and a pure rename — every
+value maps one-to-one onto the old one and nothing is classified differently:
+
+| was | is |
+|---|---|
+| `service.ingress: "public+host-port"` | `"public+lan"` |
+| `service.ingress: "public+local"` | `"public+traefik"` |
+| `service.ingress: "local"` | `"traefik"` |
+| `service.ingress: "host-port"` | `"lan"` |
+| `stats.localOnlyServices` | `stats.traefikServices` |
+| `stats.hostPortServices` | `stats.lanServices` |
+
+The old `local` meant *proxy route*, which collided with the separate LAN concept —
+a stat tile reading "Local" for something that was not the LAN.
+
 `meta.authentik.applications` changed meaning in the same spirit, which is also
 **breaking**: it counts the applications the list endpoint withheld and LabView rebuilt
 from their providers, so the figure moves for an unchanged Authentik. Three counts state
@@ -779,7 +798,7 @@ npm run build        # web bundle + server compile
 `npm run smoke` runs the whole pipeline against four fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
 redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
-nested interpolation, host-port exposure — `ports:` vs `expose:`, the
+nested interpolation, LAN-port exposure — `ports:` vs `expose:`, the
 tunnel-straight-at-the-container pattern and the bypass note on a proxied service
 — and provider attribution in a fleet whose SSO is *not* Authentik, where every
 mechanism is observable but nothing may be attributed to a vendor), `authentik` for

@@ -543,16 +543,15 @@ function App() {
           value={ov.stats.services}
           sub={ov.meta.dockerAvailable ? `${ov.stats.running} running` : undefined}
         />
-        {/* Subtitles name the mechanism, not a vendor: which tunnel or proxy is in
-            front is the routes' business, and a fleet using neither should not be
-            told otherwise by a hard-coded caption. */}
+        {/* Subtitles name the mechanism the routes describe, so a tile still reads
+            correctly for a fleet whose tunnel or proxy is a different product. */}
         <StatTile label="Public" value={ov.stats.publicServices} sub="tunnel route" />
-        <StatTile label="Local only" value={ov.stats.localOnlyServices} sub="proxy route" />
+        <StatTile label="Traefik" value={ov.stats.traefikServices} sub="proxy route" />
         <StatTile
-          label="Host port only"
-          value={ov.stats.hostPortServices}
+          label="LAN only"
+          value={ov.stats.lanServices}
           sub="no proxy in front"
-          alert={ov.stats.hostPortServices > 0}
+          alert={ov.stats.lanServices > 0}
         />
         <StatTile label="Auth-protected" value={ov.stats.authProtected} />
         <StatTile

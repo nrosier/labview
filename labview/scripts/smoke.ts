@@ -18,7 +18,14 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import type { AppStack, DockerState, Overview, Service, TraefikLiveRouter } from "../src/model/types.js";
+import type {
+  AppStack,
+  DockerState,
+  IngressKind,
+  Overview,
+  Service,
+  TraefikLiveRouter,
+} from "../src/model/types.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
@@ -369,13 +376,13 @@ check("jellyfin has published port 8096", jf.ports.some((p) => p.published === "
 check("jellyfin media bind is read-only", jf.mounts.some((m) => m.target === "/media" && m.readOnly));
 
 console.log("\ningress classification");
-check("jellyfin is public+local", jf.ingress === "public+local", jf.ingress);
+check("jellyfin is public+traefik", jf.ingress === "public+traefik", jf.ingress);
 check("jellyfin cloudflare hostname", jf.cloudflare[0]?.hostname === "jellyfin.example.com");
 check("jellyfin traefik host", jf.traefik[0]?.hosts.includes("jellyfin.example.com") ?? false);
 const emby = svc("emby", "emby");
 // Tunnel origin straight at the container, plus a published host port: public
 // via Cloudflare and directly answerable on the LAN, with no proxy either way.
-check("emby is public+host-port (dockflare only, port published)", emby.ingress === "public+host-port", emby.ingress);
+check("emby is public+lan (dockflare only, port published)", emby.ingress === "public+lan", emby.ingress);
 check("emby has no traefik route", emby.traefik.length === 0);
 
 console.log("\nauth posture");
@@ -576,19 +583,19 @@ check(
   String(envValue(web, "LITERAL_DOLLAR")),
 );
 
-console.log("\npublished host ports are reachability");
+console.log("\npublished host ports are LAN reachability");
 const media = eSvc("hostport", "media");
 check(
-  "tunnel origin at the container + published port -> public+host-port",
-  media.ingress === "public+host-port",
+  "tunnel origin at the container + published port -> public+lan",
+  media.ingress === "public+lan",
   media.ingress,
 );
 check("...and is flagged exposed without auth", media.auth.exposedWithoutAuth === true);
 
 const socketproxy = eSvc("hostport", "socketproxy");
 check(
-  "published port with nothing in front -> host-port, not internal",
-  socketproxy.ingress === "host-port",
+  "published port with nothing in front -> lan, not internal",
+  socketproxy.ingress === "lan",
   socketproxy.ingress,
 );
 check(
@@ -598,19 +605,37 @@ check(
 );
 // socketproxy, plus the two rival proxies in `tunnelorigin` — each publishes a
 // port with nothing in front of it.
-check("host-port services are counted", edge.stats.hostPortServices === 3, `got ${edge.stats.hostPortServices}`);
+check("lan-only services are counted", edge.stats.lanServices === 3, `got ${edge.stats.lanServices}`);
 
+// The overlap rule: all four situations can be true of one service at once, but the
+// kind names what is in *front* of it. A proxied service that also publishes a port
+// is `traefik`, and the LAN path it also answers on is raised as a note — so neither
+// half of the truth is lost, and the distribution does not collapse into one bucket.
 const hpApp = eSvc("hostport", "app");
-check("proxied service keeps its local kind", hpApp.ingress === "local", hpApp.ingress);
+check("proxied service keeps its traefik kind", hpApp.ingress === "traefik", hpApp.ingress);
 check(
   "cross-stack authentik@docker still resolves",
   hpApp.auth.method === "authentik-forward-auth",
   hpApp.auth.method,
 );
 check(
-  "...but the host-port bypass of that SSO is noted",
+  "...but the bypass of that SSO is noted",
   hpApp.notes.some((n) => n.includes("9999") && n.includes("bypassing")),
   hpApp.notes.join(" | "),
+);
+check(
+  "...and the note says that bypass is on the LAN, the word the kind uses",
+  hpApp.notes.some((n) => n.includes("bypassing") && n.includes("LAN")),
+  hpApp.notes.join(" | "),
+);
+// The rule holds for the tunnelled half of the overlap too: `public+traefik` is
+// proxied, so its published port is a note rather than part of the kind. Without
+// this, only the `traefik` arm of the bypass guard is pinned and the other could be
+// dropped silently.
+check(
+  "a public+traefik service that publishes a port gets the same bypass note",
+  jf.ingress === "public+traefik" && jf.notes.some((n) => n.includes("8096") && n.includes("bypassing")),
+  `${jf.ingress}: ${jf.notes.join(" | ")}`,
 );
 
 const hpWorker = eSvc("hostport", "worker");
@@ -1009,7 +1034,7 @@ check(
 // port, so without them it reads as reachable by anyone.
 check(
   "an OIDC gate no file mentions is what stops a published port reading as exposed",
-  notebook.ingress === "host-port" &&
+  notebook.ingress === "lan" &&
     notebook.auth.method === "authentik-oauth" &&
     notebook.auth.exposedWithoutAuth === false,
   `${notebook.ingress}/${notebook.auth.method} exposed=${notebook.auth.exposedWithoutAuth}`,
@@ -1150,7 +1175,7 @@ check(
 );
 check(
   "...while still counting as a gate, so its published port does not read as exposed",
-  ledger.ingress === "host-port" && ledger.auth.exposedWithoutAuth === false,
+  ledger.ingress === "lan" && ledger.auth.exposedWithoutAuth === false,
   `${ledger.ingress} exposed=${ledger.auth.exposedWithoutAuth}`,
 );
 
@@ -2811,7 +2836,7 @@ for (const s of liveOnly) {
     svc.docker = liveState;
     svc.traefikLive = [];
     svc.notes = [...svc.notes, "a note this pass happened to add"];
-    svc.ingress = svc.ingress === "internal" ? "local" : "internal";
+    svc.ingress = svc.ingress === "internal" ? "traefik" : "internal";
   }
 }
 check(
@@ -3184,6 +3209,36 @@ check(
   "and no API token either, on a line that reports what that token was used to read",
   !everyDiffLine.includes(AK_TOKEN),
   everyDiffLine,
+);
+
+console.log("\nthe ingress palette and the stylesheet name the same variables");
+// Both halves of the colour lookup are strings the compiler never sees together:
+// `ingressVar` falls back to `--muted` for a kind it has no entry for, and
+// `resolveVar` falls back to #888888 for a property the stylesheet never defines. So
+// a variable renamed in one file only, or a kind added to the union and nowhere else,
+// degrades to grey swatches and a grey graph with no error anywhere. These two
+// assertions are what stands between that and a silent regression.
+const paletteSrc = readFileSync(resolve(here, "..", "web", "lib", "palette.ts"), "utf8");
+const stylesSrc = readFileSync(resolve(here, "..", "web", "styles.css"), "utf8");
+const ingressBlock = paletteSrc.slice(paletteSrc.indexOf("INGRESS_META"), paletteSrc.indexOf("AUTH_META"));
+const paletteVars = [...ingressBlock.matchAll(/cssVar:\s*"(--[a-z0-9-]+)"/g)].map((m) => m[1]!);
+const definedVars = new Set([...stylesSrc.matchAll(/^\s*(--[a-z0-9-]+)\s*:/gm)].map((m) => m[1]!));
+const missingVars = paletteVars.filter((v) => !definedVars.has(v));
+check(
+  // The count guard matters as much as the emptiness one: a regex that stopped
+  // matching would otherwise pass this by finding nothing to check.
+  "every ingress colour the palette names is defined in styles.css",
+  paletteVars.length === 6 && missingVars.length === 0,
+  `${paletteVars.length} named, undefined: ${missingVars.join(", ") || "none"}`,
+);
+// The union is the source of truth. This list fails to *compile* if a member is
+// renamed, so unlike the strings above it cannot go stale quietly.
+const ALL_INGRESS: IngressKind[] = ["public", "public+lan", "public+traefik", "traefik", "lan", "internal"];
+const unstyled = ALL_INGRESS.filter((k) => !ingressBlock.includes(`key: "${k}"`));
+check(
+  "and every ingress kind has a palette entry, so none falls back to grey",
+  unstyled.length === 0,
+  `no entry for: ${unstyled.join(", ") || "none"}`,
 );
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);

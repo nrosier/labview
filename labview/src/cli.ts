@@ -23,9 +23,11 @@ if (summary) {
     for (const line of formatConnection(r)) console.log(`  ${line}`);
   }
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
+  // The four ingress situations, named rather than slash-packed: they are disjoint
+  // and they sum to `services`, so a reader can check the line against itself.
   console.log(
-    `  public/local/int: ${stats.publicServices}/${stats.localOnlyServices}/${stats.internalServices}` +
-      `  (host-port only: ${stats.hostPortServices})`,
+    `  by ingress:       public ${stats.publicServices}, traefik ${stats.traefikServices},` +
+      ` lan ${stats.lanServices}, internal ${stats.internalServices}`,
   );
   console.log(`  auth protected:   ${stats.authProtected}`);
   console.log(`  EXPOSED, no auth: ${stats.exposedWithoutAuth}`);

@@ -14,13 +14,19 @@ export interface RoleMeta<K extends string> {
   cssVar: string;
 }
 
-/** Ingress kinds in a fixed, meaningful order (most→least exposed). */
+/**
+ * Ingress kinds in a fixed, meaningful order (most→least exposed).
+ *
+ * `cssVar` is the one string here the compiler cannot check: a name with no
+ * matching custom property in styles.css resolves to grey through the fallbacks
+ * below rather than failing, so the smoke test asserts the two files agree.
+ */
 export const INGRESS_META: RoleMeta<IngressKind>[] = [
   { key: "public", label: "Public", cssVar: "--ing-public" },
-  { key: "public+host-port", label: "Public + host port", cssVar: "--ing-publichostport" },
-  { key: "public+local", label: "Public + Local", cssVar: "--ing-publiclocal" },
-  { key: "local", label: "Local", cssVar: "--ing-local" },
-  { key: "host-port", label: "Host port (no proxy)", cssVar: "--ing-hostport" },
+  { key: "public+lan", label: "Public + LAN", cssVar: "--ing-publiclan" },
+  { key: "public+traefik", label: "Public + Traefik", cssVar: "--ing-publictraefik" },
+  { key: "traefik", label: "Traefik", cssVar: "--ing-traefik" },
+  { key: "lan", label: "LAN (no proxy)", cssVar: "--ing-lan" },
   { key: "internal", label: "Internal", cssVar: "--ing-internal" },
 ];
 

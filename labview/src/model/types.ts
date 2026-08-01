@@ -646,21 +646,24 @@ export interface Graph {
 }
 
 /**
- * How a service can be reached.
+ * How a service can be reached, in the four situations a fleet distinguishes:
+ * `public` through a tunnel, `lan` at a published host port, `traefik` through the
+ * reverse proxy, `internal` on the container network only.
  *
- * `host-port` covers a service that publishes a port on the host but has no
- * Traefik router — it is reachable directly at `hostIP:port`, bypassing the
- * reverse proxy and therefore any proxy-level SSO. It is only reported when no
- * Traefik route exists: a proxied service that *also* publishes a port keeps its
- * `local` / `public+local` kind and gets a note instead, so the common case does
- * not collapse every service into one bucket.
+ * **The kind names what is in *front* of the service, so a published host port is
+ * named only when nothing proxies it.** `lan` is a service answerable directly at
+ * `hostIP:port` with no proxy and therefore no proxy-level SSO in the path. A
+ * proxied service that *also* publishes a port keeps its `traefik` /
+ * `public+traefik` kind and gets a note instead — most services in a fleet publish
+ * a port, so folding that into the kind would collapse the whole distribution into
+ * one bucket.
  */
 export type IngressKind =
   | "public"
-  | "public+host-port"
-  | "public+local"
-  | "local"
-  | "host-port"
+  | "public+lan"
+  | "public+traefik"
+  | "traefik"
+  | "lan"
   | "internal";
 
 /** Aggregate counters for the dashboard header. */
@@ -669,9 +672,10 @@ export interface OverviewStats {
   services: number;
   running: number;
   publicServices: number;
-  localOnlyServices: number;
-  /** Reachable only via a published host port (no proxy in front). */
-  hostPortServices: number;
+  /** Reached through the reverse proxy, with no tunnel route. */
+  traefikServices: number;
+  /** Reachable only at a published host port (no proxy in front). */
+  lanServices: number;
   internalServices: number;
   authProtected: number;
   exposedWithoutAuth: number;

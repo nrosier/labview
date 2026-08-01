@@ -271,7 +271,7 @@ function finalizeAuth(
   // a SAML application is protected, and calling it exposed would be plainly wrong.
   const hasEdgeAuth = svc.auth.method !== "none" || hasCloudflareAccess || hasEnforcedAuthentikGate(svc);
   // Anything other than `internal` is answerable by someone: via the tunnel, via
-  // the proxy, or straight at a published host port.
+  // the proxy, or straight at a published port on the LAN.
   const reachable = svc.ingress !== "internal";
   svc.auth.exposedWithoutAuth = reachable && !hasEdgeAuth;
 
@@ -299,26 +299,27 @@ function finalizeAuth(
 /**
  * Classify reachability from the tunnel routes, the proxy routes, and published
  * host ports. A published port is real reachability: `ports: ["8096:8096"]` makes
- * the service answerable at `hostIP:8096` with no proxy and no SSO in the path.
+ * the service answerable at `hostIP:8096` on the LAN, with no proxy and no SSO in
+ * the path.
  *
- * It is only promoted to an ingress kind of its own when nothing else fronts the
- * service. When Traefik does front it, the published port is a *bypass* rather
- * than the primary path, and is reported as a note by `noteHostPortBypass` — most
- * services in a typical fleet publish a port, so folding that into the kind would
- * flatten the whole distribution into a single value.
+ * The kind names what is in *front* of the service, so `lan` is only reported when
+ * nothing else fronts it. When Traefik does front it, the published port is a
+ * *bypass* rather than the primary path, and is reported as a note by
+ * `noteHostPortBypass` — most services in a typical fleet publish a port, so
+ * folding that into the kind would flatten the whole distribution into one value.
  */
 function classifyIngress(svc: Service): IngressKind {
   const isPublic = svc.cloudflare.some((r) => r.hostname);
-  const isLocal = svc.traefik.some((r) => r.hosts.length > 0 || r.rule);
+  const isTraefik = svc.traefik.some((r) => r.hosts.length > 0 || r.rule);
   // Every entry under `ports:` is host-published — that is precisely what
   // distinguishes it from `expose:`. A short form with no host side
   // (`ports: ["9100"]`) still publishes, just on an ephemeral host port, so the
   // presence of the mapping is the signal rather than a parsed host port number.
-  const hasHostPort = svc.ports.length > 0;
-  if (isPublic && isLocal) return "public+local";
-  if (isPublic) return hasHostPort ? "public+host-port" : "public";
-  if (isLocal) return "local";
-  if (hasHostPort) return "host-port";
+  const hasLanPort = svc.ports.length > 0;
+  if (isPublic && isTraefik) return "public+traefik";
+  if (isPublic) return hasLanPort ? "public+lan" : "public";
+  if (isTraefik) return "traefik";
+  if (hasLanPort) return "lan";
   return "internal";
 }
 
@@ -328,7 +329,7 @@ function classifyIngress(svc: Service): IngressKind {
  * overstate the posture.
  */
 function noteHostPortBypass(svc: Service): void {
-  if (svc.ingress !== "local" && svc.ingress !== "public+local") return;
+  if (svc.ingress !== "traefik" && svc.ingress !== "public+traefik") return;
   if (svc.ports.length === 0) return;
   const list = svc.ports.map((p) => p.published ?? `(ephemeral)->${p.target}`).join(", ");
   const guard = svc.auth.method === "none" ? "the proxy" : `the proxy and its ${svc.auth.method} SSO`;
@@ -381,8 +382,8 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     services: 0,
     running: 0,
     publicServices: 0,
-    localOnlyServices: 0,
-    hostPortServices: 0,
+    traefikServices: 0,
+    lanServices: 0,
     internalServices: 0,
     authProtected: 0,
     exposedWithoutAuth: 0,
@@ -392,10 +393,10 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     for (const svc of stack.services) {
       stats.services++;
       if (svc.docker?.running) stats.running++;
-      if (svc.ingress === "public" || svc.ingress === "public+local" || svc.ingress === "public+host-port")
+      if (svc.ingress === "public" || svc.ingress === "public+traefik" || svc.ingress === "public+lan")
         stats.publicServices++;
-      else if (svc.ingress === "local") stats.localOnlyServices++;
-      else if (svc.ingress === "host-port") stats.hostPortServices++;
+      else if (svc.ingress === "traefik") stats.traefikServices++;
+      else if (svc.ingress === "lan") stats.lanServices++;
       else stats.internalServices++;
       if (svc.auth.method !== "none") stats.authProtected++;
       if (svc.auth.exposedWithoutAuth) stats.exposedWithoutAuth++;

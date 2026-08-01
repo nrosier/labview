@@ -167,7 +167,7 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
           )}
 
           {svc.traefik.length > 0 && (
-            <Section title="Local ingress — Traefik">
+            <Section title="Traefik ingress — from the compose labels">
               {svc.traefik.map((r) => (
                 <div style="margin-bottom:10px;">
                   <div style="font-weight:600;">{r.router}</div>
@@ -227,7 +227,7 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
               useful side by side, and any difference between them is what the notes at
               the top of the drawer are about. */}
           {svc.traefikLive && svc.traefikLive.length > 0 && (
-            <Section title="Local ingress — Traefik (live, from its API)">
+            <Section title="Traefik ingress — live, from its API">
               {svc.traefikLive.map((r) => (
                 <div style="margin-bottom:10px;">
                   <div style="font-weight:600;">

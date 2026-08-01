@@ -3,10 +3,22 @@ import { authLabel, authVar, ingressLabel, ingressVar } from "../lib/palette";
 import { statusView } from "../lib/format";
 import { IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
 
-/** Ingress badge — colored swatch + icon + label (identity, not color alone). */
+/**
+ * Ingress badge — colored swatch + icon + label (identity, not color alone).
+ *
+ * The icon answers "how far does this reach": a globe for the kinds a tunnel
+ * publishes to the internet, the LAN glyph for the ones answerable only on the
+ * server's own network, a server for the container network alone.
+ */
 export function IngressBadge({ kind }: { kind: IngressKind }) {
   const icon =
-    kind === "internal" ? <IconServer /> : kind === "local" ? <IconLan /> : <IconGlobe />;
+    kind === "internal" ? (
+      <IconServer />
+    ) : kind === "traefik" || kind === "lan" ? (
+      <IconLan />
+    ) : (
+      <IconGlobe />
+    );
   return (
     <span class="badge soft" title={`Ingress: ${ingressLabel(kind)}`}>
       <span class="swatch" style={`background:var(${ingressVar(kind)})`} />

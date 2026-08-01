@@ -53,7 +53,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Stack list** | One card per stack — the unit you deploy — rolling up the live status, hostnames and every distinct ingress/auth badge of its services, with a count of anything reachable without auth. Click to expand the services underneath. Search and filters work per service and open the stacks that matched. |
 | **Detail drawer** | Per service: a Mermaid diagram of its connections, Cloudflare routes **with the origin each resolves to**, Traefik routers, the derived auth posture **with its evidence**, networks, ports, volumes, environment (secrets masked), and live container state. |
 | **Relationship graph** | Interactive cytoscape graph of the whole fleet — services colored by exposure, plus network, volume and SSO/tunnel nodes, linked by network membership, `depends_on`, shared volumes, ingress and auth. Tunnel ingress is drawn as the path the config describes: where a route's origin resolves to another service, that service appears as the hop (`tunnel → proxy → service`) instead of the tunnel being drawn straight at the container. |
-| **Ingress classification** | Every service resolves to `public`, `public+host-port`, `public+local`, `local`, `host-port`, or `internal`. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
+| **Ingress classification** | The four network situations a fleet distinguishes: reachable from the internet through the tunnel (`public`), on the server's LAN at a published port (`lan`), through the reverse proxy (`traefik`), or on the container network alone (`internal`) — plus `public+lan` and `public+traefik` where the tunnel is one of two paths. A `ports:` mapping publishes on the host (unlike `expose:`), so it counts as reachability — with no proxy and no SSO in the path. |
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
@@ -313,6 +313,15 @@ so this is a **breaking change** for any external consumer. It was made rather
 than adding a second, parallel list so that why a match did not happen has exactly
 one home instead of a name in one place and an explanation in another.
 
+Also **breaking**: the ingress vocabulary. Every `service.ingress` value and the
+two counters named after it were renamed to the four situations an operator
+actually distinguishes — `public+host-port` → `public+lan`, `public+local` →
+`public+traefik`, `local` → `traefik`, `host-port` → `lan`, and in `stats`,
+`localOnlyServices` → `traefikServices`, `hostPortServices` → `lanServices`.
+Nothing is classified differently; only the names moved. The old `local` meant
+*proxy route*, which collided with the separate LAN concept — a tile reading
+"Local" for something that was not the LAN.
+
 Also **breaking**: `meta.authentik.applications` now counts the applications
 Authentik's list endpoint withheld and LabView rebuilt from their providers, so the
 number moves for an unchanged Authentik. The alternative was to add the new counts
@@ -365,9 +374,9 @@ output is sensitive.
   rather than read — for lexical `..` escapes and for symlinks pointing out of the
   tree alike.
 - **Published ports count as exposure.** A service with a `ports:` mapping and no
-  proxy in front is classified `host-port` and flagged exposed-without-auth — it
-  answers on the LAN regardless of what the Traefik labels say. When a proxy *is*
-  in front, the service keeps its kind and gains a note that the published port
+  proxy in front is classified `lan` and flagged exposed-without-auth — it answers
+  on the LAN regardless of what the Traefik labels say. When a proxy *is* in front,
+  the service keeps its `traefik` kind and gains a note that the published port
   bypasses the proxy and its SSO.
 - **The Authentik token is optional, read-only, and never speculatively sent.**
   LabView issues GETs only, so the token needs `view_application`,
@@ -433,7 +442,7 @@ npm run build        # web bundle + server compile
 `npm run smoke` runs the whole pipeline over four fixture fleets: `fixtures/apps`
 for the expected classifications, `fixtures/edge` for regression cases (URL
 credential redaction, `env_file` containment, `dockflare.enable=false`, LDAP
-attribution, nested interpolation, host-port exposure, provider attribution),
+attribution, nested interpolation, LAN-port exposure, provider attribution),
 `fixtures/authentik` for the identity-provider integration, and
 `fixtures/traefik` for the reverse-proxy integration. The two API integrations are
 driven through an injected `fetchImpl` serving `fixtures/authentik-api.json` and
