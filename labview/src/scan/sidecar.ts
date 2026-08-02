@@ -6,6 +6,7 @@ import type {
   DeclaredAuth,
   DeclaredDependency,
   DeclaredLink,
+  DeclaredServiceDependency,
   IngressKind,
   ServiceDeclaration,
 } from "../model/types.js";
@@ -40,7 +41,7 @@ import type { DiscoveredStack } from "./discover.js";
 export const MAX_SIDECAR_BYTES = 64 * 1024;
 /** Truncate any single declared string to this many characters. */
 export const MAX_TEXT_CHARS = 2000;
-/** Cap on `links` and on `dependencies`, each counted separately. */
+/** Cap on `links`, `dependencies` and `depends_on`, each counted separately. */
 export const MAX_LIST_ENTRIES = 32;
 /** Cap on declared auth mechanisms for one service. */
 export const MAX_AUTH_ENTRIES = 8;
@@ -75,6 +76,7 @@ const SERVICE_KEYS = [
   "data",
   "links",
   "dependencies",
+  "depends_on",
   "auth",
   "unauthenticated",
   "expected",
@@ -144,7 +146,19 @@ export function parseSidecar(text: string, serviceNames: string[], file: string)
     return emptyResult(warnings);
   }
 
-  warnUnknownKeys(doc, STACK_KEYS, file, file, warnings);
+  // A service-level key written at the top level. Named rather than lumped in with the
+  // unknown keys, because it is spelled correctly and would parse — "unknown key" would
+  // send the operator hunting for a typo instead of telling them what is actually wrong:
+  // one entry here could not say *which* of the stack's services depends on the target.
+  const stackKeys: readonly string[] =
+    "depends_on" in doc ? [...STACK_KEYS, "depends_on"] : STACK_KEYS;
+  if ("depends_on" in doc) {
+    warnings.push(
+      `${file}: "depends_on" is a service-level key — at stack level it cannot say which ` +
+        `service depends on the target; ignored`,
+    );
+  }
+  warnUnknownKeys(doc, stackKeys, file, file, warnings);
   const stack = readCommon(doc, file, file, warnings);
 
   const rawServices = doc.services;
@@ -168,6 +182,7 @@ export function parseSidecar(text: string, serviceNames: string[], file: string)
 
         const decl: ServiceDeclaration = {
           ...readCommon(value, file, where, warnings),
+          dependsOn: readDependsOn(value.depends_on, where, warnings),
           auth: readAuth(value.auth, where, warnings),
           unauthenticatedAccepted: readUnauthenticated(value.unauthenticated, where, warnings),
           expectedIngress: readExpected(value.expected, where, warnings),
@@ -273,6 +288,67 @@ function readDependencies(value: unknown, where: string, warnings: string[]): De
     out.push({ name, detail: readText(item.detail, `${at}.detail`, warnings) });
   }
   return capList(out, `${where}.dependencies`, warnings);
+}
+
+/**
+ * `depends_on`: references to other scanned services.
+ *
+ * Nothing is resolved here — the parser sees one stack and the target usually lives in
+ * another — so the reference is kept exactly as written and checked only for a shape that
+ * could name a service at all. `stack/service` and a bare `service` both can;
+ * `a/b/c` cannot, and neither can a name with a blank half, so those are refused here
+ * rather than travelling on to the resolver as references that can never match.
+ *
+ * The long form's key is `service` rather than `dependencies`' `name`, because that is
+ * what it has to be: a compose service, named as the scan names it.
+ */
+function readDependsOn(
+  value: unknown,
+  where: string,
+  warnings: string[],
+): DeclaredServiceDependency[] {
+  const items = readList(value, `${where}.depends_on`, warnings);
+  const out: DeclaredServiceDependency[] = [];
+  for (const [index, item] of items.entries()) {
+    const at = `${where}.depends_on[${index}]`;
+    let ref: string | undefined;
+    let detail: string | undefined;
+    if (typeof item === "string" || typeof item === "number") {
+      ref = readText(item, at, warnings);
+    } else if (isMapping(item)) {
+      warnUnknownKeys(item, ["service", "detail"] as const, where, at, warnings);
+      ref = readText(item.service, `${at}.service`, warnings);
+      if (!ref) {
+        warnings.push(`${at}: needs a "service"; ignored`);
+        continue;
+      }
+      detail = readText(item.detail, `${at}.detail`, warnings);
+    } else {
+      warnings.push(`${at}: expected "stack/service" or {service, detail}; ignored`);
+      continue;
+    }
+    if (!ref) continue;
+    if (!isServiceRefShape(ref)) {
+      warnings.push(
+        `${at}: "${ref}" is not a service reference — write "stack/service", or the ` +
+          `service name on its own; ignored`,
+      );
+      continue;
+    }
+    out.push({ ref, ...(detail ? { detail } : {}) });
+  }
+  return capList(out, `${where}.depends_on`, warnings);
+}
+
+/**
+ * Whether a reference could name a scanned service: one name, or a stack and a name,
+ * with nothing blank and no whitespace inside. Says nothing about whether it *does* —
+ * that is the resolver's answer, and its four outcomes are reported as drift.
+ */
+function isServiceRefShape(ref: string): boolean {
+  const parts = ref.split("/");
+  if (parts.length > 2) return false;
+  return parts.every((p) => p.length > 0 && !/\s/.test(p));
 }
 
 function readAuth(value: unknown, where: string, warnings: string[]): DeclaredAuth[] {
@@ -438,5 +514,11 @@ function hasContent(d: Declaration): boolean {
 }
 
 function hasServiceContent(d: ServiceDeclaration): boolean {
-  return hasContent(d) || d.auth.length > 0 || Boolean(d.unauthenticatedAccepted) || Boolean(d.expectedIngress);
+  return (
+    hasContent(d) ||
+    d.dependsOn.length > 0 ||
+    d.auth.length > 0 ||
+    Boolean(d.unauthenticatedAccepted) ||
+    Boolean(d.expectedIngress)
+  );
 }

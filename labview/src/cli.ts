@@ -64,6 +64,14 @@ if (summary) {
       `  declared-protected: ${stats.declaredAuthProtected}  (reachable, no detected auth, declared self-authenticating — unverified)`,
     );
   }
+  // Dependencies a sidecar stated, which is the only way one can cross stacks. Counted,
+  // never verified: the scan cannot see the relation, and says so by naming where it came
+  // from. A reference that resolved to nothing is not here — it is drift, below.
+  if (stats.declaredDependencies > 0) {
+    console.log(
+      `  declared deps:    ${stats.declaredDependencies}  (stated in a sidecar, drawn through the network they share)`,
+    );
+  }
   if (stats.declarationDrift > 0) {
     console.log(`  ! declaration drift: ${stats.declarationDrift} service(s) disagree with their sidecar`);
   }

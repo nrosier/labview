@@ -11,9 +11,9 @@ import {
   declaredAuthLabel,
   graphServiceId,
   ingressMatchesExpectation,
+  networkMembershipText,
   networkScopeMeta,
   noAuthReason,
-  peerlessNetworkText,
   relationLabel,
   serviceConnections,
   showsDeclaredAuth,
@@ -730,7 +730,13 @@ export function AppDetail({
           {/* Networks, and who else is on them — the answer a bare list of network names
               never gave. Real docker names, so the one `external:` network six stacks
               share is named here exactly as it is named in every other stack's drawer.
-              Every peer is listed, even where the fleet graph capped the spokes. */}
+
+              Two groups per network, and the distinction between them is the point. What
+              this service depends on or is needed by across it — the only relations there
+              are — then, separately, who else is merely attached. A co-member is reachable,
+              not depended on, so it is listed under a heading that says only that and is
+              never drawn as a connection. Both groups are exact even where the fleet graph
+              capped the spokes, each capped on its own count. */}
           {conn.links.length > 0 && (
             <Section title="Networks">
               {conn.links.map((l) => (
@@ -745,9 +751,9 @@ export function AppDetail({
                       {l.stackCount >= 2 && ` · ${l.stackCount} stacks`}
                     </span>
                   </div>
-                  {l.peers.length > 0 ? (
+                  {l.dependencies.length > 0 && (
                     <div class="chips">
-                      {l.peers.map((p) => (
+                      {l.dependencies.map((p) => (
                         <button
                           key={p.id}
                           class="chip"
@@ -755,13 +761,52 @@ export function AppDetail({
                           title={`Open ${p.stack}/${p.service}`}
                         >
                           {p.stack === stack.id ? p.service : `${p.stack}/${p.service}`}
-                          {p.relation !== "peer" && <span class="pill">{relationLabel(p.relation)}</span>}
+                          <span class="pill">{relationLabel(p.relation)}</span>
+                          {/* Where the claim came from, named on the chip itself: a declared
+                              dependency was taken on the operator's word, and the sidecar
+                              that said so can belong to another stack entirely — which is
+                              exactly the case on the service every database points at. */}
+                          {p.declared && (
+                            <span
+                              class="pill"
+                              title={`Declared in ${p.stack}${p.file ? `/${p.file}` : ""}${p.detail ? ` — ${p.detail}` : ""}. Stated by the operator, not observed by the scan.`}
+                            >
+                              declared
+                            </span>
+                          )}
                         </button>
                       ))}
-                      {l.omitted > 0 && <span class="muted-inline">+{l.omitted} more</span>}
+                      {l.dependenciesOmitted > 0 && (
+                        <span class="muted-inline">+{l.dependenciesOmitted} more</span>
+                      )}
                     </div>
-                  ) : (
-                    <div class="muted-inline">{peerlessNetworkText(l)}</div>
+                  )}
+                  {/* Reachability, worded as such. The sentence carries the case where a
+                      network has members but connects this service to none of them, which
+                      is the ordinary state of a proxy network and would otherwise read as
+                      something the view failed to draw. */}
+                  {networkMembershipText(l) && (
+                    <div class="muted-inline">{networkMembershipText(l)}</div>
+                  )}
+                  {l.alsoOn.length > 0 && (
+                    <div class="netalso">
+                      <span class="muted-inline">also on it</span>
+                      <div class="chips">
+                        {l.alsoOn.map((p) => (
+                          <button
+                            key={p.id}
+                            class="chip"
+                            onClick={() => onOpenService(p.stack, p.service)}
+                            title={`Open ${p.stack}/${p.service} — on this network, with no dependency either way`}
+                          >
+                            {p.stack === stack.id ? p.service : `${p.stack}/${p.service}`}
+                          </button>
+                        ))}
+                        {l.alsoOnOmitted > 0 && (
+                          <span class="muted-inline">+{l.alsoOnOmitted} more</span>
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               ))}

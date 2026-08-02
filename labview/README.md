@@ -56,16 +56,22 @@ live state from the Docker API, and never needs an agent inside each app.
   chain, and each backend with the health Traefik itself reports for it), the
   **derived auth posture with the evidence that led to it**, the matched
   **Authentik applications and providers** when that API was read (including which
-  outpost, if any, is actually serving each one), **each network it is on and who else
-  is on it** — every peer named, marked where one depends on the other, each a link to
-  that service — ports, volumes, environment (secrets masked), and live container
-  state. A network with nothing else on it says which kind of nothing that is: no other
-  scanned service, on a network external to the scan, is not the same answer as a
-  network only this stack could ever join.
+  outpost, if any, is actually serving each one), **each network it is on, what it
+  depends on across that network, and who else is merely attached** — the two are
+  separate lists, because sharing a network means reachable and nothing more; the
+  diagram draws only the dependencies, each a link to that service, marked where the
+  dependency was declared rather than read from a compose file — ports, volumes,
+  environment (secrets masked), and live container state. A network with nothing else on
+  it says which kind of nothing that is: no other scanned service, on a network external
+  to the scan, is not the same answer as a network only this stack could ever join.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
   and tunnel / proxy / SSO hub nodes, connected by network membership,
-  `depends_on`, shared volumes, ingress, and auth edges. Click a service to open
+  `depends_on` — from a compose file or from a sidecar, the declared ones **dashed**,
+  since a declaration is a statement and not an observation — shared volumes, ingress,
+  and auth edges. This is the one view where a membership spoke is drawn for its own
+  sake: it is the fleet's membership picture, and an arrowhead is what marks the
+  spokes a dependency actually crosses. Click a service to open
   its detail. A hub appears only when something observed calls for it — and an
   SSO gate whose provider could not be identified gets its own generic hub rather
   than being drawn as a vendor. Tunnel ingress is drawn as the path the config
@@ -1080,6 +1086,7 @@ fine here. Only the first can take a service out of the count.
 | `owner`, `criticality` | stack and service | who to ask, and what breaks if it stops |
 | `links` | stack and service | admin UI, upstream docs, the runbook |
 | `dependencies` | stack and service | the off-fleet things it needs — a NAS share, a DNS resolver |
+| `depends_on` | service | a dependency on another **scanned** service, drawn as a relation — see below |
 | `data` | stack and service | what lives in the volumes, and whether it is backed up |
 | `auth` | service | authentication the scan cannot see, from the fixed mechanism list below |
 | `unauthenticated` | service | that reachable-without-auth is a decision, with the reason |
@@ -1118,6 +1125,61 @@ The four outcomes, in the order they are decided:
 | redundant | the scan detected the same family | **nothing** — repeating it would send a reader to check two sources that agree |
 | supplements | anything else | the declaration, shown as declared, no warning |
 
+### A dependency on another service
+
+`dependencies` and `depends_on` look alike and are not the same key. `dependencies` is
+prose about things outside the fleet, so nothing about it is checked. `depends_on` names a
+service LabView **scanned**: the target is looked up, the pair becomes a relation in both
+graphs, and a reference that resolves to nothing is reported as drift. That is the whole
+reason for a second key — a list that mixes prose with references cannot tell a typo from
+a sentence.
+
+Write it where compose cannot say it, which is most of the time:
+
+- **Across stacks.** Compose's own `depends_on` reaches no further than its own project,
+  so nothing in a compose file can name another stack's service. Two databases in two
+  stacks backed up by an agent in a third share a network and, as far as any scan can tell,
+  nothing else.
+- **Inside one stack, where the compose key would be the wrong claim.** That key orders
+  container startup; "reads the cache" is a different statement, and writing the compose
+  one to express it changes how the stack boots.
+
+```yaml
+# stacks/media/.labview
+services:
+  emby:
+    depends_on:
+      - service: backups/restic-agent          # stack/service
+        detail: Nightly dump target; the agent connects inbound over backup-net.
+      - postgres                               # this stack's own database
+```
+
+**Declare it once, on the service that needs the other.** The target reports it from its
+own side automatically — `restic-agent`'s drawer lists both databases as *required by*,
+with nothing in its own sidecar, and it stays correct when a fourth database appears. A
+`required_by` key would mean editing the agent's file every time anything new depended on
+it, which is exactly the work this avoids.
+
+A reference resolves in one of four ways, and three of them draw nothing:
+
+| the reference | outcome |
+|---|---|
+| `stack/service`, or a bare name matching one service | resolved: an edge, drawn through the network the pair shares |
+| a bare name matching this stack's own service **and** others | resolved to the local one, as compose's own key would read it |
+| a bare name matching two services in other stacks | **drift**, naming both candidates and asking you to qualify it |
+| a name matching nothing, or this service itself | **drift**, quoting what you wrote |
+
+Resolution never edits the declaration. The reference is stored exactly as you wrote it —
+which is what makes adding one an edit that Rescan reports — while the target it resolved
+to lives on the graph. Storing it in the file's parsed form would make a rename in someone
+else's stack read as *this* sidecar having changed.
+
+Two things a declared dependency deliberately does not do. It is **not evidence**: it
+changes no ingress class, no exposed count and no auth posture, so it is dashed wherever
+it is drawn and its chip names the file it came from. And **resolving is not reachability**
+— a pair that shares no docker network still gets the relation, plus a note saying that if
+those two communicate it is over something the scan cannot see.
+
 ### Drift
 
 The failure mode a sidecar actually has is not a typo, it is going quietly out of
@@ -1132,6 +1194,10 @@ in the summary:
 - A declared `auth` mechanism that **disagrees with a detected one at the same layer**
   names both: `declares "OIDC login by the app", but the scan detected ldap (LDAP bind
   against …) — both describe the app's own login, so one of the two is out of date`.
+- A `depends_on` reference that **no longer names one scanned service** quotes what you
+  wrote and says which way it failed: `declares depends_on "nope/missing", which names no
+  scanned service`, or `names 2 services (layered/probe, shared-d/probe) — qualify it as
+  "stack/service"`. No relation is drawn for it, because a guess is worse than a gap.
 - An `expected.ingress` that disagrees with the classification names the difference in
   both directions: `expects ingress "public, lan"; the scan classified this service
   as "public, traefik" (missing: lan; unexpected: traefik)`. Order is irrelevant —
@@ -1323,7 +1389,8 @@ decision log explaining why the non-obvious choices are what they are.
 src/
   scan/       discover + compose/.env parsing
   labels/     dockflare, traefik, auth derivation
-  analyze/    two-pass pipeline, middleware registry, network index, graph, stats
+  analyze/    two-pass pipeline, middleware registry, network index,
+              declared-dependency resolution, graph, stats
   enrich/     docker snapshot (dockerode) + authentik and traefik API clients
               over a shared http.ts (fetch, timeouts, injectable fetchImpl)
   model/      types.ts — the shared backend⇄frontend contract
@@ -1335,7 +1402,9 @@ fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
   authentik/  a fleet with an identity provider in it
-  nets/       stacks joined by shared networks: cross-stack, stack-local, disjoint
+  nets/       what connects two services and what only lets them reach each other:
+              shared networks cross-stack and stack-local, sidecar-declared
+              dependencies, and every way a reference can fail to resolve
   authentik-api.json   canned API responses for the above
   traefik/    a fleet whose labels and live proxy config disagree
   traefik-api.json     canned proxy + identity responses for the above
@@ -1347,14 +1416,15 @@ npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
 ```
 
-`npm run smoke` runs the whole pipeline against four fixture roots — `apps` for
+`npm run smoke` runs the whole pipeline against five fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
 redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
 nested interpolation, LAN-port exposure — `ports:` vs `expose:`, the
 tunnel-straight-at-the-container pattern and the bypass note on a proxied service
 — and provider attribution in a fleet whose SSO is *not* Authentik, where every
-mechanism is observable but nothing may be attributed to a vendor), `authentik` for
-the identity-provider integration, and `traefik` for the reverse-proxy integration.
+mechanism is observable but nothing may be attributed to a vendor), `nets` for what
+is and is not a connection between two services, `authentik` for the
+identity-provider integration, and `traefik` for the reverse-proxy integration.
 
 Both API roots drive canned responses (`fixtures/authentik-api.json`,
 `fixtures/traefik-api.json`) through an injected HTTP layer, so the tests need no
@@ -1438,22 +1508,30 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - Traefik middlewares defined in a dynamic config **file** rather than in labels
   are invisible to the scan — a reference to one resolves to nothing, which is why
   the name-based fallback and the `inferred` confidence exist.
-- **A network's peers are the ones this scan can see.** An `external:` network can carry
+- **A network's members are the ones this scan can see.** An `external:` network can carry
   containers from outside the apps root, and nothing in a compose file names them — so a
   network node reports its scope and its *scanned* member count, and one with a single
   visible member says which kind of nothing is on the other end rather than reading as
   empty. Sharing a network also means reachable in principle, never that anything is
   listening; that is what ports and `expose:` answer.
+- **Sharing a network is never read as a dependency.** Thirty services on a proxy network
+  are thirty members, not four hundred and thirty-five connections, so a service's diagram
+  draws a leg only where a dependency crosses that network — from a compose `depends_on`
+  or from a [declared one](#a-dependency-on-another-service) — and everything else on it is
+  listed under *also on it*, in words. Nothing is ever inferred from co-membership, from a
+  container name in an environment value, or from a port.
 - **A busy network node cannot show which arrow pairs with which.** The arrowheads belong
   to a service, not to a pair, so a network carrying two dependencies draws four of them.
   The Networks list writes every pair out in words for exactly that reason, and the drawer
-  separates "depends on" from "required by" per peer.
+  separates "depends on" from "required by" per dependency.
 - **A large network is summarised, not drawn whole.** The graph draws at most 12 spokes
-  per network, the drawer names at most 8 peers and the Networks list 12 chips; each says
-  how many it left out, and the drawer reads the unpruned data so nothing is unreachable.
-  A monitoring network with forty members is a count plus a list rather than forty lines —
-  deliberately, since forty lines is what makes the small, informative networks
-  impossible to find.
+  per network; the drawer names at most 8 dependencies and, separately, 12 co-members, and
+  the Networks list 12 chips. Each says how many it left out, and the drawer reads the
+  unpruned data so nothing is unreachable. The two drawer caps are separate on purpose: one
+  shared cap would let services that are merely reachable crowd a real dependency out of
+  the diagram. A monitoring network with forty members is a count plus a list rather than
+  forty lines — deliberately, since forty lines is what makes the small, informative
+  networks impossible to find.
 - **No filesystem watcher.** A compose or `.env` edit is picked up by the next scan —
   the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
   stays an explicit action; nothing auto-refreshes the page.

@@ -1,0 +1,20 @@
+# The stack whose sidecar gets every reference wrong but one. Two services on one
+# stack-local network, so the one reference that does resolve has a network to travel over
+# and the failures are the only thing being tested.
+#
+# `cache` shares its name with a service in `layered`, deliberately: a bare name written
+# next to a service of that name means the sibling, which is also all compose's own
+# `depends_on` can mean.
+services:
+  caller:
+    image: alpine:3.20
+    networks:
+      - side
+
+  cache:
+    image: redis:7-alpine
+    networks:
+      - side
+
+networks:
+  side:

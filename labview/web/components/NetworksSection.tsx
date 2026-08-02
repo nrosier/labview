@@ -11,10 +11,12 @@ import { MAX_LIST_PEERS, hiddenNetworksNote, networkGroups, networkScopeMeta } f
  * illegibly. This list answers it exactly, in text, with no layout engine involved — and
  * it is the target the graph's network nodes link to.
  *
- * Membership and dependency are one relation here, as everywhere else in this feature: a
- * row names the services on the network, then the dependencies that travel over it. Which
- * rows exist is decided by `showsNetworkNode` inside `networkGroups`, the same rule the
- * graph draws with, so the two cannot disagree about which networks matter.
+ * Membership and dependency are two facts here, and the row keeps them apart: it names the
+ * services **on** the network, then, separately, the dependencies that travel **over** it.
+ * Being on a network with twenty others means each can reach the rest — not that any needs
+ * another — so the member chips are a membership list and nothing more. Which rows exist is
+ * decided by `showsNetworkNode` inside `networkGroups`, the same rule the graph draws with,
+ * so the two cannot disagree about which networks matter.
  */
 export function NetworksSection({
   graph,
@@ -63,6 +65,15 @@ export function NetworksSection({
       </button>
       {open && (
         <div class="netpanel-body">
+          {/* Said once, at the top, rather than repeated on every row: the chips below are
+              who can reach whom, and the lines under them are the only dependencies there
+              are. A reader who takes the first for the second reads a proxy network as a
+              fleet in which everything needs everything. */}
+          <div class="muted-inline">
+            Services on one network can reach each other. That is not a dependency — the
+            dependencies each network carries are named under its members, and come from a
+            compose <code>depends_on</code> or from a <code>.labview</code> sidecar.
+          </div>
           {groups.map((g) => (
             <Row
               key={g.id}
@@ -134,17 +145,37 @@ function Row({
           </button>
         )}
       </div>
-      {/* The dependencies this network carries. In the graph these are arrowheads on the
+      {/* The dependencies this network carries — the only connections it makes, as opposed
+          to the reachability every member has. In the graph these are arrowheads on the
           spokes, which cannot say which arrow pairs with which once two dependencies cross
-          the same network; here the pair is named outright. */}
+          the same network; here the pair is named outright. A network spanning two stacks
+          gets qualified names, since a bare one no longer identifies a service.
+
+          A pair one of the two stacks declared says so, and names the file: the scan did
+          not see this relation, an operator stated it. */}
       {group.pairs.map((p) => (
         <div class="netpair" key={`${p.from.id}->${p.to.id}`}>
-          <span class="mono">{p.from.service}</span> depends on <span class="mono">{p.to.service}</span> over
-          this network
+          <span class="mono">{qualified(p.from, group)}</span> depends on{" "}
+          <span class="mono">{qualified(p.to, group)}</span> over this network
+          {p.declared && (
+            <span class="pill" title={`Declared in ${p.from.stack}${p.file ? `/${p.file}` : ""}`}>
+              declared
+            </span>
+          )}
         </div>
       ))}
     </div>
   );
+}
+
+/**
+ * How a service in a dependency pair is named.
+ *
+ * Bare on a network within one stack, `stack/service` on one that spans several — where a
+ * cross-stack dependency lives, and where two stacks can each have a `db` or a `redis`.
+ */
+function qualified(ref: { stack: string; service: string }, group: NetworkGroup): string {
+  return group.stackCount >= 2 ? `${ref.stack}/${ref.service}` : ref.service;
 }
 
 /**

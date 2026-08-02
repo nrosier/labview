@@ -5,7 +5,12 @@
 # needs something on the network.
 #
 # `extra` is here to pin the other half of the rule: it is on `inner` too but declares no
-# dependency and nothing depends on it, so its leg carries no arrowhead at all.
+# dependency and nothing depends on it, so its leg carries no arrowhead at all, and it is
+# named as a co-member of the network rather than as anything this stack is connected to.
+#
+# `probe` is on `inner` for the same reason, and carries a second job: `shared-d` has a
+# service of the same name, so a bare `probe` written in a third stack names two services and
+# resolves to neither.
 services:
   web:
     image: nginx:1.27-alpine
@@ -27,6 +32,11 @@ services:
       - inner
 
   extra:
+    image: alpine:3.20
+    networks:
+      - inner
+
+  probe:
     image: alpine:3.20
     networks:
       - inner

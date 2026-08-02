@@ -1,0 +1,13 @@
+# A dependency inside one stack that compose deliberately does not state.
+#
+# `extra` reads the cache but does not need it to start, so a compose `depends_on` would be
+# wrong — it would order the containers — while saying nothing at all would leave a real
+# relation out of the picture. The key is not only for crossing stacks.
+#
+# It also puts two dependencies of different provenance on one network: `api` needs the cache
+# by compose, `extra` needs it by declaration. The cache's leg to `inner` carries both, and
+# must read as observed rather than declared — something crossing it was measured.
+services:
+  extra:
+    depends_on:
+      - cache

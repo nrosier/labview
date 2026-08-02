@@ -1,0 +1,14 @@
+# Four references, one edge. Each failure is reported against this file and draws nothing:
+# guessing would put a line in a picture whose whole point is that a line means something.
+services:
+  caller:
+    depends_on:
+      # 1. Names no scanned service. Usually a rename nobody carried over here.
+      - nope/missing
+      # 2. Names this very service. A dependency on itself is not a relation.
+      - caller
+      # 3. Resolves — and resolves to the sibling, not to the `cache` in `layered`.
+      - cache
+      # 4. The same service again, the long way. One dependency, so this is dropped
+      #    without a word: the file says nothing wrong, it just says it twice.
+      - badref/cache

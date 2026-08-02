@@ -22,6 +22,14 @@ import { INGRESS_META, ingressLabel, isDarkTheme, resolveVar } from "../lib/pale
  * them reads dependent → network → dependency. A line straight between two services
  * appears only where they share no network at all — see `showsDirectDependency`.
  *
+ * This is the one view where a plain membership spoke belongs: it is the fleet's membership
+ * picture, and a spoke says "attached", which is true. What a spoke never gets is an
+ * arrowhead from co-membership alone — only a dependency puts one there, and a dependency
+ * comes from a compose `depends_on` or a `.labview` sidecar, never from sharing a network.
+ * A dependency that was declared rather than observed is **dashed** wherever it appears:
+ * the arrowhead means the same thing, but the line says the scan is repeating a statement
+ * instead of reporting a measurement (invariant I1).
+ *
  * What gets drawn is not decided here. `showsNetworkNode`, `visibleSpokes` and
  * `networkNodeLabel` are pure functions in `model/networks.ts`, which is what makes the
  * cap and the visibility rule assertable and keeps this view and the Networks section
@@ -241,6 +249,21 @@ export function GraphView({
           },
         },
         {
+          // A membership spoke whose only dependency was declared: dashed against the solid
+          // line of an observed one, so the arrowhead can mean the same thing while the line
+          // says the scan is repeating a statement. A spoke carrying both kinds stays solid
+          // — something crossing it *was* observed.
+          selector: 'edge[flowSource = "declared"]',
+          style: { "line-style": "dashed" },
+        },
+        {
+          // The same provenance on a direct edge, where dashed is already taken: that edge
+          // exists only because the pair shares no network, and dropping that meaning to
+          // show provenance would trade one fact for another. Dotted says both.
+          selector: "edge[declaredBy]",
+          style: { "line-style": "dotted" },
+        },
+        {
           selector: 'edge[kind = "auth"]',
           style: { "line-style": "dotted", width: 1.6, "line-color": edgeColor.auth! },
         },
@@ -312,6 +335,13 @@ export function GraphView({
       style={`background:var(--surface);border:1.5px ${dashed ? "dashed" : "solid"} var(--node-network)`}
     />
   );
+  /** A dependency, drawn as its line is: solid where observed, dashed where only declared. */
+  const depSwatch = (declared: boolean) => (
+    <span
+      class="swatch"
+      style={`background:${declared ? "transparent" : "var(--c8)"};border:1.5px ${declared ? "dashed" : "solid"} var(--c8)`}
+    />
+  );
 
   return (
     <div class="graph-panel">
@@ -350,8 +380,11 @@ export function GraphView({
               {netSwatch(s.key === "stack-local")} {s.label.toLowerCase()} network
             </span>
           ))}
-          <span class="item" title="A dependency drawn through the network that carries it: the arrowhead points from the dependent towards the network, and on again to the service it needs.">
-            {swatch("--c8")} dependency
+          <span class="item" title="A dependency drawn through the network that carries it: the arrowhead points from the dependent towards the network, and on again to the service it needs. Sharing a network is not one — a spoke with no arrowhead says only that the service is attached.">
+            {depSwatch(false)} dependency
+          </span>
+          <span class="item" title="A dependency stated in a .labview sidecar rather than read from a compose file — the only way to state one across stacks. Drawn the same way, dashed, because it was taken on the operator's word.">
+            {depSwatch(true)} declared dependency
           </span>
           <span class="item">{swatch("--node-volume", "diamond")} volume</span>
           <span class="item">{swatch("--hub-auth", "diamond")} hub</span>

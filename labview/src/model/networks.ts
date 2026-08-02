@@ -20,6 +20,13 @@ import type { Graph, GraphEdge, GraphNode, NetworkScope } from "./types.js";
  * `service → network → service`, with the network in the middle. A network hanging off
  * one service says nothing, and a line straight between two services hides the thing
  * that actually joins them.
+ *
+ * And one rule decides when that shape is drawn at all: **a line between two services
+ * requires a dependency**, from a compose file or from a sidecar. Sharing a network is
+ * reachability, not dependency — every fleet has a proxy network half the services sit on,
+ * and drawing each pair of them as connected would state something about the fleet that is
+ * not true. Co-members are still worth naming, so they are named in words, under a heading
+ * that says only what they are.
  */
 
 /**
@@ -160,18 +167,36 @@ export function hiddenNetworksNote(soloLocalNetworks: number): string {
 }
 
 /**
- * What one service is to another across a shared network.
+ * Which way a dependency runs between two services.
  *
- *  - `depends-on` — this service declares `depends_on` the peer.
- *  - `required-by` — the peer declares `depends_on` this service.
- *  - `peer` — neither; they are simply on the same network and can reach each other.
+ *  - `depends-on` — this service depends on the other one.
+ *  - `required-by` — the other one depends on this service.
  *
- * `peer` is not a weaker answer. A backup service and the databases it reads declare no
- * dependency on each other at all, and the shared network is the entire relationship.
+ * Both are read off the same edge, from whichever end is being looked at. That is what
+ * lets a dependency be declared once, on the dependent, and still appear in the drawer of
+ * the service it points at — the backup service in the request that prompted this shows
+ * every database that named it, with nothing in its own sidecar.
  */
-export type NetworkRelation = "depends-on" | "required-by" | "peer";
+export type DependencyRelation = "depends-on" | "required-by";
 
-/** How a relation is worded wherever it is shown. */
+/**
+ * What one service is to another across a shared network: a dependency in one direction
+ * or the other, or `peer` — neither, meaning they are simply both attached to it.
+ *
+ * `peer` is the answer for most pairs in a real fleet, and it is **not** a connection.
+ * Two services on one network can reach each other; nothing about that says one needs the
+ * other, and a proxy network with thirty members would otherwise read as thirty
+ * services all connected to each other. Wherever a co-member is shown it is shown as a
+ * member of the network, never as a peer of the service.
+ */
+export type NetworkRelation = DependencyRelation | "peer";
+
+/**
+ * How a relation is worded wherever it is shown.
+ *
+ * `peer` reads as `reachable` rather than as any kind of dependency: it is the plain
+ * consequence of sharing a network, which is all that was observed.
+ */
 export function relationLabel(relation: NetworkRelation): string {
   return relation === "depends-on" ? "depends on" : relation === "required-by" ? "required by" : "reachable";
 }
@@ -196,11 +221,25 @@ export interface ServiceRefView {
   service: string;
 }
 
+/** A service this one depends on, or that depends on it, across one network. */
 export interface NetworkPeerView extends ServiceRefView {
-  relation: NetworkRelation;
+  relation: DependencyRelation;
+  /**
+   * Set when the dependency was stated in a `.labview` sidecar rather than read from a
+   * compose file, with the file it was stated in — so a view can show it as the
+   * unverifiable statement it is (invariant I1) instead of as something observed.
+   *
+   * Set on **both** ends of a declared dependency: the service that declared it and the
+   * service it named. `file` names the sidecar the statement came from either way, which
+   * on the target's side is a file belonging to another stack.
+   */
+  declared?: boolean;
+  file?: string;
+  /** What the operator said about the dependency, when they said anything. */
+  detail?: string;
 }
 
-/** One network a service is on, and who else is on it. */
+/** One network a service is on: what it connects it to, and who else is attached. */
 export interface NetworkLink {
   /** Graph node id, `net:<name>`. */
   id: string;
@@ -208,26 +247,46 @@ export interface NetworkLink {
   scope: NetworkScope;
   memberCount: number;
   stackCount: number;
-  /** Peers, dependencies first, capped at the caller's limit. */
-  peers: NetworkPeerView[];
-  /** Peers beyond the cap. */
-  omitted: number;
+  /**
+   * Services this network carries a dependency to or from, dependents first, capped at
+   * the caller's limit. **The only members that are drawn as connected.**
+   */
+  dependencies: NetworkPeerView[];
+  /** Dependencies beyond the cap. */
+  dependenciesOmitted: number;
+  /**
+   * Every other scanned service attached to it, in scan order, capped separately.
+   *
+   * Reachable, not dependent — which is why these are a list and never a line: they
+   * answer "who else is on this network", and nothing more than that was observed.
+   */
+  alsoOn: ServiceRefView[];
+  /** Co-members beyond their cap. */
+  alsoOnOmitted: number;
 }
 
 /**
- * Every network one service is on, with the other services on each.
+ * Every network one service is on, split into what it depends on across each and who else
+ * is merely attached.
  *
  * Read off the complete graph, so it is exact even for a network whose spokes the fleet
  * view caps — this is the view that answers "and who else is on it", which is the whole
  * question a dangling `net: x` node never answered.
  *
- * Dependencies come first within a network and are never dropped by the cap: `peers`
- * fills with `depends-on`, then `required-by`, then plain peers in scan order.
+ * The split is the point. A dependency is a relation between two services; membership is a
+ * relation between a service and a network. Returning one mixed list is what let a
+ * renderer draw thirty co-members of a proxy network as thirty connections.
+ *
+ * @param limit how many dependencies one network may name — the diagram's cap, since
+ * those are what it draws.
+ * @param alsoOnLimit how many co-members one network may name. Separate, and larger:
+ * a list of names is cheap where a diagram leg is not.
  */
 export function networkLinks(
   graph: Graph,
   serviceId: string,
   limit: number = MAX_DRAWER_PEERS,
+  alsoOnLimit: number = MAX_LIST_PEERS,
 ): NetworkLink[] {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   const membership = graph.edges.filter((e) => e.kind === "network");
@@ -238,64 +297,95 @@ export function networkLinks(
     const net = nodes.get(own.target);
     if (!net || net.kind !== "network") continue;
 
-    const peers: NetworkPeerView[] = [];
+    const dependencies: NetworkPeerView[] = [];
+    const alsoOn: ServiceRefView[] = [];
     for (const other of membership) {
       if (other.target !== own.target || other.source === serviceId) continue;
       const node = nodes.get(other.source);
       if (!node || node.kind !== "service") continue;
-      peers.push({
-        id: node.id,
-        stack: node.stack ?? "",
-        service: node.label,
-        relation: relationOver(graph, serviceId, node.id, net.label),
+      const ref: ServiceRefView = { id: node.id, stack: node.stack ?? "", service: node.label };
+      const dep = dependencyOver(graph, serviceId, node.id, net.label);
+      if (!dep) {
+        alsoOn.push(ref);
+        continue;
+      }
+      const declaredBy = dep.edge.declaredBy;
+      dependencies.push({
+        ...ref,
+        relation: dep.relation,
+        ...(declaredBy
+          ? { declared: true, file: declaredBy.file, ...(declaredBy.detail ? { detail: declaredBy.detail } : {}) }
+          : {}),
       });
     }
-    peers.sort((a, b) => RELATION_ORDER[a.relation] - RELATION_ORDER[b.relation]);
+    dependencies.sort((a, b) => RELATION_ORDER[a.relation] - RELATION_ORDER[b.relation]);
 
     links.push({
       id: net.id,
       name: net.label,
       scope: net.scope ?? "external",
-      memberCount: net.memberCount ?? peers.length + 1,
+      memberCount: net.memberCount ?? dependencies.length + alsoOn.length + 1,
       stackCount: net.stackCount ?? 1,
-      peers: peers.slice(0, Math.max(0, limit)),
-      omitted: Math.max(0, peers.length - Math.max(0, limit)),
+      dependencies: dependencies.slice(0, Math.max(0, limit)),
+      dependenciesOmitted: Math.max(0, dependencies.length - Math.max(0, limit)),
+      alsoOn: alsoOn.slice(0, Math.max(0, alsoOnLimit)),
+      alsoOnOmitted: Math.max(0, alsoOn.length - Math.max(0, alsoOnLimit)),
     });
   }
   return links;
 }
 
 /**
- * What to say about a network with no other scanned service on it.
+ * What to say about a network that connects this service to nothing.
  *
- * The two scopes need different words, and getting them the wrong way round would be a
- * false claim in one direction or the other. On a stack-local network nothing else *can*
- * be attached, so "nothing else is on it" is the whole truth. On an external one the scan
- * simply cannot see the far end — a container outside the scanned stacks may well be on
- * it — so the sentence has to stop at what was observed.
+ * Three cases, and the difference between the last two is the whole distinction this
+ * module rests on.
  *
- * Empty for a network that does have peers, so a caller can use it as the condition.
+ * **Nothing else on it.** The two scopes need different words, and getting them the wrong
+ * way round would be a false claim in one direction or the other. On a stack-local network
+ * nothing else *can* be attached, so "nothing else is on it" is the whole truth. On an
+ * external one the scan simply cannot see the far end — a container outside the scanned
+ * stacks may well be on it — so the sentence has to stop at what was observed.
+ *
+ * **Members, but no dependency across it.** The ordinary case for a proxy or monitoring
+ * network. Said in words rather than drawn as lines, and said explicitly: a diagram with
+ * one network node and no legs beside a list of fourteen names would otherwise read as
+ * something the view failed to draw.
+ *
+ * Empty for a network that does carry a dependency, so a caller can use it as the
+ * condition.
  */
-export function peerlessNetworkText(link: NetworkLink): string {
-  if (link.peers.length > 0) return "";
-  return link.scope === "stack-local"
-    ? "Nothing else is on it. It belongs to this stack's compose project, so only this stack's own services could be."
-    : "No other scanned service is on it. It is external to the scanned stacks, so containers this scan cannot see may be.";
+export function networkMembershipText(link: NetworkLink): string {
+  if (link.dependencies.length > 0) return "";
+  const others = Math.max(0, link.memberCount - 1);
+  if (others === 0) {
+    return link.scope === "stack-local"
+      ? "Nothing else is on it. It belongs to this stack's compose project, so only this stack's own services could be."
+      : "No other scanned service is on it. It is external to the scanned stacks, so containers this scan cannot see may be.";
+  }
+  return (
+    `${others} other ${others === 1 ? "service is" : "services are"} on it. Sharing a network ` +
+    `makes them reachable, not dependent — nothing declares a dependency across it.`
+  );
 }
 
 /** Everything one service's drawer says about what it is connected to. */
 export interface ServiceConnections {
-  /** Every network it is on, with the other services on each. */
+  /** Every network it is on, with what it depends on across each and who else is attached. */
   links: NetworkLink[];
   /**
    * Dependencies drawn as a direct arrow because no network carries them.
    *
    * Normally empty. A non-empty entry is the oddity {@link showsDirectDependency}
-   * describes: compose orders the two containers' startup, yet neither can address the
-   * other. The analyzer states it in words on the service's notes; this is the same fact
-   * in the diagram.
+   * describes: a compose `depends_on` orders the two containers' startup, yet neither can
+   * address the other — or a sidecar declares a dependency on a service this scan can find
+   * no path to at all. The analyzer states both in words on the service's notes; this is
+   * the same fact in the diagram.
+   *
+   * Both directions, like the network-carried dependencies: the service at the far end of
+   * an unreachable dependency has the same problem, seen from the other side.
    */
-  direct: ServiceRefView[];
+  direct: NetworkPeerView[];
 }
 
 /**
@@ -309,17 +399,32 @@ export function serviceConnections(
   graph: Graph,
   serviceId: string,
   limit: number = MAX_DRAWER_PEERS,
+  alsoOnLimit: number = MAX_LIST_PEERS,
 ): ServiceConnections {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
-  const direct: ServiceRefView[] = [];
+  const direct: NetworkPeerView[] = [];
   for (const e of graph.edges) {
-    if (e.kind !== "depends_on" || e.source !== serviceId || !showsDirectDependency(e)) continue;
-    const node = nodes.get(e.target);
-    if (node?.kind === "service") {
-      direct.push({ id: node.id, stack: node.stack ?? "", service: node.label });
-    }
+    if (e.kind !== "depends_on" || !showsDirectDependency(e)) continue;
+    const far = e.source === serviceId ? e.target : e.target === serviceId ? e.source : undefined;
+    if (!far) continue;
+    const node = nodes.get(far);
+    if (node?.kind !== "service") continue;
+    direct.push({
+      id: node.id,
+      stack: node.stack ?? "",
+      service: node.label,
+      relation: e.source === serviceId ? "depends-on" : "required-by",
+      ...(e.declaredBy
+        ? {
+            declared: true,
+            file: e.declaredBy.file,
+            ...(e.declaredBy.detail ? { detail: e.declaredBy.detail } : {}),
+          }
+        : {}),
+    });
   }
-  return { links: networkLinks(graph, serviceId, limit), direct };
+  direct.sort((a, b) => RELATION_ORDER[a.relation] - RELATION_ORDER[b.relation]);
+  return { links: networkLinks(graph, serviceId, limit, alsoOnLimit), direct };
 }
 
 /**
@@ -333,19 +438,28 @@ const RELATION_ORDER: Record<NetworkRelation, number> = {
 };
 
 /**
- * What `a` is to `b` across the network `net`.
+ * The dependency between `a` and `b` that `net` carries, if any, and which way it runs.
  *
  * A dependency counts only when the network is one of those the pair actually shares —
  * `via` — so a service that depends on a sibling over the stack's own network is not
  * drawn as depending on it over an unrelated external one they also both happen to join.
+ *
+ * `undefined` for a pair that merely shares the network. The edge comes back with the
+ * answer because whether the dependency was observed or declared is on it, and the caller
+ * has to be able to say which.
  */
-function relationOver(graph: Graph, a: string, b: string, net: string): NetworkRelation {
+function dependencyOver(
+  graph: Graph,
+  a: string,
+  b: string,
+  net: string,
+): { relation: DependencyRelation; edge: GraphEdge } | undefined {
   for (const e of graph.edges) {
     if (e.kind !== "depends_on" || !e.via?.includes(net)) continue;
-    if (e.source === a && e.target === b) return "depends-on";
-    if (e.source === b && e.target === a) return "required-by";
+    if (e.source === a && e.target === b) return { relation: "depends-on", edge: e };
+    if (e.source === b && e.target === a) return { relation: "required-by", edge: e };
   }
-  return "peer";
+  return undefined;
 }
 
 /** One network and everything it connects, for the fleet-level Networks section. */
@@ -355,10 +469,25 @@ export interface NetworkGroup {
   scope: NetworkScope;
   memberCount: number;
   stackCount: number;
-  /** Every scanned service on it, in scan order. */
+  /**
+   * Every scanned service on it, in scan order.
+   *
+   * A membership list, and only that: being on this network with twenty others says each
+   * of them can reach the rest, not that any of them needs another. What the network
+   * actually connects is `pairs`.
+   */
   members: ServiceRefView[];
   /** The dependencies this network carries, dependent first. */
-  pairs: { from: ServiceRefView; to: ServiceRefView }[];
+  pairs: NetworkPairView[];
+}
+
+/** One dependency a network carries, as the fleet-level list shows it. */
+export interface NetworkPairView {
+  from: ServiceRefView;
+  to: ServiceRefView;
+  /** Stated in a sidecar rather than read from a compose file, with the file that said so. */
+  declared?: boolean;
+  file?: string;
 }
 
 /**
@@ -388,8 +517,12 @@ export function networkGroups(graph: Graph): NetworkGroup[] {
       .filter((r): r is ServiceRefView => Boolean(r));
     const pairs = graph.edges
       .filter((e) => e.kind === "depends_on" && e.via?.includes(node.label))
-      .map((e) => ({ from: ref(e.source), to: ref(e.target) }))
-      .filter((p): p is { from: ServiceRefView; to: ServiceRefView } => Boolean(p.from && p.to));
+      .map((e) => ({
+        from: ref(e.source),
+        to: ref(e.target),
+        ...(e.declaredBy ? { declared: true, file: e.declaredBy.file } : {}),
+      }))
+      .filter((p): p is NetworkPairView => Boolean(p.from && p.to));
     groups.push({
       id: node.id,
       name: node.label,

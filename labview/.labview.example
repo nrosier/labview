@@ -87,6 +87,37 @@ services:
       - label: Dashboard
         url: https://media.example.com/web/index.html#!/dashboard
 
+    # ── A dependency on another service in the fleet ──────────────────────────
+    # Service level only, and every entry must name a service LabView scanned.
+    #
+    # Different from `dependencies:` above, and the difference is who can see the
+    # far end: `dependencies:` is prose about things outside the fleet, so nothing
+    # is checked. Here the target is looked up, drawn as a relation in the graphs,
+    # and reported as drift when it names nothing — which is what makes the key
+    # worth having, and why a typo is never silent.
+    #
+    # Write it when compose cannot say it, which is most of the time:
+    #   * across stacks — compose `depends_on` reaches no further than its own
+    #     project, so nothing in a compose file can name another stack's service
+    #   * inside one stack, where the compose key would be wrong: that key orders
+    #     container startup, and "reads the cache" is a different claim
+    #
+    # Declare it once, on the service that needs the other. The target shows it
+    # from its own side automatically ("required by"), with nothing in its own
+    # sidecar — so a service everything depends on, like a backup agent, never has
+    # to be edited when something new starts depending on it.
+    #
+    #   stack/service   unambiguous, and worth preferring
+    #   service         this stack's own service first, then the fleet; a bare
+    #                   name matching two services in other stacks is drift, and
+    #                   both candidates are named so you can qualify it
+    #
+    # Up to 32. Shorthand: `depends_on: [db, other-stack/backup-agent]`.
+    depends_on:
+      - service: backups/restic-agent
+        detail: Nightly dump target; the agent connects inbound over backup-net.
+      - postgres                       # this stack's own database
+
     # ── Authentication the application performs for itself ───────────────────
     # This is the field most worth filling in: a login LabView has no way to see,
     # because it is enforced inside the app rather than by a proxy or by Authentik.

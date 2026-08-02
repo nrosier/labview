@@ -105,8 +105,9 @@ export {
  * In `src/` for the reason every rule here is a rule and not a rendering detail: which
  * network nodes are worth drawing, how many spokes one may have, when a dependency is
  * drawn straight between two services instead of through the network that carries it, and
- * who counts as a peer. The fleet graph, the drawer diagram and the Networks section all
- * read the same complete graph through these functions, so none of them can claim a
+ * — the rule the rest rests on — that a line between two services requires a dependency,
+ * never mere co-membership. The fleet graph, the drawer diagram and the Networks section
+ * all read the same complete graph through these functions, so none of them can claim a
  * connection the others do not.
  */
 export {
@@ -118,9 +119,9 @@ export {
   hiddenNetworksNote,
   networkGroups,
   networkLinks,
+  networkMembershipText,
   networkNodeLabel,
   networkScopeMeta,
-  peerlessNetworkText,
   relationLabel,
   serviceConnections,
   showsDirectDependency,
@@ -128,8 +129,10 @@ export {
   visibleSpokes,
 } from "../src/model/networks";
 export type {
+  DependencyRelation,
   NetworkGroup,
   NetworkLink,
+  NetworkPairView,
   NetworkPeerView,
   NetworkRelation,
   NetworkScopeMeta,

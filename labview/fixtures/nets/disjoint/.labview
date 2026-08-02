@@ -1,0 +1,17 @@
+# Two references the resolver has to treat quite differently.
+#
+# `front` names a bare `probe`, and two stacks have a service by that name. Nothing here
+# does, so there is no sibling to prefer and no way to choose: both candidates are named and
+# no dependency is drawn.
+#
+# `back` names a service that exists exactly once — and shares no network with it. That is a
+# resolved dependency, so it is drawn, and it is the case worth saying out loud: whatever
+# these two do together, they do it over something this scan cannot see.
+services:
+  front:
+    depends_on:
+      - probe
+  back:
+    depends_on:
+      - service: shared-c/backup-agent
+        detail: Dumps are pushed to the agent from the host's cron, not over docker.

@@ -2,6 +2,7 @@ import type { AppStack, Service, Graph, GraphNode, GraphEdge } from "../model/ty
 import { routerIsServing } from "../labels/auth.js";
 import { primaryIngress } from "../model/ingress.js";
 import { graphServiceId } from "../model/networks.js";
+import type { ResolvedDependency } from "./dependencies.js";
 import { buildNetworkIndex, serviceKey, sharedWith, type NetworkIndex } from "./networks.js";
 
 /**
@@ -9,11 +10,21 @@ import { buildNetworkIndex, serviceKey, sharedWith, type NetworkIndex } from "./
  *  - service <-> network membership (real docker network names, so shared/external
  *    networks correctly connect services from different stacks), each network node
  *    carrying its scope and how many services and stacks it joins
- *  - service -> service depends_on, drawn **through** the network that carries it:
+ *  - service -> service dependency, drawn **through** the network that carries it:
  *    the membership edges either side of the shared network take the arrowheads, so
  *    the path reads dependent -> network -> dependency. The direct service-to-service
  *    edge stays in the model, marked with the networks the pair shares, and is only
  *    rendered when they share none — see `GraphEdge.via` and `showsDirectDependency`.
+ *    Two sources, drawn by one rule: a compose `depends_on`, which can only name a
+ *    service in the same project, and a `.labview` sidecar's `depends_on`, which is how
+ *    a cross-stack dependency can be stated at all. A declared edge carries
+ *    `declaredBy`, so no view can pass the operator's statement off as a measurement.
+ *
+ * **Sharing a network is not a dependency.** Two services on one network can reach each
+ * other, and that is the whole of what the membership edges say: they attach a service to
+ * the network node and carry no arrowhead. Every fleet has a proxy or monitoring network
+ * that half the services are on, and treating co-membership as a relation would draw a
+ * line between every pair of them — a statement about the fleet that is simply not true.
  *  - service <-> shared volumes (named volumes, and bind paths used by 2+ stacks)
  *  - ingress/auth hubs, each added only when something observed calls for it:
  *    a Cloudflare tunnel, Traefik, and either the identified SSO provider or a
@@ -34,8 +45,17 @@ import { buildNetworkIndex, serviceKey, sharedWith, type NetworkIndex } from "./
  * @param nets the fleet's network membership, when the caller already built it. The
  * analyzer does, because the ingress rule needs it first, and sharing it is what makes
  * "shares a network" mean the same thing in the picture as in the classification.
+ * @param declared cross-stack dependencies resolved from the fleet's sidecars, from
+ * `resolveDeclaredDependencies`. Already resolved and already carrying the networks each
+ * pair shares — nothing here re-reads a declaration, so the one place a sidecar reference
+ * is interpreted stays the one place its four failure modes are reported.
  */
-export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: NetworkIndex): Graph {
+export function buildGraph(
+  stacks: AppStack[],
+  proxyKey?: string,
+  nets?: NetworkIndex,
+  declared: readonly ResolvedDependency[] = [],
+): Graph {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const addNode = (n: GraphNode) => {
@@ -88,14 +108,26 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: Network
    * Marked on every network the pair shares, not just one: they can talk over any of
    * them, and picking a favourite would draw an arrow across one network while an
    * equally usable one beside it looked unrelated.
+   *
+   * Each marking also records whether it came from a compose file or a sidecar, so the
+   * arrowhead can be drawn as the kind of statement it is. Nothing marks a flow from
+   * membership alone — that is the point of the whole distinction.
    */
-  const flows = new Map<string, Map<string, { out: boolean; in: boolean }>>();
-  const markFlow = (key: string, net: string, dir: "out" | "in") => {
+  type Flow = { out: boolean; in: boolean; observed: boolean; declared: boolean };
+  const flows = new Map<string, Map<string, Flow>>();
+  const markFlow = (key: string, net: string, dir: "out" | "in", from: "observed" | "declared") => {
     let byNet = flows.get(key);
     if (!byNet) flows.set(key, (byNet = new Map()));
-    const cur = byNet.get(net) ?? { out: false, in: false };
+    const cur = byNet.get(net) ?? { out: false, in: false, observed: false, declared: false };
     cur[dir] = true;
+    cur[from] = true;
     byNet.set(net, cur);
+  };
+  const markPair = (from: string, to: string, source: "observed" | "declared", via?: string[]) => {
+    for (const net of via ?? sharedWith(index, from, to)) {
+      markFlow(from, net, "out", source);
+      markFlow(to, net, "in", source);
+    }
   };
   for (const stack of stacks) {
     for (const svc of stack.services) {
@@ -103,13 +135,19 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: Network
       for (const dep of svc.dependsOn) {
         const target = stack.services.find((s) => s.name === dep);
         if (!target) continue;
-        const to = serviceKey(stack, target);
-        for (const net of sharedWith(index, from, to)) {
-          markFlow(from, net, "out");
-          markFlow(to, net, "in");
-        }
+        markPair(from, serviceKey(stack, target), "observed");
       }
     }
+  }
+  // The declared half, over the networks the resolver already found the pair shares.
+  for (const dep of declared) markPair(dep.from, dep.to, "declared", dep.via);
+
+  /** Declared dependencies by dependent, so each service's own loop can emit its edges. */
+  const declaredFrom = new Map<string, ResolvedDependency[]>();
+  for (const dep of declared) {
+    const list = declaredFrom.get(dep.from);
+    if (list) list.push(dep);
+    else declaredFrom.set(dep.from, [dep]);
   }
 
   /** Hostnames whose tunnel route terminates at a given hop, for one edge per hop. */
@@ -156,7 +194,13 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: Network
           source: sid,
           target: nid,
           kind: "network",
-          ...(flow ? { flow: flow.out && flow.in ? "both" : flow.out ? "to-network" : "to-service" } : {}),
+          ...(flow
+            ? {
+                flow: flow.out && flow.in ? "both" : flow.out ? "to-network" : "to-service",
+                flowSource:
+                  flow.observed && flow.declared ? "both" : flow.observed ? "observed" : "declared",
+              }
+            : {}),
         });
       }
 
@@ -176,6 +220,23 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: Network
             via: sharedWith(index, key, serviceKey(stack, target)),
           });
         }
+      }
+
+      // The same relation, declared instead of observed — the one way a dependency can
+      // cross stacks. Same kind, same `via`, so every rule about how a dependency is
+      // drawn applies to it unchanged; `declaredBy` is what keeps the two tellable apart.
+      // A pair that is both declared *and* in the compose file collapses to the observed
+      // edge above, by the same de-duplication that collapses two routes into one link:
+      // the scan saw it, so it need not be taken on anyone's word.
+      for (const dep of declaredFrom.get(key) ?? []) {
+        addEdge({
+          id: `${sid}=>svc:${dep.to}`,
+          source: sid,
+          target: `svc:${dep.to}`,
+          kind: "depends_on",
+          via: dep.via,
+          declaredBy: { file: dep.file, ...(dep.detail ? { detail: dep.detail } : {}) },
+        });
       }
 
       // Volumes: named volumes always; bind paths only when shared across stacks.

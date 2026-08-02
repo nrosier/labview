@@ -5,10 +5,12 @@
  *
  *   ./fixtures/apps      — a representative happy-path fleet.
  *   ./fixtures/edge      — regression cases for previously-fixed defects.
- *   ./fixtures/nets      — services connected to each other through shared networks: one
- *                          `external:` network across three stacks, a stack-local one
- *                          carrying dependencies, a dependency with no network to travel
- *                          over, and the two kinds of single-service network.
+ *   ./fixtures/nets      — what connects two services, and what merely lets them reach each
+ *                          other: one `external:` network across four stacks, sidecars
+ *                          declaring the dependencies compose cannot express, a co-member
+ *                          that declares nothing, every way a reference can fail to resolve,
+ *                          a dependency with no network to travel over, and the two kinds of
+ *                          single-service network.
  *   ./fixtures/authentik — the identity-provider API integration, driven through an
  *                          injected HTTP layer so no network and no Authentik is
  *                          needed. Canned responses: ./fixtures/authentik-api.json.
@@ -131,12 +133,13 @@ const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normali
 const {
   MAX_DRAWER_PEERS,
   MAX_GRAPH_SPOKES,
+  MAX_LIST_PEERS,
   graphServiceId,
   hiddenNetworksNote,
   networkGroups,
   networkLinks,
+  networkMembershipText,
   networkNodeLabel,
-  peerlessNetworkText,
   serviceConnections,
   showsDirectDependency,
   showsNetworkNode,
@@ -1622,6 +1625,76 @@ check(
 );
 rmSync(bigDir, { recursive: true, force: true });
 
+// `depends_on`, read but never resolved: the parser sees one stack, and the service a
+// reference names is usually in another. So the reference is kept exactly as written and
+// only checked for a shape that could name a service at all — which is also what makes
+// every one of these rules assertable with no fixture fleet behind it.
+console.log("\nthe sidecar's reading of a service reference");
+const deps1 = parseSidecar(
+  "services:\n  app:\n    depends_on:\n      - other/backup\n      - service: two/agent\n        detail: nightly dump\n",
+  names,
+  ".labview",
+);
+check(
+  "both forms are read, and the reference is stored as written",
+  deps1.services.get("app")?.dependsOn.map((d) => d.ref).join(", ") === "other/backup, two/agent" &&
+    deps1.warnings.length === 0,
+  `${JSON.stringify(deps1.services.get("app")?.dependsOn)} ${JSON.stringify(deps1.warnings)}`,
+);
+check(
+  "...with the operator's note where they wrote one",
+  deps1.services.get("app")?.dependsOn[1]?.detail === "nightly dump",
+);
+// A service whose sidecar entry says nothing else at all. Declarations with no content are
+// dropped, and a dependency is content — losing it here would lose the whole feature for
+// the operator who only wanted to state one thing.
+check(
+  "a service declaring nothing but a dependency is still kept",
+  parseSidecar("services:\n  app:\n    depends_on: [other/agent]\n", names, ".labview").services.get("app")
+    ?.dependsOn.length === 1,
+);
+const depsBad = parseSidecar(
+  "services:\n  app:\n    depends_on:\n      - a/b/c\n      - has space\n      - detail: no service key\n      - true\n",
+  names,
+  ".labview",
+);
+check(
+  "a reference that could not name a service is refused, one warning each",
+  !depsBad.services.has("app") && depsBad.warnings.length === 4,
+  `${JSON.stringify(depsBad.services.get("app"))} ${JSON.stringify(depsBad.warnings)}`,
+);
+check(
+  "...naming the shape it should have had rather than just rejecting it",
+  depsBad.warnings.filter((w) => w.includes('write "stack/service"')).length === 2 &&
+    depsBad.warnings.some((w) => w.includes('needs a "service"')) &&
+    depsBad.warnings.some((w) => w.includes('expected "stack/service" or {service, detail}')),
+  JSON.stringify(depsBad.warnings),
+);
+check(
+  "...and the list is capped like every other",
+  parseSidecar(
+    `services:\n  app:\n    depends_on:\n${Array.from({ length: MAX_LIST_ENTRIES + 5 }, (_, i) => `      - s/n${i}\n`).join("")}`,
+    names,
+    ".labview",
+  ).services.get("app")?.dependsOn.length === MAX_LIST_ENTRIES,
+);
+// At stack level the key cannot say *which* of the stack's services depends on the target,
+// which is a different mistake from a typo — and told apart from one, because the generic
+// unknown-key warning would send an operator looking for a spelling error.
+const depsStack = parseSidecar("depends_on:\n  - other/agent\n", names, ".labview");
+check(
+  "at stack level it is refused with the reason it cannot work there",
+  depsStack.warnings.length === 1 &&
+    depsStack.warnings[0]?.includes("is a service-level key") === true &&
+    depsStack.warnings[0]?.includes("which service depends on the target") === true,
+  JSON.stringify(depsStack.warnings),
+);
+check(
+  "...and not reported as an unknown key, which would be the wrong thing to go looking for",
+  !depsStack.warnings.some((w) => w.includes("unknown")),
+  JSON.stringify(depsStack.warnings),
+);
+
 /* ========================================================================== */
 /* fixtures/nets — services connected through shared networks                 */
 /* ========================================================================== */
@@ -1634,44 +1707,140 @@ const membership = (svc: string, net: string) =>
 
 console.log("\n--- network connections (fixtures/nets) ---");
 
-console.log("\none external network across three stacks");
+/** The dependency edge between two services, from either source. */
+const dependency = (from: string, to: string) =>
+  nets.graph.edges.find(
+    (e) => e.kind === "depends_on" && e.source === `svc:${from}` && e.target === `svc:${to}`,
+  );
+/** One service's drift entries joined, so a substring assertion never depends on order. */
+const nDrift = (stack: string, svc: string) => (nSvc(stack, svc).declared?.drift ?? []).join(" | ");
+
+console.log("\none external network across four stacks");
 const backup = netNode("backup");
 check("the shared network is one node, not one per stack", Boolean(backup));
 check("...named by its real docker name, so every stack means the same network", backup?.id === "net:backup");
 check("...scoped external, since several projects name it and it belongs to none", backup?.scope === "external");
-check("...counting every scanned service on it", backup?.memberCount === 3, String(backup?.memberCount));
-check("...and the stacks they come from", backup?.stackCount === 3, String(backup?.stackCount));
-// The case the whole feature exists for: the databases and the service that backs them up
-// declare nothing about each other — they are in separate compose projects, which cannot
-// express a dependency — so the shared network is the entire relationship, and a graph
-// that only drew `depends_on` would show the consumer connected to nothing.
+check("...counting every scanned service on it", backup?.memberCount === 4, String(backup?.memberCount));
+check("...and the stacks they come from", backup?.stackCount === 4, String(backup?.stackCount));
+
+// The case the whole feature exists for. Two databases in two stacks are backed up by an
+// agent in a third; compose cannot say so, because `depends_on` reaches no further than its
+// own project. The sidecars say it, each on its own database — and the agent, which has no
+// sidecar at all, has to show both of them as services that need it.
+console.log("\nthe dependency compose cannot express");
+check(
+  "the reference is kept exactly as the sidecar wrote it, qualified",
+  nSvc("shared-a", "db-a").declared?.dependsOn[0]?.ref === "shared-c/backup-agent",
+  JSON.stringify(nSvc("shared-a", "db-a").declared?.dependsOn),
+);
+check(
+  "...and it resolves to an edge over the network the two share",
+  dependency("shared-a/db-a", "shared-c/backup-agent")?.via?.join(",") === "backup",
+  JSON.stringify(dependency("shared-a/db-a", "shared-c/backup-agent")),
+);
+check(
+  "...marked as the operator's statement, naming the file that made it",
+  dependency("shared-a/db-a", "shared-c/backup-agent")?.declaredBy?.file === ".labview" &&
+    dependency("shared-a/db-a", "shared-c/backup-agent")?.declaredBy?.detail?.startsWith("Nightly dump") === true,
+  JSON.stringify(dependency("shared-a/db-a", "shared-c/backup-agent")?.declaredBy),
+);
+check(
+  "an unqualified name resolves across the fleet to the same target",
+  dependency("shared-b/db-b", "shared-c/backup-agent")?.via?.join(",") === "backup",
+  JSON.stringify(dependency("shared-b/db-b", "shared-c/backup-agent")),
+);
+// The asymmetry the design rests on: one entry on each dependent, nothing on the target,
+// and the target still reports both. A `required_by` key would have to be edited for every
+// database anyone adds — which is the maintenance this avoids.
 const agent = serviceConnections(nets.graph, graphServiceId("shared-c", "backup-agent"));
 check("the consumer's connections are found through the network", agent.links.length === 1);
 check(
-  "...naming every database on it, in other stacks",
-  agent.links[0]?.peers.map((p) => `${p.stack}/${p.service}`).join(", ") === "shared-a/db-a, shared-b/db-b",
-  JSON.stringify(agent.links[0]?.peers),
+  "the target has no sidecar of its own at all",
+  nSvc("shared-c", "backup-agent").declared === undefined,
+  JSON.stringify(nSvc("shared-c", "backup-agent").declared),
 );
 check(
-  "...as peers, since compose cannot declare a dependency across projects",
-  agent.links[0]?.peers.every((p) => p.relation === "peer") === true,
+  "...and still reports both databases as services that require it",
+  agent.links[0]?.dependencies.map((p) => `${p.stack}/${p.service}:${p.relation}`).join(", ") ===
+    "shared-a/db-a:required-by, shared-b/db-b:required-by",
+  JSON.stringify(agent.links[0]?.dependencies),
 );
-check("...and no dependency arrow is invented for them", agent.direct.length === 0);
+check(
+  "...each naming the file it was declared in, which belongs to the other stack",
+  agent.links[0]?.dependencies.every((p) => p.declared === true && p.file === ".labview") === true,
+  JSON.stringify(agent.links[0]?.dependencies),
+);
+check(
+  "...and neither is also drawn straight across, since the network carries them",
+  agent.direct.every((d) => d.service !== "db-a" && d.service !== "db-b"),
+  JSON.stringify(agent.direct),
+);
+// Two of the four resolved dependencies are the pair above; the fleet counter is what the
+// CLI prints, and it counts resolved edges rather than references written.
+check(
+  "the fleet counts what a sidecar stated and the scan could resolve",
+  nets.stats.declaredDependencies === 5,
+  String(nets.stats.declaredDependencies),
+);
+
 // Read from the other end, the same network reports the same membership. A per-service
 // view that disagreed with the fleet view about who is on a network would be worse than
 // either alone.
 const groups = networkGroups(nets.graph);
 const backupGroup = groups.find((g) => g.name === "backup");
 check(
-  "the fleet list reports the same three members",
+  "the fleet list reports the same four members",
   backupGroup?.members.map((m) => `${m.stack}/${m.service}`).join(", ") ===
-    "shared-a/db-a, shared-b/db-b, shared-c/backup-agent",
+    "shared-a/db-a, shared-b/db-b, shared-c/backup-agent, shared-d/monitor",
   JSON.stringify(backupGroup?.members),
+);
+check(
+  "...and names the two dependencies it carries as declared, not observed",
+  backupGroup?.pairs.map((p) => `${p.from.service}->${p.to.service}:${p.declared === true}`).join(", ") ===
+    "db-a->backup-agent:true, db-b->backup-agent:true",
+  JSON.stringify(backupGroup?.pairs),
 );
 check(
   "...and the most-connecting network is listed first",
   groups[0]?.name === "backup",
   groups.map((g) => g.name).join(","),
+);
+
+// The other half of the rule, and the reason the feature exists in this shape: a fourth
+// service is on that same network and nothing anywhere says it depends on, or is depended on
+// by, any of the others. It is a member. It is not a connection.
+console.log("\nsharing a network is not a dependency");
+check(
+  "the co-member is on the network",
+  Boolean(membership("svc:shared-d/monitor", "backup")),
+);
+check(
+  "...and its leg carries no arrowhead, because nothing crosses it",
+  membership("svc:shared-d/monitor", "backup")?.flow === undefined,
+  String(membership("svc:shared-d/monitor", "backup")?.flow),
+);
+check(
+  "...it is listed as reachable rather than as a dependency",
+  agent.links[0]?.alsoOn.map((p) => `${p.stack}/${p.service}`).join(", ") === "shared-d/monitor" &&
+    agent.links[0]?.dependencies.every((p) => p.service !== "monitor") === true,
+  JSON.stringify({ alsoOn: agent.links[0]?.alsoOn, deps: agent.links[0]?.dependencies }),
+);
+const monitor = serviceConnections(nets.graph, graphServiceId("shared-d", "monitor"));
+check(
+  "...and from its own side the network connects it to nothing",
+  monitor.links[0]?.dependencies.length === 0 && monitor.direct.length === 0,
+  JSON.stringify(monitor),
+);
+check(
+  "...while still naming all three services it could reach",
+  monitor.links[0]?.alsoOn.map((p) => `${p.stack}/${p.service}`).join(", ") ===
+    "shared-a/db-a, shared-b/db-b, shared-c/backup-agent",
+  JSON.stringify(monitor.links[0]?.alsoOn),
+);
+check(
+  "...and the fleet list keeps it out of the pairs while keeping it in the members",
+  backupGroup?.members.some((m) => m.service === "monitor") === true &&
+    backupGroup?.pairs.every((p) => p.from.service !== "monitor" && p.to.service !== "monitor") === true,
 );
 
 console.log("\na dependency drawn through the network that carries it");
@@ -1702,17 +1871,55 @@ check(
 );
 check(
   "a service with no dependency either way carries no arrowhead",
-  membership("svc:layered/extra", "layered_inner")?.flow === undefined,
-  String(membership("svc:layered/extra", "layered_inner")?.flow),
+  membership("svc:layered/probe", "layered_inner")?.flow === undefined,
+  String(membership("svc:layered/probe", "layered_inner")?.flow),
 );
-// The pairing the arrowheads cannot express once two dependencies cross one network, said
+// Provenance travels with the arrowhead, because the arrowhead alone cannot say whether
+// anyone measured what it claims. `extra` needs the cache by declaration only; the cache is
+// needed by `api` as well, which compose does state, so its leg carries both provenances and
+// must read as observed — something crossing it was read from a compose file.
+check(
+  "an arrowhead put there by compose is marked observed",
+  membership("svc:layered/web", "layered_inner")?.flowSource === "observed",
+  String(membership("svc:layered/web", "layered_inner")?.flowSource),
+);
+check(
+  "...one put there by a sidecar alone is marked declared",
+  membership("svc:layered/extra", "layered_inner")?.flowSource === "declared" &&
+    membership("svc:layered/extra", "layered_inner")?.flow === "to-network",
+  JSON.stringify(membership("svc:layered/extra", "layered_inner")),
+);
+check(
+  "...and a leg carrying one of each says so, rather than picking a side",
+  membership("svc:layered/cache", "layered_inner")?.flowSource === "both",
+  String(membership("svc:layered/cache", "layered_inner")?.flowSource),
+);
+check(
+  "a leg with no arrowhead has no provenance to report",
+  membership("svc:layered/probe", "layered_inner")?.flowSource === undefined,
+  String(membership("svc:layered/probe", "layered_inner")?.flowSource),
+);
+// The declaration does not need to cross a stack boundary to be worth making: compose's own
+// key would order the containers, which is a different claim from "reads the cache".
+check(
+  "a sidecar can state a dependency inside one stack too",
+  dependency("layered/extra", "layered/cache")?.declaredBy?.file === ".labview" &&
+    dependency("layered/extra", "layered/cache")?.via?.join(",") === "layered_inner",
+  JSON.stringify(dependency("layered/extra", "layered/cache")),
+);
+check(
+  "...and the one compose stated carries no declaration",
+  dependency("layered/api", "layered/cache")?.declaredBy === undefined,
+  JSON.stringify(dependency("layered/api", "layered/cache")?.declaredBy),
+);
+// The pairing the arrowheads cannot express once several dependencies cross one network, said
 // in words instead — this is why the graph is not the only view of it.
 check(
-  "the network's row names both pairs it carries, dependent first",
+  "the network's row names every pair it carries, dependent first",
   groups
     .find((g) => g.name === "layered_inner")
-    ?.pairs.map((p) => `${p.from.service}->${p.to.service}`)
-    .join(", ") === "web->api, api->cache",
+    ?.pairs.map((p) => `${p.from.service}->${p.to.service}:${p.declared === true}`)
+    .join(", ") === "web->api:false, api->cache:false, extra->cache:true",
   JSON.stringify(groups.find((g) => g.name === "layered_inner")?.pairs),
 );
 // The drawer reads the same relations from one service's point of view, and has to tell
@@ -1720,9 +1927,18 @@ check(
 const apiConn = serviceConnections(nets.graph, graphServiceId("layered", "api"));
 check(
   "the drawer tells 'depends on' from 'required by' on the same network",
-  apiConn.links[0]?.peers.map((p) => `${p.service}:${p.relation}`).join(", ") ===
-    "cache:depends-on, web:required-by, extra:peer",
-  JSON.stringify(apiConn.links[0]?.peers),
+  apiConn.links[0]?.dependencies.map((p) => `${p.service}:${p.relation}`).join(", ") ===
+    "cache:depends-on, web:required-by",
+  JSON.stringify(apiConn.links[0]?.dependencies),
+);
+check(
+  "...and keeps the rest of the network off that list, in the reachable one",
+  apiConn.links[0]?.alsoOn.map((p) => p.service).join(", ") === "extra, probe",
+  JSON.stringify(apiConn.links[0]?.alsoOn),
+);
+check(
+  "...naming no stack, since one stack owns every service on it",
+  apiConn.links[0]?.dependencies.every((p) => p.stack === "layered") === true,
 );
 
 console.log("\na dependency with no network to travel over");
@@ -1743,6 +1959,91 @@ check(
   serviceConnections(nets.graph, graphServiceId("disjoint", "front")).direct.map((d) => d.service).join(",") ===
     "back",
 );
+// The same geometry, reached by declaration instead of by compose — and it needs a different
+// sentence, because the compose one ("startup is ordered") is simply false here. Nothing
+// orders these two containers; a sidecar cannot.
+const declaredApart = dependency("disjoint/back", "shared-c/backup-agent");
+check("a declared dependency can be just as unreachable", declaredApart?.via?.length === 0);
+check("...and the arrow between the two is the drawing that survives", showsDirectDependency(declaredApart!));
+check(
+  "...said as a statement the scan cannot confirm, not as an ordering it never established",
+  nSvc("disjoint", "back").notes.some(
+    (n) =>
+      n.includes("is declared as a dependency in .labview") &&
+      n.includes("share no docker network") &&
+      n.includes("a published port, the host, or a proxy"),
+  ),
+  JSON.stringify(nSvc("disjoint", "back").notes),
+);
+check(
+  "...and the note is not the compose one, which would claim an ordering",
+  !nSvc("disjoint", "back").notes.some((n) => n.includes("startup is ordered")),
+  JSON.stringify(nSvc("disjoint", "back").notes),
+);
+// Both of this service's dependencies are unreachable, one declared and one from compose,
+// and the drawer draws both straight across — the declared one marked as declared, so the
+// two are never confused for having the same standing.
+const backConn = serviceConnections(nets.graph, graphServiceId("disjoint", "back"));
+check(
+  "the drawer draws it straight across, marked as declared and named with its stack",
+  backConn.direct.map((d) => `${d.stack}/${d.service}:${d.relation}:${d.declared === true}`).join(", ") ===
+    "shared-c/backup-agent:depends-on:true, disjoint/front:required-by:false",
+  JSON.stringify(backConn.direct),
+);
+
+// Four things a reference can turn out to be, three of which draw nothing. Each is reported
+// against the sidecar that made the claim rather than swallowed, because a reference that
+// silently resolves to nothing is the failure mode of the whole key.
+console.log("\nwhat a reference can turn out to name");
+check(
+  "a name matching no scanned service is reported as such",
+  nDrift("badref", "caller").includes('depends_on "nope/missing", which names no scanned service'),
+  nDrift("badref", "caller"),
+);
+check(
+  "...a name matching the declaring service itself, likewise",
+  nDrift("badref", "caller").includes('depends_on "caller", which is this service itself'),
+  nDrift("badref", "caller"),
+);
+check(
+  "...and an unqualified name matching two services names both and asks for a stack",
+  nDrift("disjoint", "front").includes(
+    'depends_on "probe", which names 2 services (layered/probe, shared-d/probe) — qualify it as "stack/service"',
+  ),
+  nDrift("disjoint", "front"),
+);
+check(
+  "...with no edge drawn for any of the three",
+  !dependency("badref/caller", "badref/caller") &&
+    !dependency("disjoint/front", "layered/probe") &&
+    !dependency("disjoint/front", "shared-d/probe"),
+);
+check(
+  "an unqualified name prefers the declaring stack's own service, as compose's key would",
+  dependency("badref/caller", "badref/cache")?.declaredBy?.file === ".labview",
+  JSON.stringify(dependency("badref/caller", "badref/cache")),
+);
+check(
+  "...and naming the same target twice draws one edge and says nothing about it",
+  nets.graph.edges.filter((e) => e.kind === "depends_on" && e.source === "svc:badref/caller").length === 1 &&
+    !nDrift("badref", "caller").includes("cache"),
+  nDrift("badref", "caller"),
+);
+// Resolution reads the declaration; it must never write back into it. The sidecar object is
+// what a rescan compares to report an edited file (§3.11), so a target resolved out of the
+// fleet has no business inside it — a rename in another stack would read as this file
+// changing. All four references are still here, exactly as written, duplicate included.
+check(
+  "the declaration survives resolution unedited, failures and duplicate included",
+  nSvc("badref", "caller").declared?.dependsOn.map((d) => d.ref).join(", ") ===
+    "nope/missing, caller, cache, badref/cache",
+  JSON.stringify(nSvc("badref", "caller").declared?.dependsOn),
+);
+check(
+  "...and every failure is reported as drift, which a rescan comparison excludes",
+  nSvc("badref", "caller").declared?.drift?.length === 2 && nets.stats.declarationDrift === 2,
+  JSON.stringify({ drift: nSvc("badref", "caller").declared?.drift, fleet: nets.stats.declarationDrift }),
+);
 
 console.log("\nnetworks that connect nothing");
 check("a stack-local network with one service on it is not drawn", !showsNetworkNode(netNode("lonely_island")!));
@@ -1752,28 +2053,44 @@ check("a stack-local network with one service on it is not drawn", !showsNetwork
 check("an external network with one service on it is drawn", showsNetworkNode(netNode("outside")!));
 check(
   "...and says what it can and cannot see, rather than reporting it as empty",
-  peerlessNetworkText(networkLinks(nets.graph, graphServiceId("lonely", "edge-facing"))[0]!).includes(
+  networkMembershipText(networkLinks(nets.graph, graphServiceId("lonely", "edge-facing"))[0]!).includes(
     "containers this scan cannot see may be",
   ),
 );
 check(
   "a stack-local network with nothing else on it says the opposite",
-  peerlessNetworkText({
+  networkMembershipText({
     id: "net:x",
     name: "x",
     scope: "stack-local",
     memberCount: 1,
     stackCount: 1,
-    peers: [],
-    omitted: 0,
+    dependencies: [],
+    dependenciesOmitted: 0,
+    alsoOn: [],
+    alsoOnOmitted: 0,
   }).includes("only this stack's own services could be"),
+);
+// The third case, and the one the request turns on: services are on it, and being on it is
+// all that is true of them. Said in words, because the diagram deliberately draws nothing.
+check(
+  "a network with members but no dependency says reachable, not dependent",
+  networkMembershipText(networkLinks(nets.graph, graphServiceId("shared-d", "monitor"))[0]!) ===
+    "3 other services are on it. Sharing a network makes them reachable, not dependent — " +
+      "nothing declares a dependency across it.",
+  networkMembershipText(networkLinks(nets.graph, graphServiceId("shared-d", "monitor"))[0]!),
+);
+check(
+  "...and says nothing at all where a dependency does cross it, leaving the chips to speak",
+  networkMembershipText(agent.links[0]!) === "",
+  networkMembershipText(agent.links[0]!),
 );
 check(
   "the counters split the fleet's networks into drawn and left out",
-  nets.stats.networks === 7 &&
-    nets.stats.connectingNetworks === 2 &&
+  nets.stats.networks === 9 &&
+    nets.stats.connectingNetworks === 3 &&
     nets.stats.crossStackNetworks === 1 &&
-    nets.stats.soloLocalNetworks === 4,
+    nets.stats.soloLocalNetworks === 5,
   JSON.stringify({
     networks: nets.stats.networks,
     connecting: nets.stats.connectingNetworks,
@@ -1792,7 +2109,7 @@ check(
 check(
   "...and the reader is told how many were left out",
   hiddenNetworksNote(nets.stats.soloLocalNetworks) ===
-    "4 stack-local networks with a single service on them are not drawn.",
+    "5 stack-local networks with a single service on them are not drawn.",
   hiddenNetworksNote(nets.stats.soloLocalNetworks),
 );
 check("nothing is said when none was left out", hiddenNetworksNote(0) === "");
@@ -1830,12 +2147,15 @@ check(
   networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2) === "big\n2 services",
   networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2),
 );
-// The drawer's cap is separate and smaller, and must never cut a dependency to make room
-// for a service that is merely reachable.
+// The drawer's two caps are separate, because the two lists cost different things: a
+// dependency becomes a leg in a diagram, a co-member becomes a word in a sentence. One
+// shared cap would let twelve services that are merely reachable crowd out a dependency —
+// which is the failure this whole change is about, arriving by a different route.
+const CROWD = 26;
 const crowded = {
   nodes: [
-    { id: "net:big", label: "big", kind: "network" as const, scope: "external" as const, memberCount: 12, stackCount: 1 },
-    ...Array.from({ length: 12 }, (_, i) => ({
+    { id: "net:big", label: "big", kind: "network" as const, scope: "external" as const, memberCount: CROWD, stackCount: 1 },
+    ...Array.from({ length: CROWD }, (_, i) => ({
       id: `svc:s/n${i}`,
       label: `n${i}`,
       kind: "service" as const,
@@ -1843,22 +2163,45 @@ const crowded = {
     })),
   ],
   edges: [
-    ...Array.from({ length: 12 }, (_, i) => ({
+    ...Array.from({ length: CROWD }, (_, i) => ({
       id: `svc:s/n${i}->net:big`,
       source: `svc:s/n${i}`,
       target: "net:big",
       kind: "network" as const,
     })),
-    { id: "d", source: "svc:s/n0", target: "svc:s/n11", kind: "depends_on" as const, via: ["big"] },
+    // n0 depends on the *last* ten members in scan order, so a cap that simply took the
+    // first eight members of the network would keep none of them.
+    ...Array.from({ length: 10 }, (_, i) => ({
+      id: `d${i}`,
+      source: "svc:s/n0",
+      target: `svc:s/n${CROWD - 10 + i}`,
+      kind: "depends_on" as const,
+      via: ["big"],
+    })),
   ],
 };
 const crowdedLink = networkLinks(crowded, "svc:s/n0")[0]!;
-check("the drawer caps peers too", crowdedLink.peers.length === MAX_DRAWER_PEERS);
-check("...and reports how many it left out", crowdedLink.omitted === 11 - MAX_DRAWER_PEERS);
+check("the drawer caps the dependencies it names", crowdedLink.dependencies.length === MAX_DRAWER_PEERS);
+check("...and reports how many it left out", crowdedLink.dependenciesOmitted === 10 - MAX_DRAWER_PEERS);
 check(
-  "...and the dependency survives the cap, whatever its scan position",
-  crowdedLink.peers[0]?.service === "n11" && crowdedLink.peers[0]?.relation === "depends-on",
-  JSON.stringify(crowdedLink.peers[0]),
+  "...keeping dependencies whatever their scan position, since a co-member cannot displace one",
+  crowdedLink.dependencies[0]?.service === "n16" &&
+    crowdedLink.dependencies.every((p) => p.relation === "depends-on"),
+  JSON.stringify(crowdedLink.dependencies[0]),
+);
+check(
+  "the co-members are capped on their own, larger allowance",
+  crowdedLink.alsoOn.length === MAX_LIST_PEERS,
+  String(crowdedLink.alsoOn.length),
+);
+check(
+  "...and report their own omission separately",
+  crowdedLink.alsoOnOmitted === CROWD - 1 - 10 - MAX_LIST_PEERS,
+  String(crowdedLink.alsoOnOmitted),
+);
+check(
+  "...and no service is in both lists",
+  crowdedLink.alsoOn.every((a) => !crowdedLink.dependencies.some((d) => d.id === a.id)),
 );
 
 /* ========================================================================== */
@@ -3918,6 +4261,7 @@ declSvc.declared = {
   file: ".labview",
   links: [],
   dependencies: [],
+  dependsOn: [],
   auth: [{ mechanism: "app-ldap" }],
   drift: [],
 };
@@ -3951,6 +4295,18 @@ check(
   "…while an edit to the words in the same block is",
   descDiff.changed.length === 1 && descDiff.changed[0]?.servicesChanged.join(",") === declSvc.name,
   JSON.stringify(descDiff.changed),
+);
+// A declared dependency sits on the parsed side of that line, and has to: the reference is
+// stored as the operator wrote it, so adding one *is* an edit to the file. It is the resolved
+// target that is a conclusion, and that is why resolution never writes into the declaration —
+// otherwise a rename in another stack would report this sidecar as changed.
+const depAdded = clone(declSvcEdited);
+depAdded[0]!.services[0]!.declared!.dependsOn = [{ ref: "other/backup-agent" }];
+const depDiff = diffStacks(declSvcEdited, depAdded);
+check(
+  "a dependency declared in a sidecar is an edit to that sidecar",
+  depDiff.changed.length === 1 && depDiff.changed[0]?.servicesChanged.join(",") === declSvc.name,
+  JSON.stringify(depDiff.changed),
 );
 
 // Key order is a property of how the object was built, not of the configuration. Without

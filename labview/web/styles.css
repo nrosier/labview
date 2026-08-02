@@ -615,14 +615,19 @@ table.data tr:last-child td { border-bottom: none; }
 .mermaid-wrap svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
 
 /* One network and the services it connects this one to. Used in the drawer and, with
-   the members in place of the peers, in the fleet-wide Networks section — the two are
-   the same row about the same network, read from two starting points. */
+   the members in place of the dependencies, in the fleet-wide Networks section — the two
+   are the same row about the same network, read from two starting points. */
 .netrow { padding: 8px 0; border-bottom: 1px solid var(--border); }
 .netrow:last-child { border-bottom: none; }
 .nethead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .nethead .muted-inline { color: var(--muted); font-size: 12px; }
 .netrow > .muted-inline { color: var(--muted); font-size: 12px; }
 .netrow .chips .muted-inline { color: var(--muted); font-size: 12px; align-self: center; }
+/* The services merely attached to the same network, set apart from the dependencies above
+   them: indented under their own quiet heading, because "reachable" is a weaker statement
+   than "depends on" and must not be read as the same one. */
+.netalso { margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--border); }
+.netalso > .muted-inline { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
 /* A dependency the network carries, dependent first — the pair the arrowheads in the
    graph cannot disambiguate once more than one crosses the same network. */
 .netpair { color: var(--ink-2); font-size: 12px; margin-top: 4px; }

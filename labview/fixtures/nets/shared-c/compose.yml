@@ -1,6 +1,9 @@
-# The consumer: one service that reaches every database above over the shared network.
-# It declares no dependency on them and cannot — they are in other compose projects — so
-# a graph that only drew `depends_on` would show this service connected to nothing.
+# The consumer, and the reason the declaration goes on the dependent rather than here.
+#
+# This stack has **no sidecar**, deliberately. Both databases name it, each in its own file,
+# and its drawer has to list both as services that require it — derived from their
+# statements, not from anything of its own. A `required_by` key here would have to be edited
+# for every database anyone adds, which is exactly the work the design avoids.
 services:
   backup-agent:
     image: alpine:3.20

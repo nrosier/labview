@@ -1,0 +1,26 @@
+# The trap for the rule that co-membership is not a connection.
+#
+# `monitor` is on the same shared backup network as the two databases and the agent. It
+# declares nothing, nothing declares it, and no compose file in the fleet mentions it. So it
+# must appear as a member of that network everywhere — and as a connection nowhere. Draw a
+# leg from a service to it and the picture claims the monitor needs those databases, or that
+# they need the monitor, neither of which anything in this fleet says.
+#
+# `probe` is here for a different rule. `layered` has a service by the same name, so a bare
+# `probe` written in a third stack names two services and can honestly be resolved to
+# neither. It sits on a network of its own so that being ambiguous is the only thing it is.
+services:
+  monitor:
+    image: alpine:3.20
+    networks:
+      - backup
+
+  probe:
+    image: alpine:3.20
+    networks:
+      - watch
+
+networks:
+  backup:
+    external: true
+  watch:

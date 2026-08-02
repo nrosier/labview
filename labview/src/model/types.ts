@@ -638,6 +638,31 @@ export interface DeclaredDependency {
 }
 
 /**
+ * A dependency on another **scanned** service, as the sidecar wrote it.
+ *
+ * The counterpart to {@link DeclaredDependency}, and deliberately a different type: that
+ * one is prose about something off the fleet, this one is a reference that has to resolve
+ * to a service in the scan, and is reported when it does not.
+ *
+ * It exists because compose cannot express this relation at all. `depends_on` names a
+ * service in the same project, so a database and the service that backs it up — two
+ * stacks, one shared network — have no way to say they are related. The operator is the
+ * only one who knows, and says it once, on the dependent: the target's own view of the
+ * relation is derived, so a backup service needs no sidecar of its own however many
+ * databases point at it.
+ *
+ * Stored exactly as written and never resolved in place. The parser cannot see the other
+ * stacks, and the analyzer must not write the resolved target back here — that would make
+ * a rename in an unrelated stack read as an edited sidecar on the next rescan (§3.11). A
+ * reference that stops resolving becomes a `drift` entry instead.
+ */
+export interface DeclaredServiceDependency {
+  /** The reference as written: `stack/service`, or a bare service name. */
+  ref: string;
+  detail?: string;
+}
+
+/**
  * Fields a `.labview` file may declare at either level. Everything is optional:
  * an absent or empty sidecar changes nothing about a scan.
  */
@@ -657,6 +682,12 @@ export interface Declaration {
 /** A declaration attached to one service, with the service-only fields. */
 export interface ServiceDeclaration extends Declaration {
   auth: DeclaredAuth[];
+  /**
+   * Dependencies on other scanned services, as written. Service level only: a
+   * stack-level entry could not say *which* of the stack's services depends on the
+   * target, so the key is refused there with a warning that says so.
+   */
+  dependsOn: DeclaredServiceDependency[];
   /**
    * Present only when the sidecar said `intentional: true` **and** gave a reason.
    * An acceptance with no reason is indistinguishable from a typo, so it is refused
@@ -864,8 +895,31 @@ export interface GraphEdge {
    * membership edge rather than a second edge beside it: a dependency and the
    * network it travels over are one relation, and drawing them as two was the thing
    * that made the graph unreadable.
+   *
+   * **Membership alone never sets this.** Two services on one network can reach each
+   * other, which is not a dependency, so an arrowhead requires a dependency from one of
+   * the two sources below.
    */
   flow?: "to-network" | "to-service" | "both";
+  /**
+   * On a `network` edge carrying {@link flow}: where the dependencies crossing it came
+   * from — a compose file (`observed`), a `.labview` sidecar (`declared`), or both.
+   *
+   * Here so a view cannot present a declaration as a measurement (invariant I1). The
+   * arrowhead is the same either way, because the operator's statement is the only thing
+   * that could ever have said this; the *line* is what says which of the two it was.
+   */
+  flowSource?: "observed" | "declared" | "both";
+  /**
+   * On a `depends_on` edge: the sidecar that stated it, when the relation was declared
+   * rather than read from a compose file. Absent on an observed dependency, so its
+   * presence is the whole "declared" flag.
+   *
+   * Declared on the dependent only. The reverse direction — every service that declared a
+   * dependency on *this* one — is read back off these same edges, which is what lets a
+   * service everything points at carry no sidecar of its own.
+   */
+  declaredBy?: { file: string; detail?: string };
   /**
    * On a `depends_on` edge: every real network the two services share, in the
    * dependent's compose order — the dependency can travel over any of them, so all
@@ -957,6 +1011,15 @@ export interface OverviewStats {
   exposureAccepted: number;
   /** Services whose declaration disagrees with what the scan found. */
   declarationDrift: number;
+  /**
+   * Dependencies on another scanned service declared in a sidecar and resolved to it.
+   *
+   * A fifth declaration counter, and a relation rather than a verdict: it changes none of
+   * the four above and none of the evidence-derived counters. A reference that resolved to
+   * nothing, or to more than one service, is not counted here — it is counted in
+   * `declarationDrift`, which is what a statement the scan cannot confirm is.
+   */
+  declaredDependencies: number;
   /**
    * The four network counters, over **real** docker network names — so an
    * `external:` network two stacks share is one network here, not two.

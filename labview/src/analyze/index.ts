@@ -24,6 +24,7 @@ import {
   normalizeIngress,
 } from "../model/ingress.js";
 import { maskEnv } from "../secrets.js";
+import { resolveDeclaredDependencies, type ResolvedDependency } from "./dependencies.js";
 import { buildGraph } from "./graph.js";
 import {
   buildNetworkIndex,
@@ -124,11 +125,6 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     }
   }
 
-  // A declared dependency the two containers have no network in common to carry.
-  // Reported here, where membership is known, rather than from the graph: the graph
-  // is drawn from the services and must not edit them.
-  flagUnreachableDependencies(stacks, nets);
-
   // Where each tunnel origin points. Cross-stack by nature — an origin routinely
   // names a proxy defined in a different stack — so it runs over the whole fleet
   // once, after the routes exist and before the graph is drawn from them.
@@ -139,6 +135,17 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   // exchanges go out together instead of one round trip after the other.
   const fleet = buildFleetIndex(stacks, nets);
   resolveOrigins(stacks, fleet);
+
+  // Cross-stack dependencies the operator declared. Resolved here because that needs the
+  // whole fleet — the target is in another stack by definition — and reported here rather
+  // than from the graph, which is drawn from the services and must not edit them.
+  const declaredDeps = resolveDeclaredDependencies(stacks, fleet, nets);
+
+  // A dependency the two containers have no network in common to carry, from either
+  // source. After resolution, so the declared half can be told apart from the compose
+  // half: only one of the two orders startup, and claiming otherwise would be a false
+  // reassurance about the very case being reported.
+  flagUnreachableDependencies(stacks, nets, declaredDeps);
 
   const [ak, tf] = await Promise.all([
     configuredAk ?? snapshotAuthentik(cfg, discoverAuthentikEndpoints(stacks), deps.fetchImpl),
@@ -182,8 +189,8 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     }
   }
 
-  const graph = buildGraph(stacks, live.proxyKey, nets);
-  const stats = computeStats(stacks, nets);
+  const graph = buildGraph(stacks, live.proxyKey, nets, declaredDeps);
+  const stats = computeStats(stacks, nets, declaredDeps);
 
   const meta: ScanMeta = {
     scannedAt: now.toISOString(),
@@ -409,16 +416,26 @@ function sharedNetworks(nets: NetworkIndex): Set<string> {
 }
 
 /**
- * Note every `depends_on` whose target shares no network with the dependent.
+ * Note every dependency whose target shares no network with the dependent.
  *
- * Compose will still order startup, so the stack comes up and looks fine; the two
- * containers simply cannot address each other, which is the kind of thing that is
- * discovered later by an application timing out. Worth one note, on the dependent —
- * it is the service that will fail to connect.
+ * For a compose `depends_on`, the stack still comes up and looks fine — compose orders
+ * startup — and the two containers simply cannot address each other, which is the kind of
+ * thing that is discovered later by an application timing out. Worth one note, on the
+ * dependent: it is the service that will fail to connect. Only same-stack targets are
+ * considered, because that is all `depends_on` can name.
  *
- * Only same-stack targets are considered, because that is all `depends_on` can name.
+ * A **declared** dependency in the same position needs different words. Nothing orders
+ * those two containers and nothing was ever going to, so "startup is ordered" would be a
+ * false reassurance; what the note can say is that the two do not share a network, and
+ * therefore that whatever carries the dependency is outside what this scan can see.
+ * Stated rather than dropped: it is either a real gap or a sidecar naming the wrong
+ * service, and both are worth a look.
  */
-function flagUnreachableDependencies(stacks: AppStack[], nets: NetworkIndex): void {
+function flagUnreachableDependencies(
+  stacks: AppStack[],
+  nets: NetworkIndex,
+  declared: readonly ResolvedDependency[],
+): void {
   for (const stack of stacks) {
     for (const svc of stack.services) {
       const key = serviceKey(stack, svc);
@@ -429,6 +446,14 @@ function flagUnreachableDependencies(stacks: AppStack[], nets: NetworkIndex): vo
         svc.notes.push(
           `depends_on ${dep}, but the two share no docker network: startup is ordered, ` +
             `yet neither container can reach the other`,
+        );
+      }
+      for (const dep of declared) {
+        if (dep.from !== key || dep.via.length > 0) continue;
+        svc.notes.push(
+          `${dep.to} is declared as a dependency in ${dep.file}, but the two share no ` +
+            `docker network — if they communicate it is over something this scan cannot ` +
+            `see (a published port, the host, or a proxy)`,
         );
       }
     }
@@ -577,7 +602,11 @@ function noteAuthentikGaps(svc: Service): void {
   );
 }
 
-function computeStats(stacks: AppStack[], nets: NetworkIndex): OverviewStats {
+function computeStats(
+  stacks: AppStack[],
+  nets: NetworkIndex,
+  declaredDeps: readonly ResolvedDependency[],
+): OverviewStats {
   const stats: OverviewStats = {
     stacks: stacks.length,
     services: 0,
@@ -594,6 +623,9 @@ function computeStats(stacks: AppStack[], nets: NetworkIndex): OverviewStats {
     declaredAuthProtected: 0,
     exposureAccepted: 0,
     declarationDrift: 0,
+    // Resolved pairs, so a reference that named nothing is not counted as a dependency
+    // here — it is already counted, as drift, on the line above.
+    declaredDependencies: declaredDeps.length,
     networks: nets.byName.size,
     connectingNetworks: 0,
     crossStackNetworks: 0,

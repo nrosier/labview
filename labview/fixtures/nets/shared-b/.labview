@@ -1,0 +1,10 @@
+# The same target as the stack beside this one, named the short way: no stack, just the
+# service. Nothing in this project is called `backup-agent`, so the name is looked up across
+# the fleet and resolves to exactly one service.
+#
+# Two dependents on one target, declared in two files, is the case the whole key exists for
+# — the target's own sidecar would have to list both, and a third tomorrow.
+services:
+  db-b:
+    depends_on:
+      - backup-agent

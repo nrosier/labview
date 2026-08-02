@@ -16,8 +16,20 @@ import { resolveVar, ingressVar } from "./palette";
  * the entire encoding, as in the fleet graph: no leg touching a network node is labelled,
  * because any wording for it would describe the network as the party to the relation.
  *
+ * **Only a dependency puts a service on the far side of a network.** A network this service
+ * merely shares with others is drawn as one undirected leg and nothing else — those services
+ * are reachable, not dependent, and drawing them as legs would turn one proxy network into a
+ * claim that a dozen unrelated services are connected. Who else is on it is answered in
+ * words, beside the diagram, and by the member counts in the network node's own label.
+ *
+ * A leg for a dependency stated in a `.labview` sidecar is **dashed** wherever it appears,
+ * because it was taken on the operator's word rather than read from a compose file
+ * (invariant I1). The leg to this service is dashed only when every dependency the network
+ * carries is declared — a network carrying one of each is solid, and the peer legs beyond it
+ * still say which is which.
+ *
  * @param conn what the graph says this service is connected to, from
- * `serviceConnections()`. Peers are already capped there; `conn.direct` holds the
+ * `serviceConnections()`. Dependencies are already capped there; `conn.direct` holds the
  * dependencies no network carries, which are the only ones still drawn service-to-service.
  */
 export function buildServiceMermaid(svc: Service, stack: AppStack, conn: ServiceConnections): string {
@@ -134,9 +146,9 @@ export function buildServiceMermaid(svc: Service, stack: AppStack, conn: Service
     lines.push(`  ${svcId} -.->|"${esc(svc.auth.method)}"| ${ak}`);
   }
 
-  // Networks, and through them the services on the other side. Real docker names, so a
-  // stack-local network and an `external:` one shared by six stacks are told apart —
-  // by name, by the counts in the label and by the classDef.
+  // Networks, and through them the services this one depends on or is needed by. Real
+  // docker names, so a stack-local network and an `external:` one shared by six stacks are
+  // told apart — by name, by the counts in the label and by the classDef.
   // A peer can sit on two of this service's networks; it is one node with two legs.
   const definedPeers = new Set<string>();
   const peerNode = (key: string, label: string, cls: string): string => {
@@ -157,27 +169,36 @@ export function buildServiceMermaid(svc: Service, stack: AppStack, conn: Service
 
     // The leg to this service, directed by what crosses the network: away from it where
     // it is the dependent, towards it where something on the network needs it, both ways
-    // where both are true, and undirected where the network only makes them reachable.
-    const out = link.peers.some((p) => p.relation === "depends-on");
-    const inn = link.peers.some((p) => p.relation === "required-by");
-    edge(out && inn ? `  ${svcId} <==> ${nid}` : out ? `  ${svcId} ==> ${nid}` : inn ? `  ${nid} ==> ${svcId}` : `  ${svcId} --- ${nid}`);
+    // where both are true, and undirected where the network carries no dependency at all
+    // — which is the ordinary case, and the case where nothing else is drawn either.
+    const deps = link.dependencies;
+    const out = deps.some((p) => p.relation === "depends-on");
+    const inn = deps.some((p) => p.relation === "required-by");
+    const allDeclared = deps.length > 0 && deps.every((p) => p.declared);
+    edge(
+      out && inn
+        ? `  ${svcId} ${allDeclared ? "<-.->" : "<==>"} ${nid}`
+        : out
+          ? `  ${svcId} ${allDeclared ? "-.->" : "==>"} ${nid}`
+          : inn
+            ? `  ${nid} ${allDeclared ? "-.->" : "==>"} ${svcId}`
+            : `  ${svcId} --- ${nid}`,
+    );
 
-    for (const p of link.peers) {
+    for (const p of deps) {
       const label = p.stack === stack.id ? p.service : `${p.stack}/${p.service}`;
       const pid = peerNode(`peer:${p.id}`, label, "dep");
+      const arrow = p.declared ? "-.->" : "==>";
       edge(
-        p.relation === "depends-on"
-          ? `  ${nid} ==> ${pid}`
-          : p.relation === "required-by"
-            ? `  ${pid} ==> ${nid}`
-            : `  ${nid} --- ${pid}`,
+        p.relation === "depends-on" ? `  ${nid} ${arrow} ${pid}` : `  ${pid} ${arrow} ${nid}`,
       );
     }
-    // What the cap left out, said rather than dropped: a network shared by fifty
-    // services must not silently look like one shared by eight.
-    if (link.omitted > 0) {
+    // What the cap left out, said rather than dropped: a network carrying fifty
+    // dependencies must not silently look like one carrying eight. Only dependencies are
+    // counted here — the co-members are in the node's own label, where they belong.
+    if (link.dependenciesOmitted > 0) {
       const mid = id(`more:${link.name}`);
-      lines.push(`  ${mid}(["+${link.omitted} more services"])`);
+      lines.push(`  ${mid}(["+${link.dependenciesOmitted} more dependencies"])`);
       lines.push(`  class ${mid} more`);
       edge(`  ${nid} --- ${mid}`);
     }
@@ -193,13 +214,24 @@ export function buildServiceMermaid(svc: Service, stack: AppStack, conn: Service
     lines.push(`  ${svcId} --> ${vid}`);
   }
 
-  // depends_on that no network carries — the only dependency still drawn as a line
-  // straight between two services, because there is no network to draw it through.
-  // Dotted and labelled with what that means: docker orders the two containers, and
-  // neither can reach the other. Everything else is above, routed through its network.
+  // A dependency no network carries — the only one still drawn as a line straight between
+  // two services, because there is no network to draw it through. Dotted and labelled with
+  // what that means: for a compose `depends_on`, docker orders the two containers and
+  // neither can reach the other; for a declared one, the two are said to be related over
+  // something this scan cannot see. Both directions, since the far end of an unreachable
+  // dependency has the same problem seen from the other side. Everything else is above,
+  // routed through its network.
   for (const dep of conn.direct) {
-    const did = peerNode(`peer:${dep.id}`, dep.service, "dep");
-    edge(`  ${svcId} -. "depends on, no shared network" .-> ${did}`);
+    const label = dep.stack === stack.id ? dep.service : `${dep.stack}/${dep.service}`;
+    const did = peerNode(`peer:${dep.id}`, label, "dep");
+    const text = dep.declared
+      ? "declared dependency, no shared network"
+      : "depends on, no shared network";
+    edge(
+      dep.relation === "depends-on"
+        ? `  ${svcId} -. "${text}" .-> ${did}`
+        : `  ${did} -. "${text}" .-> ${svcId}`,
+    );
   }
 
   // classDefs resolved from the live palette

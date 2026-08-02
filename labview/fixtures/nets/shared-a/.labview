@@ -1,0 +1,13 @@
+# The statement compose cannot make. `depends_on` in a compose file names a service in the
+# same project, so this database has no way to say that the agent one stack over backs it
+# up — and the network they share does not say it either: it says they can reach each other.
+#
+# Declared on the dependent, and only there. `shared-c` has no sidecar at all, and must
+# still show this database among the things that need it.
+services:
+  db-a:
+    description: The first database on the shared backup network.
+    depends_on:
+      # Qualified with the stack, which is the form that is never ambiguous.
+      - service: shared-c/backup-agent
+        detail: Nightly dump target; the agent connects inbound over the backup network.
