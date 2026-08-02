@@ -662,12 +662,15 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   synthetic nodes far larger than any fixture (§8) — rather than living in a `.tsx` where
   it could not be falsified.
 - The sharpest rule in that module is a distinction rather than a cap: **a line between two
-  services requires a dependency, never co-membership.** `networkLinks` returns the two as
-  separate fields — `dependencies` with a relation and `alsoOn` without one — because one
-  mixed list is what let a renderer draw thirty members of a proxy network as thirty
-  connections. The caps are separate too, and larger for `alsoOn`: a name in a sentence
-  costs less than a leg in a diagram, and one shared cap would let reachable services crowd
-  a real dependency out of the drawing.
+  services requires a dependency, never co-membership** — and the corollary, that **one
+  service's view of a network names its dependencies and counts everything else.**
+  `networkLinks` returns `dependencies`, each with a relation and a cap, beside
+  `reachableCount`, a number with no names in it at all, because one mixed list is what let
+  a renderer draw thirty members of a proxy network as thirty connections — and a second,
+  truncated list of names beside the first is the same claim in quieter type. *Which*
+  services are also attached is a fact about the network, not about this service, and it is
+  answered where networks are described: `networkGroups` feeds the fleet Networks section,
+  which names every member of every network under the network's own heading.
 - **Resolution reads the declaration and never writes to it.** A `depends_on` reference is
   stored exactly as the sidecar wrote it; the service it resolved to lives on a graph edge,
   as `declaredBy`. That is not tidiness — the parsed declaration is what §3.11 compares
@@ -840,16 +843,19 @@ Three views read the same graph through the same functions, so they cannot disag
   what resolves the arrowhead ambiguity the picture has once a hub carries two dependencies
   (§11). It states how many single-service stack-local networks it is not listing.
 - **The service drawer** reads `serviceConnections` off the **unpruned** graph, so it names
-  every service on a network the fleet view capped. Its mermaid diagram draws the same
-  `svc → net → peer` shape but **only for dependencies**, and no leg touching a network node
-  is labelled: any wording would make the network a party to the relation, so direction is
-  the entire encoding. Beside it, one HTML row per network — real name, scope pill, counts,
-  a chip per dependency carrying its relation and, where it was declared, a second pill
-  naming the file it came from — then, indented under *also on it*, the services that share
-  the network and nothing else. Where no dependency crosses it at all,
-  `networkMembershipText` says which of three things that means: nothing else is on it and
-  nothing else can be, nothing else *scanned* is on it but the far end is outside the scan,
-  or services are on it and being on it is the whole of what is true.
+  every dependency a network carries even where the fleet view capped its spokes. Its
+  mermaid diagram draws the same `svc → net → peer` shape but **only for dependencies**, and
+  no leg touching a network node is labelled: any wording would make the network a party to
+  the relation, so direction is the entire encoding. Beside it, one HTML row per network —
+  real name, scope pill, counts, a chip per dependency carrying its relation and, where it
+  was declared, a second pill naming the file it came from. That is the whole of the naming:
+  `MEMBERSHIP_NOTE` says so once above the rows, and each row ends with
+  `networkMembershipText`, which accounts for everyone else in a sentence with a count in
+  it. Four cases — nothing else is on it and nothing else can be; nothing else *scanned* is
+  on it but the far end is outside the scan; *n* others are on it and being on it is the
+  whole of what is true; *n* others are on it beside the dependencies just named. The names
+  behind the count are one click away rather than withheld: the network's own name in the row
+  head is a link to its row in the fleet Networks section, which names every member.
 
 **Integration panels.** The topbar states each API integration as a count —
 `authentik: 13 apps · 9 matched` — which is an outcome with two questions behind it:
@@ -1857,9 +1863,10 @@ analyzer also states it in words on the dependent's `notes`.
 a service depending on a sibling over the stack's own network is not reported as depending
 on it over an unrelated external network they also both join. The first two are relations
 between two services; `peer` is not a third one but the **absence** of a relation — a
-co-member, reachable and no more — which is why it appears in the fleet list's member
-wording and never on a chip or a diagram leg. The connection a `peer` would once have drawn
-now has to be stated: that is what the sidecar's `depends_on` is for (§3.12).
+co-member, reachable and no more — which is why nothing is ever labelled with it: it is
+vocabulary for the member wording, never for a chip or a diagram leg, and no function
+returns it. The connection a `peer` would once have drawn now has to be stated: that is what
+the sidecar's `depends_on` is for (§3.12).
 
 **DeclaredServiceDependency / ResolvedDependency** — the two halves of one fact, kept apart.
 `DeclaredServiceDependency` is what the sidecar wrote — a `ref` string exactly as typed,
@@ -1869,21 +1876,27 @@ is what step 6b made of it: `from`, `to`, the `file` it came from, the `detail`,
 from the same `sharedWith` helper the compose edges use. One is input, the other a
 conclusion; nothing merges them.
 
-**`NetworkLink.dependencies` / `.alsoOn`** — a service's view of one network, split by
-whether anything actually crosses it. `dependencies` carries a `NetworkRelation` and, when
-declared, the file that said so; `alsoOn` is a plain list of services that share the network
-and nothing else. Separate fields with separate caps, because one mixed list is what let
-thirty members of a proxy network render as thirty connections — the diagram reads the first,
-the sentence under it reads the second, and no service is ever in both.
+**`NetworkLink.dependencies` / `.reachableCount`** — a service's view of one network, split
+by whether anything actually crosses it: a list on one side, a number on the other.
+`dependencies` carries a `DependencyRelation` and, when declared, the file that said so;
+`reachableCount` is how many other scanned services are attached with no dependency either
+way, and it holds **no names**, not even truncated ones. One mixed list is what let thirty
+members of a proxy network render as thirty connections; a second list beside the first is
+that claim in quieter type, because twelve arbitrary names out of fifty-three, in chips
+identical to the dependency chips, are read as this service's connections and say nothing
+about this service at all. A count cannot be misread that way and has nothing to truncate.
+The names are answered by `networkGroups`, under the network's own heading, which is the
+scope the question belongs to.
 
 **MAX_GRAPH_SPOKES / MAX_DRAWER_PEERS / MAX_LIST_PEERS** — `12 / 8 / 12`. The fleet graph
 caps spokes per network node; the drawer caps **dependencies** per network at
-`MAX_DRAWER_PEERS` and its co-members separately at `MAX_LIST_PEERS`, which the Networks
-section also uses for member chips. `visibleSpokes` keeps dependency-carrying spokes first,
-and the drawer's two caps are separate for the same reason: a leg in a diagram costs more
-than a name in a sentence, and one shared cap would let services that are merely reachable
-crowd a real dependency out of the drawing. All of them report what was left out, and
-`networkNodeLabel` puts `+k not drawn` on the node.
+`MAX_DRAWER_PEERS`, which is the only list it has; `MAX_LIST_PEERS` caps the member chips
+the fleet Networks section draws before a row is expanded, and reaches the drawer nowhere.
+`visibleSpokes` keeps dependency-carrying spokes first, for the reason the drawer names only
+dependencies at all: a leg in a diagram costs more than a co-member does, and anything that
+lets merely-reachable services compete for the space crowds a real dependency out of the
+picture. All of them report what was left out, and `networkNodeLabel` puts `+k not drawn` on
+the node.
 
 **`declaredDependencies`** — the `OverviewStats` counter beside the four other declaration
 counters: `depends_on` references that resolved to an edge. Resolved, not written, so it
@@ -2583,21 +2596,24 @@ to `apps`, so no existing count or assertion shifts. Same revert-proof contract:
 | Stacks | Pins |
 |---|---|
 | `shared-a`, `shared-b`, `shared-c` | the headline case, and the request this feature came from: three compose projects, one `external:` network, one node. Two databases are backed up by an agent in a third stack, which compose cannot say — so each database's `.labview` says it, one qualified and one bare, and `shared-c` has **no sidecar at all** while still reporting both as `required-by`. That last part is the check that fails if the reverse direction is ever taken from the target's own file instead of derived. Pins `scope: "external"`, `memberCount: 4`, `stackCount: 4`, `declaredBy.file`, the preserved `detail`, and that the two views agree about who is on it |
-| `shared-d` | a fourth service on that same network declaring nothing, which is the trap for a revert to co-membership-as-connection: it must appear in `alsoOn`, never in `dependencies`, carry no `flow`, and stay out of the fleet list's pairs while staying in its members. From its own side the network connects it to nothing and says so in words |
+| `shared-d` | a fourth service on that same network declaring nothing, which is the trap for a revert to co-membership-as-connection: it must be *counted* in `reachableCount`, never named in `dependencies`, carry no `flow`, and stay out of the fleet list's pairs while staying in its members. Its name must not appear anywhere in the serialised link either — asserted against the whole payload rather than a field, so a list coming back under any key fails on the first name it prints. From its own side the network connects it to nothing and says so in words, with a count of the three it could reach |
 | `badref` | every way a reference fails, in one stack: a name matching nothing, the declaring service itself, a bare name that resolves to the sibling ahead of two same-named services elsewhere, and a second reference to that same target. Two drift entries, one edge, nothing said about the duplicate — and the declaration still holding all four references exactly as written, which is what keeps a rescan from reading a rename elsewhere as an edit here |
 | `layered` | a dependency drawn *through* the stack's own network: `web → api → cache` over `layered_inner`, so `via` names it, no direct line is drawn, and the three `flow` values are each pinned on the leg that must carry them — `to-network`, `both` (a service at both ends of a chain) and `to-service`. `extra` declares the cache in the sidecar, which is where `flowSource` is pinned in all four states: `observed`, `declared`, `both` on the cache's one leg, and absent on `probe`, the co-member with no dependency either way |
 | `disjoint` | the exception, twice: a compose `depends_on` across two networks the pair does not share, and a declared one to another stack entirely. `via` empty and the direct edge **kept** in both, with the two different notes — docker orders startup yet neither container can address the other, against a declaration the scan can find no path for at all. Its sidecar also declares the bare `probe`, which two stacks now have, so the ambiguity names both candidates and draws nothing |
-| `lonely` | both arms of the single-member rule at once: one service on an `external:` network (drawn, because something outside the scan may be on it) and one alone on a stack-local network (counted, not drawn). Also where two of the three membership wordings are pinned, which are opposite claims and would be a false statement if swapped |
+| `lonely` | both arms of the single-member rule at once: one service on an `external:` network (drawn, because something outside the scan may be on it) and one alone on a stack-local network (counted, not drawn). Also where two of the four membership wordings are pinned, which are opposite claims and would be a false statement if swapped |
 
 **The caps are asserted against synthetic nodes, not a fixture.** `visibleSpokes` is driven
 with 20 edges and `networkLinks` with a 26-member network, because the alternative is
 committing a twenty-six-service fleet whose only purpose is to be large. The functions are
 pure and live in `model/networks.ts` for exactly this reason, and the revert contract is
-unaffected: returning every spoke, dropping the dependency-first ordering, or collapsing the
-drawer's two caps back into one turns a check red. The assertions that matter most are the
-ones about what is *kept* — the dependency-carrying spokes are last in scan order in the
-synthetic input, and the ten dependencies are the last ten members, so keeping them proves
-the sort rather than the slice, and proves a co-member cannot displace a dependency.
+unaffected: returning every spoke, dropping the dependency-first ordering, or naming the
+fifteen co-members the 26-member network's drawer only counts turns a check red. The
+assertions that matter most are the ones about what is *kept* — the dependency-carrying
+spokes are last in scan order in the synthetic input, and the ten dependencies are the last
+ten members, so keeping them proves the sort rather than the slice, and proves a co-member
+cannot displace a dependency. The same synthetic network is then read through
+`networkGroups`, which must still name all 26: that is the check that the drawer's count and
+the fleet list it points at are two views of one membership rather than a fact lost.
 
 **`fixtures/authentik`** — a fleet with an identity provider in it, driven against
 canned API responses in `fixtures/authentik-api.json` through `BuildDeps.fetchImpl`.
@@ -3221,11 +3237,18 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   `depends on` from `required by` per dependency. The picture is the index; the pairs are
   in the text.
 - **A large network is summarised, not drawn whole.** The fleet graph draws at most 12
-  spokes per network node; the drawer names at most 8 dependencies and 12 co-members, and
-  the Networks section 12 member chips. Each states how many it left out, and the service
-  drawer reads the unpruned graph so nothing is unreachable. But a monitoring network with
-  forty members is a count on a node plus a list, not forty lines — deliberately, since
-  forty lines is what makes the small informative networks impossible to find.
+  spokes per network node; the drawer names at most 8 dependencies and no co-members at all,
+  and the Networks section 12 member chips before a row is expanded. Each states how many it
+  left out, and the service drawer reads the unpruned graph so nothing is unreachable. But a
+  monitoring network with forty members is a count on a node plus a list under the network's
+  own heading, not forty lines — deliberately, since forty lines is what makes the small
+  informative networks impossible to find.
+- **A service's own view of a network is deliberately incomplete about its membership.** It
+  says how many others are on it and not who, and the only route to the names is the link to
+  the fleet Networks section. That is a real limit: a reader who wants both at once has two
+  places to look. It is the intended trade, because the alternative measured worse — a
+  truncated list of a proxy network's members, in the same chips as the dependencies, is read
+  as this service's connections while saying nothing about this service at all.
 - **No history.** Every scan is a snapshot; nothing is persisted, so there is no
   drift detection or change log.
 - **The Docker snapshot lists all containers**, including ones with no compose
@@ -3282,7 +3305,8 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | An unqualified reference prefers the declaring stack, and an ambiguous one is drift | `depends_on: [postgres]` almost always means the sibling, which is also all compose's own key can mean, so resolving locally first is the least surprising rule. Two candidates in other stacks and no local one is not guessable: both are named, no edge is drawn, and the operator qualifies it. Guessing there would produce a line between two services with no relationship, which is the failure this whole change removed. |
 | Resolution lands on the graph, never on the declaration | The parsed declaration is what a rescan compares to report an edited sidecar (§3.11), so a resolved target stored inside it would make a rename in *another* stack read as this file changing. The reference is kept exactly as written; the edge carries `declaredBy`. A reference that stops resolving becomes `drift`, which that comparison already excludes. |
 | A declared dependency is **dashed** everywhere, and changes no verdict | I1 with an input that has no evidence behind it: the relation is drawn because the operator stated it, so it is drawn differently from one that was read out of a compose file, and its chip names the file that claimed it. It alters no ingress kind, no exposed count and no auth posture — it draws a relation and nothing else. |
-| The drawer's two caps are separate numbers | Dependencies are capped at 8 and co-members at 12, rather than sharing one cap over one list. The two cost different things — a leg in a diagram against a name in a sentence — and a shared cap would let twelve merely-reachable services push a real dependency out of the picture, which is the original failure arriving by a different route. |
+| The drawer has one cap, because it has one list | Dependencies are capped at 8; co-members are a count with nothing to cap. An earlier version gave them their own, larger cap and their own list, on the reasoning that a name in a sentence costs less than a leg in a diagram — which was true about cost and wrong about meaning. With one list left, no number of merely-reachable services can push a real dependency out of the picture, which is what the two-cap split existed to prevent. |
+| **A service's network row names its dependencies and counts everyone else** | The drawer used to name co-members too, in a second list under *also on it*. On a shared transport network — the proxy network half a fleet sits on to be reached by Traefik — that list is the case it cannot serve: it is arbitrary (scan order), truncated, and in chips identical to the dependency chips beside it, so it reads as *what this service is connected to*, which is the claim this whole module exists to deny. It is also not about this service: membership is a property of the network, and the same list appears in the drawer of every member. Rewording it does not fix either problem, and a size threshold only moves the line. So the names left, the count stayed, and the network's name in the row head became a link to the fleet Networks section — the network-scoped view, under the network's own heading, where every member is named and the question actually belongs. Nothing about dependencies, edges, `via` or `flow` changed: this removed names from one list and added a number and a link. |
 | A single-member **external** network is drawn; a single-member **stack-local** one is not | Both look identical as a count, and they say opposite things. Nothing else *can* join a stack-local network that one service created, so it connects nothing and never will. An external network with one scanned member means something outside the scan may be on the other end — a real statement about reachability, and the only place the scan's own boundary is visible. Dropping either arm loses a different truth, which is why the rule is two-armed and each arm has its own fixture and its own revert check. |
 | Large networks are capped at 12 spokes rather than expanded on demand | A monitoring network with forty members renders forty lines through the middle of the graph, and the small networks that carry an actual dependency become unfindable. Interactive expand/collapse was the alternative and was rejected: it re-runs the layout, moves every other node, and answers "who else is on this" worse than a list does. So the cap is fixed, dependency-carrying spokes survive it first, the node states `+k not drawn`, and the drawer reads the unpruned graph — the information is never gone, only not in the picture. |
 | A fleet-level Networks section, beside the graph rather than inside it | "Show me every service on this network" is a list question, and a layout engine is a poor way to answer it — the answer moves every time it is asked. One collapsible row per network, members as chips, dependency pairs in words, needs no layout and is the only place the hub pairing can be stated exactly. It filters through the same `showsNetworkNode` the graph draws with, so the picture and the list cannot come to disagree about which networks exist. |

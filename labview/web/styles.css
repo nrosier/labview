@@ -623,11 +623,19 @@ table.data tr:last-child td { border-bottom: none; }
 .nethead .muted-inline { color: var(--muted); font-size: 12px; }
 .netrow > .muted-inline { color: var(--muted); font-size: 12px; }
 .netrow .chips .muted-inline { color: var(--muted); font-size: 12px; align-self: center; }
-/* The services merely attached to the same network, set apart from the dependencies above
-   them: indented under their own quiet heading, because "reachable" is a weaker statement
-   than "depends on" and must not be read as the same one. */
-.netalso { margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--border); }
-.netalso > .muted-inline { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+/* Said once above the rows rather than per row: why a row names only dependencies, and where
+   the rest of the answer is. Its own class because `.muted-inline` is only ever styled by
+   the container it sits in, and this one's container is the section itself. */
+.netnote { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+/* The network's name in the drawer is the way to the fleet list that names its members, so
+   it is a link — but a link to a row of text, not an action, so it keeps the mono type of
+   the plain name it replaces rather than looking like the chips below it. Restated here
+   because `.linkbtn`'s `font: inherit` is declared after `.mono` and would otherwise take
+   the family with it, leaving a real docker network name set in prose. */
+.nethead .linkbtn {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.86em;
+}
 /* A dependency the network carries, dependent first — the pair the arrowheads in the
    graph cannot disambiguate once more than one crosses the same network. */
 .netpair { color: var(--ink-2); font-size: 12px; margin-top: 4px; }

@@ -8,6 +8,7 @@ import type {
   Service,
 } from "../model";
 import {
+  MEMBERSHIP_NOTE,
   declaredAuthLabel,
   graphServiceId,
   ingressMatchesExpectation,
@@ -133,17 +134,27 @@ export function AppDetail({
   graph,
   onClose,
   onOpenService,
+  onOpenNetwork,
 }: {
   stack: AppStack;
   svc: Service;
   /**
    * The complete relationship graph, not the pruned one the fleet view draws: this is
-   * where a reader comes to see *every* peer of a network, including the ones the fleet
-   * graph capped away.
+   * where a reader comes to see *every* dependency a network carries, including the ones
+   * the fleet graph capped away.
    */
   graph: Graph;
   onClose: () => void;
   onOpenService: (stackId: string, serviceName: string) => void;
+  /**
+   * Open a network's row in the fleet Networks list.
+   *
+   * The other half of "who else is on it is answered where networks are described": the
+   * sentence in a network row says how many, and the network's name is the way to the list
+   * that names them. Closing this drawer is the caller's job — the list it lands on is
+   * behind the scrim.
+   */
+  onOpenNetwork: (name: string) => void;
 }) {
   const s = statusView(svc.docker);
   // One read of the graph for both the diagram and the Networks section, so the picture
@@ -727,22 +738,31 @@ export function AppDetail({
             </Section>
           )}
 
-          {/* Networks, and who else is on them — the answer a bare list of network names
-              never gave. Real docker names, so the one `external:` network six stacks
-              share is named here exactly as it is named in every other stack's drawer.
+          {/* Networks, and what they connect this service to — the answer a bare list of
+              network names never gave. Real docker names, so the one `external:` network six
+              stacks share is named here exactly as it is named in every other stack's drawer.
 
-              Two groups per network, and the distinction between them is the point. What
-              this service depends on or is needed by across it — the only relations there
-              are — then, separately, who else is merely attached. A co-member is reachable,
-              not depended on, so it is listed under a heading that says only that and is
-              never drawn as a connection. Both groups are exact even where the fleet graph
-              capped the spokes, each capped on its own count. */}
+              One group per network and one sentence under it, and the difference between
+              them is the point. The chips are what this service depends on or is needed by
+              across it — the only relations there are. Everything else attached is a
+              *count*, in words: which services those are is a fact about the network, not
+              about this one, and a dozen names of a proxy network's fifty-three, in chips
+              like the ones beside them, reads as a list of this service's connections. The
+              network's name is a link to the fleet Networks list, which does name them, so
+              the reader who came for that gets sent rather than refused. */}
           {conn.links.length > 0 && (
             <Section title="Networks">
+              <div class="netnote">{MEMBERSHIP_NOTE}</div>
               {conn.links.map((l) => (
                 <div class="netrow" key={l.id}>
                   <div class="nethead">
-                    <span class="mono">{l.name}</span>
+                    <button
+                      class="linkbtn mono"
+                      onClick={() => onOpenNetwork(l.name)}
+                      title={`Show ${l.name} in the fleet's Networks list, which names every service on it`}
+                    >
+                      {l.name}
+                    </button>
                     <span class="pill" title={networkScopeMeta(l.scope).title}>
                       {networkScopeMeta(l.scope).label}
                     </span>
@@ -781,32 +801,15 @@ export function AppDetail({
                       )}
                     </div>
                   )}
-                  {/* Reachability, worded as such. The sentence carries the case where a
-                      network has members but connects this service to none of them, which
-                      is the ordinary state of a proxy network and would otherwise read as
-                      something the view failed to draw. */}
+                  {/* Reachability, worded as such — and the only thing said about the
+                      members no chip above named. It carries the case where a network has
+                      members but connects this service to none of them, which is the
+                      ordinary state of a proxy network and would otherwise read as
+                      something the view failed to draw, and the case where it carries one
+                      dependency and forty members it says nothing about. Empty exactly when
+                      every service on the network is already a chip. */}
                   {networkMembershipText(l) && (
                     <div class="muted-inline">{networkMembershipText(l)}</div>
-                  )}
-                  {l.alsoOn.length > 0 && (
-                    <div class="netalso">
-                      <span class="muted-inline">also on it</span>
-                      <div class="chips">
-                        {l.alsoOn.map((p) => (
-                          <button
-                            key={p.id}
-                            class="chip"
-                            onClick={() => onOpenService(p.stack, p.service)}
-                            title={`Open ${p.stack}/${p.service} — on this network, with no dependency either way`}
-                          >
-                            {p.stack === stack.id ? p.service : `${p.stack}/${p.service}`}
-                          </button>
-                        ))}
-                        {l.alsoOnOmitted > 0 && (
-                          <span class="muted-inline">+{l.alsoOnOmitted} more</span>
-                        )}
-                      </div>
-                    </div>
                   )}
                 </div>
               ))}

@@ -930,6 +930,14 @@ function App() {
           graph={ov.graph}
           onClose={() => setSelected(null)}
           onOpenService={openService}
+          /* The same landing as a tap on a network node in the graph, plus the drawer
+             closing: the list this points at sits behind the drawer's scrim, so leaving it
+             open would scroll a row into view under a sheet of dark. */
+          onOpenNetwork={(name) => {
+            setNetwork(name);
+            setTab("overview");
+            setSelected(null);
+          }}
         />
       )}
 

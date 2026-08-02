@@ -11,7 +11,7 @@ import type { Graph, GraphEdge, GraphNode, NetworkScope } from "./types.js";
  *
  * That split is what makes the two views agree. The fleet graph hides a network that
  * connects nothing and caps the spokes of one that connects fifty; the service drawer
- * lists every peer of that same network exactly. Both read the same complete graph
+ * names every dependency of that same network exactly. Both read the same complete graph
  * through the same functions, so neither can quietly disagree with the other about who
  * is connected to whom — and none of it is decided inside a `.tsx`, where it would be
  * unassertable.
@@ -25,8 +25,15 @@ import type { Graph, GraphEdge, GraphNode, NetworkScope } from "./types.js";
  * requires a dependency**, from a compose file or from a sidecar. Sharing a network is
  * reachability, not dependency — every fleet has a proxy network half the services sit on,
  * and drawing each pair of them as connected would state something about the fleet that is
- * not true. Co-members are still worth naming, so they are named in words, under a heading
- * that says only what they are.
+ * not true.
+ *
+ * Which is why one service's view of a network **names its dependencies and counts
+ * everything else**. Who else is attached is a fact about the network, not about this
+ * service, and a truncated list of a proxy network's members — twelve arbitrary names out
+ * of fifty-three, in the same chips as the dependencies beside them — is read as the thing
+ * this rule exists to deny. The names are not lost: {@link networkGroups} feeds the
+ * fleet-level Networks list, where every member of every network is named under the
+ * network's own heading, which is the place the question belongs to.
  */
 
 /**
@@ -255,38 +262,37 @@ export interface NetworkLink {
   /** Dependencies beyond the cap. */
   dependenciesOmitted: number;
   /**
-   * Every other scanned service attached to it, in scan order, capped separately.
+   * How many other scanned services are attached to it with no dependency either way.
    *
-   * Reachable, not dependent — which is why these are a list and never a line: they
-   * answer "who else is on this network", and nothing more than that was observed.
+   * A count, and never names. *Which* services they are says nothing about this one — it
+   * is a property of the network, answered in the fleet Networks list where the network
+   * itself is described. A dozen names out of fifty-three, in chips beside the dependency
+   * chips, reads as a list of this service's connections; a number cannot, and there is no
+   * cap to truncate it with.
    */
-  alsoOn: ServiceRefView[];
-  /** Co-members beyond their cap. */
-  alsoOnOmitted: number;
+  reachableCount: number;
 }
 
 /**
- * Every network one service is on, split into what it depends on across each and who else
- * is merely attached.
+ * Every network one service is on, with what it depends on across each and a count of who
+ * else is merely attached.
  *
- * Read off the complete graph, so it is exact even for a network whose spokes the fleet
- * view caps — this is the view that answers "and who else is on it", which is the whole
- * question a dangling `net: x` node never answered.
+ * Read off the complete graph, so the dependencies are exact even for a network whose
+ * spokes the fleet view caps — this is the view that answers "and what does this network
+ * actually connect", which is the whole question a dangling `net: x` node never answered.
  *
  * The split is the point. A dependency is a relation between two services; membership is a
  * relation between a service and a network. Returning one mixed list is what let a
- * renderer draw thirty co-members of a proxy network as thirty connections.
+ * renderer draw thirty co-members of a proxy network as thirty connections, and naming
+ * them in a second list beside the first is the same claim in quieter type.
  *
  * @param limit how many dependencies one network may name — the diagram's cap, since
- * those are what it draws.
- * @param alsoOnLimit how many co-members one network may name. Separate, and larger:
- * a list of names is cheap where a diagram leg is not.
+ * those are what it draws. Co-members have no cap because they have no list.
  */
 export function networkLinks(
   graph: Graph,
   serviceId: string,
   limit: number = MAX_DRAWER_PEERS,
-  alsoOnLimit: number = MAX_LIST_PEERS,
 ): NetworkLink[] {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   const membership = graph.edges.filter((e) => e.kind === "network");
@@ -298,20 +304,23 @@ export function networkLinks(
     if (!net || net.kind !== "network") continue;
 
     const dependencies: NetworkPeerView[] = [];
-    const alsoOn: ServiceRefView[] = [];
+    let reachable = 0;
     for (const other of membership) {
       if (other.target !== own.target || other.source === serviceId) continue;
       const node = nodes.get(other.source);
       if (!node || node.kind !== "service") continue;
-      const ref: ServiceRefView = { id: node.id, stack: node.stack ?? "", service: node.label };
       const dep = dependencyOver(graph, serviceId, node.id, net.label);
+      // Counted, and the reference deliberately not kept: a co-member's name has no path
+      // out of this function, so no renderer can grow one back.
       if (!dep) {
-        alsoOn.push(ref);
+        reachable++;
         continue;
       }
       const declaredBy = dep.edge.declaredBy;
       dependencies.push({
-        ...ref,
+        id: node.id,
+        stack: node.stack ?? "",
+        service: node.label,
         relation: dep.relation,
         ...(declaredBy
           ? { declared: true, file: declaredBy.file, ...(declaredBy.detail ? { detail: declaredBy.detail } : {}) }
@@ -324,21 +333,21 @@ export function networkLinks(
       id: net.id,
       name: net.label,
       scope: net.scope ?? "external",
-      memberCount: net.memberCount ?? dependencies.length + alsoOn.length + 1,
+      memberCount: net.memberCount ?? dependencies.length + reachable + 1,
       stackCount: net.stackCount ?? 1,
       dependencies: dependencies.slice(0, Math.max(0, limit)),
       dependenciesOmitted: Math.max(0, dependencies.length - Math.max(0, limit)),
-      alsoOn: alsoOn.slice(0, Math.max(0, alsoOnLimit)),
-      alsoOnOmitted: Math.max(0, alsoOn.length - Math.max(0, alsoOnLimit)),
+      reachableCount: reachable,
     });
   }
   return links;
 }
 
 /**
- * What to say about a network that connects this service to nothing.
+ * Who else is on this network, in words — the sentence that stands in place of the list of
+ * names this view deliberately does not have.
  *
- * Three cases, and the difference between the last two is the whole distinction this
+ * Four cases, and the difference between the middle two is the whole distinction this
  * module rests on.
  *
  * **Nothing else on it.** The two scopes need different words, and getting them the wrong
@@ -349,29 +358,54 @@ export function networkLinks(
  *
  * **Members, but no dependency across it.** The ordinary case for a proxy or monitoring
  * network. Said in words rather than drawn as lines, and said explicitly: a diagram with
- * one network node and no legs beside a list of fourteen names would otherwise read as
- * something the view failed to draw.
+ * one network node and no legs would otherwise read as something the view failed to draw.
  *
- * Empty for a network that does carry a dependency, so a caller can use it as the
- * condition.
+ * **Members *and* a dependency.** Said too, because the chips above account for two of
+ * fifty-four members and silence about the rest reads as if they were not there. The
+ * clause that matters is that no dependency reaches them either — the network carrying one
+ * dependency says nothing about the members it does not carry one to.
+ *
+ * Empty only when every service on the network is already named above, so a caller can use
+ * it as the condition.
  */
 export function networkMembershipText(link: NetworkLink): string {
-  if (link.dependencies.length > 0) return "";
-  const others = Math.max(0, link.memberCount - 1);
+  const others = link.reachableCount;
+  const carries = link.dependencies.length > 0 || link.dependenciesOmitted > 0;
   if (others === 0) {
+    if (carries) return "";
     return link.scope === "stack-local"
       ? "Nothing else is on it. It belongs to this stack's compose project, so only this stack's own services could be."
       : "No other scanned service is on it. It is external to the scanned stacks, so containers this scan cannot see may be.";
   }
+  const count = `${others} other ${others === 1 ? "service is" : "services are"}`;
+  if (carries) {
+    return (
+      `${count} also on it, reachable but not dependent — nothing declares a dependency ` +
+      `to them across it.`
+    );
+  }
   return (
-    `${others} other ${others === 1 ? "service is" : "services are"} on it. Sharing a network ` +
+    `${count} on it. Sharing a network ` +
     `makes them reachable, not dependent — nothing declares a dependency across it.`
   );
 }
 
+/**
+ * Why a network row names only dependencies, and where the rest of the answer is.
+ *
+ * Said once above the rows rather than per row: it is true of every network a service is
+ * on, and repeated fourteen times it would be the loudest thing in the drawer. The pointer
+ * at the end is the part that has to be there — a reader who came to find out who else is
+ * on the proxy network is owed the place that answers it, not a refusal.
+ */
+export const MEMBERSHIP_NOTE =
+  "Only dependencies are named here. Sharing a network makes services reachable, not " +
+  "dependent — how many share each one is said below, and which ones they are is in the " +
+  "fleet's Networks list.";
+
 /** Everything one service's drawer says about what it is connected to. */
 export interface ServiceConnections {
-  /** Every network it is on, with what it depends on across each and who else is attached. */
+  /** Every network it is on, with what it depends on across each and how many else are attached. */
   links: NetworkLink[];
   /**
    * Dependencies drawn as a direct arrow because no network carries them.
@@ -399,7 +433,6 @@ export function serviceConnections(
   graph: Graph,
   serviceId: string,
   limit: number = MAX_DRAWER_PEERS,
-  alsoOnLimit: number = MAX_LIST_PEERS,
 ): ServiceConnections {
   const nodes = new Map(graph.nodes.map((n) => [n.id, n]));
   const direct: NetworkPeerView[] = [];
@@ -424,7 +457,7 @@ export function serviceConnections(
     });
   }
   direct.sort((a, b) => RELATION_ORDER[a.relation] - RELATION_ORDER[b.relation]);
-  return { links: networkLinks(graph, serviceId, limit, alsoOnLimit), direct };
+  return { links: networkLinks(graph, serviceId, limit), direct };
 }
 
 /**

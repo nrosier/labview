@@ -134,6 +134,7 @@ const {
   MAX_DRAWER_PEERS,
   MAX_GRAPH_SPOKES,
   MAX_LIST_PEERS,
+  MEMBERSHIP_NOTE,
   graphServiceId,
   hiddenNetworksNote,
   networkGroups,
@@ -1827,10 +1828,10 @@ check(
   String(membership("svc:shared-d/monitor", "backup")?.flow),
 );
 check(
-  "...it is listed as reachable rather than as a dependency",
-  agent.links[0]?.alsoOn.map((p) => `${p.stack}/${p.service}`).join(", ") === "shared-d/monitor" &&
+  "...it is counted as reachable rather than named as a dependency",
+  agent.links[0]?.reachableCount === 1 &&
     agent.links[0]?.dependencies.every((p) => p.service !== "monitor") === true,
-  JSON.stringify({ alsoOn: agent.links[0]?.alsoOn, deps: agent.links[0]?.dependencies }),
+  JSON.stringify({ reachable: agent.links[0]?.reachableCount, deps: agent.links[0]?.dependencies }),
 );
 const monitor = serviceConnections(nets.graph, graphServiceId("shared-d", "monitor"));
 check(
@@ -1839,10 +1840,19 @@ check(
   JSON.stringify(monitor),
 );
 check(
-  "...while still naming all three services it could reach",
-  monitor.links[0]?.alsoOn.map((p) => `${p.stack}/${p.service}`).join(", ") ===
-    "shared-a/db-a, shared-b/db-b, shared-c/backup-agent",
-  JSON.stringify(monitor.links[0]?.alsoOn),
+  "...while still counting all three services it could reach",
+  monitor.links[0]?.reachableCount === 3,
+  String(monitor.links[0]?.reachableCount),
+);
+// The count is the whole of what comes back, and this is the assertion that says so: a
+// co-member's name must not reach the drawer by any route, so the check is against the
+// serialised link rather than against a field — a field can be renamed, a name in the
+// payload cannot hide. Every service on `backup` is here, dependencies included, so a
+// revert that puts the members back under any key fails on the first one it names.
+check(
+  "...and no co-member's name is anywhere in what the drawer gets",
+  ["db-a", "db-b", "backup-agent"].every((n) => !JSON.stringify(monitor.links[0]).includes(n)),
+  JSON.stringify(monitor.links[0]),
 );
 check(
   "...and the fleet list keeps it out of the pairs while keeping it in the members",
@@ -1939,9 +1949,10 @@ check(
   JSON.stringify(apiConn.links[0]?.dependencies),
 );
 check(
-  "...and keeps the rest of the network off that list, in the reachable one",
-  apiConn.links[0]?.alsoOn.map((p) => p.service).join(", ") === "extra, probe",
-  JSON.stringify(apiConn.links[0]?.alsoOn),
+  "...and keeps the rest of the network off that list, counted instead",
+  apiConn.links[0]?.reachableCount === 2 &&
+    apiConn.links[0]?.dependencies.every((p) => p.service !== "probe") === true,
+  JSON.stringify({ reachable: apiConn.links[0]?.reachableCount, deps: apiConn.links[0]?.dependencies }),
 );
 check(
   "...naming no stack, since one stack owns every service on it",
@@ -2064,22 +2075,23 @@ check(
     "containers this scan cannot see may be",
   ),
 );
+const bareLink = {
+  id: "net:x",
+  name: "x",
+  scope: "stack-local" as const,
+  memberCount: 1,
+  stackCount: 1,
+  dependencies: [],
+  dependenciesOmitted: 0,
+  reachableCount: 0,
+};
 check(
   "a stack-local network with nothing else on it says the opposite",
-  networkMembershipText({
-    id: "net:x",
-    name: "x",
-    scope: "stack-local",
-    memberCount: 1,
-    stackCount: 1,
-    dependencies: [],
-    dependenciesOmitted: 0,
-    alsoOn: [],
-    alsoOnOmitted: 0,
-  }).includes("only this stack's own services could be"),
+  networkMembershipText(bareLink).includes("only this stack's own services could be"),
 );
 // The third case, and the one the request turns on: services are on it, and being on it is
-// all that is true of them. Said in words, because the diagram deliberately draws nothing.
+// all that is true of them. Said in words, because that sentence is the only thing standing
+// where a list of a proxy network's members used to be.
 check(
   "a network with members but no dependency says reachable, not dependent",
   networkMembershipText(networkLinks(nets.graph, graphServiceId("shared-d", "monitor"))[0]!) ===
@@ -2087,10 +2099,40 @@ check(
       "nothing declares a dependency across it.",
   networkMembershipText(networkLinks(nets.graph, graphServiceId("shared-d", "monitor"))[0]!),
 );
+// The fourth, and the one that had to be added when the names went: a network carrying a
+// dependency also carries members it says nothing about, and silence about them reads as if
+// the two chips above were all that was on it.
 check(
-  "...and says nothing at all where a dependency does cross it, leaving the chips to speak",
-  networkMembershipText(agent.links[0]!) === "",
+  "a network that carries a dependency still accounts for the members it does not",
+  networkMembershipText(agent.links[0]!) ===
+    "1 other service is also on it, reachable but not dependent — nothing declares a " +
+      "dependency to them across it.",
   networkMembershipText(agent.links[0]!),
+);
+check(
+  "...and says nothing at all once every service on it is named above",
+  networkMembershipText({
+    ...bareLink,
+    memberCount: 2,
+    dependencies: [{ id: "svc:s/a", stack: "s", service: "a", relation: "depends-on" }],
+  }) === "",
+  networkMembershipText({
+    ...bareLink,
+    memberCount: 2,
+    dependencies: [{ id: "svc:s/a", stack: "s", service: "a", relation: "depends-on" }],
+  }),
+);
+// A cap is not the same as nothing to say: a network whose dependencies were capped has
+// named none of the members past the cap either, so the sentence is owed even though
+// `dependencies` came back full.
+check(
+  "...but not while a dependency it carries went unnamed",
+  networkMembershipText({ ...bareLink, memberCount: 3, dependenciesOmitted: 2, reachableCount: 1 }) !== "",
+);
+check(
+  "the note above the rows says where the names went",
+  MEMBERSHIP_NOTE.includes("reachable, not dependent") && MEMBERSHIP_NOTE.includes("Networks list"),
+  MEMBERSHIP_NOTE,
 );
 check(
   "the counters split the fleet's networks into drawn and left out",
@@ -2154,10 +2196,9 @@ check(
   networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2) === "big\n2 services",
   networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2),
 );
-// The drawer's two caps are separate, because the two lists cost different things: a
-// dependency becomes a leg in a diagram, a co-member becomes a word in a sentence. One
-// shared cap would let twelve services that are merely reachable crowd out a dependency —
-// which is the failure this whole change is about, arriving by a different route.
+// The drawer has one cap, and it applies to the one thing it lists. A co-member costs a
+// digit, so nothing about a fifty-member transport network can crowd out a dependency —
+// which is the failure this whole rule is about, arriving by a different route.
 const CROWD = 26;
 const crowded = {
   nodes: [
@@ -2196,19 +2237,33 @@ check(
     crowdedLink.dependencies.every((p) => p.relation === "depends-on"),
   JSON.stringify(crowdedLink.dependencies[0]),
 );
+// Fifteen services on this network are merely reachable from n0, and the drawer's whole
+// account of them is that there are fifteen — a figure with nothing left over to truncate,
+// which is why there is no second omission count to report.
 check(
-  "the co-members are capped on their own, larger allowance",
-  crowdedLink.alsoOn.length === MAX_LIST_PEERS,
-  String(crowdedLink.alsoOn.length),
+  "the rest of the network is counted rather than listed",
+  crowdedLink.reachableCount === CROWD - 1 - 10,
+  String(crowdedLink.reachableCount),
 );
 check(
-  "...and report their own omission separately",
-  crowdedLink.alsoOnOmitted === CROWD - 1 - 10 - MAX_LIST_PEERS,
-  String(crowdedLink.alsoOnOmitted),
+  "...with not one of their names anywhere in the link",
+  Array.from({ length: CROWD - 10 }, (_, i) => `"n${i}"`).every(
+    (n) => !JSON.stringify(crowdedLink).includes(n),
+  ),
+  JSON.stringify(crowdedLink),
 );
+// The names are not lost, and this is where they went: the fleet list's group for the same
+// network holds every member, uncapped in the model — `MAX_LIST_PEERS` truncates only what
+// that row draws before the reader expands it. So the drawer's count and the list it points
+// at are two views of one membership, and they add up.
+const crowdedGroup = networkGroups(crowded).find((g) => g.name === "big")!;
 check(
-  "...and no service is in both lists",
-  crowdedLink.alsoOn.every((a) => !crowdedLink.dependencies.some((d) => d.id === a.id)),
+  "...because the fleet list names every member of the network the drawer only counted",
+  crowdedGroup.members.length === CROWD &&
+    crowdedGroup.members.length > MAX_LIST_PEERS &&
+    crowdedLink.reachableCount + crowdedLink.dependencies.length + crowdedLink.dependenciesOmitted + 1 ===
+      crowdedGroup.members.length,
+  JSON.stringify({ members: crowdedGroup.members.length, reachable: crowdedLink.reachableCount }),
 );
 
 /* ========================================================================== */

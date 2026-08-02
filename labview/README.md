@@ -1560,20 +1560,23 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   are thirty members, not four hundred and thirty-five connections, so a service's diagram
   draws a leg only where a dependency crosses that network — from a compose `depends_on`
   or from a [declared one](#a-dependency-on-another-service) — and everything else on it is
-  listed under *also on it*, in words. Nothing is ever inferred from co-membership, from a
-  container name in an environment value, or from a port.
+  a count in a sentence: *n other services are on it, reachable but not dependent*. Which
+  ones they are is a fact about the network rather than about this service, so the network's
+  name in the row is a link to its row in the **Networks** list, where every member is named.
+  Nothing is ever inferred from co-membership, from a container name in an environment value,
+  or from a port.
 - **A busy network node cannot show which arrow pairs with which.** The arrowheads belong
   to a service, not to a pair, so a network carrying two dependencies draws four of them.
   The Networks list writes every pair out in words for exactly that reason, and the drawer
   separates "depends on" from "required by" per dependency.
 - **A large network is summarised, not drawn whole.** The graph draws at most 12 spokes
-  per network; the drawer names at most 8 dependencies and, separately, 12 co-members, and
-  the Networks list 12 chips. Each says how many it left out, and the drawer reads the
-  unpruned data so nothing is unreachable. The two drawer caps are separate on purpose: one
-  shared cap would let services that are merely reachable crowd a real dependency out of
-  the diagram. A monitoring network with forty members is a count plus a list rather than
-  forty lines — deliberately, since forty lines is what makes the small, informative
-  networks impossible to find.
+  per network; the drawer names at most 8 dependencies and no co-members at all, and the
+  Networks list 12 chips before you expand the row. Each says how many it left out, and the
+  drawer reads the unpruned data so nothing is unreachable. The drawer has one cap because
+  it has one list: with co-members reduced to a number, nothing that is merely reachable can
+  crowd a real dependency out of the diagram. A monitoring network with forty members is a
+  count plus a list under the network's own heading rather than forty lines — deliberately,
+  since forty lines is what makes the small, informative networks impossible to find.
 - **No filesystem watcher.** A compose or `.env` edit is picked up by the next scan —
   the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
   stays an explicit action; nothing auto-refreshes the page.

@@ -108,16 +108,6 @@ export function buildNetworkIndex(stacks: AppStack[]): NetworkIndex {
 }
 
 /**
- * Every service on `name` other than `key`, in scan order.
- *
- * The peer relation the connection views are built on: two services on one network can
- * reach each other, whichever stacks they were declared in.
- */
-export function networkPeers(nets: NetworkIndex, name: string, key: string): string[] {
-  return (nets.byName.get(name)?.members ?? []).filter((m) => m !== key);
-}
-
-/**
  * The real networks two services share, in the first service's compose order.
  *
  * Empty means they share none — for a `depends_on` pair that is a finding, not a

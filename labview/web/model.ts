@@ -114,6 +114,7 @@ export {
   MAX_DRAWER_PEERS,
   MAX_GRAPH_SPOKES,
   MAX_LIST_PEERS,
+  MEMBERSHIP_NOTE,
   NETWORK_SCOPES,
   graphServiceId,
   hiddenNetworksNote,
