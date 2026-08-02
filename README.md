@@ -168,17 +168,23 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh; Rescan ignores it |
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
-| `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a **read-only** Authentik API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested |
+| `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | A **read-only** Authentik API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Authentik base URL, e.g. `http://authentik-server:9000`. Only needed when Authentik is outside `appsRoot` |
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Traefik API base URL, e.g. `http://traefik:8080`. Only needed when the proxy is outside `appsRoot`, or when discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through a hostname Authentik gates: an Authentik user, or the reserved `goauthentik.io/token`. An unauthenticated endpoint is used with no credential |
-| `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
+| `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
 | `LABVIEW_AUTH_PASSWD_FILE` | `/config/passwd` | `user:hash` lines. One usable entry turns LabView's own login on; no file means it stays off |
 | `LABVIEW_AUTH_PASSWD_ENABLED` | `true` | `false` switches the password form off entirely — the file is then not read |
 | `LABVIEW_OIDC_ISSUER` | *(unset)* | e.g. `https://authentik.example.com/application/o/labview/`. With a client id, this turns OIDC login on |
 | `LABVIEW_OIDC_CLIENT_ID` | *(unset)* | The provider's client id |
-| `LABVIEW_OIDC_CLIENT_SECRET_FILE` | *(unset)* | Path to a file holding the client secret. Empty for a public client — PKCE is used either way |
-| `LABVIEW_SESSION_SECRET_FILE` | *(unset)* | Path to a file holding the session-cookie HMAC key. Unset generates one at startup, so restarts sign everyone out |
+| `LABVIEW_OIDC_CLIENT_SECRET` | *(unset)* | The client secret, set the same way as the id beside it. Unset for a public client — PKCE is used either way |
+| `LABVIEW_SESSION_SECRET` | *(unset)* | The session-cookie HMAC key. Unset generates one at startup, so restarts sign everyone out |
+
+Those four credentials — the Authentik token, the Traefik password, the OIDC client
+secret and the session key — come from the environment and nowhere else. Keep the
+values in a `.env` beside your compose file and name them there as `${VAR:-}`; a name
+with no value is reported rather than guessed at, and rotating one needs a restart.
+See [Where the credentials go](labview/README.md#where-the-credentials-go).
 
 The full table — including `LABVIEW_HOST`, `LABVIEW_DOCKER_PORT`,
 `LABVIEW_DOCKER_MAX_CONCURRENCY`, `LABVIEW_DOCKER_TIMEOUT`, `LABVIEW_CONFIG`, the
@@ -426,9 +432,9 @@ output is sensitive.
   `view_provider` and `view_outpost` on a service account with no groups. When the
   endpoint is discovered rather than configured, each candidate is first probed on
   an endpoint that needs no authentication, and the token is sent only to one that
-  answers as an Authentik API — a guessed host never receives it. Prefer
-  `LABVIEW_AUTHENTIK_TOKEN_FILE` over the env var, which is readable by anyone who
-  can run `docker inspect`. There is no flag to skip TLS verification; use
+  answers as an Authentik API — a guessed host never receives it. It comes from
+  `LABVIEW_AUTHENTIK_TOKEN`, so keep the value in a `.env` that stays out of version
+  control. There is no flag to skip TLS verification; use
   `NODE_EXTRA_CA_CERTS` for a private CA. Keeping the token that narrow costs
   visibility, and LabView says so instead of absorbing it: Authentik withholds the
   applications the account may not launch, so the banner names how many were withheld
@@ -444,9 +450,10 @@ output is sensitive.
   hostname, note that an Authentik *API token* is not a valid credential — a proxy
   provider wants HTTP Basic with a user and an **app password**, or the reserved
   username `goauthentik.io/token`, and needs "Intercept header authentication"
-  enabled. Prefer `LABVIEW_TRAEFIK_PASSWORD_FILE`; `LABVIEW_TRAEFIK_PASSWORD` is in
-  the always-masked key list, so LabView scanning its own stack will not print its
-  own credential, and no credential is ever interpolated into an error message.
+  enabled. `LABVIEW_TRAEFIK_PASSWORD` holds it, and is in the always-masked key list,
+  so LabView scanning its own stack will not print its own credential — that list
+  matters more now that all four credentials live in the environment. No credential is
+  ever interpolated into an error message.
 - **Its own login: off until configured, gating the data when it is.** LabView
   exposes your topology and (masked) config, so **do not publish it raw.** The primary
   answer is still your edge — the compose example includes ready-to-adapt Traefik +

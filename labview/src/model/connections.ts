@@ -44,14 +44,14 @@ const HINTS: Record<string, Partial<Record<ConnectionPhase, string>>> = {
     "not-found":
       "A token is configured but no address to use it against. Set LABVIEW_AUTHENTIK_URL — discovery only recognises an Authentik that is itself one of the scanned stacks.",
     credential:
-      "The configured token could not be read. Check LABVIEW_AUTHENTIK_TOKEN_FILE points at a file this process can read and that it is not empty.",
+      "LABVIEW_AUTHENTIK_TOKEN is set and carries nothing. Most often it is an unresolved ${…} in a compose file with no matching entry in the .env beside it — compose passes an empty value through without complaining.",
     resolve:
       "No candidate hostname resolved. Set LABVIEW_AUTHENTIK_URL to the API's address — LabView only guesses from the scanned fleet, and an instance outside it has to be named.",
     connect: "Nothing accepted the connection. Check the port in LABVIEW_AUTHENTIK_URL, and that LabView can reach it from its own network.",
     tls: "The certificate was not trusted. Add the issuing CA with NODE_EXTRA_CA_CERTS; LabView does not skip verification.",
     timeout: "The endpoint accepted the connection and never answered. Raise LABVIEW_AUTHENTIK_TIMEOUT, or check the address points at Authentik and not at something holding the request open.",
     authenticate:
-      "Authentik rejected the token. It needs to be an API token for a user that can read applications, providers and outposts — check LABVIEW_AUTHENTIK_TOKEN or the file LABVIEW_AUTHENTIK_TOKEN_FILE points at.",
+      "Authentik rejected the token. It needs to be an API token for a user that can read applications, providers and outposts — check the value in LABVIEW_AUTHENTIK_TOKEN.",
     authorize: "The token was accepted and the read refused. Give the token's user read access to applications, providers and outposts.",
     path: "No Authentik API answered here. LABVIEW_AUTHENTIK_URL should be the instance's base URL, without `/api/v3`.",
     protocol:
@@ -63,14 +63,14 @@ const HINTS: Record<string, Partial<Record<ConnectionPhase, string>>> = {
     "not-found":
       "A credential is configured but no address to use it against. Set LABVIEW_TRAEFIK_URL — discovery only recognises a Traefik that is itself one of the scanned stacks.",
     credential:
-      "The configured password could not be read. Check LABVIEW_TRAEFIK_PASSWORD_FILE points at a file this process can read and that it is not empty.",
+      "LABVIEW_TRAEFIK_PASSWORD is set and carries nothing. Most often it is an unresolved ${…} in a compose file with no matching entry in the .env beside it — compose passes an empty value through without complaining.",
     resolve:
       "No candidate hostname resolved. Set LABVIEW_TRAEFIK_URL to the API's address — usually the proxy's own container on the internal network, e.g. http://traefik:8080.",
     connect: "Nothing accepted the connection. Traefik serves its API only when `api: {}` is enabled and an entrypoint is listening for it.",
     tls: "The certificate was not trusted. Add the issuing CA with NODE_EXTRA_CA_CERTS, or read the API over the internal network where it is plain HTTP.",
     timeout: "The endpoint accepted the connection and never answered. Raise LABVIEW_TRAEFIK_TIMEOUT, or check the address is the API's and not a routed application's.",
     authenticate:
-      "The API is gated. Behind an Authentik proxy provider, HTTP Basic needs a user plus an *app password* (not an API token), and the provider must have header authentication enabled — set LABVIEW_TRAEFIK_USERNAME and LABVIEW_TRAEFIK_PASSWORD_FILE.",
+      "The API is gated. Behind an Authentik proxy provider, HTTP Basic needs a user plus an *app password* (not an API token), and the provider must have header authentication enabled — set LABVIEW_TRAEFIK_USERNAME and LABVIEW_TRAEFIK_PASSWORD.",
     authorize: "The credential was accepted and the access refused. Grant the user LabView authenticates as access to the application in front of the API.",
     path: "No Traefik API answered here. Enable `api: {}` in the static configuration, and check the URL has no path of its own.",
     protocol:
@@ -98,7 +98,7 @@ const PHASE_TEXT: Record<ConnectionPhase, string> = {
   disabled: "disabled in configuration",
   "not-configured": "not configured",
   "not-found": "no endpoint was configured or discovered",
-  credential: "the configured credential could not be read",
+  credential: "the configured credential arrived empty",
   resolve: "the name did not resolve",
   connect: "the connection did not succeed",
   tls: "the certificate was not trusted",

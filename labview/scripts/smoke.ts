@@ -98,7 +98,7 @@ delete process.env.LABVIEW_SESSION_SECRET_FILE;
 delete process.env.LABVIEW_SESSION_TTL_MINUTES;
 delete process.env.LABVIEW_SESSION_COOKIE_NAME;
 
-const { loadConfig } = await import("../src/config.js");
+const { loadConfig, retiredSettings } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
 // Used directly by the container-IP assertions: the trap is not reachable through the
 // pipeline, because a container IP only exists in live docker state and smoke runs
@@ -341,11 +341,18 @@ function authentikStub(opts: { superuser?: boolean; hides?: string[] } = {}): {
   return { fetchImpl, calls };
 }
 
-/** Point the config loader at the stub instance — or at nothing — for the next run. */
+/**
+ * Point the config loader at the stub instance — or at nothing — for the next run.
+ *
+ * `token: ""` is a third state, and the tests below need it to be reachable: a variable
+ * that is set and carries nothing is not the same as one that was never set, and since
+ * §6 made the environment the only place a credential comes from it is the one way one
+ * still goes missing by accident. So this checks for `undefined` rather than truthiness.
+ */
 function authentikEnv(opts: { url?: string; token?: string }): void {
   if (opts.url) process.env.LABVIEW_AUTHENTIK_URL = opts.url;
   else delete process.env.LABVIEW_AUTHENTIK_URL;
-  if (opts.token) process.env.LABVIEW_AUTHENTIK_TOKEN = opts.token;
+  if (opts.token !== undefined) process.env.LABVIEW_AUTHENTIK_TOKEN = opts.token;
   else delete process.env.LABVIEW_AUTHENTIK_TOKEN;
 }
 
@@ -2796,6 +2803,43 @@ check(
   akOff.stacks.every((s) => s.services.every((x) => x.authentik === undefined)),
 );
 
+// A token variable that is *set and carries nothing* is the one way this credential still
+// goes missing by accident, now that the environment is the only place it comes from
+// (§6): `LABVIEW_AUTHENTIK_TOKEN: ${AK_TOKEN}` with `AK_TOKEN` absent from the `.env`
+// beside compose.yml expands to an empty value and compose passes it on without a word.
+// Absent is quiet; this is not, because the operator did ask for the integration.
+console.log("\na token variable that arrived empty is said out loud");
+const blankTok = authentikStub();
+authentikEnv({ url: AK_ORIGIN, token: "" });
+const akBlank = await overviewFor(authentikRoot, { fetchImpl: blankTok.fetchImpl });
+const blankConn = akBlank.meta.connections.find((c) => c.target === "authentik")!;
+check(
+  "it is the `credential` phase, not `not-configured` — half-finished reads differently from off",
+  blankConn.phase === "credential" && blankConn.ok === false,
+  JSON.stringify({ phase: blankConn.phase, ok: blankConn.ok }),
+);
+check(
+  "...and the detail names the variable to look at",
+  blankConn.detail?.includes("LABVIEW_AUTHENTIK_TOKEN is set but carries nothing") === true,
+  blankConn.detail ?? "",
+);
+check(
+  "...and its hint says where an empty value comes from, so the fix is one line away",
+  blankConn.hint?.includes(".env") === true && blankConn.hint?.includes("${") === true,
+  blankConn.hint ?? "",
+);
+check(
+  "...and nothing was requested: an empty bearer would only earn a 403 and a log line",
+  blankTok.calls.length === 0,
+  String(blankTok.calls.length),
+);
+check(
+  "...with the summary reporting it as an error rather than as an unconfigured integration",
+  akBlank.meta.authentik?.reachable === false && akBlank.meta.authentik?.error?.includes("LABVIEW_AUTHENTIK_TOKEN") === true,
+  akBlank.meta.authentik?.error ?? "",
+);
+authentikEnv({});
+
 // The pair of numbers that shows what the API actually changed. Both must move: the
 // first because five gates only the API can see stop counting as absent, the second
 // because a label-only read cannot see them at all. Three of those five are OIDC gates
@@ -3358,6 +3402,49 @@ check(
   "...and the open-API note is absent, because the API was not open",
   !lookup(tfGated)("edge", "traefik").notes.some((n) => n.includes("with no credential")),
   lookup(tfGated)("edge", "traefik").notes.join(" | "),
+);
+
+// The Traefik half of the blank-variable rule, and the other way this credential can be
+// half-configured. Both are reported rather than absorbed, because either one produces a
+// request that cannot succeed — and neither answer carries the value (**I6**).
+console.log("\nhalf a credential is reported, never completed by guesswork");
+const blankPw = traefikStub();
+traefikEnv({ url: TF_ORIGIN_INTERNAL });
+process.env.LABVIEW_TRAEFIK_USERNAME = TF_USER;
+process.env.LABVIEW_TRAEFIK_PASSWORD = "";
+authentikEnv({ token: AK_TOKEN });
+const tfBlankPw = await overviewFor(traefikRoot, { fetchImpl: blankPw.fetchImpl });
+check(
+  "a password variable that arrived empty is said out loud, on a read that succeeded without it",
+  tfBlankPw.meta.traefik?.reachable === true &&
+    tfBlankPw.meta.traefik?.error?.includes("LABVIEW_TRAEFIK_PASSWORD is set but carries nothing") === true,
+  tfBlankPw.meta.traefik?.error ?? "",
+);
+check(
+  "...and no Basic header was built out of a username and nothing",
+  tfBlankPw.meta.traefik?.credential === "none" && proxyCalls(blankPw.calls).every((c) => !c.sentToken),
+  `${tfBlankPw.meta.traefik?.credential} ${proxyCalls(blankPw.calls).filter((c) => c.sentToken).length}`,
+);
+check(
+  "...and the report names the variable, not the account it belongs to",
+  !JSON.stringify(tfBlankPw.meta.traefik).includes(TF_USER),
+);
+
+const noUser = traefikStub();
+process.env.LABVIEW_TRAEFIK_USERNAME = "";
+process.env.LABVIEW_TRAEFIK_PASSWORD = TF_PASSWORD;
+const tfNoUser = await overviewFor(traefikRoot, { fetchImpl: noUser.fetchImpl });
+check(
+  "a password with no username is reported too — inventing one would mean picking a vendor's reserved account",
+  tfNoUser.meta.traefik?.error?.includes("no username") === true,
+  tfNoUser.meta.traefik?.error ?? "",
+);
+check(
+  "...with nothing sent, and the password nowhere in the report",
+  tfNoUser.meta.traefik?.credential === "none" &&
+    proxyCalls(noUser.calls).every((c) => !c.sentToken) &&
+    !JSON.stringify(tfNoUser.meta.traefik).includes(TF_PASSWORD),
+  tfNoUser.meta.traefik?.credential ?? "",
 );
 
 console.log("\nendpoint from configuration");
@@ -5599,43 +5686,154 @@ console.log("\nthe posture comes from the file, read as configured");
   const configured = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET: SESSION_KEY }), () => "minted");
   check("a configured secret is used as-is", !configured.generated && configured.secret === SESSION_KEY && configured.notes.length === 0);
 
-  const secretDir = mkdtempSync(resolve(tmpdir(), "labview-secret-"));
-  const secretFile = resolve(secretDir, "session.key");
-  writeFileSync(secretFile, "  from-a-file\n");
-  const fromFile = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET_FILE: secretFile }), () => "minted");
-  check("a secret file beats an inline value and is trimmed", fromFile.secret === "from-a-file" && !fromFile.generated);
-  const badFile = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET_FILE: resolve(secretDir, "gone") }), () => "minted");
+  // A credential comes from one variable and nowhere else, so the one way one still goes
+  // missing by accident is a variable that is *set and carries nothing* —
+  // `${LABVIEW_SESSION_SECRET}` in a compose file with no matching `.env` entry, which
+  // compose expands to an empty value and passes on without a word. Each reader says so in
+  // its own vocabulary; for LabView's own login that is a startup note.
+  const blankSession = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET: "" }), () => "minted");
   check(
-    "an unreadable secret file falls back to the inline value with a note, rather than failing the start-up",
-    badFile.secret === SESSION_KEY && badFile.notes.length === 1,
-    badFile.notes.join("|"),
+    "a session secret that is set and carries nothing mints a key and says both things",
+    blankSession.generated &&
+      blankSession.secret === "minted" &&
+      blankSession.notes.some((n) => n.includes("LABVIEW_SESSION_SECRET is set but carries nothing")) &&
+      blankSession.notes.some((n) => n.includes("restart signs everyone out")),
+    blankSession.notes.join("|"),
   );
-  check("...and the note does not echo the secret it could not replace", badFile.notes.every((n) => !n.includes(SESSION_KEY)));
+  const spacedSession = resolveSessionSecret(cfgFor({ LABVIEW_SESSION_SECRET: "   " }), () => "minted");
+  check(
+    "...and one holding only whitespace is the same mistake, not a key made of spaces",
+    spacedSession.generated && spacedSession.notes.some((n) => n.includes("carries nothing")),
+    spacedSession.notes.join("|"),
+  );
 
-  const noOidc = resolveOidc(cfgFor({ LABVIEW_SESSION_SECRET: undefined, LABVIEW_SESSION_SECRET_FILE: undefined }));
+  const noOidc = resolveOidc(cfgFor({ LABVIEW_SESSION_SECRET: undefined }));
   check("no issuer means no OIDC client is built", noOidc.settings === undefined && noOidc.notes.length === 0);
-  writeFileSync(secretFile, "  file-client-secret\n");
   const oidcCfg = resolveOidc(
     cfgFor({
       LABVIEW_OIDC_ISSUER: " https://idp.example.com/application/o/labview/ ",
       LABVIEW_OIDC_CLIENT_ID: " labview ",
-      LABVIEW_OIDC_CLIENT_SECRET: "inline-client-secret",
-      LABVIEW_OIDC_CLIENT_SECRET_FILE: secretFile,
+      LABVIEW_OIDC_CLIENT_SECRET: "  inline-client-secret  ",
     }),
   );
   check(
-    "a configured issuer trims what an operator pasted, and the secret file beats the inline value",
+    "the issuer, the client id and the secret beside it are all trimmed of what an operator pasted",
     oidcCfg.settings?.issuer === "https://idp.example.com/application/o/labview/" &&
       oidcCfg.settings?.clientId === "labview" &&
-      oidcCfg.settings?.clientSecret === "file-client-secret",
+      oidcCfg.settings?.clientSecret === "inline-client-secret" &&
+      oidcCfg.notes.length === 0,
     JSON.stringify({ issuer: oidcCfg.settings?.issuer, clientId: oidcCfg.settings?.clientId }),
   );
-  const publicClient = resolveOidc(cfgFor({ LABVIEW_OIDC_CLIENT_SECRET: undefined, LABVIEW_OIDC_CLIENT_SECRET_FILE: undefined }));
-  check("no secret at all is a public client authenticating by PKCE, not an error", publicClient.settings !== undefined && publicClient.settings.clientSecret === "" && publicClient.notes.length === 0);
+  const blankClientSecret = resolveOidc(cfgFor({ LABVIEW_OIDC_CLIENT_SECRET: "" }));
+  check(
+    "a client secret that arrived empty is a note and a working public client, never a refusal to start (I4)",
+    blankClientSecret.settings?.clientSecret === "" &&
+      blankClientSecret.notes.some((n) => n.includes("LABVIEW_OIDC_CLIENT_SECRET is set but carries nothing")),
+    blankClientSecret.notes.join("|"),
+  );
+  const publicClient = resolveOidc(cfgFor({ LABVIEW_OIDC_CLIENT_SECRET: undefined }));
+  check(
+    "no secret at all is a public client authenticating by PKCE, and not worth a word",
+    publicClient.settings !== undefined && publicClient.settings.clientSecret === "" && publicClient.notes.length === 0,
+  );
 
-  rmSync(secretDir, { recursive: true, force: true });
-  cfgFor({ LABVIEW_OIDC_ISSUER: undefined, LABVIEW_OIDC_CLIENT_ID: undefined, LABVIEW_AUTH_PASSWD_FILE: undefined });
+  // Two empty variables beside two real credentials: what is reported is the *names* of
+  // the empty ones, and no note goes anywhere near the values of the others. This is the
+  // one place a credential could reach a log, since masking runs on the API payload.
+  const mixed = cfgFor({
+    LABVIEW_OIDC_CLIENT_SECRET: "",
+    LABVIEW_SESSION_SECRET: "",
+    LABVIEW_AUTHENTIK_TOKEN: "smoke-authentik-token",
+    LABVIEW_TRAEFIK_PASSWORD: "smoke-app-password",
+  });
+  check(
+    "blankCredentialVars names exactly the variables that arrived empty, in the order they are read",
+    mixed.blankCredentialVars.join(",") === "LABVIEW_OIDC_CLIENT_SECRET,LABVIEW_SESSION_SECRET",
+    mixed.blankCredentialVars.join(","),
+  );
+  check(
+    "...and holds no value: the two credentials that did arrive are not in it",
+    mixed.blankCredentialVars.every((v) => !v.includes("smoke-")),
+    mixed.blankCredentialVars.join(","),
+  );
+  const mixedNotes = [...resolveOidc(mixed).notes, ...resolveSessionSecret(mixed, () => "minted").notes];
+  check(
+    "...and no note carries a credential either, only the name of a variable",
+    mixedNotes.length === 3 && mixedNotes.every((n) => !n.includes("smoke-authentik-token") && !n.includes("smoke-app-password")),
+    mixedNotes.join("|"),
+  );
+
+  cfgFor({
+    LABVIEW_OIDC_ISSUER: undefined,
+    LABVIEW_OIDC_CLIENT_ID: undefined,
+    LABVIEW_OIDC_CLIENT_SECRET: undefined,
+    LABVIEW_SESSION_SECRET: undefined,
+    LABVIEW_AUTHENTIK_TOKEN: undefined,
+    LABVIEW_TRAEFIK_PASSWORD: undefined,
+    LABVIEW_AUTH_PASSWD_FILE: undefined,
+  });
   clearPasswdCache();
+}
+
+console.log("\nsettings LabView no longer reads");
+{
+  // The four `*_FILE` variables and their config-file keys are recognised for one purpose:
+  // to say they are gone. Ignoring one would be a lock-out dressed up as a simplification
+  // (I4) — a client secret that was a mounted file becomes a public client on the next
+  // pull, and the provider refuses every sign-in with nothing in any log to explain it.
+  const cfg = loadConfig();
+  check("with none of them set, nothing is said", retiredSettings(cfg, {}).length === 0, retiredSettings(cfg, {}).join("|"));
+
+  const retired = [
+    ["LABVIEW_AUTHENTIK_TOKEN_FILE", "LABVIEW_AUTHENTIK_TOKEN"],
+    ["LABVIEW_TRAEFIK_PASSWORD_FILE", "LABVIEW_TRAEFIK_PASSWORD"],
+    ["LABVIEW_OIDC_CLIENT_SECRET_FILE", "LABVIEW_OIDC_CLIENT_SECRET"],
+    ["LABVIEW_SESSION_SECRET_FILE", "LABVIEW_SESSION_SECRET"],
+  ] as const;
+  for (const [was, now] of retired) {
+    const lines = retiredSettings(cfg, { [was]: "/run/secrets/somewhere" });
+    // `slice(was.length)` rather than a bare `includes`: every replacement name is a
+    // prefix of the variable that replaced it, so "names the replacement" has to be
+    // asserted *past* the mention of the retired one or it holds for free.
+    check(
+      `${was} is reported, and names ${now} as where the value goes`,
+      lines.length === 1 && lines[0]!.startsWith(was) && lines[0]!.slice(was.length).includes(now),
+      lines.join("|"),
+    );
+    check(`...without echoing the path ${was} pointed at`, lines.every((l) => !l.includes("/run/secrets/somewhere")));
+  }
+  check(
+    "one set to nothing at all is still reported — the operator still has a value to move",
+    retiredSettings(cfg, { LABVIEW_SESSION_SECRET_FILE: "" }).length === 1,
+  );
+  check(
+    "all four at once produce four lines, so a deployment hears about every one of them",
+    retiredSettings(cfg, Object.fromEntries(retired.map(([was]) => [was, "/x"]))).length === 4,
+  );
+  check(
+    "the variable that replaced them is not itself a complaint",
+    retiredSettings(cfg, { LABVIEW_AUTHENTIK_TOKEN: "still-fine", LABVIEW_SESSION_SECRET: "also-fine" }).length === 0,
+  );
+
+  // The config-file half. `merge` keeps keys it does not recognise, which is what makes a
+  // `config.yml` written against the previous `config.example.yml` still parse — and still
+  // need telling.
+  const legacyDir = mkdtempSync(resolve(tmpdir(), "labview-legacy-"));
+  const legacyPath = resolve(legacyDir, "config.yml");
+  writeFileSync(legacyPath, "authentik:\n  tokenFile: /config/authentik-token\nauth:\n  session:\n    secretFile: /config/session-key\n");
+  process.env.LABVIEW_CONFIG = legacyPath;
+  const legacy = loadConfig();
+  process.env.LABVIEW_CONFIG = "___none___"; // back to the sentinel the run started with
+  const legacyLines = retiredSettings(legacy, {});
+  check(
+    "a config.yml written against the old example is caught too, at both nesting depths",
+    legacyLines.length === 2 &&
+      legacyLines.some((l) => l.includes("authentik.tokenFile") && l.includes("LABVIEW_AUTHENTIK_TOKEN")) &&
+      legacyLines.some((l) => l.includes("auth.session.secretFile") && l.includes("LABVIEW_SESSION_SECRET")),
+    legacyLines.join("|"),
+  );
+  check("...and neither line echoes the path that was in the file", legacyLines.every((l) => !l.includes("/config/")));
+  rmSync(legacyDir, { recursive: true, force: true });
 }
 
 console.log("\nwhat may be read without a session");

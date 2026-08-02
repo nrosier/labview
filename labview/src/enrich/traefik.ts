@@ -30,7 +30,6 @@
  * unconfigured — and reports *that it needed no credential*, which is itself a
  * finding about the proxy's exposure.
  */
-import { readFileSync } from "node:fs";
 import type {
   AppStack,
   ConnectionAttempt,
@@ -429,7 +428,7 @@ export async function snapshotTraefik(
     const entrypointMiddlewares = eps.ok ? parseEntrypoints(eps.body) : undefined;
 
     const parsed = parseRawData(raw.body, entrypointMiddlewares ?? new Map());
-    // A broken credential file is still worth reporting on a read that succeeded
+    // A half-configured credential is still worth reporting on a read that succeeded
     // without one: the operator configured something that did not work.
     const gap = joinErrors([
       entrypointMiddlewares
@@ -509,24 +508,20 @@ function credentialHint(status: number): string | undefined {
 }
 
 /**
- * Resolve the Basic credential, file before inline value.
+ * Resolve the Basic credential from the two variables that carry it.
  *
- * A password with no username is not sent. Inventing one would mean picking a
- * vendor's reserved account name on the operator's behalf, and a request that
- * cannot succeed is not worth making — so the omission is reported instead.
+ * Two ways to be half-configured, both reported rather than absorbed, because either one
+ * produces a request that cannot succeed. A password variable that is *present and empty*
+ * is an unresolved `${…}` nine times in ten (§3.10). A password with no username is the
+ * other half: inventing one would mean picking a vendor's reserved account name on the
+ * operator's behalf. Neither answer carries the value (**I6**).
  */
 function readCredential(cfg: LabViewConfig): { basic?: string; error?: string } {
   const username = cfg.traefik.username.trim();
-  const file = cfg.traefik.passwordFile.trim();
-  let password = cfg.traefik.password.trim();
-  if (file) {
-    try {
-      password = readFileSync(file, "utf8").trim();
-      if (!password) return { error: `Traefik password file ${file} is empty` };
-    } catch (err) {
-      return { error: `Traefik password file ${file} could not be read: ${(err as Error).message}` };
-    }
+  if (cfg.blankCredentialVars.includes("LABVIEW_TRAEFIK_PASSWORD")) {
+    return { error: "LABVIEW_TRAEFIK_PASSWORD is set but carries nothing" };
   }
+  const password = cfg.traefik.password.trim();
   if (!password) return {};
   if (!username) {
     return { error: "a Traefik API password is configured but no username, so no credential was sent" };

@@ -147,12 +147,11 @@ authentik:
   # the API call stays on the container network. Set this only when your Authentik
   # lives outside appsRoot, or when discovery picks the wrong endpoint.
   url: ""
-  # The API token. Prefer tokenFile — a value here ends up in the config file, and
-  # a value in LABVIEW_AUTHENTIK_TOKEN ends up in `docker inspect` output.
+  # The API token. Set it in LABVIEW_AUTHENTIK_TOKEN rather than here, and keep the
+  # value in a `.env` beside compose.yml — see "Where the credentials go" in
+  # README.md. A value written here is read, and the variable overrides it, but this
+  # file is the one you are most likely to copy somewhere or commit by accident.
   token: ""
-  # Path to a file holding the token, e.g. a docker secret or a mounted file.
-  # Takes precedence over `token`.
-  tokenFile: ""
   # Per-request timeout in milliseconds. The whole exchange is a handful of GETs;
   # if it times out the scan continues without the API and says so.
   timeoutMs: 5000
@@ -218,12 +217,9 @@ traefik:
   # authentication" enabled, or it will answer the request itself instead of
   # passing it through.
   username: ""
-  # Prefer passwordFile. A value here ends up in the config file, and a value in
-  # LABVIEW_TRAEFIK_PASSWORD ends up in `docker inspect` output.
+  # Set it in LABVIEW_TRAEFIK_PASSWORD, for the reason given at `authentik.token`
+  # above.
   password: ""
-  # Path to a file holding the password (docker secret, mounted file). Takes
-  # precedence over `password`.
-  passwordFile: ""
   # Per-request timeout in milliseconds. The whole exchange is three GETs; if it
   # times out the scan continues from the labels alone and says so.
   timeoutMs: 5000
@@ -275,11 +271,10 @@ server:
 #    # The discovery document's own `issuer` must equal this exactly.
 #    issuer: ""
 #    clientId: ""
-#    # Prefer clientSecretFile. A value here sits in this file; a value in
-#    # LABVIEW_OIDC_CLIENT_SECRET shows up in `docker inspect`. Leave both empty for
-#    # a public client — PKCE is used either way.
+#    # Set the id and the secret the same way — LABVIEW_OIDC_CLIENT_ID and
+#    # LABVIEW_OIDC_CLIENT_SECRET — since the provider issues them together. Leave
+#    # the secret out entirely for a public client; PKCE is used either way.
 #    clientSecret: ""
-#    clientSecretFile: ""
 #    # Registered with the provider. Leave empty to derive it from the request
 #    # (honouring X-Forwarded-Proto/Host), which is right behind a single proxy;
 #    # set it when several hostnames reach the same LabView.
@@ -295,10 +290,9 @@ server:
 #    timeoutMs: 5000
 #
 #  session:
-#    # HMAC key for the session cookie. Unset means one is generated at startup, so
-#    # every restart signs everyone out. Prefer secretFile.
+#    # HMAC key for the session cookie, from LABVIEW_SESSION_SECRET. Unset means one
+#    # is generated at startup, so every restart signs everyone out.
 #    secret: ""
-#    secretFile: ""
 #    ttlMinutes: 720
 #    cookieName: labview_session
 #    # auto marks the cookie Secure when the request arrived over https (reading

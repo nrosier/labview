@@ -282,15 +282,13 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_MASK_SECRETS` | `true` | Mask secret-looking env values |
 | `LABVIEW_CONFIG` | `config.yml` | Path to a config file |
 | `LABVIEW_AUTHENTIK_ENABLED` | `true` | Whether to read the Authentik API at all. With no token it does nothing either way |
-| `LABVIEW_AUTHENTIK_TOKEN_FILE` | *(unset)* | Path to a file holding a read-only API token (docker secret, mounted file). Wins over `LABVIEW_AUTHENTIK_TOKEN` |
-| `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | The token itself. Works, but is visible in `docker inspect` — prefer the file form |
+| `LABVIEW_AUTHENTIK_TOKEN` | *(unset)* | A read-only API token. Set it to confirm auth posture from the provider itself; leave it unset and nothing is requested. See [Where the credentials go](#where-the-credentials-go) |
 | `LABVIEW_AUTHENTIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://authentik-server:9000`. Needed only when Authentik is outside `appsRoot` or discovery picks the wrong endpoint |
 | `LABVIEW_AUTHENTIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues without the API |
 | `LABVIEW_TRAEFIK_ENABLED` | `true` | Whether to read the reverse proxy's API at all. Needs no credential and no configuration; if nothing answers the scan continues from the labels |
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Base URL incl. scheme and port, e.g. `http://traefik:8080`. Needed only when the proxy is outside `appsRoot` or discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
-| `LABVIEW_TRAEFIK_PASSWORD_FILE` | *(unset)* | Path to a file holding that user's **app password** (docker secret, mounted file). Wins over `LABVIEW_TRAEFIK_PASSWORD` |
-| `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | The password itself. Works, but is visible in `docker inspect` — prefer the file form |
+| `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** — not an API token, see [`config.example.yml`](config.example.yml). See [Where the credentials go](#where-the-credentials-go) |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues from the labels alone |
 
 The default Docker endpoint is the conventional local socket, since it is the one
@@ -303,6 +301,53 @@ label prefixes, and the Authentik detection hints — see the comments in
 they are discovered from your fleet at scan time (see below), and adding a
 host-naming convention like `auth.` is how unrelated providers get mislabelled.
 
+### Where the credentials go
+
+LabView has four single-value credentials, and each one comes from an environment
+variable: `LABVIEW_AUTHENTIK_TOKEN`, `LABVIEW_TRAEFIK_PASSWORD`,
+`LABVIEW_OIDC_CLIENT_SECRET` and `LABVIEW_SESSION_SECRET`. Keep the values in a
+`.env` file beside `compose.yml` and name them in the compose file:
+
+```yaml
+environment:
+  LABVIEW_AUTHENTIK_TOKEN: ${LABVIEW_AUTHENTIK_TOKEN:-}
+  LABVIEW_SESSION_SECRET: ${LABVIEW_SESSION_SECRET:-}
+```
+
+```dotenv
+# .env, beside compose.yml, not in version control
+LABVIEW_AUTHENTIK_TOKEN=ak-...
+LABVIEW_SESSION_SECRET=...
+```
+
+Yes, a value in the environment is readable with `docker inspect`. That is worth
+knowing and is narrower than it sounds: `docker inspect` needs the Docker socket,
+and anyone holding that is already root-equivalent on the host — they can read a
+mounted secret file just as easily. The exposure a `.env` **does** close is the one
+that actually bites, which is a compose file committed to a repository with a
+credential inside it.
+
+Two consequences of naming a variable rather than pointing at a path:
+
+- **A name with no value is reported, not guessed at.** `${LABVIEW_AUTHENTIK_TOKEN:-}`
+  with no matching `.env` entry arrives as an empty variable, which LabView reports
+  as *set and carries nothing* — a `credential` fault on that integration, or a
+  startup note for its own login. It does not stop the container from starting,
+  which is why the compose examples use `:-` and not `:?`.
+- **Rotating one needs a restart.** An environment variable is fixed for the life of
+  the process. `docker compose up -d labview` after editing `.env` is the whole
+  procedure. The one credential still read from a path is `auth.passwd.file`, the
+  `user:hash` database — it is re-read on change, because a user list is edited over
+  the life of an install rather than set once.
+
+An earlier version of LabView also accepted `LABVIEW_AUTHENTIK_TOKEN_FILE`,
+`LABVIEW_TRAEFIK_PASSWORD_FILE`, `LABVIEW_OIDC_CLIENT_SECRET_FILE` and
+`LABVIEW_SESSION_SECRET_FILE`, along with `tokenFile`, `passwordFile`,
+`clientSecretFile` and `secretFile` in `config.yml`. None of them is read now. If one
+is still set, LabView says so at startup and names the variable to move the value
+to, rather than ignoring it and leaving you with a provider that refuses every
+sign-in for no visible reason.
+
 ### The Authentik API token
 
 Optional. Without it, auth posture is derived from labels and env vars alone;
@@ -311,13 +356,11 @@ with it, LabView reports what Authentik itself says about each gate.
 Create a **service account** in Authentik (*Directory → Users → Create service
 account*), leave it out of every group, and grant only three global permissions:
 `view_application`, `view_provider`, `view_outpost`. Then issue a token for it and
-mount it:
+put it in the `.env` beside your compose file:
 
 ```yaml
 environment:
-  LABVIEW_AUTHENTIK_TOKEN_FILE: /run/secrets/authentik_token
-volumes:
-  - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
+  LABVIEW_AUTHENTIK_TOKEN: ${LABVIEW_AUTHENTIK_TOKEN:-}
 ```
 
 LabView only ever issues `GET`s, so anything beyond those three permissions is
@@ -413,9 +456,9 @@ the credentials are used internally with the OAuth2 machine-to-machine flow, whi
 an API token cannot drive — or the reserved username `goauthentik.io/token` with a
 token as the password. Either way the provider needs **"Intercept header
 authentication"** enabled, or it answers the request itself instead of passing it
-through. Prefer `LABVIEW_TRAEFIK_PASSWORD_FILE`; `LABVIEW_TRAEFIK_PASSWORD` is
-always masked in LabView's own output, and no credential is ever interpolated into
-an error message.
+through. `LABVIEW_TRAEFIK_PASSWORD` holds it ([where the credentials
+go](#where-the-credentials-go)); it is always masked in LabView's own output, and no
+credential is ever interpolated into an error message.
 
 Every failure here is soft too: nothing answering, a rejected credential, a timeout
 or a shape the parser doesn't recognize leaves the posture exactly as the labels
@@ -532,9 +575,8 @@ replicas behind the same proxy work with no shared state beyond `auth.session.se
   **missing** `Origin` is allowed, so `curl` and health checkers still work; a present one
   from another host gets a `403`.
 
-Set **`auth.session.secret`** (or `LABVIEW_SESSION_SECRET_FILE`) if you would rather a
-restart did not sign everyone out. With it unset, LabView generates one at startup and
-says so.
+Set **`LABVIEW_SESSION_SECRET`** if you would rather a restart did not sign everyone out.
+With it unset, LabView generates one at startup and says so.
 
 ### OIDC with Authentik
 
@@ -577,15 +619,14 @@ Ten minutes, and the last two steps are the ones people miss.
    ```yaml
    environment:
      LABVIEW_OIDC_ISSUER: https://authentik.example.com/application/o/labview/
-     LABVIEW_OIDC_CLIENT_ID: <client id>
-     LABVIEW_OIDC_CLIENT_SECRET_FILE: /run/secrets/labview_oidc_secret
+     LABVIEW_OIDC_CLIENT_ID: ${LABVIEW_OIDC_CLIENT_ID:-}
+     LABVIEW_OIDC_CLIENT_SECRET: ${LABVIEW_OIDC_CLIENT_SECRET:-}
      LABVIEW_OIDC_REDIRECT_URI: https://labview.example.com/auth/oidc/callback
-   volumes:
-     - ./config/oidc-secret:/run/secrets/labview_oidc_secret:ro
    ```
 
-   `LABVIEW_OIDC_CLIENT_SECRET` works and is visible in `docker inspect`; prefer the file
-   form. `LABVIEW_OIDC_REDIRECT_URI` may be omitted — LabView then derives it from the
+   The id and the secret are one credential pair and are set one way, from the `.env`
+   beside the compose file ([where the credentials go](#where-the-credentials-go)).
+   `LABVIEW_OIDC_REDIRECT_URI` may be omitted — LabView then derives it from the
    request, honouring `X-Forwarded-Proto`/`-Host`, which is right behind a single proxy and
    wrong as soon as two hostnames reach the same LabView.
 
@@ -683,7 +724,7 @@ banner — an optional integration being off is not a fault.
 | `disabled` | switched off in config | `LABVIEW_*_ENABLED` |
 | `not-configured` | nothing was asked for | no token / no endpoint — nothing to fix unless you expected otherwise |
 | `not-found` | a credential is configured with no address to use it against | set `LABVIEW_AUTHENTIK_URL` / `LABVIEW_TRAEFIK_URL`; discovery only finds an instance that is itself one of the scanned stacks |
-| `credential` | the configured token or password file could not be read | the `*_FILE` path, its permissions, and that it is not empty |
+| `credential` | the variable holding the token or password is set and carries nothing | most often an unresolved `${…}` in the compose file with no matching `.env` entry |
 | `resolve` | the name does not exist here | the hostname, and whether LabView shares a network with it |
 | `connect` | nothing accepted the connection | the port; for a unix socket, whether it is mounted, is really a socket, and has a daemon behind it |
 | `tls` | the certificate was not trusted | `NODE_EXTRA_CA_CERTS` — verification is never skipped |
@@ -987,8 +1028,9 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `view_provider`, `view_outpost` on a groupless service account — LabView only
   issues `GET`s). A discovered endpoint is probed unauthenticated first and the
   token is sent only to a host that answered as an Authentik API, so a wrong guess
-  never receives it. Prefer `LABVIEW_AUTHENTIK_TOKEN_FILE`; a token in the
-  environment is readable via `docker inspect`. Certificate verification cannot be
+  never receives it. It comes from `LABVIEW_AUTHENTIK_TOKEN` and nowhere else, so a
+  `.env` outside version control is where it belongs ([where the credentials
+  go](#where-the-credentials-go)). Certificate verification cannot be
   disabled — use `NODE_EXTRA_CA_CERTS` for a private CA. The cost of that narrow
   token is stated rather than hidden: Authentik withholds the applications the
   account may not launch, so LabView reports how many, rebuilds what the providers
@@ -1535,8 +1577,7 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - **No filesystem watcher.** A compose or `.env` edit is picked up by the next scan —
   the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
   stays an explicit action; nothing auto-refreshes the page.
-- LabView's own `config.yml` is read once at startup. Rescan re-reads the fleet, not
-  LabView's configuration: changing a configured endpoint, or a token given inline or
-  through an environment variable, needs a restart. A token or password given as a
-  **file** (`tokenFile`, `passwordFile`) is the exception — those are read on every
-  build, so rotating the file takes effect on the next rescan.
+- LabView's own `config.yml` and environment are read once at startup. Rescan re-reads
+  the fleet, not LabView's configuration: changing a configured endpoint, or rotating
+  any of the four credentials, needs a restart. The one exception is the `user:hash`
+  file behind the password login, which is re-read whenever it changes.

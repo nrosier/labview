@@ -1024,9 +1024,13 @@ hold the two payloads a diff needs.
 
 #### A rescan re-reads the integrations, and reports what came back
 
-A rescan re-runs both API exchanges — endpoint discovery, every request, and the
-credential files with them, since `tokenFile` and `passwordFile` are read per build,
-so a rotated secret is picked up. Nothing is memoized. What changed in those answers
+A rescan re-runs both API exchanges — endpoint discovery and every request. Nothing is
+memoized. It does **not** re-read the credentials: those come from the environment,
+which is fixed for the life of the process, so a rotated token takes effect on the next
+container restart and not before. (An earlier design read them from a path per build,
+which did survive rotation; that is the one capability the move to env-only gives up,
+and §12 records it as a documented consequence rather than a bug.) What changed in
+those answers
 is reported by `diffIntegrations(prev, next)`, and neither rule above would do it:
 the configuration diff excludes live API answers on purpose, and `read` is excluded
 from `changedConnections`'s signature for the same reason. Between them, an
@@ -1635,9 +1639,11 @@ endpoint, and needs no privileged access:
   enough to be *used*, but not to be *authenticated to* — that needs a hand-written
   URL or proven ownership of the hostname (§3.6). There is deliberately no
   TLS-verification bypass flag: `NODE_EXTRA_CA_CERTS` covers a private CA without
-  teaching the tool to trust anything that answers. `tokenFile` and `passwordFile`
-  exist so neither value need sit in the environment where `docker inspect` reveals
-  it.
+  teaching the tool to trust anything that answers. Both values come from the
+  environment and nowhere else; the honest reading of that is in §6 — `docker inspect`
+  does expose them, and it needs the Docker socket to do it, which is root-equivalent
+  on that host anyway. The exposure worth engineering against is a compose file in a
+  repository, which a gitignored `.env` beside it closes.
 - The image runs as `USER node`.
 - Its own compose example publishes **no `ports:`** — see §7.
 - **Its own login is read-only too.** LabView authenticates people; it authorizes
@@ -1671,7 +1677,10 @@ LabView's own credentials fall under this too, in three places (§3.13):
 - `LABVIEW_OIDC_CLIENT_SECRET` and `LABVIEW_SESSION_SECRET` join
   `LABVIEW_AUTHENTIK_TOKEN` and `LABVIEW_TRAEFIK_PASSWORD` in **`keysAlways`**, for the
   reason already written above that list: a fleet that runs LabView from inside `appsRoot`
-  scans its own stack, and editing `keyPatterns` must not be able to expose them.
+  scans its own stack, and editing `keyPatterns` must not be able to expose them. That
+  list carries more weight since §6 made the environment the only place the four values
+  live: every one of them is now guaranteed to be in a variable LabView may well read
+  back out of its own container, and `keysAlways` is what makes that harmless.
 - **No password hash, session token or client secret is ever an API field or a log
   value.** A passwd warning names the line, the user and the algorithm, never the hash;
   `/api/session` is unauthenticated and therefore carries no username, no user count, no
@@ -2072,9 +2081,14 @@ against forward-auth addresses, issuer URLs and LDAP hosts.
 target (§3.10). `disabled` and `not-configured` are outcomes, not faults: nothing
 was attempted. `not-found` and `credential` are the two cases that stop before the
 network: the read was asked for and discovery identified no candidate at all, and a
-configured credential could not be read (a missing or empty `tokenFile`). Both are
-faults — a half-finished configuration will never work — which is what separates
-them from `not-configured`. Then the transport stages `resolve`, `connect`,
+credential was asked for and arrived empty — its variable is set and carries nothing,
+which since §6 made the environment the only source means an unresolved `${…}` in a
+compose file far more often than
+anything else. Both are faults — a half-finished configuration will never work — which
+is what separates them from `not-configured`. The distinction is only observable in
+`applyEnvOverrides`, which is why it is carried forward in `blankCredentialVars` rather
+than recomputed: by the time a reader holds the config, an empty token and an unset one
+are the same empty string. Then the transport stages `resolve`, `connect`,
 `tls`, `timeout`; the answer stages `authenticate` (401), `authorize` (403), `path`
 (404/405), `status` (any other non-2xx), `protocol` (answered, but not with this
 API); and finally `partial` — connected, part of the read failed — and `connected`.
@@ -2307,15 +2321,13 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_MASK_SECRETS` | `secrets.maskValues` | leave on |
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
-| `LABVIEW_AUTHENTIK_TOKEN_FILE` | `authentik.tokenFile` | preferred over the token env var, which `docker inspect` exposes. Wins over `authentik.token` |
-| `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | with neither set, step 7 makes no request at all |
+| `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | unset = step 7 makes no request at all; set and empty = a `credential` fault (§3.10) |
 | `LABVIEW_AUTHENTIK_URL` | `authentik.url` | skips discovery entirely; needed only when the provider is outside `appsRoot` |
 | `LABVIEW_AUTHENTIK_ENABLED` | `authentik.enabled` | `false` = never contact the provider |
 | `LABVIEW_AUTHENTIK_TIMEOUT` | `authentik.timeoutMs` | per request; `authentik.maxPages` bounds pagination and is file-only |
 | `LABVIEW_TRAEFIK_URL` | `traefik.url` | skips discovery, and is one of the two things that make an endpoint eligible for a credential (§3.6) |
 | `LABVIEW_TRAEFIK_USERNAME` | `traefik.username` | an Authentik user, or the reserved `goauthentik.io/token`. Only for an API behind a gate |
-| `LABVIEW_TRAEFIK_PASSWORD_FILE` | `traefik.passwordFile` | preferred over the password env var, which `docker inspect` exposes. Wins over `traefik.password` |
-| `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it |
+| `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it. Set and empty = a `credential` fault |
 | `LABVIEW_TRAEFIK_ENABLED` | `traefik.enabled` | `false` = never contact the proxy. Unlike Authentik this stage is on by default, because it needs no credential |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
 | `LABVIEW_AUTH_PASSWD_ENABLED` | `auth.passwd.enabled` | `false` = the password form is off and the file is not read at all. The explicit off switch for an operator who wants only OIDC, or only their edge |
@@ -2326,22 +2338,58 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_OIDC_ENABLED` | `auth.oidc.enabled` | `false` = never contact the provider, whatever else is set |
 | `LABVIEW_OIDC_ISSUER` | `auth.oidc.issuer` | with a client id, this is what turns OIDC on. The discovery document's own `issuer` must equal it |
 | `LABVIEW_OIDC_CLIENT_ID` | `auth.oidc.clientId` | |
-| `LABVIEW_OIDC_CLIENT_SECRET_FILE` | `auth.oidc.clientSecretFile` | preferred over the env var, which `docker inspect` exposes. Wins over `clientSecret`. Both empty = a public client; PKCE is used either way |
-| `LABVIEW_OIDC_CLIENT_SECRET` | `auth.oidc.clientSecret` | in `secrets.keysAlways` (I6) |
+| `LABVIEW_OIDC_CLIENT_SECRET` | `auth.oidc.clientSecret` | in `secrets.keysAlways` (I6). Set exactly the way `clientId` is — the provider issues the pair together. Unset = a public client; PKCE is used either way. Set and empty = a startup note plus a public client, never a refusal to start (I4) |
 | `LABVIEW_OIDC_REDIRECT_URI` | `auth.oidc.redirectUri` | what the provider has registered. Empty derives it from the request, honouring `X-Forwarded-Proto`/`-Host` — right behind one proxy, wrong as soon as two hostnames reach the same LabView |
 | `LABVIEW_OIDC_SCOPES` | `auth.oidc.scopes` | comma-separated; `openid` is sent whether or not it is listed |
 | `LABVIEW_OIDC_USERNAME_CLAIM` | `auth.oidc.usernameClaim` | tried first, then `preferred_username`, `email`, `sub` |
 | `LABVIEW_OIDC_LABEL` | `auth.oidc.label` | the button's text. Empty names the issuer host, which tells a visitor who has not signed in what your provider is |
 | `LABVIEW_OIDC_TIMEOUT` | `auth.oidc.timeoutMs` | per request, for discovery, the token exchange and the JWKS |
-| `LABVIEW_SESSION_SECRET_FILE` | `auth.session.secretFile` | preferred over the env var. Wins over `secret` |
-| `LABVIEW_SESSION_SECRET` | `auth.session.secret` | in `secrets.keysAlways` (I6). Unset generates one per start, so restarts sign everyone out — said once in the log, and only when there are sessions to lose |
+| `LABVIEW_SESSION_SECRET` | `auth.session.secret` | in `secrets.keysAlways` (I6). Unset generates one per start, so restarts sign everyone out — said once in the log, and only when there are sessions to lose. Set and empty says both things |
 | `LABVIEW_SESSION_TTL_MINUTES` | `auth.session.ttlMinutes` | also the cookie's `Max-Age` |
 | `LABVIEW_SESSION_COOKIE_NAME` | `auth.session.cookieName` | the OIDC transient cookie is this plus `_oidc` |
 
 The `auth` block follows the `authentik`/`traefik` shape on purpose — `enabled`, a value,
-a `*File` variant that wins over it, a `timeoutMs` — so an operator who has configured one
-integration already knows the vocabulary. `enabled` means **allowed, not on**: what turns
-a method on is having something usable (§3.13).
+a `timeoutMs` — so an operator who has configured one integration already knows the
+vocabulary. `enabled` means **allowed, not on**: what turns a method on is having
+something usable (§3.13).
+
+### Credentials come from the environment
+
+Four settings are credentials rather than knobs: `authentik.token`, `traefik.password`,
+`auth.oidc.clientSecret` and `auth.session.secret`. Each has exactly one variable, and
+that variable is the documented place for the value. There is deliberately **no path
+form** — no `tokenFile`, no `LABVIEW_OIDC_CLIENT_SECRET_FILE` — because the alternative
+was what LabView shipped before: the OIDC client id arriving as a variable and the
+secret beside it as a bind-mounted file, two mechanisms for two halves of one credential
+the provider issued together.
+
+Two rules exist to keep that simplification from costing an operator anything:
+
+**`blankCredentialVars: string[]`** — filled by `applyEnvOverrides`, holding the names of
+credential variables that were **present and carried nothing**. That distinction exists
+nowhere else: every other setting can fall back to its default silently, and by the time
+a reader holds the config an empty token is indistinguishable from an unset one. It is
+also the footgun the change introduces — `LABVIEW_OIDC_CLIENT_SECRET: ${OIDC_SECRET}`
+with no matching `.env` entry expands to an empty value and compose passes it on without
+complaint. Each reader translates the name into its own vocabulary: a `credential` fault
+for a scan target (§3.10), a startup note for LabView's own login (§3.13). **Names only
+— a value never lands in it** (I6).
+
+**`retiredSettings(cfg, env)`** — the four retired variables and their four config-file
+keys are still *recognised*, for the single purpose of saying they are gone. Ignoring one
+silently would be a lock-out dressed as a simplification (I4): an operator whose client
+secret was a mounted file becomes a public client on the next pull, the provider refuses
+every sign-in, and nothing in any log explains it. The config-file keys are caught
+because `merge()` preserves keys it does not recognise, so a `config.yml` written against
+an older `config.example.yml` still parses and still contains `tokenFile:`. Each line
+names the variable to move the value to, and neither the value nor the path is echoed.
+Both entry points print it: `buildApp` through `app.log.warn`, `cli.ts` to stderr so JSON
+on stdout stays parseable.
+
+The consequence, stated rather than hidden: an environment variable is fixed for the life
+of the process, so **rotating a credential needs a restart** (§3.11). `auth.passwd.file`
+is untouched by all of this and is still re-read on change — a `user:hash` database is a
+mechanism, not a single secret smuggled into a path.
 
 **Docker endpoint resolution order:** explicit socket → configured/env TCP host →
 default socket path. The default is the conventional local socket, the one
@@ -3345,3 +3393,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | No CSP | Mermaid and cytoscape both inject styles at runtime, so any policy tight enough to be worth setting breaks the graph tab, and one loose enough to work (`style-src 'unsafe-inline'`) buys nothing. The three headers that cost nothing — `nosniff`, `Referrer-Policy: same-origin`, `X-Frame-Options: DENY` — are set unconditionally instead. Revisit if the graph libraries gain a nonce-friendly mode. |
 | The `Origin` check runs before the session check | Both orders refuse the request; only this one refuses it without having looked at the cookie, so a cross-site POST cannot learn from the difference between `403` and `401` whether the visitor has a session — and a rejection carries no `Set-Cookie`. A missing `Origin` passes, because browsers always send it on a cross-site POST: its absence means the request did not come from a page, and `curl` has no ambient cookie to abuse. |
 | A login failure crosses the boundary as a code, never a message | The failure has to survive two trips — a JSON body, and a `?login_error=` query parameter on a redirect from the provider — and text in a query parameter is text an attacker can put on the login page. So the union is closed, `parseLoginFailure` refuses anything outside it, and the wording lives in `model/access.ts` where the browser composes it and smoke asserts it (I6). It is also what keeps a provider's raw error string off the page. |
+| Every credential comes from an environment variable, and the `*File` forms are gone | The precedence rule was documented eleven times and the wording nagged in all eleven — *works, but is visible in `docker inspect` — prefer the file form* — which produced the state this row reverses: the OIDC client id arriving as a variable while the client secret beside it needed a bind mount and a `/run/secrets` path. Two mechanisms for two halves of one credential the provider issues together, and no reader can tell which half is misconfigured. One mechanism means no precedence to explain and nothing that can silently override what was set. The exposure argument is real and is now stated once, honestly, in §6: `docker inspect` needs the Docker socket, which is root-equivalent on that host and can read a mounted file just as easily; what a gitignored `.env` beside the compose file actually closes is a credential committed to a repository. `auth.passwd.file` is untouched — a `user:hash` database is a mechanism, not a single secret in a path. |
+| A retired variable is warned about, not ignored | Ignoring `LABVIEW_OIDC_CLIENT_SECRET_FILE` on the next image pull turns a confidential client into a public one, the provider refuses every sign-in, and nothing in any log connects the two — a lock-out dressed up as a simplification, against I4. So `retiredSettings` keeps all four variable names and all four `config.yml` keys recognised for the single purpose of naming what replaced them. The config-file half is checkable because `merge()` preserves unknown keys, so a `config.yml` written against the previous `config.example.yml` still contains `tokenFile:` and still gets told. Neither the value nor the path is echoed: the variable to move it to is the whole actionable part. |
+| "Set but empty" is carried forward in `blankCredentialVars` rather than recomputed | `applyEnvOverrides` is the only place the difference between unset and empty survives — every reader downstream sees one empty string — and that difference is now the likeliest way a credential fails to arrive: `${OIDC_SECRET}` with no matching `.env` entry expands to nothing and compose passes it on without complaint. Carrying the *names* keeps the readers pure and assertable, keeps `credential` (§3.10) a producible phase after its file-read producer was deleted, and holds to I6 by construction, since a value never lands in the list. The compose examples use `${VAR:-}` and not `${VAR:?}` for the same reason: an unresolved credential should reach LabView and be reported, not stop the container from starting. |
+| Rotation now needs a restart, and the docs say so | `tokenFile` and `passwordFile` were read per build, so a rotated secret took effect on the next rescan; an environment variable is fixed for the life of the process. This is the one capability the row above gives up, and it is written into §3.11 and the README rather than quietly dropped — a documented `docker compose up -d` beats an undocumented rotation that silently stopped working. The passwd file keeps its per-change re-read, which is where the property was actually earning its cost. |

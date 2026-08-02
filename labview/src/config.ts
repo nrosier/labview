@@ -59,10 +59,13 @@ export interface LabViewConfig {
     enabled: boolean;
     /** Base URL of the Authentik instance. Empty = discover it from the fleet. */
     url: string;
-    /** API token. Prefer `tokenFile` so the value never sits in the environment. */
+    /**
+     * API token, from `LABVIEW_AUTHENTIK_TOKEN`. That variable is where it belongs; a
+     * value written into this config file is still read and the variable overrides it.
+     * There is no path-to-a-file form any more — see {@link retiredSettings} — and no
+     * fourth way, so *Where the credentials go* in the README is a short section.
+     */
     token: string;
-    /** Path to a file holding the token (docker secret, mounted file). Wins over `token`. */
-    tokenFile: string;
     /** Per-request timeout. The whole exchange is a handful of GETs. */
     timeoutMs: number;
     /** Hard cap on paginated pages per endpoint, so a huge instance cannot stall a scan. */
@@ -89,12 +92,11 @@ export interface LabViewConfig {
      */
     username: string;
     /**
-     * Password for HTTP Basic. Behind Authentik this must be an *app password* or
-     * a token, not the account password. Prefer `passwordFile`.
+     * Password for HTTP Basic, from `LABVIEW_TRAEFIK_PASSWORD`, on the same terms as
+     * {@link LabViewConfig.authentik}'s token. Behind Authentik this must be an *app
+     * password* or a token, not the account password.
      */
     password: string;
-    /** Path to a file holding the password (docker secret, mounted file). Wins over `password`. */
-    passwordFile: string;
     /** Per-request timeout. The whole exchange is three GETs. */
     timeoutMs: number;
   };
@@ -121,10 +123,13 @@ export interface LabViewConfig {
       /** e.g. `https://authentik.example.com/application/o/labview/`. Empty = off. */
       issuer: string;
       clientId: string;
-      /** Prefer `clientSecretFile`. Empty means a public client authenticating by PKCE. */
+      /**
+       * The client secret, from `LABVIEW_OIDC_CLIENT_SECRET` — set exactly the way
+       * `clientId` beside it is set, because the provider issued them together and
+       * splitting one pair across two mechanisms only ever costs somebody an evening.
+       * Empty means a public client authenticating by PKCE, which is not an error.
+       */
       clientSecret: string;
-      /** Path to a file holding the secret. Wins over `clientSecret`. */
-      clientSecretFile: string;
       /** Registered with the provider. Empty = derive it from the request. */
       redirectUri: string;
       scopes: string[];
@@ -135,10 +140,11 @@ export interface LabViewConfig {
       timeoutMs: number;
     };
     session: {
-      /** HMAC key for the session cookie. Empty = a random one per start. */
+      /**
+       * HMAC key for the session cookie, from `LABVIEW_SESSION_SECRET`. Empty = a random
+       * one per start, so restarts sign everyone out.
+       */
       secret: string;
-      /** Path to a file holding the secret. Wins over `secret`. */
-      secretFile: string;
       ttlMinutes: number;
       cookieName: string;
       /** `auto` follows the effective scheme; `true`/`false` force it. */
@@ -150,6 +156,21 @@ export interface LabViewConfig {
   };
   cacheTtlSeconds: number;
   server: { host: string; port: number };
+  /**
+   * Credential variables that were present in the environment and carried nothing.
+   *
+   * Recorded here because {@link applyEnvOverrides} is the only place the difference
+   * between "unset" and "set to the empty string" survives: `${X}` in a compose file
+   * with `X` absent from `.env` expands to an empty value, and by the time a reader sees
+   * the config that mistake is indistinguishable from an unconfigured install. It is the
+   * likeliest way a credential fails to arrive now that a file is not an option, so it
+   * is reported rather than absorbed.
+   *
+   * Names only — a value never lands here (**I6**). Each reader turns it into its own
+   * vocabulary: a `credential` fault for a scan target (§3.10), a startup note for
+   * LabView's own login (§3.13).
+   */
+  blankCredentialVars: string[];
 }
 
 /**
@@ -214,7 +235,6 @@ const DEFAULTS: LabViewConfig = {
     enabled: true,
     url: "",
     token: "",
-    tokenFile: "",
     timeoutMs: 5000,
     maxPages: 20,
   },
@@ -223,7 +243,6 @@ const DEFAULTS: LabViewConfig = {
     url: "",
     username: "",
     password: "",
-    passwordFile: "",
     timeoutMs: 5000,
   },
   auth: {
@@ -235,7 +254,6 @@ const DEFAULTS: LabViewConfig = {
       issuer: "",
       clientId: "",
       clientSecret: "",
-      clientSecretFile: "",
       redirectUri: "",
       scopes: ["openid", "profile", "email"],
       usernameClaim: "preferred_username",
@@ -244,12 +262,16 @@ const DEFAULTS: LabViewConfig = {
     },
     // Twelve hours: long enough that a dashboard left open all day does not sign itself
     // out, short enough that a stolen cookie is not indefinite.
-    session: { secret: "", secretFile: "", ttlMinutes: 720, cookieName: "labview_session", secure: "auto" },
+    session: { secret: "", ttlMinutes: 720, cookieName: "labview_session", secure: "auto" },
     maxFailedAttempts: 5,
     lockoutSeconds: 60,
   },
   cacheTtlSeconds: 60,
   server: { host: "0.0.0.0", port: 8080 },
+  // Filled by applyEnvOverrides, never by a config file: only the environment can be
+  // "present and empty". A config file that sets it is merged over and then ignored,
+  // which is harmless — nothing reads it as a request.
+  blankCredentialVars: [],
 };
 
 /**
@@ -298,6 +320,20 @@ function parseDockerTarget(value: string): { host?: string; port?: number; socke
 
 function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   const env = process.env;
+  // The four credentials are the only settings where "present and empty" is worth
+  // telling apart from "absent". Every other variable can fall back to its default
+  // without anyone needing to know; a credential that fails to arrive is a fault
+  // somebody has to hear about, and this is the last place the difference exists.
+  // `LABVIEW_OIDC_CLIENT_SECRET: ${OIDC_SECRET}` with no matching `.env` entry is
+  // the case that makes it worth the four lines.
+  const blank: string[] = [];
+  const credential = (name: string, apply: (value: string) => void): void => {
+    const raw = env[name];
+    if (raw === undefined) return;
+    const value = raw.trim();
+    if (value) apply(value);
+    else blank.push(name);
+  };
   if (env.LABVIEW_APPS_ROOT) cfg.appsRoot = env.LABVIEW_APPS_ROOT;
   if (env.LABVIEW_SIDECAR_FILENAMES) {
     const names = env.LABVIEW_SIDECAR_FILENAMES.split(",")
@@ -337,8 +373,7 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   }
   if (env.LABVIEW_AUTHENTIK_ENABLED) cfg.authentik.enabled = env.LABVIEW_AUTHENTIK_ENABLED !== "false";
   if (env.LABVIEW_AUTHENTIK_URL) cfg.authentik.url = env.LABVIEW_AUTHENTIK_URL;
-  if (env.LABVIEW_AUTHENTIK_TOKEN) cfg.authentik.token = env.LABVIEW_AUTHENTIK_TOKEN;
-  if (env.LABVIEW_AUTHENTIK_TOKEN_FILE) cfg.authentik.tokenFile = env.LABVIEW_AUTHENTIK_TOKEN_FILE;
+  credential("LABVIEW_AUTHENTIK_TOKEN", (v) => (cfg.authentik.token = v));
   if (env.LABVIEW_AUTHENTIK_TIMEOUT) {
     const n = Number(env.LABVIEW_AUTHENTIK_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.authentik.timeoutMs = Math.floor(n);
@@ -346,8 +381,7 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_TRAEFIK_ENABLED) cfg.traefik.enabled = env.LABVIEW_TRAEFIK_ENABLED !== "false";
   if (env.LABVIEW_TRAEFIK_URL) cfg.traefik.url = env.LABVIEW_TRAEFIK_URL;
   if (env.LABVIEW_TRAEFIK_USERNAME) cfg.traefik.username = env.LABVIEW_TRAEFIK_USERNAME;
-  if (env.LABVIEW_TRAEFIK_PASSWORD) cfg.traefik.password = env.LABVIEW_TRAEFIK_PASSWORD;
-  if (env.LABVIEW_TRAEFIK_PASSWORD_FILE) cfg.traefik.passwordFile = env.LABVIEW_TRAEFIK_PASSWORD_FILE;
+  credential("LABVIEW_TRAEFIK_PASSWORD", (v) => (cfg.traefik.password = v));
   if (env.LABVIEW_TRAEFIK_TIMEOUT) {
     const n = Number(env.LABVIEW_TRAEFIK_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.traefik.timeoutMs = Math.floor(n);
@@ -359,8 +393,7 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_OIDC_ENABLED) cfg.auth.oidc.enabled = env.LABVIEW_OIDC_ENABLED !== "false";
   if (env.LABVIEW_OIDC_ISSUER) cfg.auth.oidc.issuer = env.LABVIEW_OIDC_ISSUER;
   if (env.LABVIEW_OIDC_CLIENT_ID) cfg.auth.oidc.clientId = env.LABVIEW_OIDC_CLIENT_ID;
-  if (env.LABVIEW_OIDC_CLIENT_SECRET) cfg.auth.oidc.clientSecret = env.LABVIEW_OIDC_CLIENT_SECRET;
-  if (env.LABVIEW_OIDC_CLIENT_SECRET_FILE) cfg.auth.oidc.clientSecretFile = env.LABVIEW_OIDC_CLIENT_SECRET_FILE;
+  credential("LABVIEW_OIDC_CLIENT_SECRET", (v) => (cfg.auth.oidc.clientSecret = v));
   if (env.LABVIEW_OIDC_REDIRECT_URI) cfg.auth.oidc.redirectUri = env.LABVIEW_OIDC_REDIRECT_URI;
   if (env.LABVIEW_OIDC_SCOPES) {
     const scopes = env.LABVIEW_OIDC_SCOPES.split(/[,\s]+/)
@@ -374,8 +407,7 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
     const n = Number(env.LABVIEW_OIDC_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.auth.oidc.timeoutMs = Math.floor(n);
   }
-  if (env.LABVIEW_SESSION_SECRET) cfg.auth.session.secret = env.LABVIEW_SESSION_SECRET;
-  if (env.LABVIEW_SESSION_SECRET_FILE) cfg.auth.session.secretFile = env.LABVIEW_SESSION_SECRET_FILE;
+  credential("LABVIEW_SESSION_SECRET", (v) => (cfg.auth.session.secret = v));
   if (env.LABVIEW_SESSION_TTL_MINUTES) {
     const n = Number(env.LABVIEW_SESSION_TTL_MINUTES);
     if (Number.isFinite(n) && n >= 1) cfg.auth.session.ttlMinutes = Math.floor(n);
@@ -399,6 +431,9 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_HOST) cfg.server.host = env.LABVIEW_HOST;
   if (env.LABVIEW_CACHE_TTL) cfg.cacheTtlSeconds = Number(env.LABVIEW_CACHE_TTL);
   if (env.LABVIEW_MASK_SECRETS) cfg.secrets.maskValues = env.LABVIEW_MASK_SECRETS !== "false";
+  // Assigned, not appended: a config file that sets this key has no standing here, since
+  // only the environment can be present-and-empty in the first place.
+  cfg.blankCredentialVars = blank;
   return cfg;
 }
 
@@ -414,4 +449,55 @@ export function loadConfig(): LabViewConfig {
     }
   }
   return applyEnvOverrides(cfg);
+}
+
+/**
+ * The settings LabView used to read, paired with what replaced them.
+ *
+ * Credentials come from the environment and nowhere else. The four `*_FILE` variables and
+ * their config-file keys are still *recognised*, though — for exactly one purpose, which
+ * is to say they are gone. Silently ignoring one would be a lock-out dressed up as a
+ * simplification (**I4**): an operator whose OIDC client secret was mounted as a file
+ * becomes a public client on the next pull, and the only symptom is a provider refusing
+ * every sign-in with nothing in any log to explain it.
+ *
+ * A config-file key is caught as well as a variable, because {@link merge} keeps keys it
+ * does not recognise — so a `config.yml` written against an older `config.example.yml`
+ * still parses, still contains `tokenFile:`, and still needs to hear about it.
+ *
+ * Neither the value nor the path is echoed: the name of the variable to move it to is the
+ * whole actionable part, and a path is one more thing in a log that did not need to be
+ * there.
+ */
+const RETIRED: { was: string; now: string; key: [string, string] }[] = [
+  { was: "LABVIEW_AUTHENTIK_TOKEN_FILE", now: "LABVIEW_AUTHENTIK_TOKEN", key: ["authentik", "tokenFile"] },
+  { was: "LABVIEW_TRAEFIK_PASSWORD_FILE", now: "LABVIEW_TRAEFIK_PASSWORD", key: ["traefik", "passwordFile"] },
+  { was: "LABVIEW_OIDC_CLIENT_SECRET_FILE", now: "LABVIEW_OIDC_CLIENT_SECRET", key: ["auth.oidc", "clientSecretFile"] },
+  { was: "LABVIEW_SESSION_SECRET_FILE", now: "LABVIEW_SESSION_SECRET", key: ["auth.session", "secretFile"] },
+];
+
+/** A dotted config path, walked without assuming the key at the end still has a type. */
+function blockAt(cfg: LabViewConfig, path: string): Record<string, unknown> | undefined {
+  return path
+    .split(".")
+    .reduce<Record<string, unknown> | undefined>(
+      (obj, part) => obj?.[part] as Record<string, unknown> | undefined,
+      cfg as unknown as Record<string, unknown>,
+    );
+}
+
+/** Anything set that LabView no longer reads, each naming what to use instead. */
+export function retiredSettings(cfg: LabViewConfig, env: NodeJS.ProcessEnv = process.env): string[] {
+  const out: string[] = [];
+  for (const { was, now, key } of RETIRED) {
+    const [block, field] = key;
+    if (env[was] !== undefined) {
+      out.push(`${was} is no longer read — put the value in ${now} instead`);
+    }
+    const held = blockAt(cfg, block)?.[field];
+    if (typeof held === "string" && held.trim()) {
+      out.push(`${block}.${field} in the config file is no longer read — put the value in ${now} instead`);
+    }
+  }
+  return out;
 }

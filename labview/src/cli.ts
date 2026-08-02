@@ -3,12 +3,17 @@
  *   LABVIEW_APPS_ROOT=./fixtures/apps npm run scan
  *   npm run scan -- --summary
  */
-import { loadConfig } from "./config.js";
+import { loadConfig, retiredSettings } from "./config.js";
 import { buildOverview } from "./analyze/index.js";
 import { formatConnection } from "./model/connections.js";
 import { formatExposureCount } from "./model/declarations.js";
 
 const cfg = loadConfig();
+// To stderr, and whether or not `--summary` was asked for. A setting LabView stopped
+// reading is the one thing a reader cannot deduce from the output — the scan below simply
+// looks like the integration was never configured. stderr rather than stdout so the JSON
+// on the other stream stays parseable by whatever is piping it.
+for (const line of retiredSettings(cfg)) console.error(`config: ${line}`);
 const summary = process.argv.includes("--summary");
 
 const overview = await buildOverview(cfg, new Date());

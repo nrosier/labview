@@ -26,7 +26,6 @@
  *    Every one of those paths also returns a `ConnectionReport` naming the stage it
  *    stopped at, because "unreachable" alone covers six different fixes.
  */
-import { readFileSync } from "node:fs";
 import type {
   AppStack,
   AuthentikApplication,
@@ -371,17 +370,18 @@ export async function snapshotAuthentik(
   );
 }
 
-/** Resolve the token from a file when given one, else from config/env. */
+/**
+ * Resolve the token, and tell an absent one from an empty one.
+ *
+ * The difference is the whole reason this returns two fields. No token at all means the
+ * integration was never switched on, which is quiet. A token that was *asked for* and
+ * carries nothing is a half-finished configuration — the `credential` phase (§3.10) — and
+ * the likeliest cause is an unresolved `${…}` in a compose file, so the variable is named
+ * and the fix is one line away. The value itself is never in either answer (**I6**).
+ */
 function readToken(cfg: LabViewConfig): { value?: string; error?: string } {
-  const file = cfg.authentik.tokenFile.trim();
-  if (file) {
-    try {
-      const value = readFileSync(file, "utf8").trim();
-      if (!value) return { error: `Authentik token file ${file} is empty` };
-      return { value };
-    } catch (err) {
-      return { error: `Authentik token file ${file} could not be read: ${(err as Error).message}` };
-    }
+  if (cfg.blankCredentialVars.includes("LABVIEW_AUTHENTIK_TOKEN")) {
+    return { error: "LABVIEW_AUTHENTIK_TOKEN is set but carries nothing" };
   }
   const value = cfg.authentik.token.trim();
   return value ? { value } : {};

@@ -3,7 +3,7 @@ import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
-import type { LabViewConfig } from "../config.js";
+import { retiredSettings, type LabViewConfig } from "../config.js";
 import type { ConnectionReport, Overview } from "../model/types.js";
 import { buildOverview } from "../analyze/index.js";
 import {
@@ -31,6 +31,11 @@ const webRoot = join(here, "..", "..", "web", "dist");
  */
 export async function buildApp(cfg: LabViewConfig, access: AccessControlOptions = {}): Promise<BuiltApp> {
   const app = Fastify({ logger: { level: process.env.LABVIEW_LOG_LEVEL ?? "info" } });
+
+  // First of all, because a retired setting is most often a credential something below
+  // needs, and "the gate is open" or "authentik is not configured" are both easier to read
+  // once you know a value LabView used to pick up is now being ignored.
+  for (const line of retiredSettings(cfg)) app.log.warn(`config: ${line}`);
 
   // Before the API routes, so the hooks it installs apply to them, and before the
   // scanning line, so the startup block opens with who may read this LabView.

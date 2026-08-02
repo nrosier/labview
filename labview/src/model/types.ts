@@ -338,7 +338,10 @@ export type ConnectionPhase =
    * configuration will never work and is worth saying so.
    */
   | "not-found"
-  /** A configured credential could not be read — a missing or empty token file. */
+  /**
+   * A credential was asked for and arrived empty — its variable is set in the environment
+   * and carries nothing, which is a half-finished configuration rather than an absent one.
+   */
   | "credential"
   /** The name does not exist (`ENOTFOUND`, `EAI_AGAIN`). */
   | "resolve"

@@ -154,10 +154,12 @@ export function parsePasswd(text: string): { entries: Map<string, PasswdEntry>; 
  * changes.
  *
  * Re-reading rather than loading once at startup means adding a user does not need a
- * restart — the same treatment the Authentik `tokenFile` gets, and the same reason: a
- * credential an operator can rotate without downtime is a credential they will
- * actually rotate. The identity is size + mtime + inode, so an editor that replaces
- * the file is picked up as well as one that writes in place.
+ * restart. This is the one credential LabView still reads from a path, and the reason it
+ * does is exactly this: a user database is edited over the life of the install, so a
+ * change an operator can make without downtime is a change they will actually make. The
+ * single-value credentials come from the environment instead and are fixed for the life
+ * of the process. The identity is size + mtime + inode, so an editor that replaces the
+ * file is picked up as well as one that writes in place.
  */
 const cache = new Map<string, { key: string; file: PasswdFile }>();
 

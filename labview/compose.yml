@@ -10,6 +10,19 @@
 # never touches the raw socket, and needs only its read endpoints
 # (CONTAINERS/NETWORKS/VOLUMES/IMAGES/INFO/PING). Your app stacks are mounted
 # read-only.
+#
+# Credentials — the Authentik token, the Traefik password, the session key and the
+# OIDC client secret — come from the environment, and only from there. Keep the
+# values in a `.env` file beside this one (git ignores it) and reference them as
+# `${NAME:-}` below, so the compose file you commit names each credential without
+# holding it:
+#
+#   LABVIEW_AUTHENTIK_TOKEN=ak-...
+#   LABVIEW_SESSION_SECRET=...
+#
+# `:-` and not `:?` on purpose: a name with no matching `.env` entry arrives empty,
+# LabView reports it as a credential that carries nothing, and the rest of the scan
+# still runs. A typo in a secret's name should not stop the container from starting.
 services:
   labview:
     image: niqck/labview:latest
@@ -39,9 +52,8 @@ services:
       # application whose provider no outpost is serving, which protects nothing.
       #
       # Use a read-only service account (view_application / view_provider /
-      # view_outpost, no groups). Prefer the _FILE form: a token in the
-      # environment is visible to anyone who can run `docker inspect`.
-      # LABVIEW_AUTHENTIK_TOKEN_FILE: /run/secrets/authentik_token
+      # view_outpost, no groups), and keep the value in `.env`:
+      # LABVIEW_AUTHENTIK_TOKEN: ${LABVIEW_AUTHENTIK_TOKEN:-}
       #
       # The host is discovered from the scanned stacks when Authentik runs among
       # them, preferring its container address so the call stays on the container
@@ -64,9 +76,9 @@ services:
       #
       # Only needed if the API is reachable solely through a hostname Authentik
       # gates: an Authentik user plus an **app password** — an API token will not
-      # work, see config.example.yml. Prefer the _FILE form.
+      # work, see config.example.yml.
       # LABVIEW_TRAEFIK_USERNAME: labview
-      # LABVIEW_TRAEFIK_PASSWORD_FILE: /run/secrets/traefik_password
+      # LABVIEW_TRAEFIK_PASSWORD: ${LABVIEW_TRAEFIK_PASSWORD:-}
       #
       # --- Optional: LabView's own login ---
       # Nothing here is required. LabView asks for a sign-in only once a method is
@@ -77,9 +89,8 @@ services:
       # Make a line with `docker exec labview node dist/hashpw.js alice` (or
       # `htpasswd -nbB alice <password>`) and append it to ./config/passwd.
       #
-      # Set a session key, or every restart signs everyone out. Prefer the _FILE
-      # form, for the reason given above about `docker inspect`:
-      # LABVIEW_SESSION_SECRET_FILE: /run/secrets/labview_session
+      # Set a session key, or every restart signs everyone out:
+      # LABVIEW_SESSION_SECRET: ${LABVIEW_SESSION_SECRET:-}
       #
       # Turn the password form off if you would rather rely only on OIDC or on
       # your edge:
@@ -88,9 +99,11 @@ services:
       # OIDC — see "Access control" in README.md for the Authentik walkthrough.
       # The redirect URI you register there is
       # https://labview.example.com/auth/oidc/callback
+      # The client id and the secret are two halves of one credential and are set
+      # the same way; leave the secret out entirely for a public client using PKCE.
       # LABVIEW_OIDC_ISSUER: https://authentik.example.com/application/o/labview/
       # LABVIEW_OIDC_CLIENT_ID: <client id>
-      # LABVIEW_OIDC_CLIENT_SECRET_FILE: /run/secrets/labview_oidc
+      # LABVIEW_OIDC_CLIENT_SECRET: ${LABVIEW_OIDC_CLIENT_SECRET:-}
     volumes:
       # LabView's own config and users, read-only, from ./config next to this file.
       #
@@ -106,13 +119,6 @@ services:
       - ./config/passwd:/config/passwd:ro
       # Your per-container stacks, read-only.
       - /mnt/apps:/data/apps:ro
-      # Optional Authentik token, mounted as a file rather than passed as an env var:
-      # - /mnt/apps/labview/authentik-token:/run/secrets/authentik_token:ro
-      # Optional Traefik app password, mounted the same way and for the same reason:
-      # - /mnt/apps/labview/traefik-password:/run/secrets/traefik_password:ro
-      # Optional session key and OIDC client secret, same reasoning:
-      # - ./config/session-secret:/run/secrets/labview_session:ro
-      # - ./config/oidc-secret:/run/secrets/labview_oidc:ro
     # No `ports:` on purpose. A published host port answers directly at
     # <host-ip>:<port>, bypassing the reverse proxy and therefore bypassing any
     # SSO middleware on it. LabView's own login covers that gap when you have

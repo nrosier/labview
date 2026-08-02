@@ -16,7 +16,6 @@
  *  - **log notes** carry the paths, the counts and the parse warnings, because the
  *    operator reading the log is the one who can fix them.
  */
-import { readFileSync } from "node:fs";
 import type { LabViewConfig } from "../config.js";
 import type { AccessMode, LoginMethod } from "../model/types.js";
 import { issuerHost } from "../model/access.js";
@@ -207,17 +206,19 @@ export function readAccess(cfg: LabViewConfig): AccessSnapshot {
  * The OIDC settings with the client secret resolved, or `undefined` when OIDC is not
  * live.
  *
- * Follows `readToken` in `enrich/authentik.ts`: a `*File` beats an inline value, an
- * unreadable file is a note rather than a crash, and the value itself never reaches a
- * message. An empty secret is not an error — that is a public client, authenticating by
- * PKCE alone.
+ * Both halves of the credential pair are read the same way, from
+ * `LABVIEW_OIDC_CLIENT_ID` and `LABVIEW_OIDC_CLIENT_SECRET`, because they are one thing
+ * the provider issued together. Follows `readToken` in `enrich/authentik.ts`: a variable
+ * that arrived empty is a note rather than a crash, and the value itself never reaches a
+ * message. A secret that was never set is not an error at all — that is a public client,
+ * authenticating by PKCE alone.
  */
 export function resolveOidc(cfg: LabViewConfig): { settings?: OidcSettings; notes: string[] } {
   const o = cfg.auth.oidc;
   if (!o.enabled || !o.issuer.trim() || !o.clientId.trim()) return { notes: [] };
 
   const notes: string[] = [];
-  const secret = readSecret(o.clientSecretFile, o.clientSecret, "OIDC client secret", notes);
+  const secret = readSecret(cfg, "LABVIEW_OIDC_CLIENT_SECRET", o.clientSecret, "OIDC client secret", notes);
 
   return {
     settings: {
@@ -248,7 +249,7 @@ export function resolveSessionSecret(
   generate: () => string,
 ): { secret: string; generated: boolean; notes: string[] } {
   const notes: string[] = [];
-  const configured = readSecret(cfg.auth.session.secretFile, cfg.auth.session.secret, "session secret", notes);
+  const configured = readSecret(cfg, "LABVIEW_SESSION_SECRET", cfg.auth.session.secret, "session secret", notes);
   if (configured) return { secret: configured, generated: false, notes };
   return {
     secret: generate(),
@@ -260,17 +261,27 @@ export function resolveSessionSecret(
   };
 }
 
-/** A `*File` value when given one, else the inline value. Never echoes the value. */
-function readSecret(file: string, inline: string, label: string, notes: string[]): string {
-  const path = file.trim();
-  if (path) {
-    try {
-      const value = readFileSync(path, "utf8").trim();
-      if (value) return value;
-      notes.push(`${label} file ${path} is empty`);
-    } catch (err) {
-      notes.push(`${label} file ${path} could not be read: ${(err as Error).message}`);
-    }
+/**
+ * A configured secret, with a note when the variable meant to carry it arrived empty.
+ *
+ * The environment is the only place a credential comes from, so the only way one goes
+ * missing by accident is a variable that is present and carries nothing — an unresolved
+ * `${…}` from a compose file with no matching `.env` entry. That is the case worth a note:
+ * an operator who never set the variable is not making a mistake, while one who set it and
+ * got nothing has a typo two files away and no other way to find it.
+ *
+ * The note names the variable, never the value (**I6**), and returning `""` either way
+ * leaves the caller's own handling of an unset secret exactly as it was.
+ */
+function readSecret(
+  cfg: LabViewConfig,
+  variable: string,
+  inline: string,
+  label: string,
+  notes: string[],
+): string {
+  if (cfg.blankCredentialVars.includes(variable)) {
+    notes.push(`${variable} is set but carries nothing, so no ${label} was configured`);
   }
   return inline.trim();
 }
