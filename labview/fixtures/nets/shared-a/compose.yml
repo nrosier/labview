@@ -1,0 +1,12 @@
+# One of three stacks on the same externally declared network. Nothing here declares a
+# dependency on anything in another stack — compose cannot — so the network is the entire
+# relationship between them, which is what the graph has to show.
+services:
+  db-a:
+    image: postgres:16-alpine
+    networks:
+      - backup
+
+networks:
+  backup:
+    external: true

@@ -40,6 +40,7 @@ import { StackCard } from "./components/StackCard";
 import { AppDetail } from "./components/AppDetail";
 import { AuthentikDetail, TraefikDetail } from "./components/ApiDetail";
 import { GraphView } from "./components/GraphView";
+import { NetworksSection } from "./components/NetworksSection";
 
 type Theme = "light" | "dark" | "auto";
 const THEME_KEY = "labview-theme";
@@ -263,6 +264,13 @@ function App() {
   /** The other direction: only the services whose `.labview` disagrees with the scan. */
   const [driftOnly, setDriftOnly] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  /**
+   * The network whose row to open at, set by tapping a network node in the graph.
+   *
+   * A network node cannot show its own members — its spokes are capped — so tapping one
+   * has to hand the reader over to the list that can, which lives on the other tab.
+   */
+  const [network, setNetwork] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /**
    * Which integration's detail panel is open, if any.
@@ -873,6 +881,17 @@ function App() {
             </span>
           </div>
 
+          {/* Outside the filtered list on purpose: a network is a fleet-wide fact about
+              which services can reach each other, and answering "who else is on this"
+              with a set narrowed by the search box would be answering a different
+              question. */}
+          <NetworksSection
+            graph={ov.graph}
+            soloLocalNetworks={ov.stats.soloLocalNetworks}
+            highlight={network}
+            onOpenService={openService}
+          />
+
           {groups.length === 0 ? (
             <div class="center-msg">No services match the current filters.</div>
           ) : (
@@ -893,11 +912,25 @@ function App() {
       )}
 
       {tab === "graph" && (
-        <GraphView graph={ov.graph} themeKey={theme} onOpenService={openService} />
+        <GraphView
+          graph={ov.graph}
+          themeKey={theme}
+          onOpenService={openService}
+          onOpenNetwork={(name) => {
+            setNetwork(name);
+            setTab("overview");
+          }}
+        />
       )}
 
       {selectedFlat && (
-        <AppDetail stack={selectedFlat.stack} svc={selectedFlat.svc} onClose={() => setSelected(null)} />
+        <AppDetail
+          stack={selectedFlat.stack}
+          svc={selectedFlat.svc}
+          graph={ov.graph}
+          onClose={() => setSelected(null)}
+          onOpenService={openService}
+        />
       )}
 
       {/* The integration panels read the payload already in memory — `ov.stacks` for the

@@ -1,0 +1,35 @@
+# A multi-service stack with a network of its own, carrying the dependencies between them:
+# web needs api, api needs cache, and all three talk over `inner`. This is the case the
+# dependency has to be drawn *through* the network rather than beside it — api's leg to
+# `inner` carries an arrowhead at each end, since something on the network needs it and it
+# needs something on the network.
+#
+# `extra` is here to pin the other half of the rule: it is on `inner` too but declares no
+# dependency and nothing depends on it, so its leg carries no arrowhead at all.
+services:
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    networks:
+      - inner
+
+  api:
+    image: node:22-alpine
+    depends_on:
+      - cache
+    networks:
+      - inner
+
+  cache:
+    image: redis:7-alpine
+    networks:
+      - inner
+
+  extra:
+    image: alpine:3.20
+    networks:
+      - inner
+
+networks:
+  inner:

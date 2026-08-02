@@ -25,7 +25,13 @@ import {
 } from "../model/ingress.js";
 import { maskEnv } from "../secrets.js";
 import { buildGraph } from "./graph.js";
-import { realNetworks } from "./networks.js";
+import {
+  buildNetworkIndex,
+  realNetworks,
+  serviceKey,
+  sharedWith,
+  type NetworkIndex,
+} from "./networks.js";
 import { buildMiddlewareRegistry, type MiddlewareRegistry } from "./middlewares.js";
 import { buildFleetIndex, lookupContainerAddress, resolveOrigins, serviceRefKey } from "./origins.js";
 import { matchAuthentik } from "./authentik.js";
@@ -106,12 +112,22 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   // is a statement about *other* containers: it needs every service's networks, and
   // `realNetworks` prefers the live names that pass 1 has only just attached. A
   // service classified mid-loop would be judged against a half-built fleet.
-  const shared = sharedNetworks(stacks);
+  //
+  // The membership index is built here, at the first moment it can be trusted, and
+  // then threaded to everything downstream that asks about networks — the ingress
+  // rule, the fleet index and the graph — so all three answer from one pass.
+  const nets = buildNetworkIndex(stacks);
+  const shared = sharedNetworks(nets);
   for (const stack of stacks) {
     for (const svc of stack.services) {
       svc.ingress = classifyIngress(svc, stack, shared);
     }
   }
+
+  // A declared dependency the two containers have no network in common to carry.
+  // Reported here, where membership is known, rather than from the graph: the graph
+  // is drawn from the services and must not edit them.
+  flagUnreachableDependencies(stacks, nets);
 
   // Where each tunnel origin points. Cross-stack by nature — an origin routinely
   // names a proxy defined in a different stack — so it runs over the whole fleet
@@ -121,7 +137,7 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   // identifies the service acting as reverse proxy, which is one of the three signals
   // Traefik endpoint discovery rests on, and running it first also lets both discovered
   // exchanges go out together instead of one round trip after the other.
-  const fleet = buildFleetIndex(stacks);
+  const fleet = buildFleetIndex(stacks, nets);
   resolveOrigins(stacks, fleet);
 
   const [ak, tf] = await Promise.all([
@@ -166,8 +182,8 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     }
   }
 
-  const graph = buildGraph(stacks, live.proxyKey);
-  const stats = computeStats(stacks);
+  const graph = buildGraph(stacks, live.proxyKey, nets);
+  const stats = computeStats(stacks, nets);
 
   const meta: ScanMeta = {
     scannedAt: now.toISOString(),
@@ -373,23 +389,50 @@ function classifyIngress(svc: Service, stack: AppStack, shared: ReadonlySet<stri
  * Real network names carrying more than one scanned service — the fleet-wide half of
  * the `internal` rule.
  *
- * Counted over `realNetworks`, not over `svc.networks`, so it sees what docker sees:
- * the implicit `default` network compose gives a file that declares none (which is
- * what makes two services in one stack mutually reachable without either saying so),
- * an `external:` network under its verbatim name (which is what lets two *stacks*
- * share one), and live names in preference to implied ones.
+ * Read off {@link buildNetworkIndex}, which counts over `realNetworks` rather than
+ * `svc.networks` so it sees what docker sees: the implicit `default` network compose
+ * gives a file that declares none (which is what makes two services in one stack
+ * mutually reachable without either saying so), an `external:` network under its
+ * verbatim name (which is what lets two *stacks* share one), and live names in
+ * preference to implied ones.
+ *
+ * The same index the graph draws its connections from, deliberately: "shares a network"
+ * has to mean one thing, or a service could be classified `internal` by a rule the
+ * picture beside it contradicts.
  */
-function sharedNetworks(stacks: AppStack[]): Set<string> {
-  const count = new Map<string, number>();
+function sharedNetworks(nets: NetworkIndex): Set<string> {
+  const out = new Set<string>();
+  for (const [name, net] of nets.byName) {
+    if (net.members.length >= 2) out.add(name);
+  }
+  return out;
+}
+
+/**
+ * Note every `depends_on` whose target shares no network with the dependent.
+ *
+ * Compose will still order startup, so the stack comes up and looks fine; the two
+ * containers simply cannot address each other, which is the kind of thing that is
+ * discovered later by an application timing out. Worth one note, on the dependent —
+ * it is the service that will fail to connect.
+ *
+ * Only same-stack targets are considered, because that is all `depends_on` can name.
+ */
+function flagUnreachableDependencies(stacks: AppStack[], nets: NetworkIndex): void {
   for (const stack of stacks) {
     for (const svc of stack.services) {
-      // Deduped per service: one service listing a network twice is not two services.
-      for (const name of new Set(realNetworks(stack, svc))) {
-        count.set(name, (count.get(name) ?? 0) + 1);
+      const key = serviceKey(stack, svc);
+      for (const dep of svc.dependsOn) {
+        const target = stack.services.find((s) => s.name === dep);
+        if (!target) continue;
+        if (sharedWith(nets, key, serviceKey(stack, target)).length > 0) continue;
+        svc.notes.push(
+          `depends_on ${dep}, but the two share no docker network: startup is ordered, ` +
+            `yet neither container can reach the other`,
+        );
       }
     }
   }
-  return new Set([...count].filter(([, n]) => n >= 2).map(([name]) => name));
 }
 
 /**
@@ -534,7 +577,7 @@ function noteAuthentikGaps(svc: Service): void {
   );
 }
 
-function computeStats(stacks: AppStack[]): OverviewStats {
+function computeStats(stacks: AppStack[], nets: NetworkIndex): OverviewStats {
   const stats: OverviewStats = {
     stacks: stacks.length,
     services: 0,
@@ -551,7 +594,16 @@ function computeStats(stacks: AppStack[]): OverviewStats {
     declaredAuthProtected: 0,
     exposureAccepted: 0,
     declarationDrift: 0,
+    networks: nets.byName.size,
+    connectingNetworks: 0,
+    crossStackNetworks: 0,
+    soloLocalNetworks: 0,
   };
+  for (const net of nets.byName.values()) {
+    if (net.members.length >= 2) stats.connectingNetworks++;
+    else if (net.scope === "stack-local") stats.soloLocalNetworks++;
+    if (net.stacks.length >= 2) stats.crossStackNetworks++;
+  }
   for (const stack of stacks) {
     for (const svc of stack.services) {
       stats.services++;

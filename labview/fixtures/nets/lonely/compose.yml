@@ -1,0 +1,22 @@
+# Two networks with exactly one scanned service on each, which the graph must treat
+# differently:
+#
+#  - `outside` is external, so something this scan cannot see may be on it. That is a real
+#    statement about what the service can reach, and the node is kept.
+#  - `island` is this stack's own, so only this stack's services could ever join it and
+#    none has. It connects nothing and is left out of the graph — counted, not drawn.
+services:
+  edge-facing:
+    image: alpine:3.20
+    networks:
+      - outside
+
+  islanded:
+    image: alpine:3.20
+    networks:
+      - island
+
+networks:
+  outside:
+    external: true
+  island:

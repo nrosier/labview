@@ -1,15 +1,26 @@
-import type { AppStack, Service } from "../model";
+import type { AppStack, Service, ServiceConnections } from "../model";
 import { primaryIngress } from "../model";
 import { resolveVar, ingressVar } from "./palette";
 
 /**
  * Build a Mermaid `flowchart` definition for a single service, showing how it is
  * reached (Cloudflare / Traefik), what protects it (Authentik / basic auth),
- * which networks it joins, which named volumes / shared binds it uses, and what
- * it depends on. Colors are resolved from the live CSS palette so the diagram
- * matches the current theme (the component re-renders on theme change).
+ * which networks it joins **and who else is on them**, which named volumes / shared binds
+ * it uses, and what it depends on. Colors are resolved from the live CSS palette so the
+ * diagram matches the current theme (the component re-renders on theme change).
+ *
+ * Networks and dependencies are one block, not two. A network is drawn with the services
+ * it joins on the far side of it, and a dependency is drawn as the path it travels —
+ * `svc ==> net ==> peer` — so the network sits between the two services rather than
+ * dangling off one of them while a separate arrow connects them directly. Direction is
+ * the entire encoding, as in the fleet graph: no leg touching a network node is labelled,
+ * because any wording for it would describe the network as the party to the relation.
+ *
+ * @param conn what the graph says this service is connected to, from
+ * `serviceConnections()`. Peers are already capped there; `conn.direct` holds the
+ * dependencies no network carries, which are the only ones still drawn service-to-service.
  */
-export function buildServiceMermaid(svc: Service, stack: AppStack): string {
+export function buildServiceMermaid(svc: Service, stack: AppStack, conn: ServiceConnections): string {
   const lines: string[] = ["flowchart LR"];
   let n = 0;
   const ids = new Map<string, string>();
@@ -123,12 +134,53 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
     lines.push(`  ${svcId} -.->|"${esc(svc.auth.method)}"| ${ak}`);
   }
 
-  // Networks
-  for (const net of svc.networks) {
-    const nid = id(`net:${net}`);
-    lines.push(`  ${nid}(["net: ${esc(net)}"])`);
-    lines.push(`  class ${nid} net`);
-    lines.push(`  ${svcId} --- ${nid}`);
+  // Networks, and through them the services on the other side. Real docker names, so a
+  // stack-local network and an `external:` one shared by six stacks are told apart —
+  // by name, by the counts in the label and by the classDef.
+  // A peer can sit on two of this service's networks; it is one node with two legs.
+  const definedPeers = new Set<string>();
+  const peerNode = (key: string, label: string, cls: string): string => {
+    const nid = id(key);
+    if (!definedPeers.has(key)) {
+      definedPeers.add(key);
+      lines.push(`  ${nid}("${esc(label)}")`);
+      lines.push(`  class ${nid} ${cls}`);
+    }
+    return nid;
+  };
+  for (const link of conn.links) {
+    const nid = id(`net:${link.name}`);
+    const counts = [`${link.memberCount} ${link.memberCount === 1 ? "service" : "services"}`];
+    if (link.stackCount >= 2) counts.push(`${link.stackCount} stacks`);
+    lines.push(`  ${nid}(["net: ${esc(link.name)} · ${counts.join(" · ")}"])`);
+    lines.push(`  class ${nid} ${link.scope === "stack-local" ? "netlocal" : "net"}`);
+
+    // The leg to this service, directed by what crosses the network: away from it where
+    // it is the dependent, towards it where something on the network needs it, both ways
+    // where both are true, and undirected where the network only makes them reachable.
+    const out = link.peers.some((p) => p.relation === "depends-on");
+    const inn = link.peers.some((p) => p.relation === "required-by");
+    edge(out && inn ? `  ${svcId} <==> ${nid}` : out ? `  ${svcId} ==> ${nid}` : inn ? `  ${nid} ==> ${svcId}` : `  ${svcId} --- ${nid}`);
+
+    for (const p of link.peers) {
+      const label = p.stack === stack.id ? p.service : `${p.stack}/${p.service}`;
+      const pid = peerNode(`peer:${p.id}`, label, "dep");
+      edge(
+        p.relation === "depends-on"
+          ? `  ${nid} ==> ${pid}`
+          : p.relation === "required-by"
+            ? `  ${pid} ==> ${nid}`
+            : `  ${nid} --- ${pid}`,
+      );
+    }
+    // What the cap left out, said rather than dropped: a network shared by fifty
+    // services must not silently look like one shared by eight.
+    if (link.omitted > 0) {
+      const mid = id(`more:${link.name}`);
+      lines.push(`  ${mid}(["+${link.omitted} more services"])`);
+      lines.push(`  class ${mid} more`);
+      edge(`  ${nid} --- ${mid}`);
+    }
   }
 
   // Named volumes + binds
@@ -141,13 +193,13 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
     lines.push(`  ${svcId} --> ${vid}`);
   }
 
-  // depends_on — always define the target node so it renders with a label
-  // (a bare edge reference would render as the raw node id).
-  for (const dep of svc.dependsOn) {
-    const did = id(`dep:${dep}`);
-    lines.push(`  ${did}("${esc(dep)}")`);
-    lines.push(`  class ${did} dep`);
-    lines.push(`  ${svcId} -->|"depends on"| ${did}`);
+  // depends_on that no network carries — the only dependency still drawn as a line
+  // straight between two services, because there is no network to draw it through.
+  // Dotted and labelled with what that means: docker orders the two containers, and
+  // neither can reach the other. Everything else is above, routed through its network.
+  for (const dep of conn.direct) {
+    const did = peerNode(`peer:${dep.id}`, dep.service, "dep");
+    edge(`  ${svcId} -. "depends on, no shared network" .-> ${did}`);
   }
 
   // classDefs resolved from the live palette
@@ -162,7 +214,13 @@ export function buildServiceMermaid(svc: Service, stack: AppStack): string {
   lines.push(`  classDef tf ${styleFor(resolveVar("--hub-traefik"))}`);
   lines.push(`  classDef auth ${styleFor(resolveVar("--hub-auth"))}`);
   lines.push(`  classDef net fill:${surface},stroke:${resolveVar("--node-network")},color:${ink},stroke-width:1.5px`);
+  // A stack-local network reads as the weaker boundary it is — dashed here and in the
+  // fleet graph — since only this stack's own services can ever join it.
+  lines.push(
+    `  classDef netlocal fill:${surface},stroke:${resolveVar("--node-network")},color:${ink},stroke-width:1.5px,stroke-dasharray: 4 3`,
+  );
   lines.push(`  classDef vol fill:${surface},stroke:${resolveVar("--node-volume")},color:${ink},stroke-width:1.5px`);
   lines.push(`  classDef dep fill:${surface},stroke:${border},color:${ink},stroke-width:1px`);
+  lines.push(`  classDef more fill:${surface},stroke:${border},color:${resolveVar("--muted")},stroke-width:1px,stroke-dasharray: 3 3`);
   return lines.join("\n");
 }

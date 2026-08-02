@@ -1,23 +1,43 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import cytoscape from "cytoscape";
 import type { Core, ElementDefinition, NodeSingular } from "cytoscape";
-import type { Graph } from "../model";
-import { INGRESS_META, isDarkTheme, resolveVar } from "../lib/palette";
+import type { Graph, GraphEdge } from "../model";
+import {
+  NETWORK_SCOPES,
+  networkNodeLabel,
+  showsDirectDependency,
+  showsNetworkNode,
+  visibleSpokes,
+} from "../model";
+import { INGRESS_META, ingressLabel, isDarkTheme, resolveVar } from "../lib/palette";
 
 /**
  * Full relationship graph. Service nodes are colored by ingress exposure and
  * shaped by kind; networks, volumes and the Cloudflare/Traefik/Authentik hubs
  * are distinct shapes so the topology reads at a glance. Clicking a service
  * opens its detail drawer.
+ *
+ * Two services that share a network are connected *through* it: the network sits in the
+ * middle and the arrowheads sit on the two membership edges either side, so following
+ * them reads dependent → network → dependency. A line straight between two services
+ * appears only where they share no network at all — see `showsDirectDependency`.
+ *
+ * What gets drawn is not decided here. `showsNetworkNode`, `visibleSpokes` and
+ * `networkNodeLabel` are pure functions in `model/networks.ts`, which is what makes the
+ * cap and the visibility rule assertable and keeps this view and the Networks section
+ * showing the same set of networks.
  */
 export function GraphView({
   graph,
   themeKey,
   onOpenService,
+  onOpenNetwork,
 }: {
   graph: Graph;
   themeKey: string;
   onOpenService: (stackId: string, serviceName: string) => void;
+  /** Reveal a network's row in the Networks section, which names every member. */
+  onOpenNetwork?: (name: string) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | null>(null);
@@ -52,9 +72,41 @@ export function GraphView({
       auth: resolveVar("--hub-auth"),
     };
 
+    // Membership edges per network, so each network's spokes can be capped as a set —
+    // and so a network node whose spokes are all dropped drops with them.
+    const spokesByNet = new Map<string, GraphEdge[]>();
+    for (const e of graph.edges) {
+      if (e.kind !== "network") continue;
+      const list = spokesByNet.get(e.target);
+      if (list) list.push(e);
+      else spokesByNet.set(e.target, [e]);
+    }
+
+    const nodes: ElementDefinition[] = [];
+    const spokeEdges: ElementDefinition[] = [];
+    for (const n of graph.nodes) {
+      if (n.kind !== "network") {
+        nodes.push({ data: { ...n } });
+        continue;
+      }
+      if (!showsNetworkNode(n)) continue;
+      const { kept } = visibleSpokes(spokesByNet.get(n.id) ?? []);
+      // `drawn` is the spoke count, not the member count: the label has to report what
+      // the reader can see beside it, and say how many it cannot.
+      nodes.push({ data: { ...n, display: networkNodeLabel(n, kept.length) } });
+      for (const e of kept) spokeEdges.push({ data: { ...e } });
+    }
+
+    const shown = new Set(nodes.map((n) => String((n.data as { id: string }).id)));
     const elements: ElementDefinition[] = [
-      ...graph.nodes.map((n) => ({ data: { ...n } })),
-      ...graph.edges.map((e) => ({ data: { ...e } })),
+      ...nodes,
+      ...spokeEdges,
+      // Everything else, minus the dependencies now drawn through a network and anything
+      // pointing at a network that was dropped.
+      ...graph.edges
+        .filter((e) => e.kind !== "network" && showsDirectDependency(e))
+        .filter((e) => shown.has(e.source) && shown.has(e.target))
+        .map((e) => ({ data: { ...e } })),
     ];
 
     const cy = cytoscape({
@@ -103,12 +155,22 @@ export function GraphView({
         {
           selector: 'node[kind = "network"]',
           style: {
+            // The counts belong on the node: its spokes are capped, so a reader counting
+            // lines would be reading a number that is not there.
+            label: "data(display)",
             shape: "round-rectangle",
             "background-color": c.surface,
             "border-color": resolveVar("--node-network"),
             "border-width": 2,
             color: c.ink,
           },
+        },
+        {
+          // A stack-local network can only ever carry one stack's own services, so it is
+          // drawn as the weaker boundary it is — dashed against the solid border of an
+          // external one, which anything outside the scan may also be on.
+          selector: 'node[scope = "stack-local"]',
+          style: { "border-style": "dashed" },
         },
         {
           selector: 'node[kind = "volume"]',
@@ -141,11 +203,41 @@ export function GraphView({
           },
         },
         {
+          // Only survives where the pair shares no network — compose orders their
+          // startup, but neither can address the other. Drawn as the oddity it is.
           selector: 'edge[kind = "depends_on"]',
           style: {
             "target-arrow-shape": "triangle",
             "target-arrow-color": edgeColor.depends_on!,
             "line-style": "dashed",
+          },
+        },
+        {
+          // A membership edge carrying a dependency: same colour as the direct edge it
+          // replaces, and full opacity, so the path dependent → network → dependency
+          // stands out from the plain membership lines around it.
+          selector: "edge[flow]",
+          style: {
+            "line-color": edgeColor.depends_on!,
+            "arrow-scale": 0.9,
+            width: 1.8,
+            opacity: 1,
+          },
+        },
+        {
+          // Arrowhead at the network end: this service depends on something else on it.
+          selector: 'edge[flow = "to-network"], edge[flow = "both"]',
+          style: {
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": edgeColor.depends_on!,
+          },
+        },
+        {
+          // Arrowhead at the service end: something else on the network depends on it.
+          selector: 'edge[flow = "to-service"], edge[flow = "both"]',
+          style: {
+            "source-arrow-shape": "triangle",
+            "source-arrow-color": edgeColor.depends_on!,
           },
         },
         {
@@ -181,6 +273,13 @@ export function GraphView({
       if (stackId && label) onOpenService(stackId, label);
     });
 
+    // A network node answers "who else is on this", which the capped spokes beside it
+    // cannot. Tapping it goes to the row that names every member.
+    cy.on("tap", 'node[kind = "network"]', (evt) => {
+      const name = (evt.target as NodeSingular).data("label");
+      if (name) onOpenNetwork?.(name);
+    });
+
     cyRef.current = cy;
     return () => {
       cy.destroy();
@@ -206,6 +305,13 @@ export function GraphView({
 
   const dark = isDarkTheme();
   const swatch = (v: string, cls = "") => <span class={`swatch ${cls}`} style={`background:var(${v})`} />;
+  /** A network, drawn as the node is: outlined, and dashed when only one stack can join it. */
+  const netSwatch = (dashed: boolean) => (
+    <span
+      class="swatch"
+      style={`background:var(--surface);border:1.5px ${dashed ? "dashed" : "solid"} var(--node-network)`}
+    />
+  );
 
   return (
     <div class="graph-panel">
@@ -230,12 +336,23 @@ export function GraphView({
         </button>
         <div class="spacer" style="flex:1" />
         <div class="graph-legend" aria-hidden={dark ? "false" : "false"}>
-          <span class="item">{swatch("--ing-public", "round")} public</span>
-          <span class="item">{swatch("--ing-local", "round")} local</span>
-          <span class="item">{swatch("--ing-hostport", "round")} host port</span>
-          <span class="item">{swatch("--ing-internal", "round")} internal</span>
+          {/* Derived from INGRESS_META, like the node colours themselves — a legend with
+              its own list of kinds drifts from the graph the moment one is added or
+              renamed, and did. */}
+          {INGRESS_META.map((m) => (
+            <span class="item" key={m.key}>
+              {swatch(m.cssVar, "round")} {ingressLabel(m.key).toLowerCase()}
+            </span>
+          ))}
           <span class="item">{swatch("--hub-traefik", "round")} proxy hop</span>
-          <span class="item">{swatch("--node-network")} network</span>
+          {NETWORK_SCOPES.map((s) => (
+            <span class="item" key={s.key} title={s.title}>
+              {netSwatch(s.key === "stack-local")} {s.label.toLowerCase()} network
+            </span>
+          ))}
+          <span class="item" title="A dependency drawn through the network that carries it: the arrowhead points from the dependent towards the network, and on again to the service it needs.">
+            {swatch("--c8")} dependency
+          </span>
           <span class="item">{swatch("--node-volume", "diamond")} volume</span>
           <span class="item">{swatch("--hub-auth", "diamond")} hub</span>
         </div>

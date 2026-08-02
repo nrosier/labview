@@ -5,6 +5,10 @@
  *
  *   ./fixtures/apps      — a representative happy-path fleet.
  *   ./fixtures/edge      — regression cases for previously-fixed defects.
+ *   ./fixtures/nets      — services connected to each other through shared networks: one
+ *                          `external:` network across three stacks, a stack-local one
+ *                          carrying dependencies, a dependency with no network to travel
+ *                          over, and the two kinds of single-service network.
  *   ./fixtures/authentik — the identity-provider API integration, driven through an
  *                          injected HTTP layer so no network and no Authentik is
  *                          needed. Canned responses: ./fixtures/authentik-api.json.
@@ -41,6 +45,7 @@ import type { SessionCheck } from "../src/auth/session.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const appsRoot = resolve(here, "..", "fixtures", "apps");
 const edgeRoot = resolve(here, "..", "fixtures", "edge");
+const netsRoot = resolve(here, "..", "fixtures", "nets");
 const authentikRoot = resolve(here, "..", "fixtures", "authentik");
 const traefikRoot = resolve(here, "..", "fixtures", "traefik");
 // Not a fleet: three passwd files for LabView's own login. They are files rather than
@@ -118,6 +123,25 @@ const {
 } = await import("../src/model/declarations.js");
 const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress, rollUpIngress } =
   await import("../src/model/ingress.js");
+// How connected services are drawn. In `src/` so the two caps and the visibility rule are
+// assertable at all: they decide what a reader is shown about which services can reach
+// each other, and a rule that only exists inside a `.tsx` cannot be caught getting it
+// wrong. The caps are exercised against synthetic elements below — a rule that only fires
+// past twelve spokes should not need a twelve-service fixture to prove.
+const {
+  MAX_DRAWER_PEERS,
+  MAX_GRAPH_SPOKES,
+  graphServiceId,
+  hiddenNetworksNote,
+  networkGroups,
+  networkLinks,
+  networkNodeLabel,
+  peerlessNetworkText,
+  serviceConnections,
+  showsDirectDependency,
+  showsNetworkNode,
+  visibleSpokes,
+} = await import("../src/model/networks.js");
 // When the absence of an authentication mechanism may be reported at all. In `src/` for
 // the same reason as the two above, and asserted here because the alternative is a
 // dashboard that says "No proxy auth" about every internal database and gets believed.
@@ -570,6 +594,42 @@ check("cloudflare hub node exists", ov.graph.nodes.some((n) => n.id === "ext:clo
 check("authentik hub node exists", ov.graph.nodes.some((n) => n.id === "ext:authentik"));
 const dependsEdges = ov.graph.edges.filter((e) => e.kind === "depends_on");
 check("authentik depends_on edges present", dependsEdges.length >= 2, String(dependsEdges.length));
+// ...and every one of them is expressed *through* the network the pair shares, not as a
+// line beside it. This used to assert only that the edges existed; the stronger statement
+// about the same fixture is that each names the network it travels over, that the network
+// therefore does not need a direct arrow drawn, and that both membership legs carry the
+// arrowhead which makes the path dependent -> network -> dependency readable.
+check(
+  "every depends_on in this fleet names the network it travels over",
+  dependsEdges.every((e) => (e.via?.length ?? 0) > 0),
+  dependsEdges.filter((e) => !e.via?.length).map((e) => e.id).join(","),
+);
+check(
+  "...so none of them is drawn as a direct service-to-service line",
+  dependsEdges.every((e) => !showsDirectDependency(e)),
+);
+check(
+  "...and both legs either side of the network carry the dependency",
+  dependsEdges.every((e) =>
+    (e.via ?? []).every(
+      (net) =>
+        ov.graph.edges.some(
+          (m) =>
+            m.kind === "network" &&
+            m.source === e.source &&
+            m.target === `net:${net}` &&
+            (m.flow === "to-network" || m.flow === "both"),
+        ) &&
+        ov.graph.edges.some(
+          (m) =>
+            m.kind === "network" &&
+            m.source === e.target &&
+            m.target === `net:${net}` &&
+            (m.flow === "to-service" || m.flow === "both"),
+        ),
+    ),
+  ),
+);
 
 /* ========================================================================== */
 /* fixtures/edge — regression cases                                           */
@@ -1561,6 +1621,245 @@ check(
   JSON.stringify(tooBig.warnings),
 );
 rmSync(bigDir, { recursive: true, force: true });
+
+/* ========================================================================== */
+/* fixtures/nets — services connected through shared networks                 */
+/* ========================================================================== */
+
+const nets = await overviewFor(netsRoot);
+const nSvc = lookup(nets);
+const netNode = (name: string) => nets.graph.nodes.find((n) => n.kind === "network" && n.label === name);
+const membership = (svc: string, net: string) =>
+  nets.graph.edges.find((e) => e.kind === "network" && e.source === svc && e.target === `net:${net}`);
+
+console.log("\n--- network connections (fixtures/nets) ---");
+
+console.log("\none external network across three stacks");
+const backup = netNode("backup");
+check("the shared network is one node, not one per stack", Boolean(backup));
+check("...named by its real docker name, so every stack means the same network", backup?.id === "net:backup");
+check("...scoped external, since several projects name it and it belongs to none", backup?.scope === "external");
+check("...counting every scanned service on it", backup?.memberCount === 3, String(backup?.memberCount));
+check("...and the stacks they come from", backup?.stackCount === 3, String(backup?.stackCount));
+// The case the whole feature exists for: the databases and the service that backs them up
+// declare nothing about each other — they are in separate compose projects, which cannot
+// express a dependency — so the shared network is the entire relationship, and a graph
+// that only drew `depends_on` would show the consumer connected to nothing.
+const agent = serviceConnections(nets.graph, graphServiceId("shared-c", "backup-agent"));
+check("the consumer's connections are found through the network", agent.links.length === 1);
+check(
+  "...naming every database on it, in other stacks",
+  agent.links[0]?.peers.map((p) => `${p.stack}/${p.service}`).join(", ") === "shared-a/db-a, shared-b/db-b",
+  JSON.stringify(agent.links[0]?.peers),
+);
+check(
+  "...as peers, since compose cannot declare a dependency across projects",
+  agent.links[0]?.peers.every((p) => p.relation === "peer") === true,
+);
+check("...and no dependency arrow is invented for them", agent.direct.length === 0);
+// Read from the other end, the same network reports the same membership. A per-service
+// view that disagreed with the fleet view about who is on a network would be worse than
+// either alone.
+const groups = networkGroups(nets.graph);
+const backupGroup = groups.find((g) => g.name === "backup");
+check(
+  "the fleet list reports the same three members",
+  backupGroup?.members.map((m) => `${m.stack}/${m.service}`).join(", ") ===
+    "shared-a/db-a, shared-b/db-b, shared-c/backup-agent",
+  JSON.stringify(backupGroup?.members),
+);
+check(
+  "...and the most-connecting network is listed first",
+  groups[0]?.name === "backup",
+  groups.map((g) => g.name).join(","),
+);
+
+console.log("\na dependency drawn through the network that carries it");
+const inner = netNode("layered_inner");
+check("the stack's own network is scoped stack-local", inner?.scope === "stack-local");
+check("...and its name is the compose project's, not the key's", inner?.id === "net:layered_inner");
+const webDep = nets.graph.edges.find(
+  (e) => e.kind === "depends_on" && e.source === "svc:layered/web" && e.target === "svc:layered/api",
+);
+check("the dependency records the network it travels over", webDep?.via?.join(",") === "layered_inner");
+check("...so it is not drawn as a line straight between the two services", !showsDirectDependency(webDep!));
+check(
+  "the dependent's leg points at the network",
+  membership("svc:layered/web", "layered_inner")?.flow === "to-network",
+  String(membership("svc:layered/web", "layered_inner")?.flow),
+);
+check(
+  "...and the dependency's leg points back out at the service",
+  membership("svc:layered/cache", "layered_inner")?.flow === "to-service",
+  String(membership("svc:layered/cache", "layered_inner")?.flow),
+);
+// Which is what makes the middle of a chain readable: api is needed by web and needs
+// cache, both over the same network, so its one leg carries an arrowhead at each end.
+check(
+  "a service at both ends of a chain carries both arrowheads on one leg",
+  membership("svc:layered/api", "layered_inner")?.flow === "both",
+  String(membership("svc:layered/api", "layered_inner")?.flow),
+);
+check(
+  "a service with no dependency either way carries no arrowhead",
+  membership("svc:layered/extra", "layered_inner")?.flow === undefined,
+  String(membership("svc:layered/extra", "layered_inner")?.flow),
+);
+// The pairing the arrowheads cannot express once two dependencies cross one network, said
+// in words instead — this is why the graph is not the only view of it.
+check(
+  "the network's row names both pairs it carries, dependent first",
+  groups
+    .find((g) => g.name === "layered_inner")
+    ?.pairs.map((p) => `${p.from.service}->${p.to.service}`)
+    .join(", ") === "web->api, api->cache",
+  JSON.stringify(groups.find((g) => g.name === "layered_inner")?.pairs),
+);
+// The drawer reads the same relations from one service's point of view, and has to tell
+// the two directions apart: api needs cache, and web needs api.
+const apiConn = serviceConnections(nets.graph, graphServiceId("layered", "api"));
+check(
+  "the drawer tells 'depends on' from 'required by' on the same network",
+  apiConn.links[0]?.peers.map((p) => `${p.service}:${p.relation}`).join(", ") ===
+    "cache:depends-on, web:required-by, extra:peer",
+  JSON.stringify(apiConn.links[0]?.peers),
+);
+
+console.log("\na dependency with no network to travel over");
+const disjoint = nets.graph.edges.find(
+  (e) => e.kind === "depends_on" && e.source === "svc:disjoint/front" && e.target === "svc:disjoint/back",
+);
+check("the pair shares no network", disjoint?.via?.length === 0, JSON.stringify(disjoint?.via));
+check("...so the direct arrow is the one drawing left, and it is kept", showsDirectDependency(disjoint!));
+check(
+  "...and the service says what that means, since a picture alone would not",
+  nSvc("disjoint", "front").notes.some(
+    (n) => n.includes("share no docker network") && n.includes("neither container can reach the other"),
+  ),
+  JSON.stringify(nSvc("disjoint", "front").notes),
+);
+check(
+  "the same dependency is reported by the drawer as direct rather than through a network",
+  serviceConnections(nets.graph, graphServiceId("disjoint", "front")).direct.map((d) => d.service).join(",") ===
+    "back",
+);
+
+console.log("\nnetworks that connect nothing");
+check("a stack-local network with one service on it is not drawn", !showsNetworkNode(netNode("lonely_island")!));
+// The other arm of the same rule, and the reason it is two arms: an external network with
+// one scanned service on it says something a stack-local one cannot — a container this
+// scan never saw may be on the other end.
+check("an external network with one service on it is drawn", showsNetworkNode(netNode("outside")!));
+check(
+  "...and says what it can and cannot see, rather than reporting it as empty",
+  peerlessNetworkText(networkLinks(nets.graph, graphServiceId("lonely", "edge-facing"))[0]!).includes(
+    "containers this scan cannot see may be",
+  ),
+);
+check(
+  "a stack-local network with nothing else on it says the opposite",
+  peerlessNetworkText({
+    id: "net:x",
+    name: "x",
+    scope: "stack-local",
+    memberCount: 1,
+    stackCount: 1,
+    peers: [],
+    omitted: 0,
+  }).includes("only this stack's own services could be"),
+);
+check(
+  "the counters split the fleet's networks into drawn and left out",
+  nets.stats.networks === 7 &&
+    nets.stats.connectingNetworks === 2 &&
+    nets.stats.crossStackNetworks === 1 &&
+    nets.stats.soloLocalNetworks === 4,
+  JSON.stringify({
+    networks: nets.stats.networks,
+    connecting: nets.stats.connectingNetworks,
+    crossStack: nets.stats.crossStackNetworks,
+    soloLocal: nets.stats.soloLocalNetworks,
+  }),
+);
+// The arithmetic that makes the omission checkable rather than a matter of trust: what the
+// graph draws plus what it leaves out is every network in the fleet.
+check(
+  "...so drawn networks plus omitted ones account for all of them",
+  nets.graph.nodes.filter((n) => n.kind === "network" && showsNetworkNode(n)).length +
+    nets.stats.soloLocalNetworks ===
+    nets.stats.networks,
+);
+check(
+  "...and the reader is told how many were left out",
+  hiddenNetworksNote(nets.stats.soloLocalNetworks) ===
+    "4 stack-local networks with a single service on them are not drawn.",
+  hiddenNetworksNote(nets.stats.soloLocalNetworks),
+);
+check("nothing is said when none was left out", hiddenNetworksNote(0) === "");
+
+console.log("\nthe caps on a network too large to draw");
+// Synthetic, on purpose: the rule fires past twelve spokes and past eight peers, and
+// proving it with fixtures would mean committing a twenty-service fleet whose only job is
+// to be big. The functions are pure, so this asserts the rule itself.
+const bigNet = { id: "net:big", label: "big", kind: "network" as const, scope: "external" as const, memberCount: 20, stackCount: 4 };
+const bigSpokes = Array.from({ length: 20 }, (_, i) => ({
+  id: `svc:s/n${i}->net:big`,
+  source: `svc:s/n${i}`,
+  target: "net:big",
+  kind: "network" as const,
+  // Two spokes carry a dependency, and they are the last two in scan order — so keeping
+  // them proves the sort rather than the slice.
+  ...(i >= 18 ? { flow: "to-network" as const } : {}),
+}));
+const cappedSpokes = visibleSpokes(bigSpokes);
+check("a network with more spokes than the cap draws exactly the cap", cappedSpokes.kept.length === MAX_GRAPH_SPOKES);
+check("...and reports the rest rather than dropping them silently", cappedSpokes.omitted === 20 - MAX_GRAPH_SPOKES);
+check(
+  "...keeping the spokes that carry a dependency, which are the ones that say anything",
+  cappedSpokes.kept.filter((e) => e.flow).length === 2,
+  String(cappedSpokes.kept.filter((e) => e.flow).length),
+);
+check("a network within the cap is drawn whole", visibleSpokes(bigSpokes.slice(0, 5)).omitted === 0);
+check(
+  "the node's own label carries the counts and the omission",
+  networkNodeLabel(bigNet, MAX_GRAPH_SPOKES) === "big\n20 services · 4 stacks · +8 not drawn",
+  networkNodeLabel(bigNet, MAX_GRAPH_SPOKES),
+);
+check(
+  "...and says nothing about an omission where there is none",
+  networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2) === "big\n2 services",
+  networkNodeLabel({ ...bigNet, memberCount: 2, stackCount: 1 }, 2),
+);
+// The drawer's cap is separate and smaller, and must never cut a dependency to make room
+// for a service that is merely reachable.
+const crowded = {
+  nodes: [
+    { id: "net:big", label: "big", kind: "network" as const, scope: "external" as const, memberCount: 12, stackCount: 1 },
+    ...Array.from({ length: 12 }, (_, i) => ({
+      id: `svc:s/n${i}`,
+      label: `n${i}`,
+      kind: "service" as const,
+      stack: "s",
+    })),
+  ],
+  edges: [
+    ...Array.from({ length: 12 }, (_, i) => ({
+      id: `svc:s/n${i}->net:big`,
+      source: `svc:s/n${i}`,
+      target: "net:big",
+      kind: "network" as const,
+    })),
+    { id: "d", source: "svc:s/n0", target: "svc:s/n11", kind: "depends_on" as const, via: ["big"] },
+  ],
+};
+const crowdedLink = networkLinks(crowded, "svc:s/n0")[0]!;
+check("the drawer caps peers too", crowdedLink.peers.length === MAX_DRAWER_PEERS);
+check("...and reports how many it left out", crowdedLink.omitted === 11 - MAX_DRAWER_PEERS);
+check(
+  "...and the dependency survives the cap, whatever its scan position",
+  crowdedLink.peers[0]?.service === "n11" && crowdedLink.peers[0]?.relation === "depends-on",
+  JSON.stringify(crowdedLink.peers[0]),
+);
 
 /* ========================================================================== */
 /* fixtures/authentik — the identity provider's own records                   */

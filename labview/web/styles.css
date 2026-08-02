@@ -614,6 +614,50 @@ table.data tr:last-child td { border-bottom: none; }
 }
 .mermaid-wrap svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
 
+/* One network and the services it connects this one to. Used in the drawer and, with
+   the members in place of the peers, in the fleet-wide Networks section — the two are
+   the same row about the same network, read from two starting points. */
+.netrow { padding: 8px 0; border-bottom: 1px solid var(--border); }
+.netrow:last-child { border-bottom: none; }
+.nethead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.nethead .muted-inline { color: var(--muted); font-size: 12px; }
+.netrow > .muted-inline { color: var(--muted); font-size: 12px; }
+.netrow .chips .muted-inline { color: var(--muted); font-size: 12px; align-self: center; }
+/* A dependency the network carries, dependent first — the pair the arrowheads in the
+   graph cannot disambiguate once more than one crosses the same network. */
+.netpair { color: var(--ink-2); font-size: 12px; margin-top: 4px; }
+.netpair .mono { color: var(--ink); }
+
+/* The fleet-wide Networks list on the overview tab. Collapsed by default: it answers a
+   question a reader arrives with, rather than one they need answered on the way past. */
+.netpanel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+}
+.netpanel-head {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 12px 14px;
+  background: none;
+  border: none;
+  font: inherit;
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+}
+.netpanel-head h3 { margin: 0; font-size: 13px; }
+.netpanel-head .caret { color: var(--muted); }
+.netpanel-head .muted-inline { color: var(--muted); font-size: 12px; }
+.netpanel-body { padding: 0 14px 12px; }
+.netpanel-body > .muted-inline { color: var(--muted); font-size: 12px; }
+/* The row a graph node was tapped to reach. */
+.netrow.marked { box-shadow: inset 3px 0 0 var(--c1); padding-left: 8px; }
+
 /* ---- Graph view ------------------------------------------------------ */
 
 .graph-panel {

@@ -1,0 +1,19 @@
+# A dependency with no network to travel over: front waits for back to start, but the two
+# are on separate networks and neither container can address the other. The one case where
+# a line straight between two services is the honest drawing, and the one worth a note.
+services:
+  front:
+    image: nginx:1.27-alpine
+    depends_on:
+      - back
+    networks:
+      - front-side
+
+  back:
+    image: postgres:16-alpine
+    networks:
+      - back-side
+
+networks:
+  front-side:
+  back-side:

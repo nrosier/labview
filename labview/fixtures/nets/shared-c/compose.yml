@@ -1,0 +1,12 @@
+# The consumer: one service that reaches every database above over the shared network.
+# It declares no dependency on them and cannot — they are in other compose projects — so
+# a graph that only drew `depends_on` would show this service connected to nothing.
+services:
+  backup-agent:
+    image: alpine:3.20
+    networks:
+      - backup
+
+networks:
+  backup:
+    external: true

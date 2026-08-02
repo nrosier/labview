@@ -56,8 +56,12 @@ live state from the Docker API, and never needs an agent inside each app.
   chain, and each backend with the health Traefik itself reports for it), the
   **derived auth posture with the evidence that led to it**, the matched
   **Authentik applications and providers** when that API was read (including which
-  outpost, if any, is actually serving each one), networks, ports, volumes,
-  environment (secrets masked), and live container state.
+  outpost, if any, is actually serving each one), **each network it is on and who else
+  is on it** — every peer named, marked where one depends on the other, each a link to
+  that service — ports, volumes, environment (secrets masked), and live container
+  state. A network with nothing else on it says which kind of nothing that is: no other
+  scanned service, on a network external to the scan, is not the same answer as a
+  network only this stack could ever join.
 - **Relationship graph** — an interactive [cytoscape](https://js.cytoscape.org/)
   graph of the whole fleet: services colored by exposure, plus network, volume,
   and tunnel / proxy / SSO hub nodes, connected by network membership,
@@ -68,6 +72,28 @@ live state from the Docker API, and never needs an agent inside each app.
   describes: where a route's origin resolves to another service, that service is
   drawn as the hop (`tunnel → proxy → service`) and highlighted as the
   infrastructure it was observed to be.
+
+  **Services are connected *through* their networks, with the network drawn in
+  between.** A network is not a label hanging off one service, and a dependency is not
+  a line straight between two containers — both hide half the answer. So an
+  `external:` network shared by several stacks is **one** node with a spoke from every
+  service on it, labelled with how many services and stacks it joins, and a `depends_on`
+  is drawn as arrowheads on the two spokes either side of the network that carries it:
+  `web ──▶ (net: app_inner) ──▶ api`. A row of databases in separate stacks and the one
+  service that backs them all up declare nothing about each other — compose cannot
+  express that across projects — and they still show up joined, because the network they
+  share is the relationship. Where a `depends_on` pair shares *no* network
+  the direct line is kept and the service says why: docker orders the startup, but
+  neither container can reach the other. Networks that connect nothing are counted
+  rather than drawn, and a network with more members than fits states how many spokes
+  it left out.
+- **Networks** — one collapsible row per network that connects something, on the
+  overview: its scope (external, or created by one stack), how many services and stacks
+  it joins, every service on it as a chip that opens that service's drawer, and each
+  dependency it carries written out — `web depends on api over this network`. This is
+  the list answer to "who else is on this network", which no graph layout answers well,
+  and it is what disambiguates a busy hub the arrowheads alone cannot. Clicking a
+  network node in the graph jumps to its row.
 - **Integration panel** — the `authentik: 13 apps · 9 matched` and
   `traefik: 10 routers · 8 matched` counts in the topbar are buttons, because a count
   states an outcome and hides the two questions behind it. Click one for the whole
@@ -123,6 +149,12 @@ Just want a one-shot report on the terminal (no server)?
 ```bash
 LABVIEW_APPS_ROOT=/path/to/your/apps npm run scan -- --summary
 ```
+
+That digest counts the stacks and services it found, what is reachable and from where,
+and the outcome of each optional API read. Its `networks:` line counts every real docker
+network, then how many of them carry two or more services and how many span two or more
+stacks — the difference between a fleet full of networks and a fleet where networks
+connect things. Without `--summary` the same scan prints the whole `Overview` as JSON.
 
 Live-reloading development:
 
@@ -756,6 +788,16 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
 
   `network_mode: host` is not modelled (it is not parsed either), so a
   host-networked service is classified from its routes and `ports:` alone.
+- **What connects two services is the network between them, so that is what is drawn.**
+  The same resolved network names build one fleet-wide membership index — who is on which
+  network, from which stacks, and whether any stack declared it `external:` — and that
+  index is what the `internal` tag, the graph's network nodes and the Networks list all
+  read, so they cannot come to disagree. On top of it, one further question is asked per
+  service and per network: does a `depends_on` involving this service have its other end
+  on *this* network? Where it does, the dependency is drawn as arrowheads along the path
+  through the network instead of as a separate line, and the pair is named in words. Where
+  a `depends_on` pair shares no network at all, that is reported rather than smoothed
+  over: compose orders their startup, yet neither container can address the other.
 - **Auth posture** resolves to one of `authentik-forward-auth`,
   `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`,
   `basic-auth`, or `none`, each with the evidence that produced it.
@@ -1247,6 +1289,18 @@ many of those were rebuilt) — and each application carries `discoveredVia`, `"
 `"provider"`, naming the read that produced it. Leaving `applications` alone would have
 kept a headline number that under-reports, which is the defect these fields exist to fix.
 
+**The network connections are additive, and the payload is not pre-pruned.** Every
+`network` node carries `scope` (`external` | `stack-local`), `memberCount` and
+`stackCount`; every membership edge carries `flow` (`to-network` | `to-service` | `both`,
+absent for plain membership) saying where the dependency arrowhead sits; every
+`depends_on` edge carries `via`, the real networks the pair shares — empty meaning
+compose orders their startup while neither can address the other. `stats` gains
+`networks`, `connectingNetworks`, `crossStackNetworks` and `soloLocalNetworks`. Nothing
+was removed: the `depends_on` edges are all still there, `via` and all, so a consumer
+that drew them directly keeps working. The caps and the "don't draw a network that
+connects nothing" rule are applied by the *views*, not by the API — `soloLocalNetworks`
+is exactly what the graph tab omits, which is how you can tell the two apart.
+
 `GET /api/overview` is served from a cache for `LABVIEW_CACHE_TTL` seconds.
 `POST /api/rescan` ignores the cache and is answered only by a scan that started
 **after** the request arrived — so a rescan issued a second after you save a file can
@@ -1269,17 +1323,19 @@ decision log explaining why the non-obvious choices are what they are.
 src/
   scan/       discover + compose/.env parsing
   labels/     dockflare, traefik, auth derivation
-  analyze/    two-pass pipeline, middleware registry, graph, stats
+  analyze/    two-pass pipeline, middleware registry, network index, graph, stats
   enrich/     docker snapshot (dockerode) + authentik and traefik API clients
               over a shared http.ts (fetch, timeouts, injectable fetchImpl)
   model/      types.ts — the shared backend⇄frontend contract
               changes.ts — what moved between two scans, and its wording
+              networks.ts — which network connections are drawn, and their wording
   server/     fastify server + static hosting, scan cache and force semantics
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
   authentik/  a fleet with an identity provider in it
+  nets/       stacks joined by shared networks: cross-stack, stack-local, disjoint
   authentik-api.json   canned API responses for the above
   traefik/    a fleet whose labels and live proxy config disagree
   traefik-api.json     canned proxy + identity responses for the above
@@ -1382,6 +1438,22 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 - Traefik middlewares defined in a dynamic config **file** rather than in labels
   are invisible to the scan — a reference to one resolves to nothing, which is why
   the name-based fallback and the `inferred` confidence exist.
+- **A network's peers are the ones this scan can see.** An `external:` network can carry
+  containers from outside the apps root, and nothing in a compose file names them — so a
+  network node reports its scope and its *scanned* member count, and one with a single
+  visible member says which kind of nothing is on the other end rather than reading as
+  empty. Sharing a network also means reachable in principle, never that anything is
+  listening; that is what ports and `expose:` answer.
+- **A busy network node cannot show which arrow pairs with which.** The arrowheads belong
+  to a service, not to a pair, so a network carrying two dependencies draws four of them.
+  The Networks list writes every pair out in words for exactly that reason, and the drawer
+  separates "depends on" from "required by" per peer.
+- **A large network is summarised, not drawn whole.** The graph draws at most 12 spokes
+  per network, the drawer names at most 8 peers and the Networks list 12 chips; each says
+  how many it left out, and the drawer reads the unpruned data so nothing is unreachable.
+  A monitoring network with forty members is a count plus a list rather than forty lines —
+  deliberately, since forty lines is what makes the small, informative networks
+  impossible to find.
 - **No filesystem watcher.** A compose or `.env` edit is picked up by the next scan —
   the `LABVIEW_CACHE_TTL` refresh, or Rescan — not the moment you save it. Rescan
   stays an explicit action; nothing auto-refreshes the page.

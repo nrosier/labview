@@ -24,6 +24,15 @@ if (summary) {
     for (const line of formatConnection(r)) console.log(`  ${line}`);
   }
   console.log(`  stacks/services:  ${stats.stacks}/${stats.services}  (running: ${stats.running})`);
+  // What connects those services to each other. The two qualified counts are the ones
+  // that carry information — a network with a single service on it joins nothing, and
+  // most of a fleet's networks are exactly that — so the total is printed beside them
+  // rather than alone, where it would read as 52 connections.
+  const verb = (n: number, plural: string) => `${n} ${plural}${n === 1 ? "s" : ""}`;
+  console.log(
+    `  networks:         ${stats.networks}  (${verb(stats.connectingNetworks, "connect")} 2+ services,` +
+      ` ${verb(stats.crossStackNetworks, "span")} 2+ stacks)`,
+  );
   // The five ingress kinds, each counted independently. The first three **overlap** — a
   // service behind the tunnel and the proxy is in both counts — so the line does not sum
   // to `services` and says so rather than leaving a reader to add it up and doubt the

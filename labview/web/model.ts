@@ -37,6 +37,7 @@ export type {
   UnmatchedRouter,
   DockerState,
   NetworkDecl,
+  NetworkScope,
   VolumeDecl,
   Graph,
   GraphNode,
@@ -97,6 +98,45 @@ export {
   primaryIngress,
   rollUpIngress,
 } from "../src/model/ingress";
+
+/**
+ * How services connected by a shared network are drawn and worded.
+ *
+ * In `src/` for the reason every rule here is a rule and not a rendering detail: which
+ * network nodes are worth drawing, how many spokes one may have, when a dependency is
+ * drawn straight between two services instead of through the network that carries it, and
+ * who counts as a peer. The fleet graph, the drawer diagram and the Networks section all
+ * read the same complete graph through these functions, so none of them can claim a
+ * connection the others do not.
+ */
+export {
+  MAX_DRAWER_PEERS,
+  MAX_GRAPH_SPOKES,
+  MAX_LIST_PEERS,
+  NETWORK_SCOPES,
+  graphServiceId,
+  hiddenNetworksNote,
+  networkGroups,
+  networkLinks,
+  networkNodeLabel,
+  networkScopeMeta,
+  peerlessNetworkText,
+  relationLabel,
+  serviceConnections,
+  showsDirectDependency,
+  showsNetworkNode,
+  visibleSpokes,
+} from "../src/model/networks";
+export type {
+  NetworkGroup,
+  NetworkLink,
+  NetworkPeerView,
+  NetworkRelation,
+  NetworkScopeMeta,
+  ServiceConnections,
+  ServiceRefView,
+  SpokeSelection,
+} from "../src/model/networks";
 
 /**
  * When the absence of an authentication mechanism may be reported, and how it is worded.

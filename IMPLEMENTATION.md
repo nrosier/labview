@@ -99,6 +99,7 @@ labview/
     model/changes.ts  what changed between two scans, and its wording (pure)
     model/access.ts   access-control vocabulary: posture line, failure text, username rule (pure, web-safe)
     model/auth.ts     when a missing gate may be reported at all, and its wording (pure, web-safe)
+    model/networks.ts which network nodes are drawn, the spoke/peer caps, peer wording (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
       discover.ts     appsRoot -> stack directories
@@ -114,7 +115,7 @@ labview/
       origins.ts      cross-stack tunnel-origin resolution (what an origin points at)
       authentik.ts    cross-stack matching of identity-provider applications to services
       traefik.ts      cross-stack matching of live proxy routers to services + its notes
-      networks.ts     real docker network names for a service (shared by graph + origins)
+      networks.ts     real docker network names + the fleet membership index (graph, origins, stats)
       index.ts        the pipeline; ingress classification; stats
       graph.ts        nodes/edges for the relationship graph
     enrich/
@@ -140,6 +141,7 @@ labview/
     apps/             a representative happy-path fleet
     edge/             one stack per previously-fixed defect
     authentik/        a fleet with an identity provider in it
+    nets/             stacks joined by shared networks: cross-stack, stack-local, disjoint
     authentik-api.json  canned API responses driven through an injected fetch
     traefik/          a fleet whose labels and live proxy config disagree
     traefik-api.json    canned proxy + identity responses, same injected fetch
@@ -169,7 +171,7 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 10. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
 | 11. Live router matching | `analyze/traefik.ts` | `svc.traefikLive` — which live routers belong to which service, and which matched nothing |
 | 12. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
-| 13. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs |
+| 13. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs — with every dependency tied to the network it travels over |
 | 14. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
 **Why two passes.** Steps 5b–11 cannot run per-service inside step 5. Six
@@ -193,7 +195,10 @@ conclusions are only available once the *whole* fleet is parsed:
    them shares a real network with this one — so it needs every service's networks
    counted before any service is classified, and it needs the live names pass 1 has
    only just attached (step 5b, after 5 and before the graph). A service classified
-   mid-loop would be judged against a half-built fleet.
+   mid-loop would be judged against a half-built fleet. The `NetworkIndex` built there
+   is the same one the graph draws its network nodes and their counts from, so the
+   `internal` rule and the connections on screen are provably one relation rather than
+   two implementations of it (§5).
 
 A change that needs fleet-wide knowledge belongs in a new pass or in step 4/9,
 not in a per-service function reaching for global state.
@@ -634,6 +639,17 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   components it would be unfalsifiable and would drift. Not to be confused with
   `model/access.ts` beside it — that is LabView's own login, this is what was found in
   front of somebody else's service.
+- [model/networks.ts](labview/src/model/networks.ts) is web-safe for the same reason and
+  draws a line worth stating outright: **the analyzer emits the complete truth, the model
+  decides what is drawn.** `buildGraph` puts every network, every spoke, every dependency
+  and every network that dependency can travel over into the payload; which network nodes
+  are worth drawing, how many spokes and peers fit, and how a relation is worded are pure
+  functions here. Three consequences. A JSON consumer gets the whole membership relation
+  and is not silently pre-pruned. The fleet graph and the fleet Networks section contain
+  the same networks *by construction*, because both filter through `showsNetworkNode`.
+  And every cap and every rule is asserted directly in smoke — including against
+  synthetic nodes far larger than any fixture (§8) — rather than living in a `.tsx` where
+  it could not be falsified.
 - Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
   **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
   a colour and a label, and an unmapped member silently renders grey. For
@@ -749,6 +765,55 @@ lookups fail soft — `ingressVar` returns `--muted` for an unmapped kind, and
 `resolveVar` returns `#888888` for a property the stylesheet never defines. A
 variable renamed in one file only therefore turns grey rather than erroring, so
 smoke asserts the two files agree (§8).
+
+**The relationship graph connects services *through* networks.** A network drawn hanging
+off one service says nothing about what that service can reach, and a line drawn straight
+between two services hides the thing that joins them. So there is one shape —
+`service → network → service`, the network in the middle — and a dependency is expressed by
+**where the arrowheads sit on the membership edges it uses**:
+
+```
+   web ──▶ (net: layered_inner) ──▶ api          web depends_on api, both on layered_inner
+              4 services
+
+   db-a ─┐
+   db-b ─┼── (net: backup) ────── backup-agent   databases + the service that backs them
+         ┘    3 services · 3 stacks              up: no depends_on, plain lines, mutually
+                                                 reachable
+```
+
+Following the arrows reads dependent → network → dependency, and a service in the middle of
+a chain carries one leg with an arrowhead at each end. The direct service→service edge
+survives only where the pair shares no network at all (`via` empty) — the one case where
+there is no network to route through, and one worth seeing. Because `external:` networks
+are keyed by their **real** docker name, a network shared by six stacks is genuinely one
+node with six spokes, which is what makes the cross-stack case visible at all; compose
+cannot declare a dependency across projects, so there those connections are peers.
+
+Three views read the same graph through the same functions, so they cannot disagree:
+
+- **The fleet graph** ([GraphView.tsx](labview/web/components/GraphView.tsx)) filters
+  through `showsNetworkNode` and `visibleSpokes` and labels nodes with
+  `networkNodeLabel`, so a network joining fifty services is one node stating its counts
+  and how many spokes it did not draw rather than a hairball. Network nodes are tappable
+  and reveal that network's row in the Networks section instead of opening a drawer.
+  Stack-local nodes are dashed; `edge[flow]` carries the dependency colour and its
+  arrowheads. No edge labels — cytoscape renders none, and direction plus node labels
+  carry it.
+- **The Networks section** ([NetworksSection.tsx](labview/web/components/NetworksSection.tsx))
+  on the overview is the direct answer to "show me every service on this network": one
+  collapsible row per network, sorted by stacks joined then services joined, its members as
+  chips that open their drawers, and one line per dependency the network carries — which is
+  what resolves the arrowhead ambiguity the picture has once a hub carries two dependencies
+  (§11). It states how many single-service stack-local networks it is not listing.
+- **The service drawer** reads `serviceConnections` off the **unpruned** graph, so it lists
+  every peer of a network the fleet view capped. Its mermaid diagram draws the same
+  `svc ─ net ─ peer` shape, and no leg touching a network node is labelled: any wording
+  would make the network a party to the relation, so direction is the entire encoding.
+  Beside it, one HTML row per network — real name, scope pill, counts, peer chips carrying
+  their relation — and for a network with no other scanned service on it,
+  `peerlessNetworkText`, which says different things per scope because "nothing else is on
+  it" is only true of a stack-local one.
 
 **Integration panels.** The topbar states each API integration as a count —
 `authentik: 13 apps · 9 matched` — which is an outcome with two questions behind it:
@@ -1645,6 +1710,65 @@ definition of "someone outside the container network can answer" — used by bot
 note to the kinds that make it reachable, and `diffIngress` reports a sidecar
 disagreement in both directions.
 
+**NetworkIndex / NetworkMembership** — the one fleet-wide membership index, built once
+over `realNetworks` in [analyze/networks.ts](labview/src/analyze/networks.ts):
+`byName` gives each real network its `members` (`stack/service`, scan order), the
+distinct `stacks` among them and whether any stack declares it `external:`; `byService`
+gives the reverse. The same relation used to be computed three times — `sharedNetworks`,
+`FleetIndex.netsByKey` and the graph's own map — so all three now read this, which is
+what makes the `internal` ingress rule and the connections the graph draws provably the
+same relation. Passed as an optional trailing argument to `buildFleetIndex` and
+`buildGraph`; both still build their own when called without one.
+
+**NetworkScope** — `external | stack-local`, on a `network` graph node. Not a severity:
+it says who *can* be on the network. A `stack-local` network is created by one compose
+project, so only that project's services can ever join it; an `external:` one can carry
+several stacks, and containers this scan never saw. It is the reason a single-member
+network is sometimes worth drawing and sometimes not (§12), and both scopes' wording
+lives in `NETWORK_SCOPES` in [model/networks.ts](labview/src/model/networks.ts).
+
+**`memberCount` / `stackCount`** — on a `network` node: how many *scanned* services are
+attached, and how many distinct stacks they come from. Counted on the node rather than
+left to be inferred from the spokes beside it, because the spokes are capped — a reader
+counting lines on a node that joins fifty services would be reading a number that is not
+there. Neither counts what the scan cannot see, per I1.
+
+**`flow`** — on a `network` edge, where the dependency arrowhead sits:
+`to-network` when this service is the dependent, `to-service` when something else on that
+network depends on it, `both` when both are true, absent for plain membership. This is
+how a dependency is drawn *through* the network rather than beside it — following the
+arrowheads reads dependent → network → dependency, and a service in the middle of a chain
+carries one leg with an arrowhead at each end.
+
+**`via`** — on a `depends_on` edge, the real networks the pair shares, in the dependent's
+compose order. Non-empty is the normal case and means the edge is **not** drawn directly
+(`showsDirectDependency`); the relation is already visible as `flow` on the two membership
+edges either side, and a direct line beside that would state it twice while hiding the
+network that carries it. Empty means compose orders the two containers' startup yet
+neither can address the other — the direct edge is then the only honest drawing, and the
+analyzer also states it in words on the dependent's `notes`.
+
+**NetworkRelation** — `depends-on | required-by | peer`, what one service is to another
+*across a named shared network*. A dependency counts only over a network in its `via`, so
+a service depending on a sibling over the stack's own network is not reported as depending
+on it over an unrelated external network they also both join. `peer` is not a weaker
+answer: two compose projects cannot declare a dependency on each other at all, so for the
+databases and the service that backs them up the shared network is the entire
+relationship.
+
+**MAX_GRAPH_SPOKES / MAX_DRAWER_PEERS / MAX_LIST_PEERS** — `12 / 8 / 12`. The fleet graph
+caps spokes per network node, the drawer caps peers per network and the Networks section
+caps member chips. `visibleSpokes` keeps dependency-carrying spokes first and `networkLinks`
+keeps dependencies before plain peers, so the cap never removes the only edges that say
+more than "attached"; both report what was left out, and `networkNodeLabel` puts `+k not
+drawn` on the node.
+
+**`networks` / `connectingNetworks` / `crossStackNetworks` / `soloLocalNetworks`** — the
+four `OverviewStats` network counters: real networks, those with 2+ services, those
+spanning 2+ stacks, and stack-local ones with a single service. The last is *exactly* what
+the fleet graph omits, which is what lets smoke assert that drawn network nodes plus
+`soloLocalNetworks` equals `networks` — an omission that is checkable rather than trusted.
+
 **OriginTarget / OriginKind** — where a tunnel route's origin address was found to
 lead (§3.4). Attached to every `CloudflareRoute` whose `service` is non-empty, and
 carrying an `evidence` string in the same spirit as `AuthPosture.evidence`.
@@ -2215,7 +2339,7 @@ calls beyond the two scan reads above and, when configured, the one issuer.
 
 ## 8. Testing contract
 
-`npm run smoke` runs the entire pipeline against four fixture roots with Docker
+`npm run smoke` runs the entire pipeline against five fixture roots with Docker
 disabled and asserts on the resulting `Overview`. It exits non-zero on any
 failure and gates CI. `npm run typecheck` covers `scripts/` too
 (`tsconfig.scripts.json`): `tsx` strips types without checking them, so an
@@ -2226,7 +2350,9 @@ assertion on `undefined` can pass while proving nothing.
 a proxy-bypassing service, cross-stack middleware resolution, LDAP and OIDC
 services, a stack with an `.env`, shared binds across stacks, and a `proxy` stack
 that is the resolved hop for another stack's tunnel origin (§3.4). Asserts the
-normal output is right.
+normal output is right — including that every `depends_on` in it names the network it
+travels over and is drawn through it, which is the ordinary case `fixtures/nets` then
+pins the edges of.
 
 **`fixtures/edge`** — one stack per previously-fixed defect. The contract:
 
@@ -2280,6 +2406,26 @@ Two caveats worth knowing when writing these:
   behaviour, so no behavioural test can catch it; the fixture fails when the
   *class* of bug returns (both reverted), which is the strongest true statement
   available.
+
+**`fixtures/nets`** — six small stacks whose only subject is what a shared network
+connects (§3.9). A separate root rather than stacks added to `apps`, so no existing count
+or assertion shifts. Same revert-proof contract:
+
+| Stacks | Pins |
+|---|---|
+| `shared-a`, `shared-b`, `shared-c` | the headline case: three separate compose projects, one `external:` network, one node. Two databases and the service that backs them up — no `depends_on` anywhere, because compose cannot express one across projects, so the shared network is the entire relationship and a graph drawing only dependencies would show the consumer connected to nothing. Pins `scope: "external"`, `memberCount: 3`, `stackCount: 3`, and that the peers are read the same from the service's drawer and from the fleet list |
+| `layered` | a dependency drawn *through* the stack's own network: `web → api → cache` over `layered_inner`, so `via` names it, no direct line is drawn, and the three `flow` values are each pinned on the leg that must carry them — `to-network`, `both` (a service at both ends of a chain) and `to-service`. `extra` is on the same network with no dependency either way, which is the arm that fails if `flow` is set from membership rather than from dependency |
+| `disjoint` | the exception: `depends_on` across two networks the pair does not share. `via` empty, the direct edge **kept**, and the note written — docker orders startup, yet neither container can address the other |
+| `lonely` | both arms of the single-member rule at once: one service on an `external:` network (drawn, because something outside the scan may be on it) and one alone on a stack-local network (counted, not drawn). Also where the two peerless wordings are pinned, which are opposite claims and would be a false statement if swapped |
+
+**The two caps are asserted against synthetic nodes, not a fixture.** `visibleSpokes` is
+driven with 20 edges and `networkLinks` with a 12-member network, because the alternative
+is committing a twenty-service fleet whose only purpose is to be large. The functions are
+pure and live in `model/networks.ts` for exactly this reason, and the revert contract is
+unaffected: returning every spoke, or dropping the dependency-first ordering, turns a
+check red either way. The two assertions that matter most are the ones about what is
+*kept* — the dependency-carrying spokes are last in scan order in the synthetic input, so
+keeping them proves the sort rather than the slice.
 
 **`fixtures/authentik`** — a fleet with an identity provider in it, driven against
 canned API responses in `fixtures/authentik-api.json` through `BuildDeps.fetchImpl`.
@@ -2869,6 +3015,25 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   wrong posture: diagnostics feed no conclusion about the fleet. There are also no
   retries, no backoff and no on-demand probe endpoint; a phase is what one attempt
   during one scan produced.
+- **A network's peers are the ones this scan can see.** An `external:` network can carry
+  containers from outside `appsRoot` entirely, and nothing in a compose file names them.
+  So a network node states its scope and its *scanned* member count, and a network with
+  one visible member says so in words rather than being reported as empty — but the far
+  end of an external network is genuinely not knowable from the files (I1). Membership is
+  also reachability in principle, never a claim that anything is listening; that is what
+  `ports:`/`expose:` answer.
+- **A hub with two dependencies across it does not say which pairs with which.** The
+  arrowheads on a membership edge belong to the service, not to a pair: a network with
+  `a → b` and `c → d` over it draws four arrowheads and cannot show the pairing. The
+  Networks section names every pair in words for that reason, and the drawer separates
+  `depends on` from `required by` per peer. The picture is the index; the pairs are in the
+  text.
+- **A large network is summarised, not drawn whole.** The fleet graph draws at most 12
+  spokes per network node, the drawer names at most 8 peers and the Networks section 12
+  member chips; each states how many it left out, and the service drawer reads the
+  unpruned graph so nothing is unreachable. But a monitoring network with forty members is
+  a count on a node plus a list, not forty lines — deliberately, since forty lines is what
+  makes the small informative networks impossible to find.
 - **No history.** Every scan is a snapshot; nothing is persisted, so there is no
   drift detection or change log.
 - **The Docker snapshot lists all containers**, including ones with no compose
@@ -2915,6 +3080,13 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | `internal` is positive evidence, not the leftover bucket | As a fallback it meant "nothing else applied", which is not a fact about the fleet — it conflated a database two containers talk to with a service nothing can reach at all. Now it requires proof another container can reach it (`expose:`, or a shared real network) and `none` is a populated category. It buys a `noIngressServices` that answers the question the old value only appeared to. |
 | `internal` is **reported only when it is the only way in** | The other four kinds are independent of each other; this one is not independent of them. Nearly every service in a real fleet shares a network with a neighbour — 82 of 86 on the fleet this was measured against — so reporting it everywhere puts the same tag on almost everything, and a tag that is true of nearly everything says nothing about any of it. The service a reader is looking for is the one reachable *only* over the container network (the database behind a frontend), so that is the only place it is shown; the frontend shows `public`/`traefik`/`lan` alone. It is a withholding, not an inference: the evidence is unchanged, `internal` is still positive evidence, and I1 holds because nothing was added. It costs the ability to tell from an externally-reachable service's tags whether a sibling also reaches it — which the drawer's Networks section and the graph's network edges still say — and it moved `internalServices` from 82 to 25 on that fleet, which is breaking for a JSON consumer and worth it: that counter now answers a question. |
 | The **stack roll-up** is exempt from the withholding | A stack is not a service. Its badges are a union — the whole reason a collapsed row is not reduced to a "worst case" — so a public frontend beside a database only its neighbour can reach is a stack that is legitimately both, and the row saying `Public` `Internal` is what tells a reader there is something inside worth expanding for. Renormalizing the union would let the frontend's exposure delete the database from the collapsed view, which inverts the request that prompted the rule. So the union is built by `rollUpIngress` and not by `normalizeIngress`, the two are documented against each other, and the exemption is asserted over every mixed fixture stack rather than trusted: the roll-up is now the only stack-level place `internal` appears, and it previously lived as an inline expression in a `.tsx` file where nothing could test it. |
+| A connection between two services is drawn `service → network → service` | The two obvious drawings each hide the thing the reader came for. A network hanging off one service says nothing about what that service reaches — the far end is missing. A line straight between two services hides *what joins them*, which is the answer to "can I move this container" and "what else is on that network". Putting the network in the middle makes one shape answer both, and makes the cross-stack case expressible at all: two compose projects cannot declare anything about each other, so the shared network is the only place their relationship exists. |
+| A dependency is drawn as arrowheads on the membership edges, not as its own edge | With the network in the middle, a separate `depends_on` edge beside it states the same relation twice and invites the reader to believe the two are different facts. So `flow` puts the arrowhead at the network end for the dependent and at the service end for the dependency, and following the arrows reads dependent → network → dependency. It costs the pairing on a hub carrying two dependencies (§11), which the Networks section and the drawer state in words; a labelled edge would not have recovered it either, since cytoscape renders no edge labels. |
+| ...and the direct edge survives only where no network carries it | An empty `via` is not a missing value, it is a finding: compose orders the two containers' startup and neither can address the other. That is the one case where a line straight between two services is the honest drawing, so it is kept and the dependent also gets a note — a picture of an oddity that reads like a normal edge is worse than no picture. |
+| A single-member **external** network is drawn; a single-member **stack-local** one is not | Both look identical as a count, and they say opposite things. Nothing else *can* join a stack-local network that one service created, so it connects nothing and never will. An external network with one scanned member means something outside the scan may be on the other end — a real statement about reachability, and the only place the scan's own boundary is visible. Dropping either arm loses a different truth, which is why the rule is two-armed and each arm has its own fixture and its own revert check. |
+| Large networks are capped at 12 spokes rather than expanded on demand | A monitoring network with forty members renders forty lines through the middle of the graph, and the small networks that carry an actual dependency become unfindable. Interactive expand/collapse was the alternative and was rejected: it re-runs the layout, moves every other node, and answers "who else is on this" worse than a list does. So the cap is fixed, dependency-carrying spokes survive it first, the node states `+k not drawn`, and the drawer reads the unpruned graph — the information is never gone, only not in the picture. |
+| A fleet-level Networks section, beside the graph rather than inside it | "Show me every service on this network" is a list question, and a layout engine is a poor way to answer it — the answer moves every time it is asked. One collapsible row per network, members as chips, dependency pairs in words, needs no layout and is the only place the hub pairing can be stated exactly. It filters through the same `showsNetworkNode` the graph draws with, so the picture and the list cannot come to disagree about which networks exist. |
+| One membership index, replacing three independent computations | The same relation — who shares a real network with whom — was being computed in `sharedNetworks`, in the fleet index and again in the graph. This feature needed a fourth view of it, and four implementations of one relation is four chances for the `internal` ingress tag to mean something different from the line drawn on screen. `buildNetworkIndex` is built once, after the pass that attaches live network names, and the other three read it. |
 | The withholding lives in `normalizeIngress`, not in `classifyIngress` | A kind set has exactly two sources — the classifier, and a `.labview` `expected: ingress:` list — and `normalizeIngress` is the only constructor for both. Putting the rule there means a sidecar written as `[public, lan, internal]` is read as `[public, lan]` and agrees with the scan, instead of drifting against a rule the file cannot know about. Collapsed silently rather than warned about: writing down everything that is true of a service is not a mistake, and a warning would train operators to omit true things. The alternative — hiding the tag in the badges only — would have left `stats.internalServices`, the filter chip and the gauge all answering the old, useless question. |
 | `depends_on` is not evidence of reachability | It expresses start order, not a network path: two services in disjoint networks can depend on each other and never connect. Counting it would make `internal` true for pairs that cannot reach each other, which is the exact failure the change above was made to fix. |
 | `lan` is tagged whether or not a proxy is in front, and the bypass note stays | As a fallback kind, `lan` answered "publishes a port with nothing in front of it", so the count could not answer "how many publish a port" — the more useful question, since a published port is answerable with no proxy and no SSO in the path. Both are now available: the tag counts the port, and `noteHostPortBypass` still says the proxied service can be reached around its gate. That note is not cosmetic; it is the difference between "protected by SSO" and "protected by SSO unless you use the port". |

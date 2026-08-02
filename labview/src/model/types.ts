@@ -786,6 +786,24 @@ export interface NetworkDecl {
   driver?: string;
 }
 
+/**
+ * Who owns a real docker network, which is what decides whether it can join two
+ * stacks at all.
+ *
+ *  - `stack-local` — the name is `${projectName}_${key}` of exactly one scanned
+ *    stack, so compose created it for that stack and nothing outside it is on it.
+ *    This is the network a multi-service stack talks to itself over.
+ *  - `external` — everything else: a network declared `external:` (used verbatim, so
+ *    several stacks can name the same one), or a live name no scanned project owns.
+ *
+ * The second case is why this is about *ownership* rather than about the `external:`
+ * keyword. A network attached in live docker state that no scanned compose file
+ * declares is, from the fleet's point of view, exactly as external as a declared
+ * one: something this scan cannot see may be on it. Reporting it as stack-local
+ * would claim the opposite.
+ */
+export type NetworkScope = "external" | "stack-local";
+
 export interface VolumeDecl {
   name: string;
   external: boolean;
@@ -813,6 +831,18 @@ export interface GraphNode {
    * only lets the UI style it as infrastructure.
    */
   role?: "proxy";
+  /**
+   * Network nodes only: who owns the network, and how much it joins. Set on every
+   * network node, so a reader can tell a network that connects six stacks from one
+   * that connects nothing without counting spokes.
+   *
+   * `memberCount` counts *scanned* services attached — never the containers on the
+   * network that this scan cannot see. See {@link NetworkScope} for why an
+   * unowned network reads as external.
+   */
+  scope?: NetworkScope;
+  memberCount?: number;
+  stackCount?: number;
 }
 
 export interface GraphEdge {
@@ -821,6 +851,32 @@ export interface GraphEdge {
   target: string;
   kind: "network" | "depends_on" | "volume" | "ingress" | "auth";
   label?: string;
+  /**
+   * On a `network` membership edge (`source` = service, `target` = network): where the
+   * dependency arrowhead sits, so that following arrowheads reads dependent → network
+   * → dependency and the network is drawn *in between* the two services.
+   *
+   *  - `to-network` — this service depends on something else on this network.
+   *  - `to-service` — something else on this network depends on this service.
+   *  - `both` — both are true.
+   *
+   * Absent on plain membership, which carries no arrowhead. One field on the
+   * membership edge rather than a second edge beside it: a dependency and the
+   * network it travels over are one relation, and drawing them as two was the thing
+   * that made the graph unreadable.
+   */
+  flow?: "to-network" | "to-service" | "both";
+  /**
+   * On a `depends_on` edge: every real network the two services share, in the
+   * dependent's compose order — the dependency can travel over any of them, so all
+   * of them carry its arrowheads rather than one being picked as the favourite.
+   *
+   * **Empty means they share none** — `depends_on` orders startup but grants no
+   * connectivity, so such a pair is a real finding rather than a drawing detail, and
+   * it is the one case a direct service→service edge is still rendered. See
+   * `showsDirectDependency` in `model/networks.ts`.
+   */
+  via?: string[];
 }
 
 export interface Graph {
@@ -901,6 +957,26 @@ export interface OverviewStats {
   exposureAccepted: number;
   /** Services whose declaration disagrees with what the scan found. */
   declarationDrift: number;
+  /**
+   * The four network counters, over **real** docker network names — so an
+   * `external:` network two stacks share is one network here, not two.
+   *
+   * `connectingNetworks` and `crossStackNetworks` nest (every cross-stack network
+   * carries 2+ services), and `soloLocalNetworks` is disjoint from both. Together
+   * with the external networks that carry a single service they sum to `networks`.
+   *
+   * `soloLocalNetworks` is exactly the set the fleet graph does not draw — a
+   * stack-local network with one service on it connects nothing and cannot, since
+   * nothing outside its own stack can join it. It is counted rather than dropped so
+   * the graph can say how many nodes it left out.
+   */
+  networks: number;
+  /** Networks carrying two or more scanned services, i.e. joining them. */
+  connectingNetworks: number;
+  /** Networks whose members span two or more stacks. */
+  crossStackNetworks: number;
+  /** Stack-local networks with exactly one scanned service attached. */
+  soloLocalNetworks: number;
 }
 
 /** Metadata about the scan itself. */

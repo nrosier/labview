@@ -31,7 +31,7 @@
  * leg of the path, and it is as observable as the port itself.
  */
 import type { AppStack, OriginTarget, PortMapping, Service } from "../model/types.js";
-import { realNetworks } from "./networks.js";
+import { realNetworks, serviceKey, type NetworkIndex } from "./networks.js";
 
 /** One service, as referenced by the fleet index. */
 export interface ServiceRef {
@@ -83,13 +83,19 @@ export interface FleetIndex {
  * Built once across every stack, like `buildMiddlewareRegistry`, because an origin
  * routinely points at a proxy defined in a different stack than the service it
  * fronts.
+ *
+ * @param nets the fleet's network membership, when the caller has already built it —
+ * which the analyzer has, since the ingress rule needs it first. Passing it keeps one
+ * answer to "which networks is this service on" across the whole scan; omitting it
+ * indexes the networks here instead, so a caller that only wants an address lookup
+ * (a test, say) needs no second argument.
  */
-export function buildFleetIndex(stacks: AppStack[]): FleetIndex {
+export function buildFleetIndex(stacks: AppStack[], nets?: NetworkIndex): FleetIndex {
   const byPort = new Map<string, ServiceRef[]>();
   const byName = new Map<string, ServiceRef[]>();
   const byContainerIp = new Map<string, ServiceRef[]>();
   const byHostname = new Map<string, ServiceRef[]>();
-  const netsByKey = new Map<string, string[]>();
+  const netsByKey = nets ? nets.byService : new Map<string, string[]>();
   const push = (map: Map<string, ServiceRef[]>, key: string, ref: ServiceRef) => {
     const list = map.get(key);
     if (list) list.push(ref);
@@ -114,7 +120,7 @@ export function buildFleetIndex(stacks: AppStack[]): FleetIndex {
         const host = normalizeHost(raw);
         if (host) push(byHostname, host, { stackId: stack.id, serviceName: svc.name });
       }
-      netsByKey.set(`${stack.id}/${svc.name}`, realNetworks(stack, svc));
+      if (!nets) netsByKey.set(serviceKey(stack, svc), realNetworks(stack, svc));
     }
   }
   for (const [key, refs] of byHostname) byHostname.set(key, distinct(refs));

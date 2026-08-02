@@ -1,13 +1,19 @@
 import type { AppStack, Service, Graph, GraphNode, GraphEdge } from "../model/types.js";
 import { routerIsServing } from "../labels/auth.js";
 import { primaryIngress } from "../model/ingress.js";
-import { realNetworks } from "./networks.js";
+import { graphServiceId } from "../model/networks.js";
+import { buildNetworkIndex, serviceKey, sharedWith, type NetworkIndex } from "./networks.js";
 
 /**
  * Build the relationship graph across all stacks:
  *  - service <-> network membership (real docker network names, so shared/external
- *    networks correctly connect services from different stacks)
- *  - service -> service depends_on
+ *    networks correctly connect services from different stacks), each network node
+ *    carrying its scope and how many services and stacks it joins
+ *  - service -> service depends_on, drawn **through** the network that carries it:
+ *    the membership edges either side of the shared network take the arrowheads, so
+ *    the path reads dependent -> network -> dependency. The direct service-to-service
+ *    edge stays in the model, marked with the networks the pair shares, and is only
+ *    rendered when they share none — see `GraphEdge.via` and `showsDirectDependency`.
  *  - service <-> shared volumes (named volumes, and bind paths used by 2+ stacks)
  *  - ingress/auth hubs, each added only when something observed calls for it:
  *    a Cloudflare tunnel, Traefik, and either the identified SSO provider or a
@@ -25,8 +31,11 @@ import { realNetworks } from "./networks.js";
  * route — the proxy itself said so — so a router it reported is drawn from that
  * service rather than from the generic hub, in a fleet with no tunnel at all as
  * readily as in one with several.
+ * @param nets the fleet's network membership, when the caller already built it. The
+ * analyzer does, because the ingress rule needs it first, and sharing it is what makes
+ * "shares a network" mean the same thing in the picture as in the classification.
  */
-export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
+export function buildGraph(stacks: AppStack[], proxyKey?: string, nets?: NetworkIndex): Graph {
   const nodes = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const addNode = (n: GraphNode) => {
@@ -61,10 +70,45 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
     }
   }
 
-  const netsById = new Map<string, string[]>();
+  const index = nets ?? buildNetworkIndex(stacks);
+
+  /** Every service that exists as a node, for the two hop guards below. */
+  const drawn = new Set<string>();
+  for (const stack of stacks) {
+    for (const svc of stack.services) drawn.add(serviceId(stack, svc));
+  }
+
+  /**
+   * Which of a service's networks carry a dependency, and which way it runs across
+   * them — `out` where this service is the dependent, `in` where something on that
+   * network depends on it. This is what lets the two membership edges either side of
+   * a network take the arrowheads, so the dependency is drawn *through* the network
+   * instead of as a second line beside it.
+   *
+   * Marked on every network the pair shares, not just one: they can talk over any of
+   * them, and picking a favourite would draw an arrow across one network while an
+   * equally usable one beside it looked unrelated.
+   */
+  const flows = new Map<string, Map<string, { out: boolean; in: boolean }>>();
+  const markFlow = (key: string, net: string, dir: "out" | "in") => {
+    let byNet = flows.get(key);
+    if (!byNet) flows.set(key, (byNet = new Map()));
+    const cur = byNet.get(net) ?? { out: false, in: false };
+    cur[dir] = true;
+    byNet.set(net, cur);
+  };
   for (const stack of stacks) {
     for (const svc of stack.services) {
-      netsById.set(serviceId(stack, svc), realNetworks(stack, svc));
+      const from = serviceKey(stack, svc);
+      for (const dep of svc.dependsOn) {
+        const target = stack.services.find((s) => s.name === dep);
+        if (!target) continue;
+        const to = serviceKey(stack, target);
+        for (const net of sharedWith(index, from, to)) {
+          markFlow(from, net, "out");
+          markFlow(to, net, "in");
+        }
+      }
     }
   }
 
@@ -89,14 +133,38 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
         running: svc.docker?.running,
       });
 
-      // Networks (prefer live docker names for accuracy).
-      for (const name of netsById.get(sid) ?? []) {
+      // Networks, under their real docker names, so one `external:` network shared by
+      // six stacks is one node with six spokes rather than six unrelated nodes. The
+      // node carries what it joins — scope, services, stacks — because that is the
+      // whole of what a reader wants from it and counting spokes is not an answer.
+      const key = serviceKey(stack, svc);
+      for (const name of index.byService.get(key) ?? []) {
+        const net = index.byName.get(name);
+        if (!net) continue;
         const nid = `net:${name}`;
-        addNode({ id: nid, label: name, kind: "network" });
-        addEdge({ id: `${sid}->${nid}`, source: sid, target: nid, kind: "network" });
+        addNode({
+          id: nid,
+          label: name,
+          kind: "network",
+          scope: net.scope,
+          memberCount: net.members.length,
+          stackCount: net.stacks.length,
+        });
+        const flow = flows.get(key)?.get(name);
+        addEdge({
+          id: `${sid}->${nid}`,
+          source: sid,
+          target: nid,
+          kind: "network",
+          ...(flow ? { flow: flow.out && flow.in ? "both" : flow.out ? "to-network" : "to-service" } : {}),
+        });
       }
 
-      // depends_on within the stack.
+      // depends_on within the stack — all it can name. The edge records which networks
+      // the pair shares rather than being dropped when they share one: the relation is
+      // real and the drawer names the exact pair from it, while the fleet view draws it
+      // through the network instead (`showsDirectDependency`). An empty `via` is the one
+      // case with no network to draw it through, and the one worth an arrow of its own.
       for (const dep of svc.dependsOn) {
         const target = stack.services.find((s) => s.name === dep);
         if (target) {
@@ -105,6 +173,7 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
             source: sid,
             target: serviceId(stack, target),
             kind: "depends_on",
+            via: sharedWith(index, key, serviceKey(stack, target)),
           });
         }
       }
@@ -133,7 +202,7 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
       for (const r of svc.cloudflare) {
         hub.cf = true;
         const label = r.hostname || "tunnel";
-        const hop = resolvedHop(r.origin?.hopKey, sid, netsById);
+        const hop = resolvedHop(r.origin?.hopKey, sid, drawn);
         if (hop) {
           hopId ??= hop;
           // Leg 1 is aggregated per hop below: a fleet routes many hostnames
@@ -163,7 +232,7 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
       // drawn for routers no label declares, which is how ingress configured outside
       // the scanned stacks becomes visible at all. A router the proxy is not serving
       // is left out: an edge is a request path, and that one carries no requests.
-      const proxyId = liveProxy(proxyKey, sid, netsById);
+      const proxyId = liveProxy(proxyKey, sid, drawn);
       const serving = (svc.traefikLive ?? []).filter(routerIsServing);
       if (proxyId && serving.length) {
         proxyRole.add(proxyId);
@@ -256,7 +325,7 @@ export function buildGraph(stacks: AppStack[], proxyKey?: string): Graph {
 }
 
 export function serviceId(stack: AppStack, svc: Service): string {
-  return `svc:${stack.id}/${svc.name}`;
+  return graphServiceId(stack.id, svc.name);
 }
 
 /**
@@ -269,11 +338,11 @@ export function serviceId(stack: AppStack, svc: Service): string {
 function resolvedHop(
   hopKey: string | undefined,
   sid: string,
-  netsById: Map<string, string[]>,
+  drawn: ReadonlySet<string>,
 ): string | undefined {
   if (!hopKey) return undefined;
   const hop = `svc:${hopKey}`;
-  if (hop === sid || !netsById.has(hop)) return undefined;
+  if (hop === sid || !drawn.has(hop)) return undefined;
   return hop;
 }
 
@@ -287,11 +356,11 @@ function resolvedHop(
 function liveProxy(
   proxyKey: string | undefined,
   sid: string,
-  netsById: Map<string, string[]>,
+  drawn: ReadonlySet<string>,
 ): string | undefined {
   if (!proxyKey) return undefined;
   const id = `svc:${proxyKey}`;
-  if (id === sid || !netsById.has(id)) return undefined;
+  if (id === sid || !drawn.has(id)) return undefined;
   return id;
 }
 

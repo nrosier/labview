@@ -1,0 +1,13 @@
+# The second database on the shared backup network, in its own stack and its own compose
+# project. Its own `default` network is stack-local and joins nothing, so the graph must
+# draw the shared one and not that.
+services:
+  db-b:
+    image: mariadb:11
+    networks:
+      - backup
+      - default
+
+networks:
+  backup:
+    external: true

@@ -2,11 +2,22 @@ import type {
   AppStack,
   AuthentikProviderKind,
   DeclaredAuthAgreement,
+  Graph,
   IngressKind,
   OriginTarget,
   Service,
 } from "../model";
-import { declaredAuthLabel, ingressMatchesExpectation, noAuthReason, showsDeclaredAuth } from "../model";
+import {
+  declaredAuthLabel,
+  graphServiceId,
+  ingressMatchesExpectation,
+  networkScopeMeta,
+  noAuthReason,
+  peerlessNetworkText,
+  relationLabel,
+  serviceConnections,
+  showsDeclaredAuth,
+} from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
 import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
@@ -116,9 +127,29 @@ function InheritedMark({ shown }: { shown: boolean }) {
   ) : null;
 }
 
-export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Service; onClose: () => void }) {
+export function AppDetail({
+  stack,
+  svc,
+  graph,
+  onClose,
+  onOpenService,
+}: {
+  stack: AppStack;
+  svc: Service;
+  /**
+   * The complete relationship graph, not the pruned one the fleet view draws: this is
+   * where a reader comes to see *every* peer of a network, including the ones the fleet
+   * graph capped away.
+   */
+  graph: Graph;
+  onClose: () => void;
+  onOpenService: (stackId: string, serviceName: string) => void;
+}) {
   const s = statusView(svc.docker);
-  const def = buildServiceMermaid(svc, stack);
+  // One read of the graph for both the diagram and the Networks section, so the picture
+  // and the list beneath it cannot name different peers.
+  const conn = serviceConnections(graph, graphServiceId(stack.id, svc.name));
+  const def = buildServiceMermaid(svc, stack, conn);
   const declared = svc.declared;
   const accepted = declared?.unauthenticatedAccepted;
   // Undefined whenever a mechanism was detected. When it is set, it says which of the
@@ -696,10 +727,43 @@ export function AppDetail({ stack, svc, onClose }: { stack: AppStack; svc: Servi
             </Section>
           )}
 
-          {svc.networks.length > 0 && (
+          {/* Networks, and who else is on them — the answer a bare list of network names
+              never gave. Real docker names, so the one `external:` network six stacks
+              share is named here exactly as it is named in every other stack's drawer.
+              Every peer is listed, even where the fleet graph capped the spokes. */}
+          {conn.links.length > 0 && (
             <Section title="Networks">
-              {svc.networks.map((nw) => (
-                <span class="pill">{nw}</span>
+              {conn.links.map((l) => (
+                <div class="netrow" key={l.id}>
+                  <div class="nethead">
+                    <span class="mono">{l.name}</span>
+                    <span class="pill" title={networkScopeMeta(l.scope).title}>
+                      {networkScopeMeta(l.scope).label}
+                    </span>
+                    <span class="muted-inline">
+                      {l.memberCount} {l.memberCount === 1 ? "service" : "services"}
+                      {l.stackCount >= 2 && ` · ${l.stackCount} stacks`}
+                    </span>
+                  </div>
+                  {l.peers.length > 0 ? (
+                    <div class="chips">
+                      {l.peers.map((p) => (
+                        <button
+                          key={p.id}
+                          class="chip"
+                          onClick={() => onOpenService(p.stack, p.service)}
+                          title={`Open ${p.stack}/${p.service}`}
+                        >
+                          {p.stack === stack.id ? p.service : `${p.stack}/${p.service}`}
+                          {p.relation !== "peer" && <span class="pill">{relationLabel(p.relation)}</span>}
+                        </button>
+                      ))}
+                      {l.omitted > 0 && <span class="muted-inline">+{l.omitted} more</span>}
+                    </div>
+                  ) : (
+                    <div class="muted-inline">{peerlessNetworkText(l)}</div>
+                  )}
+                </div>
               ))}
             </Section>
           )}
