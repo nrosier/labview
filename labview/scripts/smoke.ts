@@ -4632,8 +4632,16 @@ check(
 );
 check(
   "a tcp:// and an ssh:// tunnel route were never resolved, let alone asked",
-  probeCalls.every((u) => !u.includes("pg.probe.example.com") && !u.includes("ssh.probe.example.com")),
-  probeCalls.filter((u) => u.includes("pg.probe") || u.includes("ssh.probe")).join(" "),
+  probeCalls.every((u) => {
+    const host = new URL(u).hostname;
+    return host !== "pg.probe.example.com" && host !== "ssh.probe.example.com";
+  }),
+  probeCalls
+    .filter((u) => {
+      const host = new URL(u).hostname;
+      return host === "pg.probe.example.com" || host === "ssh.probe.example.com";
+    })
+    .join(" "),
 );
 check(
   "...and both stay in the exposed count, unmeasured and honestly so",
