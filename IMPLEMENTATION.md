@@ -101,11 +101,19 @@ labview/
     model/auth.ts     when a missing gate may be reported at all, and its wording (pure, web-safe)
     model/networks.ts which network nodes are drawn, dependency vs. membership, the two
                       caps and all of the wording (pure, web-safe)
+    model/ingress.ts  the ingress vocabulary and every pure operation on it (pure, web-safe)
+    model/declarations.ts  the values a `.labview` may use, and how each is worded (pure, web-safe)
+    model/ports.ts    reading a compose port mapping for the published host port (pure)
+    model/probe.ts    which addresses a service may be asked at, and what counts as a
+                      login page answering (pure, web-safe)
+    model/filter.ts   the dashboard's tri-state tag filter (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
       discover.ts     appsRoot -> stack directories
       compose.ts      compose YAML -> normalized AppStack/Service
       env.ts          dotenv parsing + Compose-compatible interpolation
+      paths.ts        path containment for every file read out of a stack directory (I8)
+      sidecar.ts      the `.labview` file: parse, clamp, refuse anything outside the root
       index.ts        scanStacks(): discover + parse, collecting warnings
     labels/
       dockflare.ts    labels -> CloudflareRoute[]
@@ -122,9 +130,12 @@ labview/
       graph.ts        nodes/edges for the relationship graph
     enrich/
       http.ts         fetch wrapper: timeouts, JSON, injectable fetchImpl (no I/O policy)
+      pool.ts         bounded concurrency for many independent round-trips (no I/O policy)
       docker.ts       Docker Engine snapshot (never throws)
       authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
       traefik.ts      Traefik runtime-API snapshot (never throws; all network I/O)
+      probe.ts        asks each scanned HTTP service what it answers, and reads a login
+                      page as evidence (never throws; all network I/O)
     auth/
       hash.ts         modular-crypt dispatch over bcryptjs (`$2a$`/`$2b$`/`$2y$`)
       passwd.ts       parsePasswd (pure) + readPasswd (fs, re-read on stat change)
@@ -148,6 +159,10 @@ labview/
     authentik-api.json  canned API responses driven through an injected fetch
     traefik/          a fleet whose labels and live proxy config disagree
     traefik-api.json    canned proxy + identity responses, same injected fetch
+    probe/            what a service answers when it is asked, one address per stack
+    auth/             passwd files the access-control assertions parse: ok, messy, empty
+    outside-root.env      the `env_file` escape target; outside every scan root on purpose
+    outside-root.labview  the sidecar-symlink escape target, same reason (I8)
 ```
 
 Repo root holds the README, LICENSE, CI workflows and this document. All code is
@@ -841,7 +856,7 @@ three facts out of a build script and into the graph:
 - **`inlineDynamicImports` is load-bearing.** mermaid reaches for its diagram types
   through some 38 dynamic imports. Rollup's default is a chunk each, which would
   both break the three-file list above and make rendering a diagram a second
-  request; inlining reproduces what esbuild's `splitting: false` did before it.
+  request.
 
 `base: "./"` for the same reason `api.ts` uses relative URLs: Vite's default emits
 absolute `/app.js`, which is precisely the assumption that breaks a LabView served
@@ -1397,7 +1412,7 @@ each disagreement is one entry in `svc.declared.drift`, counted in
   never report (§5).
 
 **Agreement is silent, in both directions.** The `Expected ingress` row renders only
-when `expectedMatches` is false, and `DeclaredAuthBadge` and the declared
+when `ingressMatchesExpectation` is false, and `DeclaredAuthBadge` and the declared
 `Authentication` row render nothing for `redundant`. A sidecar that is right about
 everything is invisible beyond the prose in it — which is what makes the rows that *do*
 appear worth reading.
@@ -3160,8 +3175,14 @@ a simplification:
   assert against their own credential, and a real `LABVIEW_AUTH_PASSWD_FILE` would put
   their users' hashes in front of assertions that print what they compared.
 
-`fixtures/outside-root.env` sits outside every scan root on purpose: it is the
-target of the `env_file` escape attempt that must be refused.
+`fixtures/outside-root.env` and `fixtures/outside-root.labview` sit outside every scan
+root on purpose: they are the targets of the two escape attempts that must be refused —
+an `env_file` reaching out of the stack (`fixtures/edge/dbstack`) and a `.labview`
+symlinked out of it (`fixtures/edge/escapedecl`). Both are deliberately *valid* files
+carrying a `LEAKED_FROM_OUTSIDE_ROOT` marker, and both are asserted by that marker's
+absence from the output rather than by a warning's wording: a containment regression
+then surfaces as fixture data appearing where a reader would see it, which no rephrasing
+of a message can hide (I8).
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
 rather than inside one so the scanned trees stay purely compose stacks.
 
@@ -3181,8 +3202,10 @@ npm run typecheck   # tsc --noEmit for server, web and scripts (three tsconfigs)
 npm run smoke       # pipeline assertions over the fixtures
 npm run build       # vite build -> web/dist, then tsc server -> dist/
 npm run build:web   # just the UI: vite build --config web/vite.config.ts
+npm run build:server # just the server: tsc -p tsconfig.json -> dist/
 npm run dev         # build web once, then tsx watch on the server
 npm run dev:web     # Vite dev server with HMR, proxying /api and /auth
+npm run start       # node dist/index.js — what the image runs, after a build
 npm run scan        # one-shot JSON to stdout; --summary for the digest
 npm run hashpw -- <user>   # prompt for a password, print one `user:hash` line
 ```
