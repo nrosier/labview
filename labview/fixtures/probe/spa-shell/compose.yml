@@ -1,0 +1,40 @@
+# Regression fixture: the eighth signal, and the reason it needs a header.
+#
+# Two services that serve the same thing at `/` — a 200 of HTML with no form anywhere in
+# it, which is what a login screen drawn in the browser looks like on the wire. Neither
+# can be judged from its markup at any body size, so both cost a second request, at the
+# current-user addresses in `STATE_PATHS`. The two answers to that second request are what
+# this pair is about, and they differ by one response header.
+#
+# `app` answers `401 WWW-Authenticate: Basic realm="app"` at `/api/`. A server that sends
+# that header is asking a *browser* to prompt, which nothing does by accident — so this is
+# `challenge` one address over, and it is `state-challenge`: the service leaves the exposed
+# count on measured evidence the scan could not have read from `/`. Note the walk stops
+# here. `/api/` is the first entry in the list, so `state.asked` is 1 and the other three
+# addresses are never asked; a fixture whose refusal came later would not pin that.
+#
+# `anon` is the trap, and it is the more important half. It answers a *bare* 401 at
+# `/api/v1/me` — no scheme named — after answering 200 at `/api/` and `/api/me`. That is
+# exactly what a public application with optional accounts answers: an anonymous-enabled
+# Grafana, a Gitea whose repositories are world-readable. Its pages serve everybody and its
+# current-user endpoint still says nobody is signed in. Reading that as a gate would take a
+# genuinely open service *out* of the exposed count, which is the one direction this rule
+# must never be wrong in — so `anon` stays exposed, and the bare refusal is reported as
+# something to look at rather than as a verdict. Its three answers also pin the walk in the
+# other direction: `state.asked` is 3, because the two 200s did not stop it.
+services:
+  app:
+    image: example/app:5.0.1
+    container_name: probe-spa-app
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=app.spa.probe.example.com"
+      - "dockflare.service=http://probe-spa-app:8080"
+
+  anon:
+    image: example/anon:5.0.1
+    container_name: probe-spa-anon
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=anon.spa.probe.example.com"
+      - "dockflare.service=http://probe-spa-anon:8080"

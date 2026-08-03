@@ -119,7 +119,7 @@ live state from the Docker API, and never needs an agent inside each app.
   tried with its own stage, and the suggested fix. `Escape` closes the panel first, the
   service drawer second.
 - **A scan that can ask, not only read** — everything above comes from configuration.
-  Switch the [probe](#probing-a-service-directly) on and the scan also sends one
+  Switch the [probe](#probing-a-service-directly) on and the scan also sends a
   `GET /` per HTTP service **it found no authentication for**, and reads the answer for a
   login page, which is the largest class of protection no compose file mentions. A login
   page takes the service out of the exposed count with its own badge; an answer *without*
@@ -516,8 +516,9 @@ described it, with the reason in `meta.traefik.error`.
 
 **Off by default.** With `LABVIEW_PROBE_ENABLED=true` — or the switch beside **Rescan**,
 for one rescan at a time — a scan stops only reading configuration and starts *asking*:
-one `GET /` per eligible service, and it reads what comes back for the signs of a login
-page.
+a `GET /` per eligible service, and it reads what comes back for the signs of a login
+page. One shape of answer costs a second request, and only that one — see [what it
+sends](#probing-a-service-directly) at the end of this section.
 
 This exists because the largest class of real protection there is — an application's
 own login form — leaves no trace anywhere a compose scan can look. No middleware, no
@@ -563,29 +564,41 @@ that keeps the probe off your database ports — a Postgres port is never asked,
 no route stays inferred rather than measured. So does a `tcp://` tunnel, which is not
 HTTP no matter what is behind it.
 
-**What counts as a login page.** Seven signals, all of them things in the response
-itself:
+**What counts as a login page.** Eight signals. Seven of them read the response to
+`GET /` and nothing more:
 
 | Signal | Fires on |
 |---|---|
 | Credential requested | 401 or 407 **with** a `WWW-Authenticate` header |
 | Redirected off-site | a 3xx whose `Location` is a different origin |
-| Redirected to a login path | a 3xx to `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` |
+| Redirected to a login path | a 3xx to a login path — `/login`, `/signin`, `/sign-in`, `/users/sign_in`, `/sso`, `/oauth2`, `/auth/`, `/outpost.goauthentik.io`, `/if/flow/` or `/flows/-/` |
 | Sent to a login by refresh | a 200 whose HTML carries a `<meta http-equiv="refresh">` pointing at either of the two above |
 | SSO hand-off served | a 200 carrying a hidden `SAMLRequest` or `SAMLResponse` input — the SAML POST binding *is* that page |
 | Login form served | a 200 whose HTML carries an `<input type="password">` (or `autocomplete="current-password"`) |
 | Passwordless login form served | a 200 with a form that has a username field, a submit control and a login-intent marker — an `action` on one of the login paths above, or a `one-time-code` field — and no password anywhere. This is what magic-link and passkey sign-in look like |
 
+The eighth needs a **second** request, because it is the one page no reading of a body can
+judge. **`Credential requested behind the page`** fires on a 200 of HTML with no `<form>`
+anywhere in it — a login screen drawn in the browser is not in the served markup — where one
+of four current-user addresses then answered **401 or 407 with a `WWW-Authenticate` header** to
+a request carrying no credential. The addresses are a fixed list, the same four every scan:
+`/api/`, `/api/me`, `/api/v1/me`, `/api/v1/user`. They are asked in that order and the walk
+stops at the first refusal, so the usual cost is one extra request.
+
 Nothing else. A bare 401 with no challenge header, a 403, a `/` → `/dashboard` redirect —
 whether by `Location` or by refresh — a homepage with the words "Sign in" on it, a
 newsletter box that posts an email address to a hosted list service: all read as *not* a
-gate. They still show in the drawer as what was measured, but they do not clear an
-exposure. That asymmetry is deliberate: a false finding costs you a look, while false
+gate. So does a current-user address that refuses without naming a scheme, and that one is
+the near miss worth knowing about: it is exactly what an anonymous-enabled Grafana or a
+world-readable Gitea answers, pages that serve everybody while truthfully reporting that
+nobody is signed in. The drawer says where it was found and what it said; the service stays
+in the exposed count. All of these still show as what was measured, and none of them clears
+an exposure. That asymmetry is deliberate: a false finding costs you a look, while false
 comfort is the thing this tool exists to remove.
 
-Six of the seven rest on a single fact. The last one cannot — a username field and a
-button are also a newsletter signup — so it requires three things together, and the
-login-intent marker is what separates the two. Where a form was found, the drawer says
+Every signal but one rests on a single fact. `Passwordless login form served` cannot — a
+username field and a button are also a newsletter signup — so it requires three things
+together, and the login-intent marker is what separates the two. Where a form was found, the drawer says
 what it was made of (`a password field, a username field and a submit button`) whether or
 not anything was concluded from it, so a page that looks like a login and did not count
 shows you why.
@@ -604,10 +617,22 @@ reason its own notes contradict. And it will not make a stale
 [declaration](#declaring-what-the-scan-cannot-see) look right: an acceptance for an
 exposure the probe now finds gated is reported as drift.
 
-**What it sends.** `GET /` and nothing else — no credential is in scope on this code
-path, redirects are read rather than followed, at most four addresses per service, and
-a response body is read only when it is HTML and under a size cap. The URLs come out of
-your compose files, so they are treated as untrusted input.
+**What it sends.** `GET`, and no credential is in scope anywhere on this code path.
+Redirects are read rather than followed, at most four addresses per service, and a response
+body is read only when it is HTML and under a size cap. The URLs come out of your compose
+files, so they are treated as untrusted input.
+
+The first request is always `GET /`. A **second** goes out only for the answer the eighth
+signal is about — a 200 of form-less HTML that gated nothing — and only to the four
+current-user paths above, at the origin that already answered. Nothing is taken from the
+page: the paths are a fixed list, which is what stops a scanned document from choosing where
+LabView asks next. The walk is sequential and stops at the first refusal, so a service costs
+one extra request in the ordinary case and four at most. Every scan prints the total it sent:
+
+```text
+probe    18 services probed — 10 gated, 7 open, 1 did not answer — 2 services not asked
+         (authentication already detected) — 16 extra requests at current-user addresses
+```
 
 Failures are soft here too, and reported as their own outcome rather than folded into
 either verdict: a service that does not resolve, refuses the connection or times out is
@@ -1628,12 +1653,20 @@ absent for every service when the stage is off:
   "vantage": "public",                       // "public" | "traefik" | "lan"
   "phase": "connected",                      // `connected` = a response arrived, whatever its status
   "status": 302,
-  "gate": "redirect-origin",                 // absent unless one of the seven signals fired
+  "gate": "redirect-origin",                 // absent unless one of the eight signals fired
   "mediaType": "text/html",                  // parameters dropped; absent if no content type came back
   "redirect": { "to": "https://sso.example.com/", "crossOrigin": true },
   "refresh": { "to": "/dashboard", "crossOrigin": false },   // where a <meta refresh> pointed
   "truncated": true,                         // the body continued past the 64 KiB read
   "form": { /* what a login form was made of, when one was found */ },
+  // Present only when a second request went out — a 200 of form-less HTML that gated
+  // nothing. Absent, which is the ordinary case, means one request was sent and no more.
+  "state": {
+    "asked": 1,                              // how many current-user addresses were asked
+    "refusedAt": "/api/",                    // absent when none of them refused
+    "status": 401,
+    "challenge": true                        // the refusal named a scheme — this is the gate
+  },
   "detail": "HTTP 302 — redirected off-site",
   "attempts": [ /* one per address tried, in vantage order — same shape as every other target's */ ]
 }
@@ -1800,14 +1833,14 @@ src/
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
 tools/
   probe-lab/  a diagnostic, not part of the scan: point it at a URL and it reports
-              what the login rule read there, why each of the seven signals did or
-              did not fire, and what an eighth would have to be. It also looks where
-              the scan does not — down a redirect chain, and at a fixed list of
-              current-user addresses — since that is where the login pages it misses
-              turn out to be. It imports the real rules rather than reimplementing
-              them, so its verdict is the pipeline's verdict, and nothing it finds
-              past the first response is allowed to change that verdict. Not in the
-              image — see its own README
+              what the login rule read there, why each of the eight signals did or
+              did not fire, and what a ninth would have to be. It also looks where
+              the scan does not — down a redirect chain, and at a *wider* list of
+              current-user addresses than the scan asks — since that is where the
+              login pages it misses turn out to be. It imports the real rules rather
+              than reimplementing them, so its verdict is the pipeline's verdict, and
+              nothing it finds past what the scan would have seen is allowed to change
+              that verdict. Not in the image — see its own README
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
@@ -1833,24 +1866,35 @@ npm run probe-lab -- <url>   # diagnostic: what the login rule reads at a URL
 [tools/probe-lab/README.md](tools/probe-lab/README.md). It exists for the case the probe
 cannot settle: a service reported as answering with **no** login page is either genuinely
 unprotected or running a login screen this rule cannot see, and those look identical on the
-dashboard. Point it at the address and it prints the verdict, then all seven signals with
-the fact that decided each, then every piece of evidence no signal reads yet, then what an
-eighth signal would have to be. It writes a `.json` per target that drops into
+dashboard. Point it at the address and it prints the verdict, then all eight signals with
+the fact that decided each, then every piece of evidence no signal reads yet, then what a
+ninth signal would have to be. It writes a `.json` per target that drops into
 `scripts/smoke.ts` as a fixture, so a proposed rule is replayed offline with nobody's
 service involved. `--from-scan overview.json` picks its targets out of a saved payload:
 exactly the services LabView found neither authentication nor a login page for.
 
 Run against a real fleet, it answered the question the same way most times: **the login was
-not misread, it was somewhere the scan does not look.** So it now also follows a redirect
-chain to its end — stopping the moment a signal fires, so a hand-off to an identity provider
-is recognised rather than walked into — and, where a page came back with no gate and no form
-at all, asks a fixed list of eight current-user addresses. A `401` there, from a request
-carrying no credential, is an application refusing an anonymous caller at an address the
-probe does not ask: the service is gated, and the dashboard cannot know it. Neither of those
-findings changes what the report says LabView concluded, which is the whole point of the
-tool — but both say plainly what would have to change for it to conclude otherwise, and
-which of the two kinds of change it is (a clause needs a fixture; a second request needs a
-decision).
+not misread, it was somewhere the scan does not look.** So it also follows a redirect chain to
+its end — stopping the moment a signal fires, so a hand-off to an identity provider is
+recognised rather than walked into — and, where a page came back with no gate and no form at
+all, asks a list of eight current-user addresses. A `401` there, from a request carrying no
+credential, is an application refusing an anonymous caller: the service is gated, and the
+served markup of its page could never have said so.
+
+**Two of those findings have since become rules**, which is the tool having done its job. The
+first was a redirect to an Authentik flow executor, and it needed no new signal at all — the
+first `Location` was already the evidence and the path was simply missing from the list, so the
+change was two entries and a fixture. The second was the form-less shell, and it became
+`state-challenge`: the scan now asks four current-user addresses itself when that is the shape
+it got back, so what the lab reports at those four is what the pipeline already decides. The
+other four the lab sweeps are still its own, and a refusal at one of them now reads as *one
+entry missing from a list* rather than as a new kind of request — which is the size of change
+its report has to state, and does.
+
+Nothing the lab finds past what the scan would have seen is allowed to change what the report
+says LabView concluded — that is the whole point of the tool. But it says plainly what would
+have to change for it to conclude otherwise, and which kind of change that is (a clause needs a
+fixture; a request nobody sends yet needs a decision).
 
 `npm run smoke` runs the whole pipeline against six fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
@@ -1890,14 +1934,18 @@ directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
 both directions, so the contribution is measured rather than assumed.
 
-The `probe` root is a fleet of fifteen stacks built so that every login-page signal
+The `probe` root is a fleet of seventeen stacks built so that every login-page signal
 and every near-miss appears exactly once, and it is run **twice** — once with the probe
 off and once on — so what the stage contributes is measured rather than assumed. It
-pins: each of the seven signals clearing an exposure, and each near-miss (a bare 401
+pins: each of the eight signals clearing an exposure, and each near-miss (a bare 401
 with no challenge header, a 403, a same-origin `/dashboard` redirect — by `Location` and
-again by meta refresh — a page with "Sign in" on it and no password field, and a
+again by meta refresh — a page with "Sign in" on it and no password field, a
 newsletter box with the same email field and button as a magic-link login but nothing
-marking it as one) leaving the exposure standing; the vantage walk
+marking it as one, a redirect to `/flows/123` that is a workflow tool rather than an
+identity provider, and a form-less page whose current-user address refuses *without*
+naming a scheme, which is what an anonymous-enabled Grafana answers) leaving the exposure
+standing; the second request going out for exactly the one answer that needs it and
+stopping at the first refusal; the vantage walk
 stopping at the first address that answers, and falling through only on a transport
 failure; a `tcp://` tunnel and a service with `ports:` and no route never being asked
 at all; a service that does not answer coming back as a third outcome rather than
@@ -1918,8 +1966,12 @@ anywhere in the root carries both detected authentication and a probe result.
 Three cross-cutting checks run over both passes: that the exposed count with the probe on
 equals the count with it off minus exactly the services a login page answered for (I1),
 that no service's mechanism or confidence moved between the two runs (I3), and that the
-whole set of requests the stage sent was `GET /` and nothing else, with no credential, no
-address asked twice, and nothing sent anywhere near a published database port (I8).
+whole set of requests the stage sent was `GET` at `/` or at one of the four constant
+current-user paths and nothing else, with no credential, no address asked twice, every
+second request at an origin the first had already reached, and nothing sent anywhere near a
+published database port (I8). The request total is pinned exactly, and against the count the
+payload itself carries — which is what makes the walk's short-circuit falsifiable: removing
+it changes no verdict in the root, only how many requests went out.
 
 A separate group runs the `tools/probe-lab` report over the same canned bodies and asserts
 its verdict equals `readGate`'s on every one of them. That is the only thing standing

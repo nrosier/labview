@@ -1,0 +1,39 @@
+# Regression fixture: an identity provider's own sign-in flow is a login path, and a
+# routing path that merely starts with the same word is not.
+#
+# Two services whose only difference is one character in a `Location` header, because
+# after `LOGIN_PATHS` grew to know Authentik's flow addresses, one character is the whole
+# of the rule.
+#
+# `portal` answers 302 to `/flows/-/default/authentication/`, which is where an Authentik
+# instance sends an anonymous visitor at `/` before its own interface takes over. This is
+# the miss that put the paths in the list: a real deployment redirects twice — to this
+# address and then to `/if/flow/<slug>/` — and lands on a page whose sign-in form is drawn
+# by JavaScript, so *neither* endpoint of that chain carries a signal in served markup and
+# the scan reads only the first response. The first `Location` was always the evidence; it
+# was simply a path the list did not have. Nothing here follows a redirect, and that is
+# the point of recognising the path rather than walking to it.
+#
+# `pipeline` is the trap, and it is why `/flows/-/` keeps the `-`. It redirects to
+# `/flows/123`, an application routing a visitor to one of its own configured flows —
+# which is what a workflow tool, a CI dashboard or a data pipeline product does with that
+# word. Under a bare `/flows` prefix this service would be read as gated and would leave
+# the exposed count on the strength of a noun. The `-` is Authentik's own placeholder for
+# "no application context", so the two addresses are distinguishable, and this fixture
+# fails the moment the list stops distinguishing them.
+services:
+  portal:
+    image: example/portal:2024.8.3
+    container_name: probe-akflow-portal
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=akportal.probe.example.com"
+      - "dockflare.service=http://probe-akflow-portal:9000"
+
+  pipeline:
+    image: example/pipeline:2024.8.3
+    container_name: probe-akflow-pipeline
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=dataflow.probe.example.com"
+      - "dockflare.service=http://probe-akflow-pipeline:9000"

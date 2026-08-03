@@ -673,14 +673,28 @@ function probeOpenClause(svc: Service): string {
  * the phase and every attempt, the aggregate report says how many were silent, and a
  * fleet whose container cannot resolve its own public hostnames would otherwise collect
  * one identical note per service.
+ *
+ * Two wordings, because `state-challenge` did not see a login page. It saw a page it could
+ * read nothing from and a *second* address that refused an anonymous request by name, and a
+ * note claiming a login page there would be describing evidence LabView does not have —
+ * against a reader who may well open the page and find no login screen on it at all.
  */
 function noteProbe(svc: Service): void {
   const probe = svc.probe;
   if (!probe || probe.phase !== "connected" || !probe.gate) return;
 
+  const unknown =
+    "Which mechanism is behind that page is unknown — one address answering at one moment is the whole of the evidence.";
+  if (probe.gate === "state-challenge") {
+    const at = probe.state?.refusedAt ?? "a current-user address";
+    svc.notes.push(
+      `LabView requested ${probe.endpoint} and was answered with a page carrying no form (HTTP ${probe.status}), so it asked ${probe.endpoint}${at} as well and was refused with an authentication scheme named (HTTP ${probe.state?.status ?? 401}). A page whose own API will not serve an anonymous caller is not reachable without authenticating, so this service is not counted as exposed. ${unknown}`,
+    );
+    return;
+  }
   const what = `${probeGateText(probe.gate).label.toLowerCase()}, HTTP ${probe.status}`;
   svc.notes.push(
-    `LabView requested ${probe.endpoint} and was answered with a login page (${what}), so this service is not reachable without authenticating and is not counted as exposed. Which mechanism is behind that page is unknown — one address answering at one moment is the whole of the evidence.`,
+    `LabView requested ${probe.endpoint} and was answered with a login page (${what}), so this service is not reachable without authenticating and is not counted as exposed. ${unknown}`,
   );
 }
 

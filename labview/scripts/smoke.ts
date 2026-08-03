@@ -46,6 +46,7 @@ import type {
   Overview,
   PortMapping,
   ProbeGate,
+  ProbeState,
   Service,
   ServiceProbe,
   SessionInfo,
@@ -54,7 +55,7 @@ import type {
 } from "../src/model/types.js";
 // The probe's response record, which is deliberately not a `Response`: the recognition rule
 // is asserted as a table of literals below, and this is the shape one row has.
-import type { ProbeResponse } from "../src/model/probe.js";
+import type { ProbeResponse, StateAnswer } from "../src/model/probe.js";
 // The same row, as the diagnostic in `tools/probe-lab` records it — one request with no
 // judgement in it, which is what makes a report replayable offline.
 import type { ProbeLabObservation, ProbeLabReport } from "../tools/probe-lab/report.js";
@@ -209,11 +210,14 @@ const { hasDetectedAuth, hasEnforcedAuthentikGate } = await import("../src/label
 // page was found" would be the conclusion again rather than the fact behind it. So every row
 // of its table asserts which fact the sentence names.
 const {
+  LOGIN_PATHS,
   MAX_PROBE_TARGETS,
   PROBE_GATES,
   PROBE_VANTAGES,
+  STATE_PATHS,
   collectProbeReport,
   isHttpOrigin,
+  isLoginPath,
   probeFormText,
   probeGateText,
   probeOutcome,
@@ -227,6 +231,10 @@ const {
   readMediaType,
   readRedirect,
   readRefresh,
+  readState,
+  readStateGate,
+  stateTargets,
+  wantsStateProbe,
 } = await import("../src/model/probe.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
@@ -646,6 +654,19 @@ const PROBE_SIGNUP_HTML = `<!doctype html><html><head><title>News</title></head>
 <button type="submit">Subscribe</button></form></body></html>`;
 
 /**
+ * A client-rendered shell — the page the eighth signal exists for.
+ *
+ * There is no `<form>` and there is nothing to read. Whether this application has a login
+ * screen is not in this markup at any body size, because the markup is a script tag and an
+ * empty div: the screen is drawn after it arrives. Two services in `fixtures/probe/spa-shell`
+ * serve exactly this and differ only in what their current-user address answers, which is the
+ * whole of the rule.
+ */
+const PROBE_SHELL_HTML = `<!doctype html><html><head><title>app</title>
+<script type="module" src="/assets/index-4f2c9a.js"></script></head>
+<body><div id="root"></div></body></html>`;
+
+/**
  * Every address the fixture fleet answers at, keyed by the exact URL the probe builds.
  *
  * Keyed on the whole URL rather than the host, because the scheme and the trailing `/` are
@@ -718,6 +739,45 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
     contentType: "text/html; charset=utf-8",
     body: PROBE_SIGNUP_HTML,
   },
+  // Gated: a 302 to Authentik's own flow address, which is a login path the list now has.
+  "https://akportal.probe.example.com/": {
+    status: 302,
+    location: "/flows/-/default/authentication/",
+  },
+  // Open, and the trap for the rule above: an application routing to one of its own flows.
+  // `/flows/123` is not `/flows/-/`, and the `-` is the whole difference.
+  "https://dataflow.probe.example.com/": { status: 302, location: "/flows/123" },
+  /*
+   * The eighth signal, and the four addresses behind it.
+   *
+   * Both shells answer the same form-less 200, so both cost a second request — the entries
+   * below are what that request finds. `app` refuses at `/api/`, the first path in the walk,
+   * and names a scheme: `state-challenge`, and the walk stops there without asking the other
+   * three. `anon` serves `/api/` and `/api/me` like the public application it is and then
+   * refuses `/api/v1/me` with a bare 401, which is deliberately *not* a gate — so its walk
+   * is three long and its verdict is unchanged.
+   *
+   * Every path not listed here answers 404, which is what a service with no API does; see
+   * `probeStub`. That is why `anon`'s refusal sits at the third entry rather than the second:
+   * a walk that stopped early would not prove the walk continues past a 200.
+   */
+  "https://app.spa.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_SHELL_HTML,
+  },
+  "https://app.spa.probe.example.com/api/": {
+    status: 401,
+    wwwAuthenticate: 'Basic realm="app"',
+  },
+  "https://anon.spa.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_SHELL_HTML,
+  },
+  "https://anon.spa.probe.example.com/api/": { status: 200, contentType: "application/json" },
+  "https://anon.spa.probe.example.com/api/me": { status: 200, contentType: "application/json" },
+  "https://anon.spa.probe.example.com/api/v1/me": { status: 401 },
   // The LAN fallback. Its public hostname is absent from this table on purpose: the tunnel
   // name does not resolve from inside the fleet, so the walk falls through to the port.
   [`http://${PROBE_LAN_HOST}:18099/`]: {
@@ -726,6 +786,19 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
     body: PROBE_LOGIN_HTML,
   },
 };
+
+/**
+ * Every origin the table answers at — so a path it does not have can 404 instead of vanishing.
+ *
+ * The distinction the state walk made necessary. Before it, every address the probe sent was
+ * `/`, so "not in the table" and "this name does not resolve" were the same fact. Now the walk
+ * asks up to four more paths per shell, and a host that resolves at `/` cannot plausibly fail
+ * DNS at `/api/me` — it answers 404, because that is what a service with no API there does.
+ * Keeping `ENOTFOUND` for an unknown *origin* is what leaves `fixtures/probe/lan-fallback`
+ * meaningful: its tunnel hostname is absent from the table entirely, and the fall-through to a
+ * LAN port exists for exactly that.
+ */
+const PROBE_ORIGINS = new Set(Object.keys(PROBE_ANSWERS).map((u) => new URL(u).origin));
 
 /**
  * Stand in for the fixture fleet's own services, answering as themselves.
@@ -737,16 +810,19 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
  * resolved, and that each address was asked exactly once at `/` are all assertions about
  * this list and cannot be made any other way.
  *
- * Anything outside {@link PROBE_ANSWERS} throws the way `fetch` does — an `ENOTFOUND` on
- * `cause.code` — because that is the ordinary state of a fleet's public names seen from
- * inside it, and the fall-through to the next vantage exists for precisely that case.
+ * An address at an origin outside {@link PROBE_ORIGINS} throws the way `fetch` does — an
+ * `ENOTFOUND` on `cause.code` — because that is the ordinary state of a fleet's public names
+ * seen from inside it, and the fall-through to the next vantage exists for precisely that
+ * case. An unlisted *path* at an origin that does answer gets a 404 instead: see
+ * {@link PROBE_ORIGINS} for why the two cannot be the same answer any more.
  */
 function probeStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
   const calls: Recorded[] = [];
+  const notFound: ProbeAnswer = { status: 404, contentType: "text/plain" };
 
   const fetchImpl: FetchLike = async (url, init) => {
     calls.push({ url, sentToken: Boolean(init?.headers?.Authorization) });
-    const answer = PROBE_ANSWERS[url];
+    const answer = PROBE_ANSWERS[url] ?? (knownOrigin(url) ? notFound : undefined);
     if (!answer) {
       const err = new Error("fetch failed");
       (err as { cause?: unknown }).cause = { code: "ENOTFOUND" };
@@ -773,6 +849,15 @@ function probeStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
   };
 
   return { fetchImpl, calls };
+}
+
+/** Whether this address's origin is one the fixture fleet answers at all. */
+function knownOrigin(url: string): boolean {
+  try {
+    return PROBE_ORIGINS.has(new URL(url).origin);
+  } catch {
+    return false;
+  }
 }
 
 /** Turn the probe on for the next run, with or without a LAN vantage. Off by default. */
@@ -4573,15 +4658,193 @@ const gateCases: { name: string; res: ProbeResponse; gate: ProbeGate | undefined
 for (const c of gateCases) {
   check(c.name, readGate(c.res) === c.gate, `got ${String(readGate(c.res))}, wanted ${String(c.gate)}`);
 }
+/*
+ * The seven `readGate` can reach, which is `PROBE_GATES` minus one.
+ *
+ * `readGate` reads a single response, so `state-challenge` is not reachable from it at any input
+ * — that clause is about a *second* request and has its own table below. The subtraction is
+ * spelled out rather than the coverage check loosened, because "some signal is unreachable from
+ * every table in this file" is exactly the failure these two checks exist to catch, and a check
+ * that quietly skipped a clause would have stopped catching it.
+ */
+const READ_GATES = PROBE_GATES.filter((g) => g !== "state-challenge");
 check(
-  "every signal in the vocabulary is reached by one of those rows",
-  PROBE_GATES.every((g) => gateCases.some((c) => c.gate === g)),
-  PROBE_GATES.filter((g) => !gateCases.some((c) => c.gate === g)).join(", ") || "(all)",
+  "every signal readGate can reach is reached by one of those rows",
+  READ_GATES.every((g) => gateCases.some((c) => c.gate === g)),
+  READ_GATES.filter((g) => !gateCases.some((c) => c.gate === g)).join(", ") || "(all)",
 );
 check(
   "...and half the table is a near miss, which is what makes the rule strict",
   gateCases.filter((c) => c.gate === undefined).length >= PROBE_GATES.length,
   `${gateCases.filter((c) => c.gate === undefined).length} near misses, ${PROBE_GATES.length} signals`,
+);
+
+console.log("\nthe second request, and the one thing it is allowed to decide");
+/*
+ * The eighth signal, in three parts — because it is three separable decisions and only the last
+ * one may move a verdict.
+ *
+ * `wantsStateProbe` decides whether a request goes out at all, which is an I8 question and the
+ * only rule in this file whose failure mode is *traffic* rather than a wrong answer.
+ * `readState` says what the walk found. `readStateGate` says whether that is a gate, and the
+ * single most important row in this whole section is the one where it says no: a bare 401 at a
+ * current-user address is what a public application with optional accounts answers while serving
+ * everybody, so reading it as a gate would take a genuinely open service out of the exposed
+ * count. `fixtures/probe/spa-shell/anon` is the end-to-end half of that same claim.
+ */
+const wantsCases: { name: string; read: Parameters<typeof wantsStateProbe>[0]; want: boolean }[] = [
+  {
+    name: "a 200 of HTML with no form on it is the one page worth a second request",
+    read: { gate: undefined, status: 200, mediaType: "text/html", body: PROBE_SHELL_HTML },
+    want: true,
+  },
+  {
+    name: "...and so is an empty one, which is form-less by the same test",
+    read: { gate: undefined, status: 200, mediaType: "text/html", body: undefined },
+    want: true,
+  },
+  {
+    name: "a page with any form on it was already read by the clauses that read forms",
+    read: { gate: undefined, status: 200, mediaType: "text/html", body: PROBE_SIGNUP_HTML },
+    want: false,
+  },
+  {
+    name: "...even a form nothing matched, since the markup did have something to say",
+    read: { gate: undefined, status: 200, mediaType: "text/html", body: "<form></form>" },
+    want: false,
+  },
+  {
+    // The containment row. A service already known to be gated is never asked a second time,
+    // for the same reason `hasDetectedAuth` exists: the answer could not change the verdict.
+    name: "a page that already gated is not asked again",
+    read: { gate: "password-form", status: 200, mediaType: "text/html", body: PROBE_SHELL_HTML },
+    want: false,
+  },
+  {
+    name: "a redirect is evidence about where it pointed, not a page to ask behind",
+    read: { gate: undefined, status: 302, mediaType: undefined, body: undefined },
+    want: false,
+  },
+  {
+    name: "an answer that was never a page is not a shell",
+    read: { gate: undefined, status: 200, mediaType: "application/json", body: undefined },
+    want: false,
+  },
+  {
+    name: "...nor is one that came with no content type at all",
+    read: { gate: undefined, status: 200, mediaType: undefined, body: undefined },
+    want: false,
+  },
+];
+for (const c of wantsCases) {
+  check(c.name, wantsStateProbe(c.read) === c.want, `got ${String(wantsStateProbe(c.read))}`);
+}
+
+const stateCases: {
+  name: string;
+  answers: StateAnswer[];
+  want: ProbeState;
+  gate: ProbeGate | undefined;
+}[] = [
+  {
+    name: "a refusal that names a scheme is the gate, and stops the walk where it happened",
+    answers: [{ path: "/api/", status: 401, wwwAuthenticate: 'Basic realm="app"' }],
+    want: { asked: 1, refusedAt: "/api/", status: 401, challenge: true },
+    gate: "state-challenge",
+  },
+  {
+    name: "...and a 407 is the same refusal, from a proxy instead of the application",
+    answers: [
+      { path: "/api/", status: 404 },
+      { path: "/api/me", status: 407, wwwAuthenticate: "Negotiate" },
+    ],
+    want: { asked: 2, refusedAt: "/api/me", status: 407, challenge: true },
+    gate: "state-challenge",
+  },
+  {
+    // The row the whole rule turns on. Everything about this answer is a refusal except the
+    // one fact that separates an application from an API, so it is recorded and not acted on.
+    name: "a bare refusal is recorded in full and is deliberately not a gate",
+    answers: [
+      { path: "/api/", status: 200 },
+      { path: "/api/me", status: 200 },
+      { path: "/api/v1/me", status: 401 },
+    ],
+    want: { asked: 3, refusedAt: "/api/v1/me", status: 401, challenge: false },
+    gate: undefined,
+  },
+  {
+    // 403 is excluded on purpose, and the exclusion is load-bearing rather than cautious:
+    // nginx answers 403 for a directory with no index, so a static site would "refuse" here.
+    name: "a 403 is not a refusal, so the walk carries on past it",
+    answers: [
+      { path: "/api/", status: 403 },
+      { path: "/api/me", status: 404 },
+    ],
+    want: { asked: 2 },
+    gate: undefined,
+  },
+  {
+    name: "an address that answered nothing still counts as asked",
+    answers: [{ path: "/api/" }, { path: "/api/me", status: 404 }],
+    want: { asked: 2 },
+    gate: undefined,
+  },
+  {
+    name: "a walk that found nothing says how many it asked and nothing more",
+    answers: STATE_PATHS.map((p) => ({ path: p, status: 404 })),
+    want: { asked: 4 },
+    gate: undefined,
+  },
+  {
+    name: "...and a walk that never ran says zero rather than nothing",
+    answers: [],
+    want: { asked: 0 },
+    gate: undefined,
+  },
+];
+for (const c of stateCases) {
+  const got = readState(c.answers);
+  check(
+    c.name,
+    JSON.stringify(got) === JSON.stringify(c.want) && readStateGate(got) === c.gate,
+    `${JSON.stringify(got)} → ${String(readStateGate(got))}`,
+  );
+}
+check(
+  // The rule's request budget, and the only place it is stated as a number a reader can check.
+  // Four addresses is the worst case per shell and one is the ordinary case, because the walk
+  // stops at the first refusal — which is what the `asked: 1` row above pins.
+  "the walk is bounded by the list, and the list is four addresses",
+  STATE_PATHS.length === 4 && new Set(STATE_PATHS).size === 4,
+  `${STATE_PATHS.length} paths, ${new Set(STATE_PATHS).size} distinct`,
+);
+check(
+  "...every one of them an absolute path, so none can be read as relative to a page",
+  STATE_PATHS.every((p) => p.startsWith("/")),
+  STATE_PATHS.filter((p) => !p.startsWith("/")).join(", "),
+);
+check(
+  // Nothing on a page may name an address LabView then dials. The addresses come from a
+  // constant and an origin that already answered, and this is that claim as an assertion.
+  "the addresses are built on the origin that answered, not on the path that did",
+  stateTargets("https://a.example.com/en/dashboard?next=1").join(" ") ===
+    STATE_PATHS.map((p) => `https://a.example.com${p}`).join(" "),
+  stateTargets("https://a.example.com/en/dashboard?next=1").join(" "),
+);
+check(
+  "...and an address that will not parse yields none rather than throwing",
+  stateTargets("not a url").length === 0,
+  stateTargets("not a url").join(" "),
+);
+check(
+  "the two tables between them reach every signal in the vocabulary",
+  PROBE_GATES.every(
+    (g) => gateCases.some((c) => c.gate === g) || stateCases.some((c) => c.gate === g),
+  ),
+  PROBE_GATES.filter(
+    (g) => !gateCases.some((c) => c.gate === g) && !stateCases.some((c) => c.gate === g),
+  ).join(", ") || "(all)",
 );
 
 console.log("\nwhat a login form is made of");
@@ -4783,6 +5046,67 @@ check(
   }),
   redirectCases.map((c) => String(readRedirect(c.location, "https://a.example.com/")?.to)).join(" | "),
 );
+/*
+ * The list of path names, one row per entry, each with a path it matches and a path it must not.
+ *
+ * This is the only rule in the probe that can take a service out of the exposed count on the
+ * strength of a *name* — no status, no header, no markup, just a string in a `Location` that
+ * stayed on the same origin. So the near misses are the point of the table, and each one is a
+ * real service: a blog with authors, a workflow tool routing to a configured flow, a shop
+ * whose product is called Signal. Every entry is a prefix match, which is what makes both
+ * columns necessary — a prefix is exactly as strong as the shortest word it is a prefix of.
+ */
+const loginPathCases: { pins: string; yes: string[]; no: string[] }[] = [
+  { pins: "/login", yes: ["/login", "/login.php", "/login?next=%2F"], no: ["/log", "/dashboard/login"] },
+  { pins: "/signin", yes: ["/signin", "/signin/callback"], no: ["/signal", "/signage"] },
+  // Two spellings of one word, because an application picks one and redirects to it forever.
+  { pins: "/sign-in", yes: ["/sign-in", "/sign-in/"], no: ["/sign-up", "/signed-out"] },
+  { pins: "/users/sign_in", yes: ["/users/sign_in"], no: ["/users/sign_up", "/users/1"] },
+  // The widest entry in the list, and the row that says so: `/sso` is four characters with no
+  // trailing slash, so it claims every path beginning with them — `/ssologin` and `/ssoadmin`
+  // included. It stays that way because no word in use starts with those four and means
+  // something else, which is exactly what cannot be said of `/auth`. The near misses are
+  // therefore the two shapes that genuinely miss: a shorter path, and the name somewhere other
+  // than the front.
+  { pins: "/sso", yes: ["/sso", "/sso/saml/login", "/ssologin"], no: ["/ss", "/assets/sso.png", "/single-sign-on"] },
+  { pins: "/oauth2", yes: ["/oauth2", "/oauth2/start", "/oauth2/authorize"], no: ["/oauth", "/api/oauth2"] },
+  // The slash is the rule. Without it this row's near misses are both gates.
+  { pins: "/auth/", yes: ["/auth/", "/auth/login", "/auth/realms/master/protocol/openid-connect/auth"], no: ["/auth", "/authors", "/author/jane"] },
+  {
+    pins: "/outpost.goauthentik.io",
+    yes: ["/outpost.goauthentik.io/start", "/outpost.goauthentik.io/auth/nginx"],
+    no: ["/outpost", "/outposts/1"],
+  },
+  { pins: "/if/flow/", yes: ["/if/flow/default-authentication-flow/", "/if/flow/x/?next=%2F"], no: ["/if/admin/", "/if/user/"] },
+  // The `-` is the rule here, and `dataflow` in `fixtures/probe/authentik-flow` is the service
+  // that would leave the exposed count without it.
+  { pins: "/flows/-/", yes: ["/flows/-/default/authentication/", "/flows/-/default/invalidation/"], no: ["/flows", "/flows/123", "/flows/build-nightly"] },
+];
+for (const c of loginPathCases) {
+  for (const p of c.yes) {
+    check(`\`${p}\` is a login path`, isLoginPath(p), `${p} was not matched`);
+  }
+  for (const p of c.no) {
+    check(`...and \`${p}\` is not`, !isLoginPath(p), `${p} was matched`);
+  }
+}
+check(
+  "every path in the list is pinned by a row of its own, matching and not matching",
+  LOGIN_PATHS.every((p) => loginPathCases.some((c) => c.pins === p)),
+  LOGIN_PATHS.filter((p) => !loginPathCases.some((c) => c.pins === p)).join(", ") || "(all)",
+);
+check(
+  "...and every row pins an entry that is really in it, spelled the way the list spells it",
+  loginPathCases.every((c) => LOGIN_PATHS.includes(c.pins)),
+  loginPathCases.filter((c) => !LOGIN_PATHS.includes(c.pins)).map((c) => c.pins).join(", ") || "(all)",
+);
+check(
+  "...and the path each row pins is matched by the rule under its own name",
+  loginPathCases.every((c) => isLoginPath(c.pins) && c.yes.every((p) => p.toLowerCase().startsWith(c.pins))),
+  loginPathCases.filter((c) => !c.yes.every((p) => p.toLowerCase().startsWith(c.pins))).map((c) => c.pins).join(", ") || "(all)",
+);
+// Case folding, which is not decoration: a `Location` is written by whoever wrote the server.
+check("a login path is recognised however it was capitalised", isLoginPath("/Login") && isLoginPath("/IF/Flow/x/"), "case");
 const refreshCases: { name: string; body: string; want: string }[] = [
   {
     name: "a meta refresh is read as the target a browser would honour",
@@ -4920,6 +5244,22 @@ const reasonCases: ReasonCase[] = [
     must: ["one-time-code field"],
   },
   {
+    // The only verdict in the vocabulary that rests on a fact from a *second* request, so its
+    // sentence has to name both halves — what the page did not have and what the address behind
+    // it answered. A reader shown only the second would have no idea why a form-less 200 was
+    // read as gated; shown only the first, no idea what moved the verdict.
+    name: "a state challenge names the empty page and the address that refused behind it",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      gate: "state-challenge",
+      state: { asked: 1, refusedAt: "/api/", status: 401, challenge: true },
+      detail: "x",
+    },
+    must: ["no form at all", "/api/", "401", "WWW-Authenticate", "drawn by this service's own client"],
+  },
+  {
     // The near miss the challenge clause is strict for. A bare 401 is also what an API returns
     // to a call it will not serve, and reading it as a gate would clear those wholesale.
     name: "a bare 401 names the header that was absent, and what else answers that way",
@@ -4977,6 +5317,44 @@ const reasonCases: ReasonCase[] = [
       detail: "x",
     },
     must: ["nearest thing to a signal", "no login intent", "action is not a login path"],
+  },
+  {
+    // The bare refusal, and the most carefully worded sentence in the module. It is asserted
+    // for two things at once: that it names what was found, and that it says the finding stands
+    // anyway. Drop the second half and this reads as a gate LabView declined to count, which is
+    // the opposite of what happened — nothing here is strong enough to count (**I1**).
+    name: "a form-less page whose API said `nobody is signed in` is told about, and still stands",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      state: { asked: 3, refusedAt: "/api/v1/user", status: 401, challenge: false },
+      detail: "x",
+    },
+    must: [
+      "/api/v1/user",
+      "nobody is signed in",
+      "named no authentication scheme",
+      "optional accounts",
+      "not a gate",
+      "the finding stands",
+    ],
+  },
+  {
+    // The other answer, which is a finding rather than a shortfall: the one page the rule cannot
+    // read, with nothing behind it contradicting what it served. Asserted because a silent
+    // "nothing found" here and a silent "not asked" would be the same sentence, and this feature
+    // costs a request per service precisely to tell them apart.
+    name: "...and one whose addresses all answered says nothing behind the page contradicts it",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      state: { asked: 4 },
+      detail: "x",
+    },
+    must: ["4 current-user addresses", "refused an anonymous request either", "nothing behind the page contradicts"],
+    mustNot: ["gate", "signed in"],
   },
   {
     // §11's known miss, reported the one time it can be: a form below the cap was never
@@ -5369,17 +5747,29 @@ check(
     renderMarkdown(refusedReport).includes("a catch-all, not an endpoint"),
 );
 check(
-  // The finding, and the size of the change it implies. A refusal one path away from where the
-  // scan looks is not a new clause — every clause reads a response, and this one needs a second
-  // request. Saying which kind of change it is, in the report, is what keeps it from being
-  // mistaken for a one-word fix.
-  "...and section 4 leads with the refusal, naming it as a change to what the probe requests",
+  // The finding, and the size of the change it implies — which is the assertion that moved when
+  // the eighth signal shipped. This used to have to say "a change to what the probe requests",
+  // because the probe requested one address per service and reading a refusal at a second one
+  // was a new kind of request. It now requests four, so the same observation has shrunk to *one
+  // entry missing from a list* — a commit with a fixture and no new rule in it. Section 4 exists
+  // to size a change rather than only to report one, so the size is what is asserted, and this
+  // row failing on the old wording is how the difference stayed visible.
+  "...and section 4 leads with the refusal, sized as one entry missing from `STATE_PATHS`",
   refusedReport.next[0]!.includes("/api/v1/users/me") &&
     refusedReport.next[0]!.includes("401") &&
-    refusedReport.next[0]!.includes("challenge") &&
-    refusedReport.next[0]!.includes("what the probe requests") &&
+    refusedReport.next[0]!.includes("STATE_PATHS") &&
+    refusedReport.next[0]!.includes("state-challenge") &&
+    refusedReport.next[0]!.includes("no new rule") &&
     refusedReport.next.some((n) => n.includes("no body-only signal can see it")),
   refusedReport.next.join(" | "),
+);
+check(
+  // And the address it names is one the *scan* would not have asked, which is the whole content
+  // of the recommendation. A tool that recommended adding a path already in the list would be
+  // reporting its own sweep back as a finding.
+  "...and the path it recommends adding is one the scan does not already ask",
+  !STATE_PATHS.includes("/api/v1/users/me") && AUTH_STATE_PATHS.includes("/api/v1/users/me"),
+  `${STATE_PATHS.join(" ")} vs ${AUTH_STATE_PATHS.join(" ")}`,
 );
 check(
   // I6 on the new path. A `SweepStep` has no headers field at all — status, content type, the
@@ -5584,13 +5974,13 @@ const idleProbe = probeStub();
 const unasked = await overviewFor(probeRoot, { fetchImpl: idleProbe.fetchImpl });
 const pbSvcOff = lookup(unasked);
 check(
-  "found 15 stacks, 21 services",
-  unasked.stats.stacks === 15 && unasked.stats.services === 21,
+  "found 17 stacks, 25 services",
+  unasked.stats.stacks === 17 && unasked.stats.services === 25,
   `${unasked.stats.stacks}/${unasked.stats.services}`,
 );
 check(
-  "...16 of which are reachable without detected authentication before anything is asked",
-  unasked.stats.exposedWithoutAuth === 16,
+  "...20 of which are reachable without detected authentication before anything is asked",
+  unasked.stats.exposedWithoutAuth === 20,
   String(unasked.stats.exposedWithoutAuth),
 );
 check("not one request was sent", idleProbe.calls.length === 0, idleProbe.calls.map((c) => c.url).join(" "));
@@ -5646,8 +6036,9 @@ const probeFlat = (ov: Overview): [string, Service][] =>
   ov.stacks.flatMap((st) => st.services.map((s) => [`${st.id}/${s.name}`, s] as [string, Service]));
 
 console.log("\na login page answering is protection LabView measured");
-// Each of the seven signals, once, through the whole pipeline rather than on a literal: the
-// stub answers as the service, the rule reads it, and the verdict changes.
+// Each of the signals readGate decides, once, through the whole pipeline rather than on a
+// literal: the stub answers as the service, the rule reads it, and the verdict changes. The
+// eighth is further down, under its own heading, because it takes a second answer to reach.
 check(
   "a tunnel service served its own login form",
   result("tunnel-login", "app").gate === "password-form" &&
@@ -5679,6 +6070,27 @@ check(
   "a proxied service redirected to a login path of its own",
   result("own-login", "wiki").gate === "redirect-login",
   JSON.stringify(result("own-login", "wiki")),
+);
+check(
+  // The same signal, at a path the list did not have until now — and the whole of what it took to
+  // recognise an identity provider's own sign-in flow. This is asserted through the pipeline
+  // rather than only in the `isLoginPath` table because the table cannot show what the entry is
+  // *worth*: one line in a list, and a service that answered two hops short of a login form is
+  // read from its first response with no extra request at all.
+  "an identity provider's own flow address is a login path, read from the first Location",
+  result("authentik-flow", "portal").gate === "redirect-login" &&
+    result("authentik-flow", "portal").status === 302 &&
+    result("authentik-flow", "portal").redirect?.to === "/flows/-/default/authentication/" &&
+    result("authentik-flow", "portal").redirect?.crossOrigin === false,
+  JSON.stringify(result("authentik-flow", "portal")),
+);
+check(
+  // And the cost of getting there, because it is the argument for reading the path rather than
+  // walking to it: one request, and the page at the far end of that chain has no form in its
+  // markup, so walking would have cost two more requests and arrived at no signal.
+  "...for one request, which is the argument for recognising the path instead of following it",
+  probeCalls.filter((u) => u.startsWith("https://akportal.probe.example.com")).length === 1,
+  probeCalls.filter((u) => u.startsWith("https://akportal.probe.example.com")).join(" "),
 );
 // The three signals a 200 can carry besides a password field. Each is here because a real
 // class of service is invisible to the other six, and each is asserted through the pipeline
@@ -5859,6 +6271,134 @@ check(
     result("passwordless", "news").form?.action === undefined,
   JSON.stringify(result("passwordless", "news").form),
 );
+check(
+  // The third trap, and the one the new `LOGIN_PATHS` entries needed. `/flows/123` is an
+  // application sending a visitor to one of its own configured flows — a workflow tool, a CI
+  // dashboard, a data pipeline — and under a bare `/flows` prefix this wide-open service would
+  // leave the exposed count on the strength of a noun. Drop the `-` from the entry and this row
+  // is the one that fails.
+  "a redirect to one of an application's own flows is routing, and the `-` is what says so",
+  pbSvc("authentik-flow", "pipeline").auth.exposedWithoutAuth === true &&
+    result("authentik-flow", "pipeline").gate === undefined &&
+    result("authentik-flow", "pipeline").redirect?.to === "/flows/123",
+  `exposed=${pbSvc("authentik-flow", "pipeline").auth.exposedWithoutAuth} gate=${String(result("authentik-flow", "pipeline").gate)} to=${String(result("authentik-flow", "pipeline").redirect?.to)}`,
+);
+check(
+  // Same contract as the two traps above: the record has to name the target, because that string
+  // is the entire difference between this service and the one two rows up.
+  "...and the record names the flow it routed to, which is all that separates it from a gate",
+  probeReasonText(result("authentik-flow", "pipeline")).includes("/flows/123") &&
+    probeReasonText(result("authentik-flow", "pipeline")).includes("routing rather than a gate"),
+  probeReasonText(result("authentik-flow", "pipeline")),
+);
+
+console.log("\nthe one page no reading of a body can judge, and the address behind it");
+/*
+ * The eighth signal, through the pipeline, as the pair it has to be asserted as.
+ *
+ * Both services serve the same thing at `/`: HTTP 200, `text/html`, and not a `<form>` anywhere in
+ * it — which is what a login screen drawn in the browser looks like on the wire, and is also what
+ * a public single-page application looks like. No reading of that body decides anything, at any
+ * cap, which is why this is the one clause allowed to send a second request.
+ *
+ * What separates them is one response header at one address, and the direction of the risk is what
+ * makes the trap the more important half. Reading `app`'s challenge as a gate costs nothing if it
+ * is wrong — the service stays in a list a reader is looking at either way. Reading `anon`'s bare
+ * 401 as a gate takes a genuinely open application *out* of the exposed count, silently, and that
+ * is the one direction this program's evidence rules do not permit (**I1**).
+ */
+const spaApp = result("spa-shell", "app");
+const spaAnon = result("spa-shell", "anon");
+check(
+  "a form-less page whose own API demands a credential is behind a login the markup never showed",
+  spaApp.gate === "state-challenge" &&
+    spaApp.status === 200 &&
+    spaApp.mediaType === "text/html" &&
+    spaApp.form === undefined &&
+    pbSvc("spa-shell", "app").auth.exposedWithoutAuth === false,
+  JSON.stringify(spaApp),
+);
+check(
+  // The walk, and the two facts about it that are not visible in the verdict: which address
+  // refused, and that the refusal ended it. `/api/` is the first entry in `STATE_PATHS`, so a
+  // walk that carried on regardless would record 4 here and send three requests to a service that
+  // had already answered the question.
+  "...and the walk stopped on the refusal, at the first address, having asked once",
+  spaApp.state?.asked === 1 &&
+    spaApp.state?.refusedAt === "/api/" &&
+    spaApp.state?.status === 401 &&
+    spaApp.state?.challenge === true &&
+    probeCalls.filter((u) => u.startsWith("https://app.spa.probe.example.com")).length === 2,
+  `${JSON.stringify(spaApp.state)} · ${probeCalls.filter((u) => u.startsWith("https://app.spa.probe.example.com")).join(" ")}`,
+);
+check(
+  // The note, and the reason `noteProbe` has two wordings. Every other gate can honestly say a
+  // login page answered; this one cannot — nothing that arrived was a login page. A note reusing
+  // the other sentence would be telling a reader LabView saw something it never saw, about the one
+  // verdict most in need of being checked.
+  "...and the note says what actually happened, which is not that a login page answered",
+  /and was answered with a page carrying no form/.test(noteText(pbSvc("spa-shell", "app"))) &&
+    noteText(pbSvc("spa-shell", "app")).includes("/api/") &&
+    noteText(pbSvc("spa-shell", "app")).includes("not reachable without authenticating") &&
+    !/answered with a login page/.test(noteText(pbSvc("spa-shell", "app"))),
+  noteText(pbSvc("spa-shell", "app")),
+);
+check(
+  // The trap. An anonymous-enabled Grafana and a world-readable Gitea both answer exactly this
+  // way — pages for everybody, and a current-user endpoint saying nobody is signed in. Loosen
+  // `readStateGate` to accept a bare 401 and this row is what fails, which is the whole reason it
+  // is here rather than in the rule's own table.
+  "a form-less page whose API merely says `nobody is signed in` stays in the exposed count",
+  spaAnon.gate === undefined &&
+    pbSvc("spa-shell", "anon").auth.exposedWithoutAuth === true &&
+    spaAnon.state?.refusedAt === "/api/v1/me" &&
+    spaAnon.state?.status === 401 &&
+    spaAnon.state?.challenge === false,
+  `gate=${String(spaAnon.gate)} exposed=${pbSvc("spa-shell", "anon").auth.exposedWithoutAuth} state=${JSON.stringify(spaAnon.state)}`,
+);
+check(
+  // The other half of the walk, in the other direction: two 200s did not stop it, so the number
+  // that arrives here is 3 rather than 1. Between this row and `app`'s, the short-circuit is
+  // pinned from both sides — a walk that always ran to the end and a walk that stopped on any
+  // answer would each fail exactly one of them.
+  "...having been asked at three addresses, because an answer that is not a refusal is not an end",
+  spaAnon.state?.asked === 3 &&
+    probeCalls.filter((u) => u.startsWith("https://anon.spa.probe.example.com")).length === 4,
+  `${JSON.stringify(spaAnon.state)} · ${probeCalls.filter((u) => u.startsWith("https://anon.spa.probe.example.com")).join(" ")}`,
+);
+check(
+  // And it is reported rather than buried, which is the compromise the bare 401 gets: a reader is
+  // sent to look at the thing LabView found and told in the same sentence that it changed nothing.
+  // Both halves are asserted, because either one alone is misleading.
+  "...and the refusal is named to the reader anyway, as a place to look and not as a verdict",
+  probeReasonText(spaAnon).includes("/api/v1/me") &&
+    probeReasonText(spaAnon).includes("named no authentication scheme") &&
+    probeReasonText(spaAnon).includes("the finding stands") &&
+    noAuthReason(pbSvc("spa-shell", "anon")) === "gap",
+  probeReasonText(spaAnon),
+);
+check(
+  // Fleet-wide, and the bound that keeps this clause from being a crawler. A second request only
+  // ever goes to a service that answered an HTML 200 with no form in it and no gate read off it,
+  // so every service carrying a `state` record has to be one — and every service that is one has
+  // to carry the record, or the connection line's request count is describing traffic nobody can
+  // account for. Stated as an equivalence in both directions for that reason: an over-eager rule
+  // and a rule that quietly skipped a service would each break one half of it.
+  //
+  // `state-challenge` is the one gate that may coexist with a record, because it *is* the record.
+  "a second request went to exactly the services whose page had no form in it to read",
+  probeFlat(probed).every(([, s]) => {
+    const p = s.probe;
+    if (!p) return true;
+    const unreadable = p.status === 200 && p.mediaType === "text/html" && p.form === undefined;
+    const eligible = unreadable && (p.gate === undefined || p.gate === "state-challenge");
+    return (p.state !== undefined) === eligible;
+  }),
+  probeFlat(probed)
+    .filter(([, s]) => s.probe?.state)
+    .map(([k, s]) => `${k}=${s.probe?.status}/${String(s.probe?.mediaType)}`)
+    .join(" "),
+);
 
 console.log("\na service whose authentication this scan already found is not asked at all");
 /*
@@ -5959,7 +6499,7 @@ check(
 );
 check(
   "it counts in neither of the two counters",
-  probed.stats.probeGated + probed.stats.probeOpen === 13,
+  probed.stats.probeGated + probed.stats.probeOpen === 17,
   `${probed.stats.probeGated} gated + ${probed.stats.probeOpen} open`,
 );
 check(
@@ -6255,11 +6795,36 @@ check(
     pbSvc("tcp-tunnel", "bastion").auth.exposedWithoutAuth === true,
   probed.stacks.find((s) => s.id === "tcp-tunnel")?.services.map((s) => `${s.name}=${String(s.probe?.phase)}`).join(" ") ?? "",
 );
-// Bounds on the requests that *were* sent: one per address, at `/`, GET, no credential.
+// Bounds on the requests that *were* sent: at `/` or at one of four fixed paths, GET, no
+// credential, and no address that came off a page.
 check(
-  "every request was a GET at `/` and nothing else",
-  probeCalls.every((u) => new URL(u).pathname === "/" && !new URL(u).search),
-  probeCalls.filter((u) => new URL(u).pathname !== "/" || new URL(u).search).join(" "),
+  "every request was a GET at `/` or at one of the four current-user addresses",
+  probeCalls.every((u) => {
+    const { pathname, search } = new URL(u);
+    return !search && (pathname === "/" || STATE_PATHS.includes(pathname));
+  }),
+  probeCalls
+    .filter((u) => {
+      const { pathname, search } = new URL(u);
+      return search || (pathname !== "/" && !STATE_PATHS.includes(pathname));
+    })
+    .join(" "),
+);
+check(
+  // The containment claim the second request rests on, and the one worth asserting over the
+  // whole run rather than reasoning about at the call site. Nothing a service *served* decides
+  // where the second request goes — the four paths are a constant and the origin is the one
+  // already reached — so a scanned document can add at most four requests to its own origin and
+  // cannot add a single one to anybody else's. That is the same bound `MAX_PROBE_TARGETS` puts
+  // on the first request, arrived at a different way (**I8**).
+  "...and every current-user address was on an origin the first request had already reached",
+  (() => {
+    const rootOrigins = new Set(
+      probeCalls.filter((u) => new URL(u).pathname === "/").map((u) => new URL(u).origin),
+    );
+    return probeCalls.every((u) => new URL(u).pathname === "/" || rootOrigins.has(new URL(u).origin));
+  })(),
+  probeCalls.filter((u) => new URL(u).pathname !== "/").join(" "),
 );
 check(
   "...no credential was sent to a scanned service, since none is in scope to send",
@@ -6272,19 +6837,45 @@ check(
   probeCalls.filter((u, i) => probeCalls.indexOf(u) !== i).join(" "),
 );
 /*
- * The total, spelled out as the sum it is. Sixteen services in this root show an HTTP address;
- * two of them already had authentication detected and were withheld, so fourteen get one
- * request each — and exactly one of those, `lan-fallback/vault`, whose public hostname does not
- * resolve, gets a second from the next vantage. `silent/ghost` does *not* get a second: it also
- * fails, but it publishes no port, so there is no LAN address to fall through to. That asymmetry
- * is the assertion worth having here, because "walk the vantages until one answers" and "walk
- * them all" produce the same verdicts on this root and differ only in this number.
+ * The total, spelled out as the sum it is, in the two parts it now has.
+ *
+ * Twenty services in this root show an HTTP address; two of them already had authentication
+ * detected and were withheld, so eighteen get one request each — and exactly one of those,
+ * `lan-fallback/vault`, whose public hostname does not resolve, gets a second from the next
+ * vantage. `silent/ghost` does *not*: it also fails, but it publishes no port, so there is no LAN
+ * address to fall through to. That asymmetry is worth asserting because "walk the vantages until
+ * one answers" and "walk them all" produce the same verdicts on this root and differ only in this
+ * number. Nineteen requests, then, to settle what the first response can settle.
+ *
+ * The other sixteen are the second request, and they are the price of the eighth signal — five
+ * services here answer with a form-less HTML 200, which is the one page no reading of a body can
+ * judge. Four of them cost the full walk (nothing refuses, so the list runs out) and one costs a
+ * single request (`/api/` refuses immediately, and a refusal is the answer). A rule that walked
+ * all four regardless would show up here as 19 rather than 16, which is the only symptom it would
+ * have — every verdict on this root would be identical.
  */
 const eligibleCount = probeFlat(probed).filter(([, s]) => s.probe !== undefined).length;
+const secondCount = probeCalls.filter((u) => new URL(u).pathname !== "/").length;
 check(
-  "15 requests: one for each of the 14 services asked, plus one fallthrough",
-  eligibleCount === 14 && probeCalls.length === 15,
-  `${eligibleCount} asked, ${probeCalls.length} requests: ${probeCalls.join(" ")}`,
+  "35 requests: one for each of the 18 services asked, one fallthrough, and 16 second requests",
+  eligibleCount === 18 && probeCalls.length === 35 && secondCount === 16,
+  `${eligibleCount} asked, ${probeCalls.length} requests (${secondCount} second): ${probeCalls.join(" ")}`,
+);
+check(
+  // What ties the number above to the payload rather than to this file. `ProbeState.asked` exists
+  // so a reader can see how many requests a scan sent without going and reading a rule, so it had
+  // better be the number that was sent — asserted as a sum over the fleet against the stub's own
+  // record of the wire.
+  "...and the payload's own account of the second requests adds up to what was sent",
+  probeFlat(probed).reduce((n, [, s]) => n + (s.probe?.state?.asked ?? 0), 0) === secondCount,
+  `${probeFlat(probed).reduce((n, [, s]) => n + (s.probe?.state?.asked ?? 0), 0)} recorded vs ${secondCount} sent`,
+);
+check(
+  // And the bound, stated as a bound rather than as today's total: no service may cost more than
+  // the list is long, however many addresses it has or however its pages answer.
+  "...and no one service was asked at more current-user addresses than the list holds",
+  probeFlat(probed).every(([, s]) => (s.probe?.state?.asked ?? 0) <= STATE_PATHS.length),
+  probeFlat(probed).map(([k, s]) => `${k}=${s.probe?.state?.asked ?? 0}`).join(" "),
 );
 const addressable = probeFlat(probed).filter(([, s]) => probeTargets(s, PROBE_LAN_HOST).length > 0);
 check(
@@ -6334,16 +6925,27 @@ const removedByProbe = probeFlat(probed).filter(
   ([k, s]) => s.probe?.gate && offExposed.get(k) === true,
 ).length;
 check(
-  "...so the aggregate adds back up: 9 exposed + 7 the probe removed = the 16 counted with it off",
-  probed.stats.exposedWithoutAuth === 9 &&
-    removedByProbe === 7 &&
+  "...so the aggregate adds back up: 11 exposed + 9 the probe removed = the 20 counted with it off",
+  probed.stats.exposedWithoutAuth === 11 &&
+    removedByProbe === 9 &&
     probed.stats.exposedWithoutAuth + removedByProbe === unasked.stats.exposedWithoutAuth,
   `${probed.stats.exposedWithoutAuth} + ${removedByProbe} vs ${unasked.stats.exposedWithoutAuth}`,
 );
 check(
   "...and `probeGated` counts login pages, which is one more — the service already declared",
-  probed.stats.probeGated === 8 && probed.stats.probeGated === removedByProbe + 1,
+  probed.stats.probeGated === 10 && probed.stats.probeGated === removedByProbe + 1,
   `${probed.stats.probeGated} gated, ${removedByProbe} removed`,
+);
+check(
+  // The eighth signal's own share of that subtraction, isolated. Two of the nine services the
+  // probe removed left on evidence no reading of a body could have produced — so this row is what
+  // fails if the second request stops going out, or stops being allowed to decide anything, while
+  // every other count above stays where it is.
+  "...and exactly one of the nine left the count on a second request rather than on a page",
+  probeFlat(probed).filter(([, s]) => s.probe?.gate === "state-challenge").length === 1 &&
+    probeFlat(probed).filter(([k, s]) => s.probe?.gate === "state-challenge" && offExposed.get(k) === true)
+      .length === 1,
+  probeFlat(probed).filter(([, s]) => s.probe?.gate === "state-challenge").map(([k]) => k).join(" ") || "(none)",
 );
 const offPosture = new Map(probeFlat(unasked).map(([k, s]) => [k, `${s.auth.method}/${s.auth.confidence}`]));
 const movedMechanism = probeFlat(probed).filter(
@@ -6369,13 +6971,16 @@ check(
   `${probeConn.ok}/${probeConn.phase}`,
 );
 check(
-  // Three segments, and the third is not decoration. This line is the only place a reader sees
-  // the whole stage at once, and "14 services probed" in a root with 16 HTTP addresses invites
-  // exactly the wrong conclusion — that two of them were somehow unreachable rather than
-  // deliberately left alone. It comes last, after everything that was measured, and it says why.
-  "...and says what it found in counts, including what it chose not to ask and why",
+  // Four segments, and neither of the last two is decoration. This line is the only place a
+  // reader sees the whole stage at once. "18 services probed" in a root with 20 HTTP addresses
+  // invites exactly the wrong conclusion — that two of them were somehow unreachable rather than
+  // deliberately left alone — so the third segment says why, and comes after everything measured.
+  // The fourth is the request budget: a stage that sent 35 requests while reporting 18 services
+  // would be understating its own traffic by half, and an operator deciding whether to switch this
+  // on is entitled to the real number (**I8**).
+  "...and says what it found in counts, including what it chose not to ask and what it cost",
   probeConn.read ===
-    "14 services probed — 8 gated, 5 open, 1 did not answer — 2 services not asked (authentication already detected)",
+    "18 services probed — 10 gated, 7 open, 1 did not answer — 2 services not asked (authentication already detected) — 16 extra requests at current-user addresses",
   probeConn.read ?? "no read line",
 );
 check(

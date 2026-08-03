@@ -51,6 +51,8 @@ import type { ConnectionPhase, Overview } from "../../src/model/types.js";
 import {
   AUTH_STATE_PATHS,
   buildReport,
+  firstRefusal,
+  refusalIsPipelineGate,
   renderJson,
   renderMarkdown,
   wantsSweep,
@@ -514,7 +516,7 @@ function renderIndex(rows: Row[], at: string): string {
     // was nothing to say, and neither is ever the same cell as a gate: the verdict column is what
     // LabView concluded and these are what it could not see.
     const ahead = report.chain.find((h) => h.gate !== undefined);
-    const refused = report.sweep.filter((s) => s.status === 401 || s.status === 403);
+    const refused = firstRefusal(report.sweep);
     L.push(
       `| ${target.url} | ${report.verdict.label} | ${report.verdict.gate ?? "—"} | ${
         report.verdict.withdrawsExposure ? "yes" : "no"
@@ -525,8 +527,8 @@ function renderIndex(rows: Row[], at: string): string {
       } | ${
         report.sweep.length === 0
           ? "—"
-          : refused.length
-            ? `**${refused[0]!.status} at ${refused[0]!.path}**`
+          : refused
+            ? `**${refused.status} at ${refused.path}**${refusalIsPipelineGate(refused) ? "" : " (evidence only)"}`
             : `${report.sweep.length} asked, none refused`
       } | ${report.next.length} | [${file}](${file}) |`,
     );
@@ -594,7 +596,7 @@ async function main(): Promise<void> {
     await writeFile(resolvePath(opts.out, `${slug(target.url)}.json`), renderJson(report), "utf8");
     rows.push({ target, report, file });
     const ahead = report.chain.find((h) => h.gate !== undefined);
-    const refused = report.sweep.find((s) => s.status === 401 || s.status === 403);
+    const refused = firstRefusal(report.sweep);
     process.stdout.write(
       `${report.verdict.gate ? "gated " : report.read.status === undefined ? "silent" : "open  "} ${
         report.read.status ?? "—"
@@ -614,7 +616,7 @@ async function main(): Promise<void> {
     await emit(target, await reportOn(obs, hops));
     // The end of a chain gets a report of its own, built from the answer already in hand rather
     // than from a second request. It is the page an operator's browser actually shows them, so it
-    // is the one they will want the seven rows for — and where the chain ended on a shell, it is
+    // is the one they will want the signal rows for — and where the chain ended on a shell, it is
     // also the observation the sweep has something to say about.
     const end = hops[hops.length - 1];
     if (end && !asked.has(end.requestUrl)) {
@@ -665,18 +667,29 @@ async function main(): Promise<void> {
       }`,
     );
   }
-  // The two findings this whole tool exists to surface, and the reason they are last: they are
-  // what somebody scrolls back for. Both name a login page LabView cannot see from where it looks
-  // — one further down a chain than it reads, one at an address it does not ask.
+  // The findings this whole tool exists to surface, and the reason they are last: they are what
+  // somebody scrolls back for. Each names a login page LabView cannot see from where it looks —
+  // one further down a chain than it reads, one at an address it does not ask, one it asked and
+  // decided on purpose not to act on.
   const aheadRows = rows.filter((r) => r.report.chain.some((h) => h.gate !== undefined));
-  const refusedRows = rows.filter((r) => r.report.sweep.some((s) => s.status === 401 || s.status === 403));
   for (const r of aheadRows) {
     const h = r.report.chain.find((x) => x.gate !== undefined)!;
     L.push(`gated further down the chain: ${r.target.url} → ${h.gate} at ${h.url}`);
   }
-  for (const r of refusedRows) {
-    const s = r.report.sweep.find((x) => x.status === 401 || x.status === 403)!;
-    L.push(`gated at an address the probe does not ask: ${r.target.url} → ${s.status} at ${s.path}`);
+  // A refusal that already became the verdict is in the `gated` count above and is not a finding
+  // about a blind spot any more — it is the eighth clause working. What is left divides in two,
+  // and the two are wildly different sizes of change, so they are not one list: a scheme named at
+  // an address outside `STATE_PATHS` is one entry short of a fix, while a bare refusal is a
+  // deliberate non-gate that a reader must not mistake for an oversight.
+  for (const r of rows) {
+    if (r.report.verdict.gate === "state-challenge") continue;
+    const s = firstRefusal(r.report.sweep);
+    if (!s) continue;
+    L.push(
+      s.wwwAuthenticate?.trim()
+        ? `gated at an address the probe does not ask: ${r.target.url} → ${s.status} at ${s.path} — one entry in STATE_PATHS away`
+        : `refused with no scheme named, so deliberately not a gate: ${r.target.url} → ${s.status} at ${s.path}`,
+    );
   }
   L.push(`reports in ${opts.out}`);
   process.stdout.write(`${L.join("\n")}\n`);

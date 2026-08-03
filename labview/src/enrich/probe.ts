@@ -42,12 +42,14 @@ import type {
   AppStack,
   ConnectionAttempt,
   ConnectionReport,
+  ProbeState,
   ServiceProbe,
   Service,
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
 import { dominantAttempt, hintFor, phaseText, plural } from "../model/connections.js";
 import {
+  STATE_PATHS,
   probeGateText,
   probeTargets,
   readGate,
@@ -55,7 +57,12 @@ import {
   readMediaType,
   readRedirect,
   readRefresh,
+  readState,
+  readStateGate,
+  stateTargets,
+  wantsStateProbe,
   type ProbeTarget,
+  type StateAnswer,
 } from "../model/probe.js";
 import { getResponse, safeOrigin, type FetchLike, type HttpResponse } from "./http.js";
 import { mapWithConcurrency } from "./pool.js";
@@ -182,9 +189,11 @@ export async function probeServices(
   const byKey = new Map<string, ServiceProbe>();
   let gated = 0;
   let open = 0;
+  let second = 0;
   const silent: ServiceProbe[] = [];
   for (const { key, probe } of probed) {
     byKey.set(key, probe);
+    second += probe.state?.asked ?? 0;
     if (probe.phase === "connected") {
       if (probe.gate) gated++;
       else open++;
@@ -205,6 +214,13 @@ export async function probeServices(
     // Only when some were. A zero here would put "0 not asked" on the startup line of every
     // fleet whose services are all unauthenticated, which is a fact about nothing.
     ...(skipped ? [`${plural(skipped, "service")} not asked (authentication already detected)`] : []),
+    // Every run says what it sent, and this is the only stage that can send more than one
+    // request per service — so a fleet of form-less shells must not be able to quietly cost
+    // four times what the line implies. Summed from `ServiceProbe.state.asked` rather than
+    // carried on `ProbeRun`, and that is the difference from `skipped`: this number is
+    // derivable from the payload the UI already has, so duplicating it onto the run would be
+    // two places to keep true instead of one.
+    ...(second ? [`${plural(second, "extra request")} at current-user addresses`] : []),
   ].join(" — ");
 
   // Three outcomes, and the middle one is the ordinary case in any real fleet: some
@@ -294,8 +310,20 @@ async function probeOne(
     const mediaType = readMediaType(res.contentType);
     const redirect = res.location ? readRedirect(res.location.trim(), target.url) : undefined;
     const refresh = res.body ? readRefresh(res.body, target.url) : undefined;
-    const detail = gate
-      ? `HTTP ${res.status} — ${lowerFirst(probeGateText(gate).label)}`
+    // The second request, and the only one in this file. Sent for one shape of answer — a 200
+    // that served HTML with no form anywhere in it, having gated nothing — because that is the
+    // one page whose markup cannot answer the question even in principle. Everything else is
+    // decided by the response already in hand.
+    const state = wantsStateProbe({ gate, status: res.status, mediaType, body: res.body })
+      ? await probeState(doFetch, target.url, timeoutMs)
+      : undefined;
+    // `??` and not `||`: the state gate can only fill an absence, never replace a finding. By
+    // `wantsStateProbe`'s first condition `gate` is undefined wherever `state` exists, so the
+    // fallback is unreachable — and it is written this way so that stops being something a
+    // reader has to go and check.
+    const verdict = gate ?? (state ? readStateGate(state) : undefined);
+    const detail = verdict
+      ? `HTTP ${res.status} — ${lowerFirst(probeGateText(verdict).label)}`
       : `HTTP ${res.status} — answered with no login page`;
     tried.push({ endpoint, why: target.why, phase: "connected", code: String(res.status), detail });
     return {
@@ -303,12 +331,13 @@ async function probeOne(
       vantage: target.vantage,
       phase: "connected",
       status: res.status,
-      ...(gate ? { gate } : {}),
+      ...(verdict ? { gate: verdict } : {}),
       ...(mediaType ? { mediaType } : {}),
       ...(redirect ? { redirect } : {}),
       ...(refresh ? { refresh } : {}),
       ...(res.truncated ? { truncated: true } : {}),
       ...(form ? { form } : {}),
+      ...(state ? { state } : {}),
       detail,
       attempts: tried,
     };
@@ -327,6 +356,51 @@ async function probeOne(
     detail: worst?.detail ?? "nothing was tried",
     attempts: tried,
   };
+}
+
+/**
+ * Ask the current-user addresses, in order, and stop at the first refusal.
+ *
+ * The only place in LabView that sends a second request to a scanned service, so every bound
+ * in the file header applies again and two more besides:
+ *
+ *  - **Sequential, always**, regardless of `probe.maxConcurrency`. Concurrency there is a
+ *    fleet-wide budget across *services*; four addresses fired at once at one service would
+ *    spend it inside a single one. And a parallel walk cannot short-circuit: the ordinary case
+ *    is one request precisely because the second is never sent once the first refuses.
+ *  - **Nothing parsed from the page.** The addresses come from `stateTargets`, which builds
+ *    them from `STATE_PATHS` and the origin that answered — see its doc comment for why that
+ *    is the line that matters.
+ *
+ * The addresses are deliberately kept **out of `attempts`**. That list is the reachability
+ * record — which addresses of this service LabView tried before one answered, and it is what
+ * the drawer shows and what `dominantAttempt` reasons over. A `/api/me` that 404s is not a
+ * vantage that failed; folding it in would make a service look like it took five tries to
+ * answer when it answered on the first. What the walk found is on `ServiceProbe.state`, which
+ * exists for exactly this and says how many were asked.
+ */
+async function probeState(
+  doFetch: FetchLike,
+  requestUrl: string,
+  timeoutMs: number,
+): Promise<ProbeState | undefined> {
+  const urls = stateTargets(requestUrl);
+  if (!urls.length) return undefined;
+  const answers: StateAnswer[] = [];
+  for (const [i, url] of urls.entries()) {
+    const res = await getResponse(doFetch, url, { timeoutMs });
+    const path = STATE_PATHS[i]!;
+    answers.push({
+      path,
+      ...(res.ok && res.status !== undefined ? { status: res.status } : {}),
+      ...(res.wwwAuthenticate ? { wwwAuthenticate: res.wwwAuthenticate } : {}),
+    });
+    // Short-circuit here as well as in `readState`. The pure rule decides what the walk *is*,
+    // so it has to truncate whatever a caller did; this stops the requests actually going out,
+    // and the two agreeing is what makes `asked` a count of the wire and not of the intent.
+    if (res.status === 401 || res.status === 407) break;
+  }
+  return readState(answers);
 }
 
 function countAttempts(probes: ServiceProbe[]): number {

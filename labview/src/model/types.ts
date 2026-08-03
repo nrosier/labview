@@ -613,7 +613,26 @@ export type ProbeGate =
    * A 200 with a passwordless login form: a username field, a submit control and a
    * login intent marker on one form, with no password input. See the note above.
    */
-  | "credential-form";
+  | "credential-form"
+  /**
+   * A 200 whose HTML carries no form at all — a client-rendered shell — while one of the
+   * fixed current-user addresses answered 401/407 **with** a `WWW-Authenticate` header.
+   *
+   * The one member that rests on a **second request**, and the only signal that can see the
+   * blind spot the other seven cannot: a login screen drawn by JavaScript is not in the
+   * served markup, so no amount of body-reading finds it at any size. What is observable is
+   * that the address the shell's own client fetches the signed-in user from refuses a caller
+   * with no credential.
+   *
+   * It is `challenge` asked one address over, and it requires the same header for the same
+   * reason. A *bare* 401 there is an API declining a call, which is what a public application
+   * with optional accounts answers too — its shell serves everybody and its `/api/user` still
+   * says nobody is signed in. Reading that as a gate would take a genuinely open service out
+   * of the count, so the header is required: only a server that wants a *browser* to prompt
+   * sends one. The bare case is recorded on `ServiceProbe.state` and named in
+   * `probeReasonText` instead, where it is evidence a reader can act on and not a verdict.
+   */
+  | "state-challenge";
 
 /**
  * Where a response sent the request instead of serving it.
@@ -640,6 +659,47 @@ export interface ProbeRedirect {
   to: string;
   /** Whether that origin differs from the one that was asked. */
   crossOrigin: boolean;
+}
+
+/**
+ * What the current-user addresses answered — the second request, and the record of it.
+ *
+ * Present only for the one case a second request can settle: a 200 that served HTML with no
+ * `<form>` anywhere in it and carried none of the seven body signals. That page is a
+ * client-rendered shell, and the served markup of a shell says nothing about whether a login
+ * stands in front of it — which is the blind spot `STATE_PATHS` exists to look past.
+ *
+ * Recorded whether or not it cleared anything, on the same reasoning as `form`: the negative
+ * answer is the one a reader most needs. `asked: 4` with nothing refused is the evidence that
+ * a form-less shell probably *is* open, and a bare 401 that did not qualify as a gate is
+ * evidence pointing the other way that a reader is entitled to see rather than have suppressed.
+ *
+ * Carries no header value and no body — a path, a status and one boolean. A response from a
+ * second address is exactly as capable of setting a session cookie as the first (**I6**), and
+ * there is no field here for one to land in.
+ */
+export interface ProbeState {
+  /**
+   * How many of `STATE_PATHS` were asked before the walk stopped.
+   *
+   * Fewer than the list when one refused, because a refusal is the answer and the walk ends
+   * on it. The number is here so the payload states what the scan sent, rather than leaving
+   * the request count to be inferred from a rule somebody has to go and read (**I8**).
+   */
+  asked: number;
+  /**
+   * The address that refused an anonymous caller — a path, never a URL, since the origin is
+   * already `endpoint`. Absent when none of them did.
+   */
+  refusedAt?: string;
+  /** The status it refused with. Present exactly when `refusedAt` is. */
+  status?: number;
+  /**
+   * Whether that refusal named an authentication scheme in a `WWW-Authenticate` header —
+   * the single fact that separates `state-challenge` from evidence that is only suggestive.
+   * Present exactly when `refusedAt` is.
+   */
+  challenge?: boolean;
 }
 
 /**
@@ -760,6 +820,15 @@ export interface ServiceProbe {
    * means a form was read, and the reader can see which parts of one were there.
    */
   form?: LoginFormShape;
+  /**
+   * What the fixed current-user addresses answered, when they were asked at all.
+   *
+   * Present only for a 200 that served form-less HTML and gated nothing — see
+   * {@link ProbeState}. Its absence means no second request was sent, which is the case for
+   * every service that answered with a redirect, a challenge, a non-HTML body, or a page with
+   * any form on it.
+   */
+  state?: ProbeState;
   /** What happened, in one line, with no credential in the text. */
   detail: string;
   /** Every address tried, in vantage order, whether it answered or not. */

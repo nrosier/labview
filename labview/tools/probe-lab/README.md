@@ -15,8 +15,8 @@ observed — is one of two completely different things:
 
 Both appear as the same row on the dashboard, and there was no way to look at the page and find
 out which. That is what this is for. Point it at the address and it reports the verdict, then
-**every one of the seven signals and why each did not fire**, then all the evidence no signal
-reads yet, then what an eighth signal would have to be.
+**every one of the eight signals and why each did not fire**, then all the evidence no signal
+reads yet, then what a ninth signal would have to be.
 
 **Two of those misses are not about the page at all.** Pointed at a real fleet, the reports came
 back saying "no `<form>` in the served markup" for service after service whose operator sees a
@@ -30,9 +30,34 @@ rather than something the scan misread:
   has to fetch state, and that fetch is refused when nobody is signed in. The refusal is real,
   HTTP-level, and one path away from where the scan asks.
 
-So the tool follows the chain and asks a fixed list of current-user addresses. Both are reported
-as evidence, and **neither can change the verdict**: what a report says LabView concluded is what
-LabView would conclude from the one response it reads.
+So the tool follows the chain and asks a list of current-user addresses. Both are reported as
+evidence, and the report's verdict stays the pipeline's: what a report says LabView concluded is
+what LabView would conclude from what the scan itself would have seen.
+
+**Both of those findings have since become rules, which is this tool having worked.** Neither
+needed the rule loosened:
+
+- The first one turned out not to need a chain at all. The services in question were Authentik,
+  and their **first** `Location` was already the evidence — a flow-executor path that
+  `LOGIN_PATHS` simply did not have. Two list entries and a fixture, no new signal, no second
+  request, and the chain-walking the report suggested was never needed.
+- The second became the eighth signal, `state-challenge` (see
+  [§3.6b](../../../IMPLEMENTATION.md)). The scan now asks four current-user addresses itself
+  when — and only when — it got back a 200 of HTML with no `<form>` in it, and a refusal
+  carrying `WWW-Authenticate` is a gate.
+
+The lab still sweeps **eight** addresses where the scan asks four, so a refusal it finds at one
+of the other four remains a finding. What changed is the size of the change it implies: it is now
+*one entry missing from a list*, which is a commit with a fixture and no new rule in it, and the
+report says so in those words.
+
+It also makes the chain and the sweep **asymmetrical**, which they were not before. The chain
+still cannot move a verdict — the scan follows no redirect, so nothing past the first `Location`
+is something the pipeline could have seen. The sweep now can, but only for the four paths the
+pipeline shares and only under the pipeline's own eligibility test: `report.ts` reconstructs a
+`ProbeState` from `STATE_PATHS` alone and hands it to the real `readStateGate`. That is not this
+tool acquiring a rule of its own; it is the same construction as before, following a rule that
+moved.
 
 The rule being sharpened lives in [`src/model/probe.ts`](../../src/model/probe.ts). It is strict
 on purpose: everything it does not recognise reads as "answered, no gate observed", which leaves
@@ -103,13 +128,21 @@ addresses a person typed.
   provider is recognised at the first response and **never walked into**. Nothing is sent to
   somebody's SSO endpoint by this tool. The chain's end gets a report of its own, built from the
   answer already in hand rather than from a second request.
-- **The auth-state sweep is the one place it asks for more than it was given.** Where a page came
-  back with no gate and no `<form>` at all — the client-rendered shell, the one case where reading
-  the body cannot work even in principle — the addresses in `AUTH_STATE_PATHS` are asked as well:
-  a **fixed list of eight**, the same eight every run, reviewed in the source rather than derived
-  at runtime. Sequential regardless of `--concurrency`, because eight requests at once is a burst
-  a rate limiter is entitled to read as an attack. `--no-sweep` restores the older bound of one
-  address per target; `--sweep` asks everywhere, for a page that is not obviously a shell.
+- **The auth-state sweep asks four addresses more than the scan does.** Where a page came back
+  with no gate and no `<form>` at all — the client-rendered shell, the one case where reading the
+  body cannot work even in principle — the addresses in `AUTH_STATE_PATHS` are asked as well: a
+  **fixed list of eight**, the same eight every run, reviewed in the source rather than derived at
+  runtime. Four of them are `STATE_PATHS`, which the scan now asks itself under the same
+  eligibility test, so the sweep is *four* addresses beyond the pipeline rather than eight beyond
+  nothing. Sequential regardless of `--concurrency`, because eight requests at once is a burst a
+  rate limiter is entitled to read as an attack. `--sweep` asks everywhere, for a page that is not
+  obviously a shell.
+- **`--no-sweep` now makes the lab ask *less* than a scan would**, which is worth knowing before
+  using it. It is still the tightest setting and still bounds the run to one address per target —
+  but with no sweep there is nothing to reconstruct a `ProbeState` from, so `pipelineState`
+  withholds the eighth signal instead of guessing at it: *a short prefix understates the walk,
+  which at worst withholds a gate; it can never invent one.* A `--no-sweep` report is therefore a
+  floor on the verdict, not the verdict. Section 4 says which addresses went unasked.
 - **Nothing a page suggests is ever fetched** — not an asset, not a form action, not a link. Every
   address asked is one of four things: given on the command line, listed in `--urls` or `--paths`,
   named by the *service* in a `Location` header, or a constant in this tool's source. None of them
@@ -146,13 +179,17 @@ there was something to put in them:
 2. **What the rule read** — status, `Location` and its resolution, `WWW-Authenticate`,
    `Content-Type` → media type → whether that is HTML at all, body size and truncation, the
    strongest form's shape. Then **one row per signal**, fired or not, naming the fact that
-   decided it. Rows are in `readGate`'s precedence order and the deciding one is marked, so a
-   page satisfying two clauses shows which one won.
+   decided it. Rows are in `PROBE_GATES`' order — `readGate`'s precedence for its seven, with
+   `readStateGate`'s `state-challenge` last — and the deciding one is marked, so a page
+   satisfying two clauses shows which one won. The last row is the only one that can cite a
+   *second* response, so it is the only one that has to say whether that request went out at all:
+   it reads either "the served page was readable" — no second question warranted, the common case
+   — or how many addresses were asked and what the one that refused answered.
 2b. **Where the chain went** — one row per followed hop, with the address, the status, the
    `Location` and its resolution, and **what `readGate` would have found there**. Present only
    when the first answer was a redirect the rule found nothing in. A signal on any row is a
    signal the scan does not see, and the heading says so above the table.
-3. **What the rule did not consider** — the evidence an eighth signal would be built from:
+3. **What the rule did not consider** — the evidence a ninth signal would be built from:
    every `<form>` with every `<input>`'s `type`/`name`/`id`/`placeholder`/`autocomplete`/
    `aria-label` and every button label, `<title>`, first `<h1>`, `lang`,
    `<meta name="generator">`, every `<script src>` and `<link>`, all surviving response headers,
@@ -173,8 +210,9 @@ with no network and nobody's service involved.
 
 **The verdict in a report *is* the pipeline's verdict.** `report.ts` imports `readGate`,
 `readLoginForm`, `readRedirect`, `readRefresh`, `readMediaType`, `isHtmlMediaType`,
-`probeGateText`, `probeOutcome`, `probeReasonText` and the four clause predicates
-(`isLoginPath`, `pointsAtLogin`, `hasPasswordField`, `hasSamlField`) from
+`probeGateText`, `probeOutcome`, `probeReasonText`, the four clause predicates
+(`isLoginPath`, `pointsAtLogin`, `hasPasswordField`, `hasSamlField`) and — for the eighth
+signal — `wantsStateProbe`, `readState`, `readStateGate` and `STATE_PATHS` itself from
 [`src/model/probe.ts`](../../src/model/probe.ts) and reimplements none of them. A report that
 described a decision LabView would not make would be worse than no report — it would send
 somebody to change a rule that was never the problem — so the smoke pass asserts the equality
@@ -192,17 +230,25 @@ Three patterns are worth knowing by sight, and the first two are the common ones
 **A 200 with no `<form>` and one bundle.** Section 4 says so explicitly. This is the known blind
 spot: a login screen drawn by JavaScript is not in the served markup, so no body-only signal can
 see it, at any body size and after any number of redirects. **Read the auth-state table.** A 401
-or 403 at a current-user address, from a request carrying no credential, is the application saying
-it does not know who is calling — the service is gated, and the gate is simply not at the address
-the scan asks. That is the strongest evidence available short of rendering the page, and rendering
-is a different tool with different bounds. If nothing there refuses either, the shell probably is
-what it looks like, and section 4 says that too.
+at a current-user address, from a request carrying no credential, is the application saying it
+does not know who is calling. That is the strongest evidence available short of rendering the
+page, and rendering is a different tool with different bounds. If nothing there refuses either,
+the shell probably is what it looks like, and section 4 says that too.
 
-Acting on a refusal is a bigger change than it looks, which is why the report says so in those
-words. Every one of the seven clauses reads *a response*; this one needs a **second request per
-service** — a request budget, a list of addresses to argue about, and an I8 case to make. It is a
-change to what the probe asks, not to how the rule reads, and the two should not be confused
-because one needs a fixture and the other needs a decision.
+What to do about a refusal depends on **which** address it came from, and that is the one thing to
+read carefully here:
+
+- **At one of the four in `STATE_PATHS`** — the scan already asks it. If the refusal carried
+  `WWW-Authenticate`, the verdict at the top of the report is already `state-challenge` and there
+  is nothing to change. If it did not, that is deliberate: a bare 401 is what an anonymous-enabled
+  Grafana and a world-readable Gitea answer, so counting it would clear services that really are
+  open. Changing that is a one-line change to `readStateGate` and a decision about which error you
+  would rather make — not a missing rule.
+- **At one of the other four the lab sweeps** — that is a finding, and section 4 sizes it: one
+  entry added to `STATE_PATHS`, a fixture under `fixtures/probe/`, and no new rule. The list is
+  the request budget, so an entry is not free; but it is a much smaller change than the one this
+  paragraph used to describe, back when the scan asked a single address per service and reading a
+  refusal at a second one was a new *kind* of request.
 
 **A same-origin 3xx to a path that is not in the login list.** LabView reads it as routing, and
 the chain section says where it actually went. If a hop carries a signal, the service is gated and

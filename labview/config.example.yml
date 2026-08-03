@@ -240,7 +240,7 @@ traefik:
 # answering is evidence. The other half is just as useful: a service that answers
 # with its homepage turns an exposure you inferred into one that was measured.
 #
-# One GET per service, at `/`, with no credential and no redirect followed. Seven
+# A GET per service, at `/`, with no credential and no redirect followed. Seven
 # things count as a login page: 401/407 with a WWW-Authenticate header; a redirect
 # off the origin; a redirect to a login path; a `<meta http-equiv="refresh">` that
 # goes to either of those; a hidden SAMLRequest/SAMLResponse field (the SAML POST
@@ -250,6 +250,20 @@ traefik:
 # finding you dismiss costs you a look, false comfort costs you the point of the tool.
 # So a refresh to `/dashboard` is routing, and a newsletter box posting to a hosted
 # list service is not a hand-off.
+#
+# One shape of answer costs a SECOND request, and it is the only one that does: a 200
+# of HTML with no `<form>` anywhere in it. That page is either a login screen drawn in
+# the browser or an open dashboard, and its markup cannot tell you which — so four
+# current-user addresses (`/api/`, `/api/me`, `/api/v1/me`, `/api/v1/user`) are asked
+# in that order, at the origin that already answered, until one of them refuses. A
+# refusal that names an authentication scheme in a WWW-Authenticate header is a gate;
+# a bare 401 is not, because that is also what an anonymous-enabled Grafana or a
+# world-readable Gitea answers. It is reported and left out of the verdict.
+#
+# The list is the budget. The walk stops at the first refusal, so the usual cost is
+# one extra request and the ceiling is four, per service that answered that way. The
+# paths are fixed — nothing is taken from the page — and every scan's startup line
+# says how many of these it sent, so this can never quietly multiply your traffic.
 #
 # Only services where HTTP was *observed* are asked — a tunnel route with an
 # http/https origin, or a `traefik.http.routers.*` label. A service that only
@@ -297,6 +311,12 @@ probe:
   # Services asked at once. Kept low because these requests fan out across the whole
   # fleet and many of them land on one reverse proxy; a burst big enough to make it
   # start refusing connections would be recorded as services that did not answer.
+  #
+  # This is a budget across services, not within one. The current-user walk described
+  # above is always sequential, whatever this is set to — four requests fired at once
+  # at a single service would spend the fleet's whole allowance inside it, and a
+  # parallel walk could not stop at the first refusal, which is what keeps the usual
+  # cost at one request instead of four.
   maxConcurrency: 4
 
 # Rescan cache: how long (seconds) a scan result is served before a fresh scan is

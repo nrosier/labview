@@ -4,6 +4,7 @@ import type {
   LoginFormShape,
   ProbeGate,
   ProbeRedirect,
+  ProbeState,
   ProbeVantage,
   Service,
   ServiceProbe,
@@ -40,6 +41,13 @@ import { publishedHostPort } from "./ports.js";
  *    it does not recognise reads as "answered, no gate observed", which leaves the
  *    exposure finding standing. A finding a reader dismisses costs them a look; false
  *    comfort is the thing this project exists to remove.
+ *  - **{@link wantsStateProbe} / {@link readState} / {@link readStateGate}** — the eighth
+ *    signal, and the only one that needs a **second request**. A login screen drawn by
+ *    JavaScript is not in the served markup, so the seven above cannot see it at any body
+ *    size; what is observable is that the address the page's own client fetches the signed-in
+ *    user from refuses a caller with no credential. Three functions rather than one because
+ *    they answer three separable questions — may a second request be sent, what did it find,
+ *    and is what it found a gate — and only the last is allowed to move a verdict.
  *  - **{@link readLoginForm}** — what a form on the page was *made of*, which is
  *    reported whether or not it cleared anything. A verdict a reader cannot inspect is
  *    one they have to take on trust, and this is the part they can check.
@@ -103,16 +111,49 @@ export const MAX_PROBE_TARGETS = 4;
 /**
  * Paths that are a login page by name.
  *
- * Five entries and no convention-guessing beyond them. Four are the paths the OAuth and
- * SSO ecosystem standardised on; `/outpost.goauthentik.io` is Authentik's own outpost
- * path, which is published rather than inferred. Matched as a prefix so `/login.php` and
+ * Ten entries and no convention-guessing beyond them. Every one is either a path the OAuth
+ * and SSO ecosystem standardised on, a spelling of one of those that real applications
+ * redirect to, or a path a named product publishes. Matched as a prefix so `/login.php` and
  * `/oauth2/start` both count, which is what real applications redirect to.
  *
  * This list only ever *adds* a gate to a redirect that stayed on the same origin. A
  * cross-origin redirect is already `redirect-origin` without consulting it, so a
- * hand-rolled login path that is missing here costs a gate — never a false one.
+ * hand-rolled login path that is missing here costs a gate — never a false one. Which is
+ * also the direction the risk runs in: a **wrong** entry takes a service out of the exposed
+ * count on the strength of a path name, so every entry has to be a name that means "sign in
+ * here" and nothing else. That is why `/flows/-/` carries its odd-looking `-/` and `/auth/`
+ * carries its trailing slash — see below.
+ *
+ *  - `/login`, `/signin`, `/sso`, `/oauth2` — the four the ecosystem settled on.
+ *  - `/sign-in`, `/users/sign_in` — the same two words hyphenated and underscored. Not new
+ *    conventions: the first is what a great many applications spell `/signin` as, and the
+ *    second is Devise's own path, which every Rails application using it redirects to.
+ *  - `/auth/` — the fourth ecosystem convention, and the one that needs its slash. `/auth`
+ *    as a bare prefix would match `/authors` and `/author/jane`, which is a blog routing to
+ *    content; with the slash it matches `/auth/login`, `/auth/realms/…` (Keycloak) and
+ *    `/auth/authorize`, and matches no word that merely starts with those four letters.
+ *  - `/outpost.goauthentik.io`, `/if/flow/`, `/flows/-/` — Authentik's three published
+ *    paths: the outpost endpoint, the flow interface a browser is sent to, and the flow
+ *    executor. `/flows/-/` keeps the `-` because that segment is Authentik's own placeholder
+ *    for "any brand", and a bare `/flows` prefix would read an application routing to its own
+ *    list of flows as a login page — which is what `authentik-flow/pipeline` exists to catch.
+ *
+ * Exported for one reason: so `scripts/smoke.ts` can assert that every entry has a row of its
+ * own there, with a path it matches and a near miss it does not. An entry nothing pins is an
+ * entry that can take a service out of the exposed count for a reason nobody wrote down.
  */
-const LOGIN_PATHS: readonly string[] = ["/login", "/signin", "/sso", "/oauth2", "/outpost.goauthentik.io"];
+export const LOGIN_PATHS: readonly string[] = [
+  "/login",
+  "/signin",
+  "/sign-in",
+  "/users/sign_in",
+  "/sso",
+  "/oauth2",
+  "/auth/",
+  "/outpost.goauthentik.io",
+  "/if/flow/",
+  "/flows/-/",
+];
 
 /**
  * Words that name a username field, matched against `name`, `id` and `autocomplete`.
@@ -293,7 +334,7 @@ function bindAnswersAt(bindIp: string | undefined, host: string): boolean {
 }
 
 /**
- * The gate rule: which of the seven signals a response carries, or none.
+ * The gate rule: which of the seven signals a *single* response carries, or none.
  *
  * Ordered strongest first. Every clause but the last is one observable fact:
  *
@@ -328,6 +369,12 @@ function bindAnswersAt(bindIp: string | undefined, host: string): boolean {
  * and `undefined` means *the exposure finding stands*. That asymmetry is the design: this
  * function can only ever take a service out of the exposed count, so every clause in it
  * has to be a fact rather than a likelihood.
+ *
+ * There is an eighth signal, and it is deliberately not decided here: `state-challenge`
+ * rests on a **second request** and so cannot be read off the one response this function is
+ * given. {@link wantsStateProbe} decides whether that request may be sent — only where this
+ * function found nothing — and {@link readStateGate} judges the answer. Keeping the two
+ * apart is what lets a reader see that no clause above was loosened to accommodate it.
  */
 export function readGate(res: ProbeResponse): ProbeGate | undefined {
   if ((res.status === 401 || res.status === 407) && res.wwwAuthenticate?.trim()) return "challenge";
@@ -358,6 +405,135 @@ export function readGate(res: ProbeResponse): ProbeGate | undefined {
   const form = readLoginForm(res.body, res.requestUrl);
   if (form?.username && form.submit && (form.action !== undefined || form.otp)) return "credential-form";
   return undefined;
+}
+
+/**
+ * The current-user addresses, and the whole of the second request's eligibility.
+ *
+ * Four paths, the same four every scan, reviewed here rather than derived at runtime. Every
+ * one is a published convention for "who am I": `/api/` is the root a great many
+ * applications mount their API at and refuse wholesale, and the other three are the shapes
+ * `me`/`user` endpoints are actually spelled in. Nothing is guessed from a page — see
+ * {@link stateTargets}.
+ *
+ * The list length *is* the request budget, and the walk stops at the first refusal
+ * ({@link readState}), so the ordinary cost is one extra request and the worst case is four —
+ * for the subset of services that answered 200 with form-less HTML and gated nothing. A
+ * service that answered anything else is never asked (**I8**).
+ */
+export const STATE_PATHS: readonly string[] = ["/api/", "/api/me", "/api/v1/me", "/api/v1/user"];
+
+/** Whether the page carries a `<form>` at all — the precondition, not a login test. */
+function hasAnyForm(body: string): boolean {
+  return /<form\b/i.test(body);
+}
+
+/**
+ * Whether this answer is the one case a second request can settle: a form-less HTML shell.
+ *
+ * All four conditions do work, and the third and fourth are what keep the second request off
+ * services it could tell nothing about:
+ *
+ *  - **No gate.** A service already known to be gated has nothing left to ask about, and
+ *    asking would be a request that cannot change a verdict — the same argument
+ *    `hasDetectedAuth` rests on, one stage further in.
+ *  - **200, and HTML.** An API answering JSON was never a page, and a redirect's evidence is
+ *    where it pointed.
+ *  - **No `<form>` anywhere on it.** The line between "this rule cannot see the login" and
+ *    "there was no login to see". A page with any form on it was read by clauses 5–7 with
+ *    everything they need; a page with none either has no login screen or draws it in the
+ *    browser, and those two are indistinguishable in served markup at any body size.
+ *
+ * A body of `undefined` under an HTML content type is an empty page, which is form-less by
+ * the same test and is asked about for the same reason.
+ */
+export function wantsStateProbe(read: {
+  gate: ProbeGate | undefined;
+  status: number;
+  mediaType: string | undefined;
+  body: string | undefined;
+}): boolean {
+  if (read.gate !== undefined || read.status !== 200) return false;
+  if (!isHtmlMediaType(read.mediaType)) return false;
+  return !hasAnyForm(read.body ?? "");
+}
+
+/**
+ * {@link STATE_PATHS} as absolute addresses on the origin that answered, in order.
+ *
+ * Resolved against the origin rather than against the path that was asked, so a service
+ * answering at `/en` is still asked at `/api/` and not at `/en/api/`. Built from a constant in
+ * this file and a URL LabView already sent a request to — **nothing here is parsed out of a
+ * page**, which is the containment rule that matters: the served markup of an application
+ * LabView did not write must never be able to name an address LabView then dials.
+ *
+ * Empty for a request URL that will not parse, which cannot happen for a URL that answered.
+ */
+export function stateTargets(requestUrl: string): string[] {
+  try {
+    const origin = new URL(requestUrl).origin;
+    return STATE_PATHS.map((p) => new URL(p, origin).toString());
+  } catch {
+    return [];
+  }
+}
+
+/** One current-user address's answer. No body and no header value — see {@link ProbeState}. */
+export interface StateAnswer {
+  /** The path asked, as it appears in {@link STATE_PATHS}. */
+  path: string;
+  /**
+   * Absent when the address was asked and nothing came back.
+   *
+   * A sentinel would have done the same arithmetic, and would have put a status on the record
+   * that no server ever sent. Optional instead: an entry with no status is one LabView asked
+   * and got no answer to, which is not a refusal but is also not an address it skipped — so it
+   * counts toward `asked` and toward nothing else.
+   */
+  status?: number;
+  wwwAuthenticate?: string;
+}
+
+/**
+ * What the walk found, and where it stopped.
+ *
+ * **401 and 407 are a refusal and 403 is not**, which is the one line here worth arguing.
+ * A 403 is what a plain file server returns for a directory it will not list, so a static
+ * site with no `/api/` at all would refuse by that test and be read as gated — a false gate
+ * on a genuinely open service, which is the only direction this file must never be wrong in.
+ * A 401 is the HTTP layer saying *you are not authenticated*, and nothing emits one by
+ * accident.
+ *
+ * The walk ends at the first refusal, so `asked` is what LabView sent rather than what it was
+ * offered — the truncation is here, in the pure rule, so the count on the payload and the
+ * requests on the wire cannot come apart however the caller loops.
+ */
+export function readState(answers: readonly StateAnswer[]): ProbeState {
+  for (const [i, a] of answers.entries()) {
+    if (a.status !== 401 && a.status !== 407) continue;
+    return {
+      asked: i + 1,
+      refusedAt: a.path,
+      status: a.status,
+      challenge: Boolean(a.wwwAuthenticate?.trim()),
+    };
+  }
+  return { asked: answers.length };
+}
+
+/**
+ * The eighth signal: a refusal that named a scheme, at an address the page's client asks.
+ *
+ * `challenge` one address over, and the header is required for the same reason it is there —
+ * see {@link ProbeGate}'s `state-challenge` for why a bare 401 here is weaker evidence than a
+ * bare 401 at `/` rather than stronger, and stays out of the verdict.
+ *
+ * A separate function from {@link readGate} because it answers a question about a *different
+ * request*, and keeping them apart is what lets a reader see that no clause of the first was
+ * loosened to accommodate the second.
+ */
+export function readStateGate(state: ProbeState): ProbeGate | undefined {
+  return state.challenge ? "state-challenge" : undefined;
 }
 
 /**
@@ -669,6 +845,11 @@ const GATE_TEXT: Record<ProbeGate, ProbeGateText> = {
     title:
       "The service answered with a form asking for a username or a one-time code and submitting it to a login path — a magic-link or passkey sign-in, which has no password field to find.",
   },
+  "state-challenge": {
+    label: "Credential requested behind the page",
+    title:
+      "The service answered with a page carrying no form at all — a login screen drawn in the browser is not in the served markup — and the address its own client fetches the signed-in user from asked for a credential, with a WWW-Authenticate header, from a request that carried none.",
+  },
 };
 
 /** The wording for a signal. One place, so the drawer and a note cannot drift. */
@@ -677,8 +858,9 @@ export function probeGateText(gate: ProbeGate): ProbeGateText {
 }
 
 /**
- * Every signal, in the precedence {@link readGate} applies — so a consumer can enumerate
- * them rather than restate the union, and the order a reader sees is the order that decides.
+ * Every signal, strongest first — the precedence {@link readGate} applies for its seven, with
+ * {@link readStateGate}'s one after them. A consumer can enumerate them rather than restate the
+ * union, and the order a reader sees is the order that decides.
  */
 export const PROBE_GATES: readonly ProbeGate[] = [
   "challenge",
@@ -688,6 +870,10 @@ export const PROBE_GATES: readonly ProbeGate[] = [
   "sso-form",
   "password-form",
   "credential-form",
+  // Last, because it is the only one that needs a second request — and the second request is
+  // sent only where all seven above already found nothing. Ordering it anywhere else would
+  // suggest a page could satisfy it *instead* of one of them, and none can.
+  "state-challenge",
 ];
 
 /**
@@ -760,6 +946,7 @@ export function probeToggleText(run: { enabled: boolean; source: "config" | "req
   return [
     "Ask each HTTP service what it answers, and read a login page as evidence — this is the only stage that sends requests to the scanned services, and for a service behind a public hostname those requests leave the fleet.",
     "Only services this scan found no authentication for are asked: where a gate is already detected the answer could not change the verdict, so no request is sent.",
+    "One address each, at /, except for a page that came back with no form on it at all — a login screen drawn in the browser is invisible in served markup, so up to four fixed current-user addresses are asked as well, stopping at the first that refuses.",
     "It applies to the next Rescan and to nothing else: a refresh after the cache expires has no request behind it and goes back to the configured value.",
     `The scan on screen ${did} ${why}.`,
   ].join(" ");
@@ -807,7 +994,16 @@ export function probeOutcome(
 /** Everything {@link probeReasonText} reads. Spelled out so the rule cannot quietly grow. */
 type ProbeReasonInput = Pick<
   ServiceProbe,
-  "phase" | "status" | "gate" | "form" | "mediaType" | "redirect" | "refresh" | "truncated" | "detail"
+  | "phase"
+  | "status"
+  | "gate"
+  | "form"
+  | "mediaType"
+  | "redirect"
+  | "refresh"
+  | "truncated"
+  | "state"
+  | "detail"
 >;
 
 /**
@@ -866,6 +1062,8 @@ const GATE_REASON: Record<ProbeGate, (p: ProbeReasonInput, at: string) => string
   "password-form": (_p, at) => `${at} with an HTML page carrying a password field.`,
   "credential-form": (p, at) =>
     `${at} with one form carrying ${credentialMarkers(p.form)}, and no password field — a magic-link or passkey sign-in.`,
+  "state-challenge": (p, at) =>
+    `${at} with a page carrying no form at all, so nothing in the markup could be read as a login — and then ${p.state?.refusedAt ?? "a current-user address"} answered ${p.state?.status ?? 401} with a WWW-Authenticate header to a request carrying no credential. The login screen is drawn by this service's own client, and the gate is at the address that client asks.`,
 };
 
 /** The three facts `credential-form` rests on, in the words of the form they were read from. */
@@ -909,7 +1107,38 @@ function openReason(probe: ProbeReasonInput, at: string): string {
     probe.form ? formShortfall(probe.form) : undefined,
   ].filter((s): s is string => s !== undefined);
   const closest = near.length ? ` The nearest thing to a signal on it: ${joinAnd(near)}.` : "";
-  return `${at} and served an HTML page carrying none of the signals — no password field, no SAML hand-off, no refresh to a login and no form with login intent.${closest}`;
+  return `${at} and served an HTML page carrying none of the signals — no password field, no SAML hand-off, no refresh to a login and no form with login intent.${closest}${stateShortfall(probe.state)}`;
+}
+
+/**
+ * What the second request found, for the page it did not clear — the sentence this whole
+ * feature is honest in.
+ *
+ * Two outcomes, and the first is the one that costs something to report this way. A **bare**
+ * 401 at a current-user address is the shape three services in four wear in a real fleet, and
+ * it is exactly as consistent with a fully gated application as with a public one that has
+ * optional accounts. Naming it while *leaving the finding standing* is the whole of the
+ * compromise: a reader is told where to look, and the count is not moved on a maybe.
+ *
+ * The second outcome is a reassurance and is worth as much. A form-less shell is the one page
+ * this rule cannot read, so "and nothing behind it refused an anonymous caller either" is what
+ * turns "no signals found" from a limit of the rule into a finding about the service.
+ *
+ * Empty when no second request was sent, which is every service that answered anything but a
+ * form-less HTML 200.
+ */
+function stateShortfall(state: ProbeState | undefined): string {
+  if (!state) return "";
+  const plural = (n: number) => `${n} current-user address${n === 1 ? "" : "es"}`;
+  if (state.refusedAt === undefined) {
+    return ` None of the ${plural(state.asked)} it was asked at refused an anonymous request either, so nothing behind the page contradicts what the page itself served.`;
+  }
+  // A refusal that gated would have been reported by `GATE_REASON` and never reach here, so
+  // this arm is only ever the bare one — but the condition is stated rather than assumed,
+  // because a future clause that gates on something else must not silently land in this
+  // sentence and describe itself as evidence that changed nothing.
+  if (state.challenge) return "";
+  return ` Its ${state.refusedAt} did answer ${state.status} to a request carrying no credential, which is an application saying nobody is signed in — but it named no authentication scheme, and a public application with optional accounts answers exactly the same way while serving everybody. So it is a place to look and not a gate, and the finding stands.`;
 }
 
 /**
@@ -960,7 +1189,7 @@ export interface ProbeReportEntry {
 export interface ProbeReport {
   /** Answered, and no signal fired — so nothing was taken out of the exposed count. */
   open: ProbeReportEntry[];
-  /** Answered with a login page, by one of the seven signals. */
+  /** Answered with a login page, by one of the eight signals in `PROBE_GATES`. */
   gated: ProbeReportEntry[];
   /** Nothing answered, so nothing was measured. */
   silent: ProbeReportEntry[];

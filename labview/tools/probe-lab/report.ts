@@ -18,22 +18,30 @@
  * genuinely unprotected application, or a login page this rule cannot see. Those are the same
  * row on the dashboard and completely different facts, and until now there was no way to look
  * at the page and find out which. So section 2 lists every signal *and why it did not fire*,
- * section 3 dumps the evidence no signal reads yet, and section 4 says what an eighth signal
- * would have to be. Fine-tuning happens against sections 3 and 4.
+ * section 3 dumps the evidence no signal reads yet, and section 4 says what the next signal
+ * would have to be. Fine-tuning happens against sections 3 and 4 — the eighth clause LabView
+ * ships was designed from exactly those two sections of five real reports.
  *
- * **Two of those sections are about addresses the rule never asks**, because the two ways a login
- * page hides from a body-reading rule are both about *where* rather than *what*. A same-origin
- * redirect chain can end at a sign-in screen three responses past the one the scan reads
- * ({@link ChainStep}). A client-rendered shell has no sign-in screen in its markup at any depth,
- * but the application behind it still refuses an anonymous caller somewhere, and that somewhere is
- * an address ({@link AUTH_STATE_PATHS}). Both appear as evidence in the report and as a proposal in
- * section 4. Neither can move the verdict — see {@link buildReport}.
+ * **Two of those sections are about addresses `/` cannot answer for**, because the two ways a
+ * login page hides from a body-reading rule are both about *where* rather than *what*. A
+ * same-origin redirect chain can end at a sign-in screen three responses past the one the scan
+ * reads ({@link ChainStep}). A client-rendered shell has no sign-in screen in its markup at any
+ * depth, but the application behind it still refuses an anonymous caller somewhere, and that
+ * somewhere is an address ({@link AUTH_STATE_PATHS}).
+ *
+ * The scan has since learned to ask four of those addresses itself, so the two are no longer
+ * symmetrical: **the chain cannot move the verdict and the sweep can**, for the four paths the
+ * pipeline shares and under the pipeline's own eligibility test. That is not this tool acquiring a
+ * rule of its own — it is the same construction as before, following a rule that moved. See
+ * {@link buildReport} and {@link pipelineState}, which is where the eight addresses this tool asks
+ * are narrowed to the four a scan would have.
  *
  * **Nothing here decides anything about a fleet.** This is a diagnostic; it writes files a
  * person reads. It is not imported by `src/`, it is not in the image, and no scan consults it.
  */
 import {
   PROBE_GATES,
+  STATE_PATHS,
   hasPasswordField,
   hasSamlField,
   isHtmlMediaType,
@@ -47,12 +55,17 @@ import {
   readMediaType,
   readRedirect,
   readRefresh,
+  readState,
+  readStateGate,
+  wantsStateProbe,
+  type StateAnswer,
 } from "../../src/model/probe.js";
 import type {
   ConnectionPhase,
   LoginFormShape,
   ProbeGate,
   ProbeRedirect,
+  ProbeState,
   ServiceProbe,
 } from "../../src/model/types.js";
 
@@ -93,7 +106,7 @@ export interface ProbeLabObservation {
   elapsedMs?: number;
 }
 
-/** One of the seven clauses, and what it turned on for this page. */
+/** One of the eight clauses, and what it turned on for this page. */
 export interface SignalRow {
   gate: ProbeGate;
   /** What a reader sees this signal called, from `probeGateText` — never a second wording. */
@@ -292,18 +305,19 @@ export interface ProbeLabReport {
  *  - **`GET`, no credential.** Which is the whole point: a 401 here is what an anonymous visitor
  *    gets, and a credential would turn the one useful answer into a useless one.
  *
- * What comes back is never a verdict. It goes in section 3 as evidence and section 4 as a
- * proposal, and a proposal to ask a second address is a change to what the probe *requests* —
- * a different and larger argument than a change to how it reads a response.
+ * **The pipeline's four come first, and they come from the pipeline.** `STATE_PATHS` is spread in
+ * rather than retyped, so this list is a superset of what a scan asks by construction and not by
+ * an assertion somebody has to keep true. That matters because {@link buildReport} reconstructs
+ * the scan's own walk from these answers: a path the scan asks and this sweep does not would
+ * silently truncate that reconstruction, and the report would understate the verdict rather than
+ * fail. The order puts them first for the same reason — those are the four that can move a
+ * verdict, and the four after them are evidence only.
  */
 export const AUTH_STATE_PATHS: readonly string[] = [
-  "/api/",
-  "/api/me",
+  ...STATE_PATHS,
   "/api/user",
   "/api/session",
   "/api/auth/session",
-  "/api/v1/me",
-  "/api/v1/user",
   "/api/v1/users/me",
 ];
 
@@ -318,6 +332,14 @@ export const AUTH_STATE_PATHS: readonly string[] = [
  * evidence. A 3xx has a `Location`, which is evidence, and following it is the chain's job. A
  * non-HTML answer says the address is not a UI. A page *with* forms said something the reader can
  * act on, so section 3's dump is the next thing to look at rather than eight more requests.
+ *
+ * **Not the same test as `wantsStateProbe`, and deliberately looser.** The pipeline's test asks
+ * whether *any* `<form` appears in the markup; this one asks whether the report's form dump came
+ * out empty, which is a parse and can be empty where the regex would have matched. The difference
+ * only ever makes this tool ask more — it is a diagnostic, so a wasted eight requests against a
+ * page the reader pointed it at costs nothing but time. It must never make the *verdict* wider,
+ * and it cannot: {@link buildReport} consults `wantsStateProbe` before it lets a swept answer near
+ * the gate.
  */
 export function wantsSweep(report: ProbeLabReport): boolean {
   return (
@@ -336,15 +358,23 @@ export function wantsSweep(report: ProbeLabReport): boolean {
  * Build the whole report for one observation.
  *
  * The order below is the order the sections are read in, and it is not arbitrary: the verdict
- * comes from `readGate` first, so everything after it is an account of a decision already made
+ * comes from the rule first, so everything after it is an account of a decision already made
  * rather than a second derivation that could disagree with it.
  *
  * `extra` is what the caller went on to ask after the first answer — hops of a redirect chain,
- * and the auth-state sweep. **Neither can move the verdict**, and that is structural rather than
- * promised: the verdict is computed from `obs` alone, above the line where `extra` is read. A
- * chain that ends at a login page still reports "no login page", because that is what LabView
- * would conclude from the same first response, and a report whose verdict improved on the
- * pipeline's would be describing a dashboard nobody has.
+ * and the auth-state sweep. **The chain cannot move the verdict.** A chain that ends at a login
+ * page still reports "no login page", because that is what LabView would conclude from the same
+ * first response, and a report whose verdict improved on the pipeline's would be describing a
+ * dashboard nobody has.
+ *
+ * **The sweep can**, and that is not an exception to the rule above — it is the same rule, applied
+ * after the pipeline learned to send a second request of its own. `readStateGate` is now part of a
+ * scan's verdict, so a report that withheld it would be the thing this file exists to prevent: a
+ * verdict LabView does not share. What keeps it honest is that only the pipeline's own four
+ * addresses are consulted, in the pipeline's order, truncated at the pipeline's short-circuit, and
+ * only where the pipeline's own eligibility test says the request would have been sent at all — see
+ * {@link pipelineState}. This tool asks eight addresses; four of them are evidence for a reader and
+ * cannot appear in a verdict.
  */
 export function buildReport(
   obs: ProbeLabObservation,
@@ -359,7 +389,19 @@ export function buildReport(
   // verdict, the reason and every signal row, so the three cannot describe different responses.
   const res = asProbeResponse(obs);
   const answered = obs.status !== undefined;
-  const gate = answered ? readGate(res) : undefined;
+  const firstGate = answered ? readGate(res) : undefined;
+
+  // The scan's walk, reconstructed — but only if the scan would have walked. `wantsSweep` is this
+  // tool's looser test and may well have run the sweep on a page the pipeline would never have
+  // asked a second question about; reading a gate out of those answers would put a verdict in the
+  // report that no scan can reach.
+  const state =
+    answered &&
+    extra.sweep?.length &&
+    wantsStateProbe({ gate: firstGate, status: obs.status!, mediaType, body: obs.body })
+      ? pipelineState(extra.sweep)
+      : undefined;
+  const gate = firstGate ?? (state ? readStateGate(state) : undefined);
 
   const redirect = location ? readRedirect(location.trim(), obs.requestUrl) : undefined;
   const refresh = obs.body ? readRefresh(obs.body, obs.requestUrl) : undefined;
@@ -371,7 +413,16 @@ export function buildReport(
   // rules start reading is a field this has to start providing.
   const asProbe: Pick<
     ServiceProbe,
-    "phase" | "status" | "gate" | "form" | "mediaType" | "redirect" | "refresh" | "truncated" | "detail"
+    | "phase"
+    | "status"
+    | "gate"
+    | "form"
+    | "mediaType"
+    | "redirect"
+    | "refresh"
+    | "state"
+    | "truncated"
+    | "detail"
   > = {
     phase: answered ? "connected" : (obs.phase ?? "connect"),
     ...(obs.status !== undefined ? { status: obs.status } : {}),
@@ -380,11 +431,12 @@ export function buildReport(
     ...(mediaType ? { mediaType } : {}),
     ...(redirect ? { redirect } : {}),
     ...(refresh ? { refresh } : {}),
+    ...(state ? { state } : {}),
     ...(obs.truncated ? { truncated: true } : {}),
     detail: obs.error ?? `HTTP ${obs.status}`,
   };
 
-  const signals = signalRows(obs, { mediaType, redirect, refresh, form, wwwAuthenticate });
+  const signals = signalRows(obs, { mediaType, redirect, refresh, form, wwwAuthenticate, state });
   const chain = buildChain(extra.chain ?? []);
   const sweep = buildSweep(extra.sweep ?? [], obs.body);
   return {
@@ -491,6 +543,69 @@ export function buildSweep(
   });
 }
 
+/**
+ * The first swept address that refused an anonymous caller, if any.
+ *
+ * **401 and 407, not 403.** The same two statuses `readState` treats as a refusal, and the reason
+ * is in its doc comment: a plain file server 403s a directory it will not list, so 403 would make a
+ * static site refuse. Exported so `cli.ts`'s index row, its per-target line and its closing summary
+ * all mean the same thing by "refused" as the rule does — four wordings of one test is four chances
+ * for the tool to describe a finding the report it links to does not have.
+ */
+export function firstRefusal(sweep: readonly SweepStep[]): SweepStep | undefined {
+  return sweep.find((s) => s.status === 401 || s.status === 407);
+}
+
+/**
+ * Whether a refusal is one a *scan* would have found, rather than one only this tool asked for.
+ *
+ * Both halves are the difference between a verdict and a note. The path has to be one of the four
+ * `STATE_PATHS` a scan sends, and the refusal has to have named a scheme — see `ProbeGate`'s
+ * `state-challenge` for why a bare 401 at a deliberately chosen API path is weaker evidence than a
+ * bare 401 at `/` rather than stronger.
+ */
+export function refusalIsPipelineGate(step: SweepStep): boolean {
+  return STATE_PATHS.includes(step.path) && Boolean(step.wwwAuthenticate?.trim());
+}
+
+/**
+ * The scan's own state walk, reconstructed from a sweep that asked more than the scan would.
+ *
+ * Three things make this a reconstruction rather than a re-reading, and all three are what let the
+ * result be put in a verdict:
+ *
+ *  - **`STATE_PATHS`' order, not the sweep's.** The walk is ordered, because it stops early, so
+ *    which address refused first is part of the answer.
+ *  - **Only `STATE_PATHS`.** The four extra addresses this tool asks are for a reader deciding
+ *    whether the list should grow. A refusal at `/api/session` is a good argument for a commit; it
+ *    is not something a scan would have found.
+ *  - **`readState` does the truncating.** Not a loop here — the same function the scan calls, so
+ *    `asked` counts what a scan would have sent and the tool cannot claim a cheaper or dearer walk
+ *    than the real one.
+ *
+ * A missing path stops the reconstruction where it stops. That cannot happen while
+ * {@link AUTH_STATE_PATHS} spreads `STATE_PATHS` in, and it is handled rather than asserted because
+ * the failure mode is worth being boring: a short prefix understates the walk, which at worst
+ * withholds a gate. It can never invent one.
+ */
+function pipelineState(sweep: readonly ProbeLabObservation[]): ProbeState {
+  const byPath = new Map<string, ProbeLabObservation>();
+  for (const o of sweep) byPath.set(pathOf(o.requestUrl), o);
+
+  const answers: StateAnswer[] = [];
+  for (const path of STATE_PATHS) {
+    const o = byPath.get(path);
+    if (!o) break;
+    const header = o.headers["www-authenticate"];
+    answers.push({
+      path,
+      ...(o.status !== undefined ? { status: o.status } : {}),
+      ...(header ? { wwwAuthenticate: header } : {}),
+    });
+  }
+  return readState(answers);
+}
+
 /** The path of an address, or the whole address if it will not parse. */
 function pathOf(url: string): string {
   try {
@@ -509,6 +624,8 @@ function signalRows(
     refresh?: ProbeRedirect;
     form?: LoginFormShape;
     wwwAuthenticate?: string;
+    /** The reconstructed walk, when there was one. `undefined` is "the scan would not have asked". */
+    state?: ProbeState;
   },
 ): SignalRow[] {
   const status = obs.status;
@@ -597,9 +714,23 @@ function signalRows(
           ? "no form on the page carries any of the parts a login form is made of"
           : (shortfall(ctx.form) ?? `one form carries ${markers(ctx.form)}`)),
     },
+    // The only row whose fact came from a request the other seven know nothing about, so it is
+    // the only one that has to say whether that request went out at all. Three answers, and the
+    // first is the common one: the page was readable, so no second question was warranted.
+    "state-challenge": {
+      fired: ctx.state !== undefined && readStateGate(ctx.state) !== undefined,
+      because: !ctx.state
+        ? "the served page was readable — a second request is only sent for a 200 of HTML with no <form> anywhere on it, and only when nothing else fired"
+        : ctx.state.refusedAt === undefined
+          ? `none of the ${ctx.state.asked} current-user addresses refused an anonymous request`
+          : ctx.state.challenge
+            ? `${ctx.state.refusedAt} answered HTTP ${ctx.state.status} and named an authentication scheme`
+            : `${ctx.state.refusedAt} answered a bare HTTP ${ctx.state.status} with no WWW-Authenticate — which is also what an API with optional accounts answers while its pages serve everybody, so it is evidence and not a gate`,
+    },
   };
-  // In `PROBE_GATES`' order, which is `readGate`'s precedence — so the first firing row is the
-  // one that decided the verdict, and a reader can see what it beat.
+  // In `PROBE_GATES`' order — `readGate`'s precedence for its seven, with `readStateGate`'s one
+  // after them — so the first firing row is the one that decided the verdict, and a reader can
+  // see what it beat.
   return PROBE_GATES.map((gate) => ({ gate, label: probeGateText(gate).label, ...rows[gate] }));
 }
 
@@ -938,24 +1069,35 @@ function chainLines(chain: ChainStep[]): string[] {
 }
 
 /**
- * What the auth-state sweep adds — the strongest evidence available about a shell, in both
- * directions.
+ * What the auth-state sweep adds, once the scan asks these addresses itself.
  *
- * **A refusal is the finding.** A 401 or 403 at a current-user address, from a request carrying no
- * credential, is an application saying it does not know who is calling. That is a gate, at the
- * HTTP level, on the same origin the dashboard calls exposed. It says nothing about `/` — which is
- * exactly why the line is careful to describe the change it implies as a change to *what the probe
- * asks*, not to how the rule reads. Those are different sizes of decision: one more address per
- * service is a request budget and a list to argue about; a new clause is a fixture.
+ * **This function is only ever reached when the eighth signal did not fire.** `nextSteps` returns
+ * early on any firing signal, and `state-challenge` is one of them now — so the case this used to
+ * be written for, a refusal that named its scheme at one of the scan's own four addresses, no
+ * longer arrives here. It is a verdict, in section 1, and there is nothing to propose about it.
  *
- * **No refusal is also a finding**, and the more common one worth trusting. If nothing anywhere
- * near a current-user endpoint refuses an anonymous caller, the shell is not hiding a gate — and
- * a reader who came here suspecting a false positive can stop.
+ * What is left is the three near misses, and each implies a different size of change:
+ *
+ *  - **A refusal with a scheme, at one of the four addresses the scan does *not* ask.** The
+ *    smallest change in this whole tool: one entry in `STATE_PATHS`. The clause already exists and
+ *    the request budget already exists; the list is simply one path short. Worth a commit and a
+ *    fixture, and nothing else.
+ *  - **A bare refusal, at any address.** Deliberately not a gate, and the line has to say why
+ *    rather than read as an oversight — a public application with optional accounts answers exactly
+ *    this while serving everybody, so reading it as a gate would take a genuinely open service out
+ *    of the count. It is the one direction this file must never be wrong in.
+ *  - **A 403.** Excluded for the same reason and a sharper one: a plain file server 403s a
+ *    directory it will not list, so a static site with no API at all would refuse by that test.
+ *
+ * **No refusal anywhere is also a finding**, and the more common one worth trusting. If nothing
+ * near a current-user endpoint refuses an anonymous caller, the shell is not hiding a gate — and a
+ * reader who came here suspecting a false positive can stop.
  */
 function sweepLines(sweep: SweepStep[]): string[] {
   if (!sweep.length) return [];
-  const refused = sweep.filter((s) => s.status === 401 || s.status === 403);
-  if (!refused.length) {
+  const refused = sweep.filter((s) => s.status === 401 || s.status === 407);
+  const forbidden = sweep.filter((s) => s.status === 403);
+  if (!refused.length && !forbidden.length) {
     const answered = sweep.filter((s) => s.status !== undefined);
     const shells = sweep.filter((s) => s.sameAsRoot).length;
     return [
@@ -966,17 +1108,34 @@ function sweepLines(sweep: SweepStep[]): string[] {
       }${shells ? `; ${shells} answered with the same bytes as the page itself, which is a catch-all rather than an endpoint` : ""}). So there is no gate hiding behind this shell at any address this tool knows to ask, and on the evidence available the service is reachable without authenticating.`,
     ];
   }
-  const challenged = refused.find((s) => s.wwwAuthenticate?.trim());
-  const first = challenged ?? refused[0]!;
-  return [
-    `**${first.path} answered ${first.status} while the page answered 200** — a request with no credential on it, refused${
-      refused.length > 1 ? `, as were ${refused.length - 1} more of the addresses asked` : ""
-    }. This service *is* gated; the gate is at an address the probe does not ask.${
-      challenged
-        ? ` It even named its scheme: \`WWW-Authenticate: ${challenged.wwwAuthenticate}\`, which is \`challenge\` — the first clause in the list, satisfied one path away from where the scan looks.`
-        : ""
-    } Acting on this means changing **what the probe requests**, not how it reads an answer: a second address per service, from a fixed list, sent only where the first answer was a form-less shell. That is a request-budget decision and an I8 argument, and it is the one change that would close this blind spot without rendering a page.`,
-  ];
+  const out: string[] = [];
+  // The one actionable case, and it is actionable precisely because it is small. Ordered first:
+  // a reader with a one-line change available should not have to read past two paragraphs of why
+  // the other refusals are not gates to find it.
+  const growList = refused.find((s) => s.wwwAuthenticate?.trim() && !STATE_PATHS.includes(s.path));
+  if (growList) {
+    out.push(
+      `**${growList.path} answered ${growState(growList)} while the page answered 200**, and \`${growList.path}\` is not one of the ${STATE_PATHS.length} addresses a scan asks. This is the smallest change this tool can recommend: add the path to \`STATE_PATHS\` in \`src/model/probe.ts\`. The clause that reads it (\`state-challenge\`) already exists and already ships — the list is one entry short, which is a commit with a fixture and no new rule at all.`,
+    );
+  }
+  const bare = refused.filter((s) => !s.wwwAuthenticate?.trim());
+  if (bare.length) {
+    out.push(
+      `${bare.map((s) => `${s.path} → ${s.status}`).join(", ")} refused an anonymous request but named no authentication scheme. **This is deliberately not a gate.** A public application with optional accounts answers a bare 401 at its current-user endpoint while serving its pages to everybody — an anonymous-enabled Grafana and a public Gitea both do — so reading it as one would take a genuinely open service out of the exposed count, which is the only direction this rule must never be wrong in. Only a server that wants a *browser* to prompt sends the header. So this is a place to look and not a finding, and the exposure stands.`,
+    );
+  }
+  if (forbidden.length) {
+    out.push(
+      `${forbidden.map((s) => `${s.path} → 403`).join(", ")} — a 403 is not read as a refusal either, and this exclusion is load-bearing rather than cautious: nginx answers 403 for a directory with no index, so a static site with no API whatsoever would "refuse" at \`/api/\` and be called gated. If this service's real gate answers 403, the evidence has to come from somewhere else on the response.`,
+    );
+  }
+  return out;
+}
+
+/** `401` or `401 with WWW-Authenticate: Basic`, for a line that has room to name the scheme. */
+function growState(step: SweepStep): string {
+  const scheme = step.wwwAuthenticate?.trim();
+  return scheme ? `${step.status} with \`WWW-Authenticate: ${scheme}\`` : String(step.status);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -992,7 +1151,7 @@ export function renderJson(report: ProbeLabReport): string {
  * The report as Markdown, for reading while changing `readGate`.
  *
  * Four sections in the order the docstring at the top gives, and the signal table is the middle
- * of it — seven rows of "why not" is the thing this tool exists to put in front of somebody.
+ * of it — eight rows of "why not" is the thing this tool exists to put in front of somebody.
  */
 export function renderMarkdown(report: ProbeLabReport): string {
   const L: string[] = [];
