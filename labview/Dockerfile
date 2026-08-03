@@ -1,5 +1,5 @@
 # ---- build stage -------------------------------------------------------------
-FROM node:22-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 
 # Install all deps (incl. dev) for the build.
@@ -17,7 +17,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ---- runtime stage -----------------------------------------------------------
-FROM node:22-alpine AS runtime
+FROM node:26-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
