@@ -29,10 +29,11 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type {
   AppStack,
   AuthMethod,
+  BuildStamp,
   CloudflareRoute,
   DeclaredAuthMechanism,
   DockerState,
@@ -120,6 +121,10 @@ delete process.env.LABVIEW_SESSION_SECRET;
 delete process.env.LABVIEW_SESSION_SECRET_FILE;
 delete process.env.LABVIEW_SESSION_TTL_MINUTES;
 delete process.env.LABVIEW_SESSION_COOKIE_NAME;
+// The build stamp, so an exported value cannot decide what the payload assertions below
+// see: with it set, every fixture run would report `source: "image"` and a sha nobody in
+// this repository can predict. Cleared here, injected per assertion (**I7**).
+delete process.env.LABVIEW_BUILD_SHA;
 
 const { loadConfig, retiredSettings, withProbeEnabled } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
@@ -187,19 +192,30 @@ const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
 // that reads several facts at once. Every other gate rests on a single unambiguous marker;
 // a composite can be talked into a false positive by a newsletter box, and a false positive
 // here removes a service from the exposed count.
+//
+// `probeReasonText` is asserted the same way and for the mirror-image reason: it is the only
+// rule here whose whole job is the *negative* verdict, and a sentence that passed on "no login
+// page was found" would be the conclusion again rather than the fact behind it. So every row
+// of its table asserts which fact the sentence names.
 const {
   MAX_PROBE_TARGETS,
   PROBE_GATES,
   PROBE_VANTAGES,
+  collectProbeReport,
   isHttpOrigin,
   probeFormText,
   probeGateText,
   probeOutcome,
+  probeReasonText,
+  probeReportSummaryText,
   probeTargets,
   probeToggleText,
   probeVantageText,
   readGate,
   readLoginForm,
+  readMediaType,
+  readRedirect,
+  readRefresh,
 } = await import("../src/model/probe.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
@@ -207,6 +223,18 @@ const {
 const { EMPTY_TAG_FILTER, cycleTag, describeTagFilter, matchesTagFilter, tagFilterActive } = await import(
   "../src/model/filter.js"
 );
+// Which build is running, split the way `parsePasswd`/`readPasswd` are: the resolver takes
+// its environment and its file reads as arguments, so the precedence, the shortening and
+// the four ways `HEAD` can read are asserted as a table — a `.git` directory is not
+// something a fixture can commit, and git would refuse to store one if it were.
+const { MAX_SHA_CHARS, MAX_WALK_LEVELS, SHORT_SHA_CHARS, VERSION, resolveBuildStamp } = await import(
+  "../src/build.js"
+);
+// The wording, from the module the topbar and the startup line share. Asserted here for
+// `model/access.ts`'s reason: `image` and `checkout` are different claims about the same
+// seven characters, and a tooltip that conflated them would be an over-claim no browser
+// test would catch (**I1**).
+const { buildLabel, buildSummary, buildTitle } = await import("../src/model/build.js");
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -4653,6 +4681,312 @@ check(
   probeFormText({ password: false, username: false, submit: false, otp: false }),
 );
 
+console.log("\nwhere a response was pointing, read once for both the verdict and the record");
+/*
+ * The three readers `readGate` now decides on, asserted directly.
+ *
+ * They exist as exported functions rather than as expressions inside the gate rule because the
+ * result is *recorded* as well as judged: what a negative verdict rested on is the half of a
+ * probe result a reader can check, and it cannot be recovered from the verdict. One rule read
+ * twice would be two rules eventually, and the second one would be the one nothing asserts.
+ *
+ * The reduction each performs is load-bearing for **I6**, not cosmetic. A redirect to an
+ * identity provider carries `state`, `code` and `redirect_uri`; a redirect to a login carries
+ * `?next=`. None of that may enter the payload, so the query and fragment are dropped here,
+ * once, where it can be pinned.
+ */
+const redirectCases: { name: string; location: string; want: string }[] = [
+  {
+    name: "a relative Location is resolved against the address that was asked",
+    location: "/login?next=%2F",
+    want: "/login (same origin)",
+  },
+  {
+    // The I6 case. Everything after the path is credential material or a return address, and
+    // neither is evidence of anything — the *origin* is what makes this a hand-off.
+    name: "an OAuth hand-off is recorded as origin and path, with the query dropped",
+    location: "https://sso.example.com/application/o/authorize?client_id=x&state=s&code=abc",
+    want: "https://sso.example.com/application/o/authorize (cross-origin)",
+  },
+  {
+    name: "...and a fragment goes the same way, for the same reason",
+    location: "https://sso.example.com/callback#access_token=abc",
+    want: "https://sso.example.com/callback (cross-origin)",
+  },
+  {
+    // Same origin, spelled absolutely. Recorded as the path alone, so a reader cannot mistake
+    // it for a hand-off on the strength of how the header happened to be written.
+    name: "an absolute Location back to the same origin is a path, not a hand-off",
+    location: "https://a.example.com/dashboard",
+    want: "/dashboard (same origin)",
+  },
+  {
+    // A different port is a different origin by the URL rules, and is genuinely a different
+    // service. The recorded value keeps the port for exactly that reason.
+    name: "another port on the same host is another origin, and says so",
+    location: "https://a.example.com:8443/login",
+    want: "https://a.example.com:8443/login (cross-origin)",
+  },
+  {
+    name: "a Location that will not parse is evidence of nothing rather than of something",
+    location: "http://[",
+    want: "(unreadable)",
+  },
+];
+function redirectKey(r: { to: string; crossOrigin: boolean } | undefined): string {
+  return r ? `${r.to} (${r.crossOrigin ? "cross-origin" : "same origin"})` : "(unreadable)";
+}
+for (const c of redirectCases) {
+  const got = redirectKey(readRedirect(c.location, "https://a.example.com/"));
+  check(c.name, got === c.want, `got ${got}, wanted ${c.want}`);
+}
+check(
+  "no recorded redirect carries a query or a fragment, whatever it was handed",
+  redirectCases.every((c) => {
+    const to = readRedirect(c.location, "https://a.example.com/")?.to;
+    return to === undefined || (!to.includes("?") && !to.includes("#"));
+  }),
+  redirectCases.map((c) => String(readRedirect(c.location, "https://a.example.com/")?.to)).join(" | "),
+);
+const refreshCases: { name: string; body: string; want: string }[] = [
+  {
+    name: "a meta refresh is read as the target a browser would honour",
+    body: PROBE_REFRESH_LOGIN_HTML,
+    want: "/login (same origin)",
+  },
+  {
+    // The trap's own fact, and the reason the target is recorded rather than only judged: this
+    // and the row above differ in one URL, and without it both are "answered with no gate".
+    name: "...including the one that only routes, which is what makes the trap checkable",
+    body: PROBE_REFRESH_ROUTING_HTML,
+    want: "/dashboard (same origin)",
+  },
+  {
+    name: "a refresh with no url= is a page reloading itself, and points nowhere",
+    body: `<meta http-equiv="refresh" content="30">`,
+    want: "(unreadable)",
+  },
+  {
+    name: "...and a meta tag that is not a refresh points nowhere either",
+    body: `<meta name="description" content="url=/login">`,
+    want: "(unreadable)",
+  },
+  {
+    // The browser honours the first refresh in the document, so that is what is read. Anything
+    // else would report a target the visitor never went to.
+    name: "the first refresh in the document is the one a browser acts on",
+    body: `<meta http-equiv=refresh content="0;url=/first"><meta http-equiv=refresh content="0;url=/second">`,
+    want: "/first (same origin)",
+  },
+];
+for (const c of refreshCases) {
+  const got = redirectKey(readRefresh(c.body, "https://a.example.com/"));
+  check(c.name, got === c.want, `got ${got}, wanted ${c.want}`);
+}
+const mediaCases: { name: string; header: string | undefined; want: string }[] = [
+  {
+    name: "a content type is recorded as the media type alone, without its parameters",
+    header: "text/html; charset=utf-8",
+    want: "text/html",
+  },
+  { name: "...case-folded, because the header is case-insensitive", header: "TEXT/HTML", want: "text/html" },
+  {
+    // The field a reader needs to see why nothing was searched for. An API answering its own
+    // clients is the commonest 200 that is not a page, and naming it is the whole explanation.
+    name: "an API answer is recorded as what it was",
+    header: "application/json",
+    want: "application/json",
+  },
+  { name: "a response with no content type at all yields nothing to record", header: undefined, want: "(none)" },
+  { name: "...as does a header with nothing in it", header: "   ", want: "(none)" },
+];
+for (const c of mediaCases) {
+  const got = readMediaType(c.header) ?? "(none)";
+  check(c.name, got === c.want, `got ${got}, wanted ${c.want}`);
+}
+
+console.log("\nwhy an answer was read the way it was");
+/*
+ * The half of a probe result that was missing, and the half a reader can check.
+ *
+ * `probeOutcome` says what LabView concluded. This says what it *saw*, and it exists for the
+ * negative verdict: a gate takes a service out of the exposed count and a reader who doubts one
+ * can go and look, but `gate: undefined` leaves a service in the count, and the only record of
+ * that used to be `HTTP 302 — answered with no login page`. A 302 to `/dashboard` and a 302 to
+ * `/login` are the same sentence there.
+ *
+ * So every row asserts the sentence **names the deciding fact**, not merely that a string came
+ * back — `/dashboard` for the redirect that stayed put, `application/json` for the 200 that was
+ * never a page, the missing part for the form that fell short. A rule that passed on "it did
+ * not look like a login page" would be the conclusion again, worded longer.
+ */
+type ReasonCase = {
+  name: string;
+  probe: Parameters<typeof probeReasonText>[0];
+  must: string[];
+  mustNot?: string[];
+};
+const AT_LOGIN = { to: "/login", crossOrigin: false };
+const AT_HOME = { to: "/dashboard", crossOrigin: false };
+const AT_IDP = { to: "https://sso.example.com/application/o/crm/", crossOrigin: true };
+const reasonCases: ReasonCase[] = [
+  {
+    name: "a challenge names the header that asked for a credential",
+    probe: { phase: "connected", status: 401, gate: "challenge", detail: "x" },
+    must: ["401", "WWW-Authenticate"],
+  },
+  {
+    name: "a hand-off names the origin the request was sent to",
+    probe: { phase: "connected", status: 302, gate: "redirect-origin", redirect: AT_IDP, detail: "x" },
+    must: ["302", "sso.example.com", "off its own origin"],
+  },
+  {
+    name: "a redirect to a login of its own names the path",
+    probe: { phase: "connected", status: 302, gate: "redirect-login", redirect: AT_LOGIN, detail: "x" },
+    must: ["/login", "on its own origin"],
+  },
+  {
+    name: "a refresh to a login names where the browser was being sent",
+    probe: { phase: "connected", status: 200, gate: "meta-refresh-login", refresh: AT_LOGIN, detail: "x" },
+    must: ["<meta refresh>", "/login"],
+  },
+  {
+    name: "a SAML binding names the field nothing else emits",
+    probe: { phase: "connected", status: 200, gate: "sso-form", detail: "x" },
+    must: ["SAMLRequest"],
+  },
+  {
+    name: "a password form names the field that is the whole signal",
+    probe: { phase: "connected", status: 200, gate: "password-form", detail: "x" },
+    must: ["password field"],
+  },
+  {
+    // The composite verdict, and the one that owes the reader most: three facts had to hold
+    // together, and the marker among them is the action.
+    name: "a passwordless login names the three facts it rested on, the action included",
+    probe: {
+      phase: "connected",
+      status: 200,
+      gate: "credential-form",
+      form: { password: false, username: true, submit: true, otp: false, action: "/login" },
+      detail: "x",
+    },
+    must: ["username field", "submit button", "/login", "no password field"],
+  },
+  {
+    name: "...and a one-time code is named in its place when there is no action to name",
+    probe: {
+      phase: "connected",
+      status: 200,
+      gate: "credential-form",
+      form: { password: false, username: true, submit: true, otp: true },
+      detail: "x",
+    },
+    must: ["one-time-code field"],
+  },
+  {
+    // The near miss the challenge clause is strict for. A bare 401 is also what an API returns
+    // to a call it will not serve, and reading it as a gate would clear those wholesale.
+    name: "a bare 401 names the header that was absent, and what else answers that way",
+    probe: { phase: "connected", status: 401, detail: "x" },
+    must: ["no WWW-Authenticate", "401"],
+  },
+  {
+    // The row this whole change exists for.
+    name: "a redirect that stayed put names where it went",
+    probe: { phase: "connected", status: 302, redirect: AT_HOME, detail: "x" },
+    must: ["/dashboard", "on its own origin", "routing rather than a gate"],
+  },
+  {
+    name: "...and a Location that would not parse says the target cannot be judged",
+    probe: { phase: "connected", status: 307, detail: "x" },
+    must: ["no Location that could be read"],
+  },
+  {
+    name: "a status that is neither a challenge, a redirect nor a page says so",
+    probe: { phase: "connected", status: 503, detail: "x" },
+    must: ["503", "nothing in it that a login page is recognised by"],
+  },
+  {
+    name: "a 200 that was not a page names the type it was instead",
+    probe: { phase: "connected", status: 200, mediaType: "application/json", detail: "x" },
+    must: ["application/json", "never read as one"],
+  },
+  {
+    name: "...and one with no type at all says that rather than naming nothing",
+    probe: { phase: "connected", status: 200, detail: "x" },
+    must: ["no content type at all"],
+  },
+  {
+    name: "an HTML page with nothing on it lists the signals that were absent",
+    probe: { phase: "connected", status: 200, mediaType: "text/html", detail: "x" },
+    must: ["no password field", "no SAML hand-off", "no refresh to a login", "no form with login intent"],
+    mustNot: ["nearest thing"],
+  },
+  {
+    // `meta-refresh/home`'s reason, as a unit. A page with a refresh on it and a page with
+    // nothing on it are both "no signals found", and only one of them is worth a second look.
+    name: "an HTML page whose refresh only routed names the target that fell short",
+    probe: { phase: "connected", status: 200, mediaType: "text/html", refresh: AT_HOME, detail: "x" },
+    must: ["nearest thing to a signal", "/dashboard", "neither off the origin nor a login path"],
+  },
+  {
+    // `passwordless/news`'s reason. The action is not named because it never qualified as one —
+    // a cross-origin action is not a login action, so `LoginFormShape` carries no value to name.
+    name: "...and a form that fell short names the part of a login it did not have",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      form: { password: false, username: true, submit: true, otp: false },
+      detail: "x",
+    },
+    must: ["nearest thing to a signal", "no login intent", "action is not a login path"],
+  },
+  {
+    // §11's known miss, reported the one time it can be: a form below the cap was never
+    // searched for, so the absence of a signal is weaker evidence here than elsewhere.
+    name: "a read that stopped at the body cap says a form below it was never searched for",
+    probe: { phase: "connected", status: 200, mediaType: "text/html", truncated: true, detail: "x" },
+    must: ["body cap", "never searched for"],
+  },
+  {
+    // The caveat rides only on a negative verdict. On a gate it would read as doubt about a
+    // verdict that is not in doubt — the signal was found in what *was* read.
+    name: "...and does not appear on a gate, where the signal was found in what was read",
+    probe: { phase: "connected", status: 200, gate: "password-form", truncated: true, detail: "x" },
+    must: ["password field"],
+    mustNot: ["body cap"],
+  },
+  {
+    // The one conclusion this stage must never reach by accident, in the wording rule too.
+    name: "a service that did not answer is said to have been measured not at all",
+    probe: { phase: "resolve", detail: "the name did not resolve" },
+    must: ["Nothing answered", "nothing about this service was measured", "the name did not resolve"],
+    mustNot: ["login page"],
+  },
+];
+for (const c of reasonCases) {
+  const got = probeReasonText(c.probe);
+  const missing = c.must.filter((m) => !got.includes(m));
+  const present = (c.mustNot ?? []).filter((m) => got.includes(m));
+  check(c.name, missing.length === 0 && present.length === 0, `missing [${missing.join(", ")}] unwanted [${present.join(", ")}] in: ${got}`);
+}
+check(
+  // `GATE_REASON` is an exhaustive record, so an unexplained signal is a compile error. What
+  // that cannot catch is a signal explained by the generic sentence, so the table covers each.
+  "every signal in the vocabulary has a row of its own here",
+  PROBE_GATES.every((g) => reasonCases.some((c) => c.probe.gate === g)),
+  PROBE_GATES.filter((g) => !reasonCases.some((c) => c.probe.gate === g)).join(", ") || "(all)",
+);
+check(
+  "...and no two signals are explained by the same sentence",
+  new Set(
+    PROBE_GATES.map((g) => probeReasonText({ phase: "connected", status: 200, gate: g, detail: "x" })),
+  ).size === PROBE_GATES.length,
+  PROBE_GATES.map((g) => probeReasonText({ phase: "connected", status: 200, gate: g, detail: "x" }).slice(0, 28)).join(" | "),
+);
+
 /* -------------------------------------------------------------------------- */
 /* The stage, off                                                             */
 /* -------------------------------------------------------------------------- */
@@ -4903,10 +5237,30 @@ check(
   `exposed=${pbSvc("meta-refresh", "home").auth.exposedWithoutAuth} gate=${String(result("meta-refresh", "home").gate)}`,
 );
 check(
+  // Through the pipeline, not against a literal: the target has to survive the fetch, the
+  // reader, the payload and the wording rule to arrive here. Neutering any one of them —
+  // dropping `refresh` from the probe result, or the clause that names it — fails this row,
+  // which is what the fixture-revert contract asks of a trap.
+  "...and the record says where the refresh went, which is the only thing separating it from a gate",
+  probeReasonText(result("meta-refresh", "home")).includes("/dashboard") &&
+    probeReasonText(result("meta-refresh", "home")).includes("neither off the origin nor a login path") &&
+    result("meta-refresh", "home").refresh?.to === "/dashboard",
+  probeReasonText(result("meta-refresh", "home")),
+);
+check(
   "a newsletter signup is a username field and a button, and clears nothing",
   pbSvc("passwordless", "news").auth.exposedWithoutAuth === true &&
     result("passwordless", "news").gate === undefined,
   `exposed=${pbSvc("passwordless", "news").auth.exposedWithoutAuth} gate=${String(result("passwordless", "news").gate)}`,
+);
+check(
+  // The mirror of the row above, and the same contract: the reason names the part of a login
+  // the form did not have, so a reader can see the verdict rather than accept it. The action is
+  // not named because it never qualified as one — which is precisely the fact being reported.
+  "...and the record says which part of a login it did not have",
+  probeReasonText(result("passwordless", "news")).includes("no login intent") &&
+    probeReasonText(result("passwordless", "news")).includes("action is not a login path"),
+  probeReasonText(result("passwordless", "news")),
 );
 check(
   // The shape is reported even though it cleared nothing, and this is the case that makes
@@ -5004,6 +5358,86 @@ check(
     new Set(PROBE_GATES.map((g) => probeGateText(g).title)).size === PROBE_GATES.length &&
     PROBE_GATES.every((g) => probeGateText(g).label.length > 0 && probeGateText(g).title.length > 0),
   PROBE_GATES.map((g) => `${g}=${probeGateText(g).label}`).join(" | "),
+);
+
+console.log("\nthe panel lists exactly the services the tile counted");
+/*
+ * `collectProbeReport` is what the `Login probe` tile opens onto, and it is in `src/model/`
+ * rather than in the component that renders it for the reason `collectDeclarationDrift` is:
+ * smoke never mounts a DOM, and a grouping that lived in a component could not be asserted at
+ * all — a panel that listed nine services under a tile reading twelve would ship.
+ *
+ * The three-way split is the claim worth pinning hardest. `gate: undefined` is true of a service
+ * that answered with no login page *and* of one that never answered, and conflating them would
+ * invent measurements out of network failures — the one mistake this whole stage exists to
+ * prevent.
+ */
+const probeReport = collectProbeReport(probed.stacks);
+check(
+  "every service that answered with a login page is in the gated list, and the counter agrees",
+  probeReport.gated.length === probed.stats.probeGated && probeReport.gated.every((e) => e.probe.gate !== undefined),
+  `${probeReport.gated.length} listed, ${probed.stats.probeGated} counted`,
+);
+check(
+  "...and every service that answered without one is in the open list, likewise",
+  probeReport.open.length === probed.stats.probeOpen &&
+    probeReport.open.every((e) => e.probe.gate === undefined && e.probe.phase === "connected"),
+  `${probeReport.open.length} listed, ${probed.stats.probeOpen} counted`,
+);
+check(
+  "a service that never answered is in neither, and is listed as having answered nothing",
+  probeReport.silent.length === 1 &&
+    probeReport.silent[0]!.service === "ghost" &&
+    probeReport.silent.every((e) => e.probe.phase !== "connected"),
+  probeReport.silent.map((e) => `${e.stackName}/${e.service}=${e.probe.phase}`).join(" "),
+);
+check(
+  // The tile's own number. Every probed service is in exactly one of the three lists, so a
+  // reader who opens the panel finds as many rows as the tile promised — no more, and none
+  // quietly dropped by a grouping that did not account for a case.
+  "the three lists between them are every service asked, with nothing counted twice",
+  probeReport.probed === probeReport.open.length + probeReport.gated.length + probeReport.silent.length &&
+    probeReport.probed === probed.stats.probeGated + probed.stats.probeOpen + probeReport.silent.length &&
+    new Set(
+      [...probeReport.open, ...probeReport.gated, ...probeReport.silent].map((e) => `${e.stackId}/${e.service}`),
+    ).size === probeReport.probed,
+  `${probeReport.probed} asked`,
+);
+check(
+  "...and every one of them can be found again in the fleet it was collected from",
+  [...probeReport.open, ...probeReport.gated, ...probeReport.silent].every((e) => {
+    const stack = probed.stacks.find((s) => s.id === e.stackId);
+    return stack?.services.some((s) => s.name === e.service && s.probe === e.probe) === true;
+  }),
+  `${probeReport.probed} entries`,
+);
+check(
+  // I7. Sorted by stack then service, so the panel is the same panel twice and a reader
+  // arriving from the fleet list finds a service where they left it.
+  "the same fleet produces the same panel twice, in the fleet list's own order",
+  JSON.stringify(collectProbeReport(probed.stacks)) === JSON.stringify(probeReport) &&
+    JSON.stringify(collectProbeReport([...probed.stacks].reverse())) === JSON.stringify(probeReport),
+  probeReport.open.map((e) => e.stackName).slice(0, 4).join(" < "),
+);
+check(
+  "the summary the tile and the panel share counts the same fleet once",
+  probeReportSummaryText(probeReport) ===
+    `${probeReport.probed} services asked · ${probeReport.gated.length} gated · ${probeReport.open.length} answered with no login page · ${probeReport.silent.length} did not answer`,
+  probeReportSummaryText(probeReport),
+);
+check(
+  // A zero there is a fact about nothing, and every fleet on a good day would carry it.
+  "...and says nothing about services that did not answer when none of them did",
+  !probeReportSummaryText(collectProbeReport(unasked.stacks.slice(0, 0))).includes("did not answer") &&
+    probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0 }) === "no service was asked",
+  probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0 }),
+);
+check(
+  // The tile is drawn from `probed > 0`, so a scan that asked nothing must produce a report that
+  // says nothing — otherwise a fleet with probing off gets a tile counting zero of something.
+  "a scan that asked nothing produces a report with nothing in it",
+  collectProbeReport(unasked.stacks).probed === 0,
+  `${collectProbeReport(unasked.stacks).probed} asked with the probe off`,
 );
 
 console.log("\nwhether the probe ran is part of the payload, not something a reader infers");
@@ -6710,6 +7144,268 @@ check(
   "and every ingress kind has a palette entry, so none falls back to grey",
   unstyled.length === 0,
   `no entry for: ${unstyled.join(", ") || "none"}`,
+);
+
+console.log("\nwhich build is running, and how confidently that is known");
+// The stamp in the topbar is the one thing on the page that is about LabView rather than
+// about the fleet, and the whole reason `BuildStamp.source` exists is that the same seven
+// characters mean different things depending on where they came from. `image` says these
+// bytes were compiled from that commit; `checkout` says only that the tree this process
+// started in was at it. Every row below is either that distinction or a way the resolution
+// is allowed to give up (**I4**) — none of them may throw, and none may guess.
+const FULL_SHA = "d0e2030f4a1b6c8d9e0f1a2b3c4d5e6f7a8b9c0d";
+const SHORT_SHA = "d0e2030";
+const REPO = "/repo";
+// `dist/` in an image, `src/` under tsx — either way two levels below the repository root,
+// which is where the only `.git` in this project lives.
+const FROM = join(REPO, "labview", "src");
+const gitFile = (...parts: string[]) => join(REPO, ".git", ...parts);
+/** A fake filesystem: only the paths named here are readable, everything else is absent. */
+const tree = (files: Record<string, string>) => (path: string) => files[path];
+const CHECKOUT_TREE = {
+  [gitFile("HEAD")]: "ref: refs/heads/main\n",
+  [gitFile("refs", "heads", "main")]: `${FULL_SHA}\n`,
+};
+/** Resolve with no environment at all — the checkout's turn. */
+const fromTree = (files: Record<string, string>, from = FROM): BuildStamp =>
+  resolveBuildStamp({ env: {}, readText: tree(files), from });
+/** Resolve with `LABVIEW_BUILD_SHA` set, over a checkout that would also answer. */
+const fromEnv = (LABVIEW_BUILD_SHA: string | undefined): BuildStamp =>
+  resolveBuildStamp({ env: { LABVIEW_BUILD_SHA }, readText: tree(CHECKOUT_TREE), from: FROM });
+
+// The image path. A full object id is cut to git's own seven so the stamp in the topbar is
+// the first seven characters of the `:${github.sha}` tag the same workflow pushes.
+const envStamp = fromEnv(FULL_SHA);
+check(
+  "a full object id in LABVIEW_BUILD_SHA is the image's commit, shortened to seven",
+  envStamp.source === "image" &&
+    envStamp.commit === SHORT_SHA &&
+    envStamp.commit?.length === SHORT_SHA_CHARS,
+  `${envStamp.source} ${envStamp.commit}`,
+);
+// Revert-proof: without the shortening this reads back the full 40, which is what the
+// topbar would then render and what would stop matching `git rev-parse --short HEAD`.
+check(
+  "...and the shortening is what makes it seven, not the value happening to be short",
+  envStamp.commit === FULL_SHA.slice(0, 7) && envStamp.commit !== FULL_SHA,
+  String(envStamp.commit),
+);
+// Anything that is not an object id is a deliberate answer to "which build" — a tag, a
+// release name — and truncating it would destroy the answer.
+const tagStamp = fromEnv("v0.2.0-rc1");
+check(
+  "a value that is not an object id is passed through whole",
+  tagStamp.source === "image" && tagStamp.commit === "v0.2.0-rc1",
+  `${tagStamp.source} ${tagStamp.commit}`,
+);
+// Revert-proof, and the one that matters most: an image built from a checkout that is also
+// mounted into it must still report the image's commit. Flip the precedence and every
+// container reports whatever tree it can see.
+const bothStamp = fromEnv(FULL_SHA);
+check(
+  "the environment outranks a checkout that would have answered",
+  bothStamp.source === "image" && fromTree(CHECKOUT_TREE).source === "checkout",
+  `${bothStamp.source}, and without the env ${fromTree(CHECKOUT_TREE).source}`,
+);
+for (const [label, value] of [
+  ["an unset", undefined],
+  ["an empty", ""],
+  ["a whitespace-only", "   \n"],
+] as const) {
+  const s = fromEnv(value);
+  check(
+    `${label} LABVIEW_BUILD_SHA is not an answer — the checkout gets its turn`,
+    s.source === "checkout" && s.commit === SHORT_SHA,
+    `${s.source} ${s.commit}`,
+  );
+}
+// The value reaches a log line, the topbar and a tooltip, so it is validated rather than
+// trimmed into something else: a newline here is how a log entry gets forged, and a stamp
+// that was trimmed down to its first legal characters would name a different commit.
+for (const [label, bad] of [
+  ["a shell fragment appended to an object id", `${FULL_SHA} && rm -rf /`],
+  ["a newline, which is how a log line gets forged", "d0e2030\nLabView scanning /etc"],
+  ["git's own dirty marker", "d0e2030 (dirty)"],
+] as const) {
+  const s = fromEnv(bad);
+  check(
+    `${label} is rejected outright, not sanitised into a stamp`,
+    s.source === "checkout" && s.commit === SHORT_SHA,
+    `${s.source} ${s.commit}`,
+  );
+}
+const longStamp = fromEnv("v".repeat(MAX_SHA_CHARS + 20));
+check(
+  "an over-long stamp is capped rather than rendered across the topbar",
+  longStamp.source === "image" && longStamp.commit?.length === MAX_SHA_CHARS,
+  `${longStamp.commit?.length} chars`,
+);
+
+// The checkout path, all four ways `HEAD` can read.
+const looseStamp = fromTree(CHECKOUT_TREE);
+check(
+  "a HEAD naming a branch is followed to the loose ref",
+  looseStamp.source === "checkout" && looseStamp.commit === SHORT_SHA,
+  `${looseStamp.source} ${looseStamp.commit}`,
+);
+// The normal state of a fresh clone or a repository that has been packed, which is to say
+// of most CI checkouts — not an edge case.
+const packedStamp = fromTree({
+  [gitFile("HEAD")]: "ref: refs/heads/main\n",
+  [gitFile("packed-refs")]:
+    "# pack-refs with: peeled fully-peeled sorted \n" +
+    `${"a".repeat(40)} refs/heads/other\n` +
+    `${FULL_SHA} refs/heads/main\n` +
+    `^${"b".repeat(40)}\n`,
+});
+check(
+  "...and to packed-refs when there is no loose ref, past the comment and the peeled line",
+  packedStamp.source === "checkout" && packedStamp.commit === SHORT_SHA,
+  `${packedStamp.source} ${packedStamp.commit}`,
+);
+const detachedStamp = fromTree({ [gitFile("HEAD")]: `${FULL_SHA}\n` });
+check(
+  "a detached HEAD is the object id itself",
+  detachedStamp.source === "checkout" && detachedStamp.commit === SHORT_SHA,
+  `${detachedStamp.source} ${detachedStamp.commit}`,
+);
+for (const [label, head] of [
+  ["junk", "not a ref at all\n"],
+  ["a branch with no ref anywhere", "ref: refs/heads/gone\n"],
+  ["a ref outside refs/", "ref: ../../../etc/passwd\n"],
+  // Charset-legal and traversal all the same, which is why the `..` guard is separate from
+  // the pattern: `HEAD` is a file, so its contents are input, and this one becomes a path
+  // LabView then opens (**I8**).
+  ["a ref that climbs out of the git directory", "ref: refs/../../../etc/passwd\n"],
+] as const) {
+  const s = fromTree({ [gitFile("HEAD")]: head });
+  check(
+    `${label} in HEAD resolves to nothing, and nothing is reported as such`,
+    s.source === "unknown" && !("commit" in s),
+    `${s.source} ${s.commit ?? "no commit"}`,
+  );
+}
+// Revert-proof: the case a stamp must never invent. An image built with no build-arg and a
+// directory with no git in it genuinely do not know, and `unknown` is that said out loud —
+// a blank or a fabricated commit would be the I1 failure this whole field exists to avoid.
+const noGit = fromTree({});
+check(
+  "no checkout and no environment is `unknown`, with no commit key at all",
+  noGit.source === "unknown" && noGit.commit === undefined && !("commit" in noGit),
+  `${noGit.source} ${JSON.stringify(noGit)}`,
+);
+check(
+  "...and the version is still reported, because that part is always known",
+  noGit.version === VERSION,
+  noGit.version,
+);
+// A linked worktree or a submodule has `.git` as a *file*. Following its `gitdir:` line
+// leads into another repository's layout — and continuing up the tree instead would report
+// the *parent* repository's commit, which is not the commit this build came from either.
+const worktreeStamp = fromTree(
+  {
+    [join(REPO, "labview", ".git")]: "gitdir: /repo/.git/worktrees/wt\n",
+    ...CHECKOUT_TREE,
+  },
+  FROM,
+);
+check(
+  "a .git file ends the walk instead of reporting the enclosing repository's commit",
+  worktreeStamp.source === "unknown" && !("commit" in worktreeStamp),
+  `${worktreeStamp.source} ${worktreeStamp.commit ?? "no commit"}`,
+);
+// The walk is bounded so a LabView unpacked anywhere under an unrelated repository cannot
+// report that repository's commit as its own. Four levels covers `dist/`, `src/` and
+// `scripts/`; the fifth is where it stops looking.
+check("the walk is bounded at four levels above the module", MAX_WALK_LEVELS === 4, String(MAX_WALK_LEVELS));
+const atLimit = fromTree({ [gitFile("HEAD")]: `${FULL_SHA}\n` }, join(REPO, "a", "b", "c", "d"));
+const pastLimit = fromTree({ [gitFile("HEAD")]: `${FULL_SHA}\n` }, join(REPO, "a", "b", "c", "d", "e"));
+check(
+  "...so a repository exactly four levels up is found, and one five levels up is not",
+  atLimit.source === "checkout" && pastLimit.source === "unknown",
+  `${atLimit.source} at four, ${pastLimit.source} at five`,
+);
+
+// The wording. Three sources, three sentences, and the differences between them are the
+// whole point — the label is what fits beside the wordmark, the title is what the seven
+// characters cannot say on their own.
+const IMAGE: BuildStamp = { version: VERSION, commit: SHORT_SHA, source: "image" };
+const CHECKOUT: BuildStamp = { version: VERSION, commit: SHORT_SHA, source: "checkout" };
+const UNKNOWN: BuildStamp = { version: VERSION, source: "unknown" };
+check(
+  "the topbar shows the commit, because every pre-release build carries the same version",
+  buildLabel(IMAGE) === SHORT_SHA && buildLabel(CHECKOUT) === SHORT_SHA,
+  `${buildLabel(IMAGE)} / ${buildLabel(CHECKOUT)}`,
+);
+check(
+  "...and falls back to the version, so the stamp is never blank",
+  buildLabel(UNKNOWN) === VERSION,
+  buildLabel(UNKNOWN),
+);
+check(
+  "an image is the strong claim: the bytes were built from that commit",
+  buildTitle(IMAGE).includes(SHORT_SHA) && buildTitle(IMAGE).includes("built from"),
+  buildTitle(IMAGE),
+);
+// The one assertion in this group that stands between a useful stamp and a misleading one.
+// A file read sees `HEAD`, never the working tree, so an edited checkout reports the commit
+// it diverged from — and has to say so.
+check(
+  "a checkout is the weak claim, and says outright that uncommitted work is not in it",
+  buildTitle(CHECKOUT).includes(SHORT_SHA) &&
+    /uncommitted/i.test(buildTitle(CHECKOUT)) &&
+    !buildTitle(CHECKOUT).includes("built from"),
+  buildTitle(CHECKOUT),
+);
+// Revert-proof, the third one: nothing in the `unknown` sentence may look like provenance.
+check(
+  "an unknown build names the absence and stops — no object id, no `built from`",
+  !/\b[0-9a-f]{7}\b/.test(buildTitle(UNKNOWN)) &&
+    !buildTitle(UNKNOWN).includes("built from") &&
+    !buildTitle(UNKNOWN).includes("checkout") &&
+    buildTitle(UNKNOWN).includes(VERSION),
+  buildTitle(UNKNOWN),
+);
+check(
+  "...and no two sources are worded the same, so a copied sentence cannot over-claim",
+  new Set([buildTitle(IMAGE), buildTitle(CHECKOUT), buildTitle(UNKNOWN)]).size === 3,
+);
+// The startup line names the source for the reason the tooltip does: a log gets copied into
+// an issue, where "0.1.0" alone identifies nothing and a bare sha over-claims.
+check(
+  "the startup line carries the version, the commit and which of the two claims it is",
+  buildSummary(IMAGE) === `LabView ${VERSION} (${SHORT_SHA}, image)` &&
+    buildSummary(CHECKOUT).includes("checkout"),
+  `${buildSummary(IMAGE)} | ${buildSummary(CHECKOUT)}`,
+);
+check(
+  "...and says so plainly when there is nothing to name",
+  !/\b[0-9a-f]{7}\b/.test(buildSummary(UNKNOWN)) && buildSummary(UNKNOWN).includes(VERSION),
+  buildSummary(UNKNOWN),
+);
+
+// In the payload, unconditionally — `meta.build` is not optional, for the reason
+// `meta.probe` is not: a reader may never have to infer which build answered them.
+const buildMeta = (await overviewFor(appsRoot)).meta;
+check(
+  "every scan reports which build produced it",
+  buildMeta.build !== undefined && buildMeta.build.version === VERSION,
+  JSON.stringify(buildMeta.build),
+);
+check(
+  // No assertion anywhere names a commit *value* off this machine: this suite runs from a
+  // checkout, in CI from a clone, and inside `docker build` from neither (**I7**).
+  "...with a commit exactly when the build had one to report",
+  ["image", "checkout", "unknown"].includes(buildMeta.build.source) &&
+    (buildMeta.build.source === "unknown") === (buildMeta.build.commit === undefined) &&
+    !/\s/.test(buildMeta.build.commit ?? ""),
+  `${buildMeta.build.source} ${buildMeta.build.commit ?? "no commit"}`,
+);
+const injectedMeta = (await overviewFor(appsRoot, { buildStamp: IMAGE })).meta;
+check(
+  "an injected stamp arrives verbatim, which is what makes the rest of this suite portable",
+  JSON.stringify(injectedMeta.build) === JSON.stringify(IMAGE),
+  JSON.stringify(injectedMeta.build),
 );
 
 console.log("\na missing gate is only reported where a gate was expected");

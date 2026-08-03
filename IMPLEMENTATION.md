@@ -94,7 +94,11 @@ labview/
     cli.ts            one-shot scan to stdout (`npm run scan [-- --summary]`)
     config.ts         defaults, config.yml merge, env overrides
     secrets.ts        env masking + URI credential redaction
+    build.ts          which build is running: the env stamp, else the checkout's HEAD
+                      (resolveBuildStamp is pure; the fs read is separate)
     model/types.ts    THE contract between backend and frontend
+    model/build.ts    what the topbar and the startup line say about the build, one
+                      sentence per source (pure, web-safe)
     model/connections.ts  connection-report wording, hints, log/banner rules (pure)
     model/changes.ts  what changed between two scans, and its wording (pure)
     model/access.ts   access-control vocabulary: posture line, failure text, username rule (pure, web-safe)
@@ -105,8 +109,9 @@ labview/
     model/declarations.ts  the values a `.labview` may use, and how each is worded (pure, web-safe)
     model/ports.ts    reading a compose port mapping for the published host port (pure)
     model/probe.ts    which addresses a service may be asked at, what counts as a
-                      login page answering, and what a login form is made of
-                      (pure, web-safe)
+                      login page answering, what a login form is made of, which fact
+                      each verdict rested on, and the fleet roll-up the Login probe
+                      panel lists (pure, web-safe)
     model/filter.ts   the dashboard's tri-state tag filter (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
@@ -667,9 +672,10 @@ It is the only integration that **defaults to off**, the only one that sends a r
 something the fleet's own documents named, and the only one a reader can turn on from the UI
 for a single rescan. All three facts drive the design.
 
-**Three pure rules, in [model/probe.ts](labview/src/model/probe.ts).** None lives in the
+**Four pure rules, in [model/probe.ts](labview/src/model/probe.ts).** None lives in the
 client that does the fetching, because a rule inside an I/O module can only be tested by
-mocking the I/O.
+mocking the I/O. Three decide (`probeTargets`, `readGate`, `readLoginForm`); the fourth,
+`probeReasonText`, says which fact a decision rested on.
 
 `probeTargets(svc, lanHost)` decides eligibility and try-order, from evidence already on the
 service — never from a port number and never from an image name:
@@ -700,7 +706,7 @@ means no LAN vantage, not a guessed one.
 | `challenge` | 401 or 407 **with** a `WWW-Authenticate` header | The header *is* a request for a credential |
 | `redirect-origin` | a 3xx whose `Location` resolves to a different origin | This origin declined to serve the request itself — the shape of every external SSO hand-off |
 | `redirect-login` | a 3xx that stayed on the origin and landed on `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` (prefix match) | It sent the browser to its own login instead of serving |
-| `meta-refresh-login` | a 200 whose HTML carries `<meta http-equiv="refresh">` whose `url=` resolves cross-origin or onto one of those same paths | A redirect written in markup. The page served no content; the 200 is an accident of *how* it redirected, and the same `resolveLocation` judges it as judges a `Location` |
+| `meta-refresh-login` | a 200 whose HTML carries `<meta http-equiv="refresh">` whose `url=` resolves cross-origin or onto one of those same paths | A redirect written in markup. The page served no content; the 200 is an accident of *how* it redirected, and `readRefresh` resolves the target through the same `readRedirect` a `Location` goes through |
 | `sso-form` | a 200 carrying a hidden `SAMLRequest` or `SAMLResponse` input | Those are the SAML 2.0 POST binding's own parameter names. Nothing else emits one |
 | `password-form` | a 200 whose HTML carries `<input type="password">` or `autocomplete="current-password"`, **anywhere on the page** | A password input is unambiguous alone, which is why it outranks the composite below |
 | `credential-form` | a 200 where **one** form has a username field *and* a submit control *and* a login-intent marker, with no password field | Magic-link and passkey sign-in. See below — this is the one clause that is not a single fact |
@@ -766,6 +772,44 @@ in this rule is the expensive kind of wrong:
 | A `Set-Cookie` on a 200 | Every application sets a cookie |
 | A cross-origin form `action` with no `SAMLRequest` | Indistinguishable from hosted newsletter signup, as above |
 | A 401/403 that serves a login form | The body is read as evidence on a 200 only, so this is a known miss (§11) rather than a clause — loosening it would let any 401 rendering a form bypass the challenge clause's header requirement |
+
+**The facts a verdict rested on are recorded beside the verdict.** `readGate` decides on
+things the response then goes away with — where a `Location` pointed, whether HTML came back
+at all, where a `<meta refresh>` went — so a negative verdict used to be recorded as
+`HTTP 302 — answered with no login page`: the conclusion, with the fact thrown away. A 302 to
+`/dashboard` and a 302 to `/login` are the same sentence there, and the first is the one that
+leaves a service in the exposed count. So four fields carry the observation:
+
+| Field | Answers |
+|---|---|
+| `mediaType` | *a 200 that was not a page* — `application/json`, so nothing was read and nothing could be found |
+| `redirect` | *a 3xx that stayed put* — `/dashboard`, same origin, off any login path: routing |
+| `refresh` | *a `<meta refresh>` that was not a gate* — the `meta-refresh/home` fixture's own reason |
+| `truncated` | *a form below the body cap* — §11's known miss, reported the one time it bites |
+
+`readRedirect`, `readRefresh` and `readMediaType` are exported for this and consumed by
+`readGate` itself, so there is exactly one rule for "where does this point" and the recorded
+fact is the one the verdict was reached on rather than a second reading of the response. There
+is deliberately **no** field for `WWW-Authenticate`: a 401 with no `challenge` gate already
+*means* the header was absent, so a field would be a second copy of a fact already in the
+payload.
+
+All three readers reduce what they record, and the reductions are I6 rather than cosmetics. A
+redirect to an identity provider carries `state`, `code` and `redirect_uri`; a redirect to a
+login carries `?next=`. `ProbeRedirect.to` drops the query and the fragment, keeps the origin
+only when the target *left* the origin — so a same-origin `Location` spelled absolutely cannot
+be mistaken for a hand-off — and sets `crossOrigin` beside it. `mediaType` drops the
+parameters, so a charset never reaches the payload either.
+
+`probeReasonText(probe)` is then the sentence, and it is a pure rule for the same reason the
+other three are: composed in `enrich/probe.ts` with the response in hand it could only be
+tested by mocking the network, and what it says about the two trap fixtures is exactly what
+the fixture-revert contract needs to pin (§8). It branches in `readGate`'s own precedence
+order — one sentence per signal naming the fact that fired, and for a negative verdict the
+clause that came *closest* and what it lacked: the header a bare 401 did not carry, the origin
+a redirect did not leave, the page an `application/json` answer never was, the login intent a
+newsletter box does not have. `GATE_REASON` is an exhaustive `Record<ProbeGate, …>`, so a new
+signal is a compile error until it has been explained.
 
 **Both findings are findings.** A login page answering means the service is not reachable
 without authenticating: it leaves `exposedWithoutAuth`, is counted in `probeGated`, and
@@ -914,6 +958,43 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   when nothing went wrong. It also has a second job: the probe switch (§3.6b) lasts one
   rescan, and `meta.probe` is what lets the UI show a TTL rebuild reverting to config
   rather than leave the checkbox lying.
+- **`meta.build` is the second field under that rule, and it replaced one that was not.**
+  `ScanMeta.version` used to carry a hardcoded copy of `package.json`'s version — read by no
+  code, rendered nowhere and mentioned in no document, so it could not answer the question a
+  version is asked ("is the fix in the thing I am running?"). `meta.build` is its
+  *replacement* rather than a companion, because two versions of one fact is a duplicate
+  somebody has to keep in step. It is a **breaking payload change** for an outside consumer
+  and gets the treatment `unmatchedRouters` got: named in `labview/README.md` where the
+  payload is described. `BuildStamp` carries `version`, an optional `commit`, and a required
+  `source` — and which half is optional is the whole design. `commit` may be absent because a
+  build genuinely may not know its revision: an image built with no `LABVIEW_BUILD_SHA`, or a
+  copy of the tree with no git in it. `source` may **not** be absent, because the same seven
+  characters mean different things depending on where they came from. `image` says these bytes
+  were compiled from that commit. `checkout` says only that the working tree this process
+  started in was at it, which is silent about uncommitted edits — no file read can see them.
+  Reporting one as the other would be exactly the I1 failure the field exists to prevent, so
+  each source has its own sentence in [model/build.ts](labview/src/model/build.ts) and §8
+  asserts that no two are alike. `unknown` then *names* the absence rather than leaving it to
+  a missing key, which is `ProbeRun`'s reasoning again.
+- **A fact about one response is optional, and its absence is itself the fact.** The four
+  fields `ServiceProbe` carries beside `gate` — `mediaType`, `redirect`, `refresh`,
+  `truncated`, the last three typed as `ProbeRedirect | boolean` — are the observations
+  `readGate` reached its verdict on, and each is absent exactly when the response had no such
+  thing: no `redirect` because nothing was a 3xx, no `refresh` because the page had no
+  `<meta>` tag, no `truncated` because the body fitted. That is the opposite case to
+  `meta.probe` above and not an exception to it. `meta.probe` describes the *build*, where
+  silence has two possible readings and neither is safe; these describe *one exchange*, where
+  silence has one reading and `probeReasonText` is written to say it out loud ("it answered
+  HTTP 200 with no page …"). Nothing infers from an absent field: the sentence names what was
+  missing.
+- **Both redirect fields are reduced, and the reduction is I6 rather than tidying.** A
+  redirect to an identity provider carries `state`, `code` and `redirect_uri`; a redirect to a
+  login carries `?next=`. `ProbeRedirect.to` drops the query and the fragment and keeps the
+  origin only when the target *left* the origin — path alone otherwise, so a same-origin
+  `Location` spelled absolutely cannot read as a hand-off — with `crossOrigin` beside it as
+  the fact the verdict actually used. `mediaType` drops the parameters for the same reason a
+  charset has no business in the payload. The reductions are asserted directly: a sweep over
+  the `readRedirect` table checks that no recorded target contains `?` or `#` (§8).
 - Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
   **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
   a colour and a label, and an unmapped member silently renders grey. For
@@ -1188,18 +1269,71 @@ Four rules shape it, three of them borrowed from the row above:
 - **The tile becomes a control without becoming a `<button>`.** `StatTile` takes an
   optional `onClick` and, when it has one, carries `role="button"`, `tabIndex={0}` and
   the Enter/Space handler `.stack-head`, `.svc-row` and `.tagrow` already use; its
-  content is block elements, which a real button may not contain. Only the drift tile
-  passes it — a count a reader can take off the payload has nothing further to say, and
-  a tile that looked clickable without being so would be worse than a plain one.
+  content is block elements, which a real button may not contain. Only the two tiles whose
+  count stands for a set of sentences pass it — drift and the login probe below. A count a
+  reader can take off the payload has nothing further to say, and a tile that looked
+  clickable without being so would be worse than a plain one.
+
+**The probe panel.** `Login probe 5` is the third tile of that shape, and it is a **new**
+tile rather than a line added to an existing one for a reason I3 states: `Exposed, no auth`
+would drop every *gated* result, which is half of what the probe measured, and `Auth-protected`
+or `Declared auth` would file a probe result where a mechanism belongs. So the probe gets the
+tile whose number *is* its measurement, rendered only when `report.probed > 0`, and the panel
+(`web/components/ProbeDetail.tsx`) answers the three questions the tile cannot: the address
+tried, what came back, and which fact the verdict rested on. Four rules, two of them specific
+to this tile:
+
+- **Nothing here is tinted by severity except the pill.** The tile is not `alert` and no row
+  is `crit`, and that is `OverviewStats.probeOpen`'s own doing: it is documented as **not** a
+  subset of `exposedWithoutAuth`, because a service behind a detected gate that answers
+  LabView from inside the fleet is counted in it too — the request may simply have gone around
+  the edge that gates real visitors. Tinting would claim a fleet finding that
+  `Exposed, no auth` may correctly deny, and the critical tint means one thing only (§12).
+  `probeOutcome` already decides which result pill is critical and it is the only thing in the
+  panel entitled to.
+- **What cleared nothing leads.** Sections run *answered with no login page*, *answered with a
+  login page*, *did not answer* — first the half of the measurement that left every finding
+  standing, then the half that withdrew one. The third is neither, and gets its own sentence
+  saying so: nothing arrived, so those services are classified exactly as the configuration
+  alone classified them. A blank third section would read as "no login page found", which is
+  the §3.6b error in the other direction.
+- **The grouping and the sentence are model functions.** `collectProbeReport`,
+  `probeReportSummaryText` and `probeReasonText` are in `model/probe.ts` for the reason
+  `collectDeclarationDrift` is in `model/declarations.ts`, and the claim worth asserting is the
+  same one: the panel lists exactly the services the tile counted — `gated.length ===
+  stats.probeGated`, `open.length === stats.probeOpen`, the three lists summing to `probed`
+  (§8). Sorted by stack then service (I7), and derived from `ov.stacks` rather than carried in
+  `ScanMeta`, so there is no second copy to keep in step.
+- **One fact, one voice.** Every row renders through the same `probeOutcome`,
+  `probeVantageText`, `probeFormText` and `probeReasonText` the service drawer renders
+  through, and `AppDetail` shows the reason line too — so following a row into its drawer
+  reads as the same result rather than a second account of it. The row is four lines in the
+  same order in every section: who, where and from what vantage, the form if there was one,
+  the reason. It does not restate the section it is filed under.
 
 The drawer shell itself (`.drawer-scrim`, the sticky `.dhead`, the scrolling `.dbody`)
 moved out of `ApiDetail.tsx` into `web/components/Panel.tsx`, on the `Section.tsx`
-precedent, so the drift panel inherits the scroll, close and Escape behaviour rather
-than restating it. `main.tsx` holds one `panel` state for all three — `"authentik" |
-"traefik" | "drift" | null` — which is what guarantees two are never stacked and fixes
-the Escape order: the panel closes first, the service drawer second. A row handing over
+precedent, so the drift and probe panels inherit the scroll, close and Escape behaviour
+rather than restating it. `main.tsx` holds one `panel` state for all four — `"authentik" |
+"traefik" | "drift" | "probe" | null` — which is what guarantees two are never stacked and
+fixes the Escape order: the panel closes first, the service drawer second. A row handing over
 to a service drawer clears the panel through the same `openService` the integration
 panels use.
+
+**The build stamp.** `● LabView d0e2030` — the commit on the wordmark's baseline, muted and
+small, for the whole session. It is the one thing on the page that is about LabView rather
+than about the fleet, which is why it is an identifier rather than a finding: nothing tinted,
+nothing to click. The **commit** and not the version, because while this is pre-release every
+build reports `0.1.0` and only the sha tells two of them apart; the version is the fallback
+when there is no commit, so the stamp is never blank. What those seven characters are evidence
+*of* is in the `title` rather than the label, and both come from
+[model/build.ts](labview/src/model/build.ts) — `buildLabel` and `buildTitle` — so the sentence
+that distinguishes "built from that commit" from "started in a tree at that commit" is a rule
+§8 asserts, not a string in a `.tsx` (§3.7). `cursor: help` marks that there is a sentence
+there at all.
+
+**It stays behind the session.** `meta.build` arrives only on `/api/overview`, which requires
+one, and the login screen has its own `.brand` that gets no stamp — §7 gives the reasoning.
 
 ### 3.10 Connection diagnostics
 
@@ -2040,6 +2174,17 @@ A new field that could carry a secret must be routed through `maskEnv` or given
 equivalent treatment. Note that `labels` are **not** masked — they are routing
 metadata by design; if a future label carries a credential it needs handling.
 
+**The probe's own fields are the "equivalent treatment" case, because they come from a
+response rather than from the environment.** `maskEnv` cannot help: nothing here has a key
+to match. So the reduction is in the reader. `ServiceProbe.endpoint` is an origin and a path
+with no credential in it, and `ProbeRedirect.to` — for both the `Location` and the
+`<meta refresh>` target — drops the query and the fragment before the value is ever recorded
+(§3.6b). That is not neatness: an OAuth hand-off puts `state`, `code` and `redirect_uri` in
+the query, a login redirect puts `?next=` there, and a service is free to put anything else
+in it. `crossOrigin` beside it carries the only part of the dropped information the verdict
+needed. A new field holding anything a scanned service *said* belongs under this rule, not
+under `maskEnv`.
+
 LabView's own credentials fall under this too, in three places (§3.13):
 
 - `LABVIEW_OIDC_CLIENT_SECRET` and `LABVIEW_SESSION_SECRET` join
@@ -2707,6 +2852,7 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_MASK_SECRETS` | `secrets.maskValues` | leave on |
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
+| `LABVIEW_BUILD_SHA` | — | which commit this build came from, baked in at image build time (`--build-arg`). A full object id is shortened to seven, anything else is used as given, and unset falls back to the checkout LabView is running from and then to reporting no revision at all (§3.7). **Env-only**, see below |
 | `LABVIEW_AUTHENTIK_TOKEN` | `authentik.token` | unset = step 7 makes no request at all; set and empty = a `credential` fault (§3.10) |
 | `LABVIEW_AUTHENTIK_URL` | `authentik.url` | skips discovery entirely; needed only when the provider is outside `appsRoot` |
 | `LABVIEW_AUTHENTIK_ENABLED` | `authentik.enabled` | `false` = never contact the provider |
@@ -2742,6 +2888,15 @@ The `auth` block follows the `authentik`/`traefik` shape on purpose — `enabled
 a `timeoutMs` — so an operator who has configured one integration already knows the
 vocabulary. `enabled` means **allowed, not on**: what turns a method on is having
 something usable (§3.13).
+
+**`LABVIEW_BUILD_SHA` is the one row with no config-file key, and that is a rule rather than
+an omission.** Everything else in the table is a decision about the operator's fleet; this is
+a fact about the artifact, settled when the image was built. `config.yml` is editable while
+LabView runs, so a key there would let a running instance be told it is a different build
+than it is — the one claim a build stamp cannot survive making (I1). The image gets it from
+the Dockerfile's `ARG`, the workflow passes `github.sha` (§9), and an operator who needs a
+stamp on a hand-built image passes `--build-arg`. It is also why nothing writes it: LabView
+reads this variable and never sets one.
 
 ### Credentials come from the environment
 
@@ -2853,6 +3008,17 @@ role, no per-user scope and nothing to write (I5). Nor is there a trusted-header
 trusting a header is only safe when the edge is guaranteed to strip it and LabView cannot
 verify that — the operator who has such an edge is already covered by leaving the login
 unconfigured.
+
+**Why the build stamp stays behind the session.** The commit in the topbar (§3.9) arrives on
+`/api/overview`, which needs a session wherever one is configured, and the login screen gets
+no stamp of its own. It is the smallest piece of this whole surface and still worth the rule:
+a version an unauthenticated visitor can read is how a known advisory gets matched to a
+running instance, which is work an attacker would otherwise have to do by probing behaviour.
+Withholding it costs a signed-in operator nothing — they are one sign-in away from the same
+seven characters, and the startup log has them without any HTTP at all. Not a claim that
+LabView's version is a secret: an image tag on a registry says as much, and §11 lists what
+this does and does not buy. Just the same rule the three pre-auth artifacts already follow —
+nothing is served before a session that does not have to be (§3.13).
 
 **Why LabView's own compose example publishes no `ports:`.** A published host port
 answers directly at `<host-ip>:<port>`, bypassing the reverse proxy and therefore
@@ -3174,9 +3340,9 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `proxy-challenge` | `challenge`, and that a router's own `tls` setting decides the scheme it is asked on |
 | `sso-redirect` | `redirect-origin`, at the `http` address a router with no TLS implies |
 | `own-login` | `redirect-login`, and — with its sidecar — the one service where `probed-gate` and `declared` are both true: the reader gets the measured one, and the same service falls back to `declared` with the probe off |
-| `meta-refresh` | a **pair**, differing in one URL, because that URL is the whole rule: `docs` refreshes to `/login` and is `meta-refresh-login`; `home` refreshes to `/dashboard` and is a **trap** — an application routing to its own landing page, which a rule reading "any meta refresh" would take out of the exposed count |
+| `meta-refresh` | a **pair**, differing in one URL, because that URL is the whole rule: `docs` refreshes to `/login` and is `meta-refresh-login`; `home` refreshes to `/dashboard` and is a **trap** — an application routing to its own landing page, which a rule reading "any meta refresh" would take out of the exposed count. Both halves of the trap are pinned, not just its verdict: `home`'s payload must carry `refresh.to === "/dashboard"` and its reason must name `/dashboard` and say it is neither off the origin nor a login path |
 | `saml-post` | `sso-form` — the shape that defeats every simpler rule at once: no password field, no `Location`, and a cross-origin `action` the form rule refuses on purpose. The hidden `SAMLRequest` alone is the evidence. TLS on the router, so it is asked over `https` |
-| `passwordless` | a **pair**, and the reason `credential-form` cannot degenerate into word-matching: `magic` serves an email field, a submit button and `action="/login"` with no password anywhere; `news` is the **trap** — the same three tags as a newsletter box, posting to a list service on another origin, which marks nothing and clears nothing |
+| `passwordless` | a **pair**, and the reason `credential-form` cannot degenerate into word-matching: `magic` serves an email field, a submit button and `action="/login"` with no password anywhere; `news` is the **trap** — the same three tags as a newsletter box, posting to a list service on another origin, which marks nothing and clears nothing, and whose reason must say so in those terms: the form shows no login intent and its action is not a login path |
 | `open-app` | the **guard**, two services: `dash` answers 200 with a homepage and stays exposed with the finding now measured; `routing` redirects same-origin to `/dashboard`, which is application routing and clears nothing |
 | `gated-open` | a detected gate answered 200 with no login page: posture unchanged, note names the vantage the request came from |
 | `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
@@ -3185,12 +3351,23 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `dbonly` | a Postgres and an Adminer publishing ports and nothing else: **no request at all**, which is the rule that keeps the probe off a database |
 | `tcp-tunnel` | a `tcp://` and an `ssh://` tunnel origin: never resolved, let alone asked, and both stay honestly in the exposed count |
 
-Four groups of assertions carry what is not about one stack. The **rules**, driven pure: a
+Five groups of assertions carry what is not about one stack. The **rules**, driven pure: a
 33-row `readGate` table where half the rows are near-misses, plus two meta-assertions — that
 every signal in the union is reached, and that the near-misses outnumber the signals, which is
 what "strict" means here; a 14-row `readLoginForm` table, which earns its own because a
 composite rule's interesting cases are the ones where *some* parts are present, and a gate
-assertion collapses all of those to `undefined`; and `probeTargets` over hand-built routes for
+assertion collapses all of those to `undefined`; three small tables for the readers `readGate`
+now decides through — `readRedirect` (a relative `Location`, an absolute same-origin one
+reduced to its path, a different port as cross-origin, an unparseable one as nothing at all),
+`readRefresh` (including that the **first** parseable refresh in a document is the one recorded,
+because that is the tag a browser honours) and `readMediaType` — with a sweep over the redirect
+rows asserting the I6 reduction directly: no recorded target may contain a `?` or a `#`; a
+20-row `probeReasonText` table asserting the sentence **names the deciding fact** rather than
+merely coming back non-empty — `/dashboard` for the on-origin redirect, `application/json` for
+the 200 that was not a page, the missing header for a bare 401 — with `mustNot` clauses where a
+wording could over-claim (a probe that never connected must not say "login page"), plus two
+meta-assertions that every gate has a row and that no two gates are worded alike; and
+`probeTargets` over hand-built routes for
 scheme, order, the per-service cap, dedupe, the bind-address guard, a port range, and each arm
 of `isHttpObservable` separately. **Containment**, asserted on the recorded requests rather
 than on the code: every request a GET at `/` with no query, no credential on any of them, no
@@ -3209,7 +3386,15 @@ configuration or request decided it; and, through `app.inject`, that `{"probe":t
 where they should. Those route cases run against `fixtures/auth`, which carries no route on
 anything — so `probe: true` is *observable* there while remaining incapable of sending a
 request, because a body that turns the probe on must never be a body that makes the test suite
-talk to the network.
+talk to the network. **The panel**, which is one claim in eight checks: it lists exactly the
+services the tile counted. `collectProbeReport(probed.stacks)` must put `stats.probeGated`
+services in `gated` and `stats.probeOpen` in `open`, `silent` must be the one service nothing
+answered from, the three lists must sum to `probed` with no key appearing twice, and every entry
+must be findable back in `probed.stacks` by object identity (`s.probe === e.probe`) rather than
+by matching a copy. Determinism is asserted the way the fleet's other groupings are — the same
+input twice and the input reversed all produce identical JSON (I7) — the tile's tooltip and the
+panel's subtitle are asserted to be one shared string, and `collectProbeReport(unasked.stacks)`
+must report `probed === 0`, which is what keeps the tile off a scan that probed nothing.
 
 One assertion in that group is a rule about the whole vocabulary rather than about any stack:
 between them the fixture services must answer with **every** member of `PROBE_GATES`. The
@@ -3321,6 +3506,35 @@ wordings including both singulars. Ordering is pinned against *reversed* clones 
 stacks and two renamed services, because fixture discovery is already alphabetical and
 an assertion over the natural order would pass with no sort at all.
 
+**The build stamp is asserted as a resolver table, because a `.git` directory is not a
+fixture.** `resolveBuildStamp` takes its environment and its file reads as arguments
+([build.ts](labview/src/build.ts)), so the whole precedence is driven from literals: a full
+object id shortened to seven, a tag passed through whole, an unset/empty/whitespace variable
+falling through to the checkout, the environment winning over a checkout that would also have
+answered, a `HEAD` naming a branch followed to its loose ref and then to `packed-refs`, a
+detached `HEAD` used directly, and five ways to end up at `unknown` — junk, a branch with no
+ref, a ref outside `refs/`, a ref containing `..`, and nothing at all. Git will not let a
+repository store a `.git` directory inside a fixture, so an fs-backed version of this test
+could not exist. Four of the rows exist to fail if a rule is backed out: without the
+shortening the topbar stops matching `git rev-parse --short HEAD`; with the precedence flipped
+every container reports whatever tree it can see instead of the commit it was built from;
+without the `..` guard a `HEAD` file chooses which path LabView opens (I8); and if `unknown`
+is allowed a `commit` the stamp starts inventing provenance. Two more pin the walk itself — a
+repository exactly four levels up is found and one five levels up is not, so a LabView
+unpacked under an unrelated repository cannot borrow its commit, and a `.git` *file* ends the
+walk rather than reporting the enclosing repository's.
+
+The wording is a second table over `buildLabel` / `buildTitle` / `buildSummary`: the label is
+the commit and falls back to the version, the `image` sentence is the only one entitled to
+"built from", the `checkout` sentence must contain "uncommitted", the `unknown` sentence must
+contain no object id and no "built from" at all, and no two of the three may be identical — a
+copied sentence is exactly how a weak claim becomes a strong one (§3.7). In the payload,
+`meta.build` is asserted present on a fixture run with the real version, with a `commit`
+exactly when `source` is not `unknown`; and one run injects a stamp through `BuildDeps` and
+checks it arrives verbatim. **No assertion names a commit value off the running machine** —
+this suite runs from a checkout, in CI from a clone and inside `docker build` from neither,
+so `LABVIEW_BUILD_SHA` is cleared with the other variables at the top of the file (I7).
+
 **Ingress is asserted as a set, in canonical order, as a joined string.** `ing(svc)`
 returns `svc.ingress.join(", ")` so a failing assertion prints both sets — `got
 "public, lan"` against an expected `"public, traefik, lan"` names the kind that went
@@ -3331,8 +3545,8 @@ complements the per-service ones: over every service in both roots, no set carri
 that are `internal` alone — so a stack added later, or a fourth external kind, is
 covered without anyone remembering to extend a list.
 
-**Access control** (§3.13) is asserted at the end of the file and at length — 253 of the
-902 checks — because it is the only part of LabView where a silent regression is a security
+**Access control** (§3.13) is asserted at the end of the file and at length — 263 of the
+1143 checks — because it is the only part of LabView where a silent regression is a security
 hole rather than a wrong label. `fixtures/auth/` is not a fifth scan root: it holds three
 passwd files, and nothing in the section reads a compose document. The modules are
 imported locally at the bottom, for the reason `node:net` is, so the sections above do not
@@ -3470,7 +3684,14 @@ CI lives in `.github/workflows/`:
   typecheck + smoke and the build `needs:` it, so a broken build or a reverted
   fixture fix cannot reach Docker Hub. The build context is `./labview`, not the
   repo root: the Dockerfile and every path it copies are context-relative, so a
-  root context finds none of them.
+  root context finds none of them. It also passes
+  `build-args: LABVIEW_BUILD_SHA=${{ github.sha }}`, which is the only way the image can
+  learn its own commit — `.git` is at the repo root, outside that context, and
+  `.dockerignore` excludes it in any case. The full sha goes in and LabView shortens it, so
+  the stamp in the topbar is the first seven characters of the `:${{ github.sha }}` tag the
+  same step pushes (§3.7). A local `docker build` with no `--build-arg` is a supported
+  state, not a failure: the image then reports that it does not know its revision, which is
+  the path `security.yml`'s bare build exercises.
 - **security.yml** — `npm audit` at moderate (informational) and at high for
   production deps (**gating**), dependency-review at moderate on PRs, CodeQL
   `security-extended`, Trivy filesystem *and* image scans, TruffleHog
@@ -3710,7 +3931,12 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
     a login form below an inlined stylesheet or a base64 hero image is never seen. The cut
     may also land inside a tag, in which case that element is simply not counted: a
     partial read yields a partial shape, never an exception (I4), and both halves of that
-    are asserted (§8).
+    are asserted (§8). The miss is now **reported** where it can be: the response carries
+    `truncated` when the read stopped at the cap, and `probeReasonText` appends the caveat
+    that the page continued past what was read. That narrows the entry rather than closing
+    it — the reader is told the answer may be incomplete, which is all an unread byte can
+    support, and a page exactly 64 KiB long does not raise it because the stream reported
+    itself done.
   - **A login action nothing recognises as one.** `credential-form` needs a login-intent
     marker, and one of the two is the form's action resolving onto a `LOGIN_PATHS` path.
     NextAuth-style endpoints — `/api/auth/callback/email` and its neighbours — are outside
@@ -3832,6 +4058,22 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   who wants probing on for good sets `probe.enabled` and gets it on every build.
 - **The Docker snapshot lists all containers**, including ones with no compose
   file under `appsRoot`; those simply do not match a service and are not reported.
+- **A `checkout` build stamp cannot see uncommitted work.** The commit comes from reading
+  `.git/HEAD`, which is the last thing committed — so a tree with edited, staged or stashed
+  files reports the commit it diverged from, and two developers with different working trees
+  can show the same seven characters. There is no fix that stays inside a file read: knowing
+  the tree is clean means running `git status`, and shelling out to git from a scan is a
+  bigger change than the stamp is worth. So it is *said* instead — the tooltip on a
+  `checkout` stamp states that uncommitted changes are not reflected (§3.9), and an `image`
+  stamp, which is baked in at build time from a committed sha, carries no such caveat. What
+  the stamp is good for is the case it was added for: identifying which *built* artifact is
+  running.
+- **A linked worktree or a submodule reports no revision.** `.git` in those is a file
+  pointing at a real git directory elsewhere; following it leads into another repository's
+  layout, and walking further up the tree would report the *enclosing* repository's commit,
+  which is a different build. Both are wrong answers, so LabView gives none and says
+  `unknown`. `LABVIEW_BUILD_SHA` is the way to stamp such a tree, and it is what the image
+  uses anyway.
 - **Sessions do not survive a restart.** There is no session store, and the revocation
   set is in memory beside it — so a restart, a redeploy or an image pull signs everyone
   out. With `auth.session.secret` unset it is stricter still: the secret is minted per
@@ -4012,3 +4254,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | A probe result joins `hasEdgeAuth`, where a declaration may not | They look alike — both remove a service from the count without naming a mechanism — and the difference is I1 exactly. A declaration is a claim nothing in the scan can check, so it stays a separate term. A probe result is something LabView observed, the same kind of fact as a middleware definition, so it belongs in the evidence term. What keeps it honest is the `unnamed-gate` discipline it borrows: its own counter, its own reason, `auth.method` untouched, and the count reconstructible with the term dropped. |
 | The walk **stops at the first address that answers** | An answer is an answer, whatever the status — a 401 is the best outcome available here — so continuing to a weaker vantage would spend requests to learn something less. Only a transport failure falls through, which is what makes the LAN vantage useful at all: a public hostname routinely does not resolve from inside the container. Vantage order is `INGRESS_KINDS` order, most-exposed first, so the answer a reader is shown is the one an outsider would get. |
 | "Did not answer" is a **third** outcome, never folded into "no login page" | They are the same absence of a gate and completely different findings: one measured an exposure, the other measured nothing. Folding them would let a firewalled service read as "answered, open" — or, worse in the other direction, a timeout read as protection. So it counts in neither statistic, `probeOutcome` words it as `No answer`, and its note claims no measurement. |
+| The payload carries the facts a verdict rested on, so the reason can be a rule rather than a sentence | `readGate` decides on things the response then goes away with, so a negative verdict was recorded as `HTTP 302 — answered with no login page`: the conclusion, with the fact discarded, and a 302 to `/dashboard` spelled identically to a 302 to `/login`. Composing the fuller sentence in `enrich/probe.ts`, where the response is still in hand, was the smaller change and the wrong one — a string built at probe time can only be tested by mocking the network, and what these sentences say about the two trap fixtures is exactly what the revert contract has to pin. So four observations go into `ServiceProbe` (`mediaType`, `redirect`, `refresh`, `truncated`), read by the same exported readers `readGate` decides through, and `probeReasonText` is a pure rule in `model/probe.ts` with 20 rows behind it (§8). The cost is four more fields in the contract and one more thing to reduce for I6; the gain is that "why" is falsifiable. |
+| The probe gets its own tile, and the tile is not tinted | An existing tile could not hold it. `Exposed, no auth` drops every gated result, which is half the measurement; `Auth-protected` and `Declared auth` name mechanisms, and I3 forbids a probe result becoming one. So the count that *is* the measurement gets the tile. It is deliberately not `alert` and its rows are not `crit`, on `probeOpen`'s own documented terms: a service behind a detected gate that answers LabView from inside the fleet is counted in `probeOpen` too, because the request may have gone around the edge that gates real visitors. Tinting it would assert a fleet finding that `Exposed, no auth` may correctly deny, and the critical tint means one thing only (above). Severity stays with the per-result pill, which `probeOutcome` decides. |
+| The build stamp on the page is the **short commit**, not the version | A version answers "is the fix in the thing I am running?", and `0.1.0` cannot: it is the same string across every pre-release build, so a page showing it says only that this is LabView. The short commit is the smallest thing that answers the question, and it is the identifier the project already uses everywhere else — the image tag, the workflow's `github.sha`, `git rev-parse --short HEAD` in a terminal — so the stamp reads as the same name a reader already has, rather than a new one to correlate. The version is not discarded; it moves into the tooltip and the log line, where it costs nothing and is there when the pre-release ends. This replaced `meta.version`, a hardcoded copy of `package.json` that no code read and no document mentioned — so the change is a duplicate removed, and a breaking payload change on the `unmatchedRouters` precedent. |
+| `source` sits beside the commit and is never optional | `image` and `checkout` are different claims about the same seven characters, and only one of them is about the bytes that are running. An image was compiled from that commit; a checkout merely *started* in a tree that was at it, and no file read can see the uncommitted edits on top — so a stamp that reported the sha alone would let a developer's half-finished tree spell exactly like a released build, which is the I1 error in the one place a reader trusts most. Recording which source answered makes each claim wordable on its own terms: `buildTitle` is a `Record` over the three, exhaustive, so a fourth way to learn a commit is a compile error until somebody decides what it entitles LabView to say. `commit` is optional for the opposite reason — a build genuinely may not know its revision, and `unknown` is a real outcome with a sentence of its own rather than a blank field to be misread as a bug. |

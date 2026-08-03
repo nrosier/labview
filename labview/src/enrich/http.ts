@@ -19,6 +19,7 @@
  *    without writing any of this again.
  */
 import type { ConnectionPhase } from "../model/types.js";
+import { isHtmlMediaType, readMediaType } from "../model/probe.js";
 
 /** Minimal shape of a `fetch` response, so a test can supply a stub. */
 export interface HttpResponse {
@@ -192,6 +193,12 @@ export interface ResponseResult {
   contentType?: string;
   /** The body, only when it was HTML, and never more than {@link MAX_BODY_BYTES}. */
   body?: string;
+  /**
+   * Whether the body read stopped at {@link MAX_BODY_BYTES} instead of at the end of the
+   * page — so a caller knows that "not found in the body" means "not found in the part of
+   * it that was read". Absent unless the cap actually bit.
+   */
+  truncated?: boolean;
   /** Why nothing arrived, with no credential in the text. */
   error?: string;
   /** `connected` whenever a response arrived; otherwise the transport stage that failed. */
@@ -247,13 +254,19 @@ export async function getResponse(
     });
     const header = (name: string): string | undefined => res.headers?.get(name)?.trim() || undefined;
     const contentType = header("content-type");
+    // The same test `probeReasonText` explains a non-HTML answer with, from the module that
+    // owns it — so "never read as a page" and "not read as a page" cannot come apart.
+    const read = isHtmlMediaType(readMediaType(contentType)) ? await readCapped(res) : undefined;
     return {
       ok: true,
       status: res.status,
       location: header("location"),
       wwwAuthenticate: header("www-authenticate"),
       contentType,
-      body: isHtml(contentType) ? await readCapped(res) : undefined,
+      ...(read?.text !== undefined ? { body: read.text } : {}),
+      // Only when it bit. A `truncated: false` on every ordinary page would be a field the
+      // reader has to skip past to find the one time it says something.
+      ...(read?.truncated ? { truncated: true } : {}),
       phase: "connected",
     };
   } catch (err) {
@@ -267,13 +280,6 @@ export async function getResponse(
   }
 }
 
-/** Whether a content type is HTML. `text/html; charset=utf-8` and bare `text/html` both. */
-function isHtml(contentType: string | undefined): boolean {
-  if (!contentType) return false;
-  const type = contentType.split(";")[0]!.trim().toLowerCase();
-  return type === "text/html" || type === "application/xhtml+xml";
-}
-
 /**
  * At most {@link MAX_BODY_BYTES} of a response body, as text.
  *
@@ -282,27 +288,44 @@ function isHtml(contentType: string | undefined): boolean {
  * not — a stub in the smoke run, which is not untrusted input — `text()` is truncated
  * afterwards instead. Never throws: an unreadable body is no body, and the status and
  * headers already gathered are worth more than the read that failed.
+ *
+ * Reports *whether* it stopped short as well as what it read, because the two are one fact
+ * to the caller and only this function knows it. A page cut at the cap that carries no
+ * password field has not been shown to carry none, and a verdict that cannot say so is a
+ * verdict claiming more than it measured.
  */
-async function readCapped(res: HttpResponse): Promise<string | undefined> {
+async function readCapped(res: HttpResponse): Promise<{ text?: string; truncated: boolean } | undefined> {
   try {
     const stream = res.body;
     if (stream) return await readStreamCapped(stream);
     if (!res.text) return undefined;
     const text = await res.text();
-    return text.length > MAX_BODY_BYTES ? text.slice(0, MAX_BODY_BYTES) : text;
+    return text.length > MAX_BODY_BYTES
+      ? { text: text.slice(0, MAX_BODY_BYTES), truncated: true }
+      : { text, truncated: false };
   } catch {
     return undefined;
   }
 }
 
-async function readStreamCapped(stream: ReadableStream<Uint8Array>): Promise<string> {
+async function readStreamCapped(
+  stream: ReadableStream<Uint8Array>,
+): Promise<{ text: string; truncated: boolean }> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // The stream saying `done` is the only proof the page ended; the loop condition being
+  // false only proves the cap was reached. A page that is exactly MAX_BODY_BYTES long ends
+  // on the same read that fills the cap, and reporting *that* as truncated would raise a
+  // caveat about a page LabView read in full.
+  let ended = false;
   try {
     while (total < MAX_BODY_BYTES) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        ended = true;
+        break;
+      }
       if (!value?.byteLength) continue;
       chunks.push(value);
       total += value.byteLength;
@@ -319,8 +342,11 @@ async function readStreamCapped(stream: ReadableStream<Uint8Array>): Promise<str
     out.set(chunk.subarray(0, take), at);
     at += take;
   }
-  // Non-fatal: a page truncated mid-character must still be searchable.
-  return new TextDecoder("utf-8", { fatal: false }).decode(out);
+  return {
+    // Non-fatal: a page truncated mid-character must still be searchable.
+    text: new TextDecoder("utf-8", { fatal: false }).decode(out),
+    truncated: !ended,
+  };
 }
 
 async function requestJson(

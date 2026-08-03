@@ -59,8 +59,8 @@ live state from the Docker API, and never needs an agent inside each app.
   serving it** when its API was read (status, entrypoints, the resolved middleware
   chain, and each backend with the health Traefik itself reports for it), the
   **derived auth posture with the evidence that led to it**, what the service answered
-  with when the [probe](#probing-a-service-directly) asked it — which address, and
-  whether a login page came back — the matched
+  with when the [probe](#probing-a-service-directly) asked it — which address, whether a
+  login page came back, and which fact that verdict rested on — the matched
   **Authentik applications and providers** when that API was read (including which
   outpost, if any, is actually serving each one), **each network it is on, what it
   depends on across that network, and who else is merely attached** — the two are
@@ -125,6 +125,13 @@ live state from the Docker API, and never needs an agent inside each app.
   the exposed count with its own badge; an answer *without* one turns an exposure that
   was inferred into one that was measured. Off by default, since it is the only stage
   that sends a request to your own services.
+- **Login probe panel** — the `Login probe 12` tile is a button for the same reason the
+  integration counts are: the number is an outcome and the cases are behind it. Click it
+  for one row per service asked — the address tried and the vantage it came from, what
+  came back, and **why** that was or was not read as a login page, naming the fact the
+  verdict rested on rather than restating the verdict. Grouped with the answers that
+  cleared nothing first, and the services that never answered kept separate from both,
+  since nothing was measured about those at all.
 - **Rescan** — re-reads every `compose.yml` and `.env` under the apps root *and*
   re-runs both API exchanges, then reports what moved on each side, inline beside
   `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, with
@@ -134,6 +141,12 @@ live state from the Docker API, and never needs an agent inside each app.
   in either. When everything is the same as last time it says so — `no config changes
   · authentik and traefik unchanged` — rather than leaving you to guess whether it
   looked.
+- **Which build you are looking at** — the short commit beside the wordmark, since while
+  this is pre-release every build calls itself `0.1.0` and only the sha tells two of them
+  apart. The tooltip adds the version and, more usefully, *how* the commit is known: an
+  image built from it, or a checkout that was at it — which says nothing about uncommitted
+  edits, and says so. See [Which build am I looking
+  at](#which-build-am-i-looking-at).
 - **Light / dark** theme (follows the OS, with a manual toggle).
 
 Colors follow a validated, colorblind-safe palette. The ingress and auth-method
@@ -315,10 +328,16 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces and cannot work this out. Unset means published ports are not asked |
 | `LABVIEW_PROBE_TIMEOUT` | `5000` | Per-request timeout, ms. A service that does not answer in time is recorded as a timeout, which is its own finding |
 | `LABVIEW_PROBE_MAX_CONCURRENCY` | `4` | Services asked at once. Kept low because these requests fan out across the fleet and many of them land on one reverse proxy |
+| `LABVIEW_BUILD_SHA` | *(unset)* | The commit this build came from, so the page can name it. Set at **image build time** — `--build-arg LABVIEW_BUILD_SHA=$(git rev-parse HEAD)`; the published image sets it from the workflow. A full object id is shortened to seven characters, anything else is used as given, and unset is fine: LabView falls back to the checkout it is running from, then to saying it does not know. See [Which build am I looking at](#which-build-am-i-looking-at) |
 
 The default Docker endpoint is the conventional local socket, since it is the one
 endpoint that needs no assumption about your container names; a socket proxy is
 opted into with `LABVIEW_DOCKER_HOST`.
+
+`LABVIEW_BUILD_SHA` is the only variable with no `config.yml` equivalent, because
+it describes the build rather than the fleet: a value in a file you can edit while
+the same bytes keep running is a value that can start lying about which bytes those
+are.
 
 The config file also controls the secret key-patterns, the DockFlare/Traefik
 label prefixes, and the Authentik detection hints — see the comments in
@@ -574,6 +593,34 @@ that mixed case is reported as `partial` rather than as a success: some of the f
 answered, and what was read is sound, but part of the picture is missing and the line
 says which part.
 
+#### Reading the results
+
+A **Login probe** tile appears on the overview whenever a scan asked anything, showing
+how many services were asked. Clicking it opens a panel with one row per service, and
+each row answers the three questions a count cannot:
+
+- **the address tried**, with the vantage it came from — a public hostname answering
+  means something a published host port answering does not
+- **what came back** — the status, the outcome badge, and the composition of the form if
+  a form was found
+- **why that was or was not read as a login page**, naming the fact the verdict rested
+  on: `It answered HTTP 302 and sent the request to /dashboard, which is on its own
+  origin and is not a login path — routing rather than a gate.`
+
+The rows are grouped by what the answer was worth, and the group that **cleared nothing**
+comes first: those are the services the probe left exactly as it found them. Then the
+gated ones. Then, separately and last, the ones that did not answer — nothing arrived
+from those addresses, so the probe added nothing either way, and the panel says so rather
+than letting an empty result read as "no login page found".
+
+Nothing in the panel is tinted red, deliberately. A service in the first group is not by
+itself a finding: one that already has a detected gate can land there too, because
+LabView's request may have gone around the edge that gates real visitors. The panel is
+where you check *what was measured*; **Exposed, no auth** is where a fleet finding is
+claimed. Every row links through to that service's own drawer, which shows the same
+result beside everything else known about it — and the drawer carries the same "why"
+line, so following a row through reads as one result rather than a second account of it.
+
 #### The switch beside Rescan
 
 `probe.enabled` decides what a startup scan and every scheduled rebuild do. The
@@ -601,6 +648,44 @@ Two things worth knowing before you use it:
   anyone who can reach the page can ask for a probing scan — a request per eligible
   service, some of them to public hostnames. They can already read your whole inventory
   from `/api/overview`, so the login is what closes this, not the switch.
+
+---
+
+### Which build am I looking at
+
+The topbar names it, next to the wordmark:
+
+```text
+● LabView d0e2030
+```
+
+Those seven characters are the commit the build came from — the same identifier as the
+`:<sha>` image tag and as `git rev-parse --short HEAD`. While LabView is pre-release the
+version number is not the useful one (it is `0.1.0` on every build), so the commit leads
+and the version sits in the tooltip, together with **where the commit came from**:
+
+| Tooltip says | What it means |
+|---|---|
+| `image built from commit d0e2030` | `LABVIEW_BUILD_SHA` was set at image build time, so those bytes were compiled from that commit |
+| `running from a checkout at commit d0e2030` | Read from the `.git` directory this process started in. Uncommitted changes are **not** reflected — a file read sees `HEAD`, never your working tree |
+| `does not record which revision it came from` | Neither was available. The label falls back to `0.1.0` |
+
+The published image carries the first, set from the commit the workflow built. Building
+your own:
+
+```sh
+docker build --build-arg LABVIEW_BUILD_SHA=$(git rev-parse HEAD) -t labview:mine ./labview
+```
+
+Leaving the argument off is supported, not an error — the build simply says it does not
+know, and `npm start` from a checkout finds the commit without any argument at all. The
+stamp is **behind the login**: it is drawn from `/api/overview`, so the login card shows no
+build, and a visitor who cannot sign in cannot use it to match a known issue to your
+instance.
+
+A linked worktree or a submodule reports no revision rather than guessing: its `.git` is a
+file pointing into another repository's layout, and the enclosing repository's commit is
+not this build's. `LABVIEW_BUILD_SHA` is the answer for those trees.
 
 ---
 
@@ -1501,7 +1586,12 @@ absent for every service when the stage is off:
   "vantage": "public",                       // "public" | "traefik" | "lan"
   "phase": "connected",                      // `connected` = a response arrived, whatever its status
   "status": 302,
-  "gate": "redirect-origin",                 // absent unless one of the four signals fired
+  "gate": "redirect-origin",                 // absent unless one of the seven signals fired
+  "mediaType": "text/html",                  // parameters dropped; absent if no content type came back
+  "redirect": { "to": "https://sso.example.com/", "crossOrigin": true },
+  "refresh": { "to": "/dashboard", "crossOrigin": false },   // where a <meta refresh> pointed
+  "truncated": true,                         // the body continued past the 64 KiB read
+  "form": { /* what a login form was made of, when one was found */ },
   "detail": "HTTP 302 — redirected off-site",
   "attempts": [ /* one per address tried, in vantage order — same shape as every other target's */ ]
 }
@@ -1513,6 +1603,16 @@ every other value (`resolve`, `connect`, `tls`, `timeout`) means nothing answere
 which point `gate` is necessarily absent. `stats.probeGated` and `stats.probeOpen` are
 the two counts that follow from it, and `meta.connections` gains a fourth entry with
 `target: "probe"`, `disabled` when the stage is off.
+
+The four fields between `gate` and `form` are the **facts the verdict rested on**, and
+each is absent exactly when the response had no such thing: no `redirect` because nothing
+was a 3xx, no `refresh` because the page carried no `<meta>` tag, no `truncated` because
+the body fitted. They are what lets the UI say *why* rather than only *what* — a 302 to
+`/dashboard` and a 302 to `/login` are the same status and the opposite finding. Both
+redirect targets are reduced before they are recorded: the query and the fragment are
+dropped, and the origin is kept only when the target actually left the origin. That is
+not tidying — an OAuth `Location` carries `state` and `code`, and a login redirect carries
+`?next=`, and neither has any business in an API response.
 
 The **ingress vocabulary** is a third **breaking change**, in three steps. The first was
 a pure rename, every value mapping one-to-one onto the old one:
@@ -1588,6 +1688,24 @@ the arithmetic behind it — `applicationsConfigured` (what Authentik says exist
 many of those were rebuilt) — and each application carries `discoveredVia`, `"list"` or
 `"provider"`, naming the read that produced it. Leaving `applications` alone would have
 kept a headline number that under-reports, which is the defect these fields exist to fix.
+
+**`meta.version` is gone, replaced by `meta.build`** — breaking, and the smallest of these:
+
+```jsonc
+{
+  "version": "0.1.0",       // the package version, as before
+  "commit": "d0e2030",      // short commit; absent when source is "unknown"
+  "source": "image"         // "image" | "checkout" | "unknown"
+}
+```
+
+`meta.version` was a hardcoded copy of `package.json` that nothing read and nothing
+rendered, so it was replaced rather than kept beside the new field — two spellings of one
+fact would have been a fresh duplicate, not a kept promise. `source` is never absent and
+`commit` may be, because they answer different questions: a build genuinely may not know
+its revision, while *how* it knows is what says whether the sha describes the running bytes
+or only the tree they were started in. See [Which build am I looking
+at](#which-build-am-i-looking-at) for what each source is entitled to claim.
 
 **The network connections are additive, and the payload is not pre-pruned.** Every
 `network` node carries `scope` (`external` | `stack-local`), `memberCount` and
@@ -1741,7 +1859,9 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   A login shell built by JavaScript in an empty `<div id="root">` has no form in the HTML
   and there is no headless browser here. A form below the 64 KiB the probe reads is never
   seen — and if the read stops mid-tag, that element is simply not counted rather than
-  raising anything. A magic-link form posting to a path nothing recognises as a login
+  raising anything; the one thing that *is* said is that it happened, since a truncated
+  read now adds "the page continued past what was read" to the reason. A magic-link form
+  posting to a path nothing recognises as a login
   (NextAuth's `/api/auth/callback/email` and its neighbours) looks exactly like a
   newsletter box. And the *shape* of a 401/403 page is never read, since bodies are only
   parsed on a 200 — no exposure is missed there, because a challenge is already a gate,

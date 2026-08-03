@@ -1,11 +1,13 @@
 import type {
   AppStack,
+  BuildStamp,
   Service,
   Overview,
   OverviewStats,
   IngressKind,
   ScanMeta,
 } from "../model/types.js";
+import { buildStamp } from "../build.js";
 import type { LabViewConfig } from "../config.js";
 import { parseDockflare } from "../labels/dockflare.js";
 import { parseTraefik } from "../labels/traefik.js";
@@ -49,12 +51,18 @@ import { attributeEndpoint, discoverTraefikEndpoints, snapshotTraefik } from "..
 import { probeServices } from "../enrich/probe.js";
 import { scanStacks } from "../scan/index.js";
 
-const VERSION = "0.1.0";
-
 /** Injectable side-effects, so the pipeline can be driven offline in tests. */
 export interface BuildDeps {
   /** HTTP layer for the Authentik and Traefik exchanges. Defaults to the global `fetch`. */
   fetchImpl?: FetchLike;
+  /**
+   * Which build this is, for `meta.build`. Defaults to the running build's own stamp.
+   *
+   * Injectable for the reason the others are, plus one of its own: resolving it touches the
+   * environment and the filesystem, so a payload assertion that did not inject would
+   * depend on the sha of whoever's checkout ran the test (**I7**).
+   */
+  buildStamp?: BuildStamp;
   /**
    * Engine client factory, passed through to `snapshotDocker`. Defaults to a real
    * `dockerode`.
@@ -233,7 +241,7 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     probe: { enabled: cfg.probe.enabled, source: "config" },
     durationMs: Date.now() - started,
     warnings,
-    version: VERSION,
+    build: deps.buildStamp ?? buildStamp(),
   };
 
   return { meta, stats, stacks, graph };

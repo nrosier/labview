@@ -18,12 +18,16 @@ import type {
   TraefikSummary,
 } from "./model";
 import {
+  buildLabel,
+  buildTitle,
   collectDeclarationDrift,
+  collectProbeReport,
   declaredAuthLabel,
   driftSummaryText,
   formatExposureCount,
   parseLoginFailure,
   phaseText,
+  probeReportSummaryText,
   probeToggleText,
   shouldBanner,
 } from "./model";
@@ -54,6 +58,7 @@ import { AppDetail } from "./components/AppDetail";
 import { AuthentikDetail, TraefikDetail } from "./components/ApiDetail";
 import { DriftDetail } from "./components/DriftDetail";
 import { GraphView } from "./components/GraphView";
+import { ProbeDetail } from "./components/ProbeDetail";
 import { NetworksSection } from "./components/NetworksSection";
 
 type Theme = "light" | "dark" | "auto";
@@ -297,7 +302,7 @@ function App() {
    * places and closed in a defined order, and a single union would have to be unpacked at
    * every use to say which of the two it is.
    */
-  const [panel, setPanel] = useState<"authentik" | "traefik" | "drift" | null>(null);
+  const [panel, setPanel] = useState<"authentik" | "traefik" | "drift" | "probe" | null>(null);
   /**
    * Whether the next Rescan asks the services themselves what they answer.
    *
@@ -513,6 +518,11 @@ function App() {
   // are the same object rather than two counts of one fleet.
   const drift = useMemo(() => collectDeclarationDrift(ov?.stacks ?? []), [ov]);
 
+  // Every probed service, grouped by what its answer was worth. Derived from the same
+  // `ov.stacks` the drawers read rather than carried in `ScanMeta`, for the reason the drift
+  // collector states: a second copy of a grouping is a second thing to keep in step, and
+  // `stats.probeGated`/`stats.probeOpen` are already the counts this has to agree with.
+  const probeReport = useMemo(() => collectProbeReport(ov?.stacks ?? []), [ov]);
 
   const selectedFlat = selected ? flat.find((f) => f.key === selected) : undefined;
 
@@ -588,6 +598,13 @@ function App() {
         <div class="brand">
           <span class="dot">●</span>
           <h1>LabView</h1>
+          {/* The commit, not the version: every pre-release build is 0.1.0, so the sha is
+              the only part that answers "is the fix in what I am running". What that sha is
+              evidence *of* differs by source, which is why the sentence is a model function
+              rather than a string here. */}
+          <span class="build mono" title={buildTitle(ov.meta.build)}>
+            {buildLabel(ov.meta.build)}
+          </span>
         </div>
         <div class="meta">
           <span class="mono">{ov.meta.appsRoot}</span>
@@ -838,6 +855,32 @@ function App() {
             onClick={() => setPanel("drift")}
           />
         )}
+        {/* The second tile that opens, for the same reason: a count of probe results is
+            unactionable until it says which address was asked, what came back and why that
+            was or was not read as a login page.
+
+            Its own tile rather than a change to `Exposed, no auth`: that tile counts
+            services with no gate *detected*, and putting a probe result into it would make an
+            observation stand where a mechanism belongs, which I3 forbids. And deliberately
+            not `alert` — `probeOpen` is documented as no subset of the exposure count (a
+            service behind a detected gate that answers LabView from inside the fleet is in
+            it), so a red tile here would claim a fleet finding the tile beside it may
+            correctly deny. */}
+        {probeReport.probed > 0 && (
+          <StatTile
+            label="Login probe"
+            value={probeReport.probed}
+            sub={
+              probeReport.open.length > 0
+                ? `${probeReport.open.length} with no login page`
+                : probeReport.gated.length > 0
+                  ? `${probeReport.gated.length} gated`
+                  : "none answered"
+            }
+            title={`${probeReportSummaryText(probeReport)}\nclick for the address tried, what came back and why`}
+            onClick={() => setPanel("probe")}
+          />
+        )}
       </div>
 
       <div class="dists">
@@ -1037,6 +1080,9 @@ function App() {
           integration panels can with the drawer behind them. */}
       {panel === "drift" && (
         <DriftDetail report={drift} onClose={() => setPanel(null)} onOpenService={openService} />
+      )}
+      {panel === "probe" && (
+        <ProbeDetail report={probeReport} onClose={() => setPanel(null)} onOpenService={openService} />
       )}
     </div>
   );

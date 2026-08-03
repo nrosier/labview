@@ -616,6 +616,33 @@ export type ProbeGate =
   | "credential-form";
 
 /**
+ * Where a response sent the request instead of serving it.
+ *
+ * Reported for every redirect, not only for the ones that gated — which is the whole point
+ * of it being here. A 302 to `/dashboard` and a 302 to `/login` are the same field with the
+ * same status code, and without the target the first is indistinguishable from the second in
+ * the payload: both would read `HTTP 302 — answered with no login page` versus `redirected to
+ * a login path`, with nothing a reader could check. `probeReasonText` names this target, and
+ * `readGate` judges it.
+ *
+ * **`to` is reduced, and the reduction is a rule rather than formatting.** Query and fragment
+ * are dropped, because a redirect to an identity provider carries `state`, `code` and
+ * `redirect_uri`, a redirect to a login page carries `?next=`, and any of the three can carry
+ * a session token that invariant **I6** keeps out of the API. What is left is enough to judge
+ * the redirect and cannot leak one.
+ */
+export interface ProbeRedirect {
+  /**
+   * Origin and path when the redirect left the origin, path alone when it did not — so the
+   * value reads the way the difference matters, and a same-origin target is never mistaken
+   * for a hand-off because it happens to be spelled absolutely.
+   */
+  to: string;
+  /** Whether that origin differs from the one that was asked. */
+  crossOrigin: boolean;
+}
+
+/**
  * What one HTML `<form>` on a probed page is made of.
  *
  * The composition is reported separately from the verdict because the two answer
@@ -654,6 +681,16 @@ export interface LoginFormShape {
  * was probed and could not be reached still gets a record — `phase` says which stage
  * failed and `gate` is absent, so "nothing answered" stays distinguishable from
  * "answered, and served the page".
+ *
+ * **The facts a verdict rested on are recorded beside the verdict**, not consumed producing
+ * it: `mediaType`, `redirect`, `refresh`, `truncated` and `form` are what `readGate` read,
+ * and they are here whether or not anything fired. That is what makes `probeReasonText` a
+ * rule in `model/probe.ts` — pure, asserted by the smoke pass — rather than a sentence
+ * written at probe time where nothing can check it, and it is the same division §3.7 states
+ * for the payload as a whole: the analyzer emits the complete truth and the model decides
+ * what is drawn. It matters most for the answer nobody wants, since `gate: undefined` leaves
+ * a service in the exposed count and a reader is owed the fact behind that rather than the
+ * conclusion.
  */
 export interface ServiceProbe {
   /** The address that produced `phase`, origin only and credential-free. */
@@ -677,6 +714,43 @@ export interface ServiceProbe {
   status?: number;
   /** Which signal fired. Absent means no gate was observed, not that none exists. */
   gate?: ProbeGate;
+  /**
+   * The media type the answer declared, parameters dropped — `text/html`,
+   * `application/json`.
+   *
+   * The reason a 200 with no login page had none to find, in the commonest case there is: an
+   * API answering JSON was never read as HTML at all (`getResponse` does not fetch a
+   * non-HTML body), so no amount of signal-matching could have found a form in it. Without
+   * this field that case and "an HTML page with nothing on it" are the same record.
+   */
+  mediaType?: string;
+  /**
+   * Where a 3xx pointed. Absent when the status was not a redirect, or when the `Location`
+   * was missing or would not parse.
+   *
+   * The fact behind both redirect verdicts *and* behind the redirect that is not one, which
+   * is why it is recorded rather than consumed: `gate` says which of the three happened, and
+   * this says what it happened to.
+   */
+  redirect?: ProbeRedirect;
+  /**
+   * Where the page's `<meta http-equiv="refresh">` pointed, when it had one.
+   *
+   * Recorded on the same reasoning as `redirect`, for the same asymmetry: a refresh to
+   * `/login` is `meta-refresh-login` and a refresh to `/dashboard` is routing, and only the
+   * target tells them apart. The `home` service in `fixtures/probe/meta-refresh` is the
+   * second case, and this is the field that lets it explain itself.
+   */
+  refresh?: ProbeRedirect;
+  /**
+   * Whether the HTML read stopped at `MAX_BODY_BYTES` rather than at the end of the page.
+   *
+   * Present and `true` only when the cap actually bit, and then it is a caveat on a negative
+   * verdict rather than a detail: a login form below the first 64 KiB was not searched for,
+   * so `gate` being absent means "not found in what was read" and a reader is entitled to
+   * know which. Absent for every page that was read whole, which is nearly all of them.
+   */
+  truncated?: boolean;
   /**
    * What the most login-like form on the answering page was made of, when HTML came back
    * carrying one.
@@ -1262,7 +1336,16 @@ export interface ScanMeta {
   probe: ProbeRun;
   durationMs: number;
   warnings: string[];
-  version: string;
+  /**
+   * Which build produced this payload.
+   *
+   * Replaces the earlier `version: string`, which was a hardcoded copy of
+   * `package.json`'s version, read by nothing and rendered nowhere — so it could not
+   * answer the question a version is asked for. While this is pre-release the semver sits
+   * at one value across hundreds of commits, and the commit is the part that distinguishes
+   * two builds.
+   */
+  build: BuildStamp;
 }
 
 /** Whether the probe stage ran, and on whose say-so. */
@@ -1276,6 +1359,32 @@ export interface ProbeRun {
    */
   source: "config" | "request";
 }
+
+/**
+ * Which build produced this payload, and how confidently that is known.
+ *
+ * `source` carries the confidence, and it is not decoration: the two ways a commit gets
+ * here are not the same claim. `image` means these bytes were compiled from that commit,
+ * because it was passed in at docker build time. `checkout` means this process started in
+ * a working tree whose `HEAD` was at that commit — which says nothing at all about
+ * uncommitted edits, since no file read can see them. Reporting one as the other would be
+ * an I1 failure, so the wording in `model/build.ts` states which it is.
+ *
+ * `commit` is optional and `source` is not, which is `ProbeRun`'s shape for `ProbeRun`'s
+ * reason: an absent commit is a real outcome (an image built without the argument, in a
+ * directory with no git), so `source: "unknown"` *names* it rather than leaving a reader
+ * to infer it from a missing field.
+ */
+export interface BuildStamp {
+  /** The package version. `0.1.0` for as long as this is pre-release. */
+  version: string;
+  /** The short commit, when the build carried one. Absent when `source` is `unknown`. */
+  commit?: string;
+  source: BuildStampSource;
+}
+
+/** Where a `BuildStamp.commit` came from — see `BuildStamp`. */
+export type BuildStampSource = "image" | "checkout" | "unknown";
 
 /** The full payload served at /api/overview. */
 export interface Overview {

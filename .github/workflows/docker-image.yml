@@ -69,6 +69,12 @@ jobs:
           context: ./labview
           push: true
           no-cache: true
+          # The commit the image is built from, so the running UI can name it. The full
+          # sha goes in and LabView shortens it, which makes the stamp in the topbar the
+          # first seven characters of the :${{ github.sha }} tag below — one commit, named
+          # the same way in both places.
+          build-args: |
+            LABVIEW_BUILD_SHA=${{ github.sha }}
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/labview:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/labview:${{ github.sha }}

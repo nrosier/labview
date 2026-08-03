@@ -6,6 +6,8 @@ import { existsSync } from "node:fs";
 import { retiredSettings, withProbeEnabled, type LabViewConfig } from "../config.js";
 import type { ConnectionReport, Overview, ScanRequest } from "../model/types.js";
 import { buildOverview } from "../analyze/index.js";
+import { buildStamp } from "../build.js";
+import { buildSummary } from "../model/build.js";
 import {
   changedConnections,
   formatConnection,
@@ -130,8 +132,11 @@ function readScanRequest(body: unknown): ScanRequest {
 export async function startServer(cfg: LabViewConfig): Promise<void> {
   const { app, scan } = await buildApp(cfg);
 
+  // Which build, then what it is looking at — the two facts about this process a reader
+  // needs before any finding means anything, and the pair a bug report has to quote.
   // Said before the scan starts rather than after the listener is up, so the connection
   // lines the scan produces read as its result instead of arriving before it is announced.
+  app.log.info(buildSummary(buildStamp()));
   app.log.info(`LabView scanning ${cfg.appsRoot}`);
 
   // Warm the cache in the background so the first page load is instant.

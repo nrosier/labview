@@ -187,6 +187,12 @@ code, .mono {
 .topbar .brand { display: flex; align-items: baseline; gap: 10px; }
 .topbar h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
 .topbar .brand .dot { color: var(--c2); font-size: 22px; line-height: 0; }
+/* Which build this is, on the wordmark's baseline — `.brand` is already
+   `align-items: baseline`. Muted and small: it is an identifier to quote in a bug report,
+   not a finding, and it sits beside the name for the whole session. `cursor: help` because
+   the tooltip carries the part the seven characters cannot say — whether they describe the
+   running bytes or only the tree they were started in. */
+.topbar .brand .build { color: var(--muted); font-size: 11.5px; cursor: help; }
 .topbar .meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
 /* What the last rescan found, beside the time it found it. Inherits the muted meta
    colour when nothing changed — it is a confirmation, not news — and takes the ink
@@ -650,6 +656,21 @@ table.data tr:last-child td { border-bottom: none; }
    container it sits in — the same reason `.netnote` has one. Not a `.note`: it is not a
    warning, and tinting it like one would put a third register beside the entries above it. */
 .driftnote { color: var(--muted); font-size: 12px; margin-top: 18px; }
+
+/* One probed service in the Login probe panel: who it is, where it was asked, and why the
+   answer was read the way it was. Shaped like `.netrow` because it is the same kind of thing —
+   a record of one relationship, several lines long, in a list of them. */
+.proberow { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.proberow:last-child { border-bottom: none; }
+.probehead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.proberow > .muted-inline { color: var(--muted); font-size: 12px; }
+/* The fact the verdict rested on. Its own class rather than a `.note`: the sentence is the
+   same kind of sentence whichever section the row sits in, and tinting it as a warning would
+   make an ordinary observation about a gated service read as something to act on. Not
+   `.muted-inline` either — it is the line a reader came here to read, so it keeps body ink
+   while the address above it stays muted. */
+.probereason { color: var(--ink-2); font-size: 12.5px; margin: 6px 0 0; }
+.proberow .evidence { margin-top: 6px; }
 
 .mermaid-wrap {
   background: var(--surface);

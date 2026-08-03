@@ -47,6 +47,9 @@ import {
   probeTargets,
   readGate,
   readLoginForm,
+  readMediaType,
+  readRedirect,
+  readRefresh,
   type ProbeTarget,
 } from "../model/probe.js";
 import { getResponse, safeOrigin, type FetchLike, type HttpResponse } from "./http.js";
@@ -231,6 +234,13 @@ async function probeOne(
     // is the case where the answer is arguable, and hiding it would make the verdict
     // something they have to take on trust.
     const form = res.body ? readLoginForm(res.body, target.url) : undefined;
+    // The rest of what the gate rule read, kept rather than discarded. Every one of these is
+    // the reason a *negative* verdict came out the way it did, and the same functions
+    // `readGate` consults produce them — so `probeReasonText` explains the observation the
+    // verdict was actually reached on, and not a second reading of the response.
+    const mediaType = readMediaType(res.contentType);
+    const redirect = res.location ? readRedirect(res.location.trim(), target.url) : undefined;
+    const refresh = res.body ? readRefresh(res.body, target.url) : undefined;
     const detail = gate
       ? `HTTP ${res.status} — ${lowerFirst(probeGateText(gate).label)}`
       : `HTTP ${res.status} — answered with no login page`;
@@ -241,6 +251,10 @@ async function probeOne(
       phase: "connected",
       status: res.status,
       ...(gate ? { gate } : {}),
+      ...(mediaType ? { mediaType } : {}),
+      ...(redirect ? { redirect } : {}),
+      ...(refresh ? { refresh } : {}),
+      ...(res.truncated ? { truncated: true } : {}),
       ...(form ? { form } : {}),
       detail,
       attempts: tried,

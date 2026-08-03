@@ -16,6 +16,7 @@ import {
   networkScopeMeta,
   noAuthReason,
   probeFormText,
+  probeReasonText,
   probeVantageText,
   relationLabel,
   serviceConnections,
@@ -564,6 +565,13 @@ export function AppDetail({
                         it as a login is reported here and gates nothing — which is a reader
                         being handed the arguable case rather than a verdict to trust. */}
                     {svc.probe.form && <div class="muted-inline">{probeFormText(svc.probe.form)}</div>}
+                    {/* Which fact decided it, in the same sentence the Login probe panel
+                        shows — one wording rule, two places, so following a row from the
+                        panel through to here reads as the same result and not a second
+                        opinion about it. Worth most on the answer that gated nothing, where
+                        the pill above says only that no signal was found and this says what
+                        was there instead. */}
+                    <div class="muted-inline">{probeReasonText(svc.probe)}</div>
                     {/* Only where nothing answered. On a success the earlier candidates
                         are addresses that lost a race, and listing them would read as
                         problems — the same rule `formatConnection` keeps for the log. */}

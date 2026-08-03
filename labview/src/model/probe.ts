@@ -1,7 +1,9 @@
 import type {
+  AppStack,
   CloudflareRoute,
   LoginFormShape,
   ProbeGate,
+  ProbeRedirect,
   ProbeVantage,
   Service,
   ServiceProbe,
@@ -28,7 +30,7 @@ import { publishedHostPort } from "./ports.js";
  * own reason and counted in its own statistic, exactly as an unnamed gate found through
  * Authentik's API already is.
  *
- * Three rules, and all of them live here rather than in the client that does the
+ * Four rules, and all of them live here rather than in the client that does the
  * fetching, because a rule in an I/O module can only be tested by mocking the I/O:
  *
  *  - **{@link probeTargets}** — eligibility and try-order. Only where HTTP is
@@ -41,6 +43,14 @@ import { publishedHostPort } from "./ports.js";
  *  - **{@link readLoginForm}** — what a form on the page was *made of*, which is
  *    reported whether or not it cleared anything. A verdict a reader cannot inspect is
  *    one they have to take on trust, and this is the part they can check.
+ *  - **{@link probeReasonText}** — which fact decided the verdict. The other half of the
+ *    same argument: `readGate` may only recognise facts, so a reader is owed the fact,
+ *    especially for the answer that leaves a service in the exposed count.
+ *
+ * `readRedirect`, `readRefresh` and `readMediaType` are exported alongside them because
+ * `enrich/probe.ts` records what they read onto the {@link ServiceProbe} — the same reading
+ * the gate rule judges, so a verdict and its stated reason can never be about different
+ * observations.
  */
 
 /**
@@ -323,12 +333,11 @@ export function readGate(res: ProbeResponse): ProbeGate | undefined {
   if ((res.status === 401 || res.status === 407) && res.wwwAuthenticate?.trim()) return "challenge";
 
   if (res.status >= 300 && res.status < 400 && res.location?.trim()) {
-    const to = resolveLocation(res.location.trim(), res.requestUrl);
+    const to = readRedirect(res.location.trim(), res.requestUrl);
     // A `Location` that will not parse is not evidence of anything.
     if (!to) return undefined;
     if (to.crossOrigin) return "redirect-origin";
-    const path = to.pathname.toLowerCase();
-    if (LOGIN_PATHS.some((p) => path.startsWith(p))) return "redirect-login";
+    if (isLoginPath(to.to)) return "redirect-login";
     return undefined;
   }
 
@@ -336,7 +345,8 @@ export function readGate(res: ProbeResponse): ProbeGate | undefined {
 
   // The two signals that do not need a form at all: a redirect wearing a 200, and a
   // hand-off whose entire purpose is to be POSTed onward by script.
-  if (sendsBrowserToLogin(res.body, res.requestUrl)) return "meta-refresh-login";
+  const refresh = readRefresh(res.body, res.requestUrl);
+  if (refresh && pointsAtLogin(refresh)) return "meta-refresh-login";
   if (SAML_FIELD.test(res.body)) return "sso-form";
 
   if (PASSWORD_INPUT.test(res.body)) return "password-form";
@@ -351,41 +361,96 @@ export function readGate(res: ProbeResponse): ProbeGate | undefined {
 }
 
 /**
- * Whether a page's `<meta http-equiv="refresh">` points at a login.
+ * Where a page's `<meta http-equiv="refresh">` sends the browser, if anywhere.
  *
- * The judgement is deliberately the same one the 3xx arm makes — off the origin, or onto a
- * {@link LOGIN_PATHS} path — so the two ways of redirecting cannot disagree about what
- * counts. A refresh with no `url=` is a page reloading itself on a timer, which is a live
- * dashboard and not a gate; a refresh to `/dashboard` is routing, and the `home` service in
- * `fixtures/probe/meta-refresh` is there to hold that line.
+ * Reported rather than judged, which is the difference between this and the predicate it
+ * replaced: {@link readGate} asks {@link pointsAtLogin} about the answer and
+ * {@link probeReasonText} names it, so the verdict and the reason rest on one reading of one
+ * tag and cannot describe different tags. A refresh with no `url=` is a page reloading itself
+ * on a timer — a live dashboard, not a gate — and is skipped rather than returned, so a page
+ * that reloads itself *and* refreshes elsewhere is read by the second tag.
+ *
+ * **The first parseable target wins**, because that is the one a browser honours. A page with
+ * two of them is contrived, and reading all of them would let a gate fire on a target the
+ * payload does not name — a reason that contradicts its own verdict, which is worse than the
+ * gate that first-tag semantics can only ever decline to give.
  */
-function sendsBrowserToLogin(body: string, requestUrl: string): boolean {
+export function readRefresh(body: string, requestUrl: string): ProbeRedirect | undefined {
   for (const tag of body.match(META_TAG) ?? []) {
     if ((attrOf(tag, "http-equiv") ?? "").trim().toLowerCase() !== "refresh") continue;
     // `content` is `<seconds>` or `<seconds>; url=<target>`.
     const url = /\burl\s*=\s*["']?([^"';]+)/i.exec(attrOf(tag, "content") ?? "")?.[1]?.trim();
     if (!url) continue;
-    const to = resolveLocation(url, requestUrl);
-    if (!to) continue;
-    if (to.crossOrigin) return true;
-    const path = to.pathname.toLowerCase();
-    if (LOGIN_PATHS.some((p) => path.startsWith(p))) return true;
+    const to = readRedirect(url, requestUrl);
+    if (to) return to;
   }
-  return false;
+  return undefined;
 }
 
-/** Where a `Location` points, relative to the URL that was asked. */
-function resolveLocation(
-  location: string,
-  requestUrl: string,
-): { crossOrigin: boolean; pathname: string } | undefined {
+/**
+ * Where a `Location` points, relative to the URL that was asked — resolved once, for both the
+ * verdict and the record of it.
+ *
+ * `to` is deliberately not the header. Query and fragment are dropped, because a redirect to
+ * an identity provider carries `state`, `code` and `redirect_uri`, a redirect to a login page
+ * carries `?next=`, and any of them can carry a session token that invariant **I6** keeps out
+ * of the API — while none of them changes whether this is a gate. The origin is kept only
+ * when the redirect left it, so the value reads as the fact it is: `/dashboard` went nowhere,
+ * `https://sso.example.com/application/o/crm/` went to somebody else.
+ *
+ * Returns nothing for a `Location` that will not parse, which is not evidence of anything.
+ */
+export function readRedirect(location: string, requestUrl: string): ProbeRedirect | undefined {
   try {
     const from = new URL(requestUrl);
     const to = new URL(location, from);
-    return { crossOrigin: to.origin !== from.origin, pathname: to.pathname };
+    const crossOrigin = to.origin !== from.origin;
+    return { to: crossOrigin ? `${to.origin}${to.pathname}` : to.pathname, crossOrigin };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The media type alone — `text/html; charset=utf-8` becomes `text/html`.
+ *
+ * The parameters are dropped because none of them says anything about whether a page could be
+ * a login page, and a charset in the payload is a detail a reader has to look past to find
+ * the fact: an answer of `application/json` was never read as HTML at all, so no signal could
+ * have been found in it however hard the rule looked.
+ */
+export function readMediaType(contentType: string | undefined): string | undefined {
+  const type = contentType?.split(";")[0]?.trim().toLowerCase();
+  return type || undefined;
+}
+
+/**
+ * Whether a media type is HTML — `text/html` and `application/xhtml+xml`, nothing else.
+ *
+ * Here rather than beside the fetch that acts on it, because two copies of this test could
+ * disagree: `getResponse` uses it to decide whether to read a body at all, and
+ * {@link probeReasonText} uses it to explain a 200 that carried no login page *because it was
+ * never a page*. Those two answers must be the same answer.
+ */
+export function isHtmlMediaType(mediaType: string | undefined): boolean {
+  return mediaType === "text/html" || mediaType === "application/xhtml+xml";
+}
+
+/** Whether a same-origin path is a login page by name. Cross-origin never reaches here. */
+function isLoginPath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return LOGIN_PATHS.some((p) => lower.startsWith(p));
+}
+
+/**
+ * Whether a resolved target is a login: off the origin, or onto a {@link LOGIN_PATHS} path.
+ *
+ * One predicate for both ways of redirecting — a `Location` and a `<meta refresh>` — so the
+ * two cannot disagree about what counts, and so `probeReasonText` explains a near-miss in the
+ * terms this function actually failed on.
+ */
+function pointsAtLogin(to: ProbeRedirect): boolean {
+  return to.crossOrigin || isLoginPath(to.to);
 }
 
 /**
@@ -506,10 +571,9 @@ function namesAUser(tag: string, autocomplete: string): boolean {
 function loginAction(attrs: string, requestUrl: string): string | undefined {
   const raw = attrOf(attrs, "action")?.trim();
   if (!raw) return undefined;
-  const to = resolveLocation(raw, requestUrl);
+  const to = readRedirect(raw, requestUrl);
   if (!to || to.crossOrigin) return undefined;
-  const path = to.pathname.toLowerCase();
-  return LOGIN_PATHS.some((p) => path.startsWith(p)) ? to.pathname : undefined;
+  return isLoginPath(to.to) ? to.to : undefined;
 }
 
 /**
@@ -713,4 +777,228 @@ export function probeOutcome(
     title: `Nothing was measured for this service — ${phaseText(probe.phase)}: ${probe.detail}. Its posture rests on configuration alone.`,
     critical: false,
   };
+}
+
+/** Everything {@link probeReasonText} reads. Spelled out so the rule cannot quietly grow. */
+type ProbeReasonInput = Pick<
+  ServiceProbe,
+  "phase" | "status" | "gate" | "form" | "mediaType" | "redirect" | "refresh" | "truncated" | "detail"
+>;
+
+/**
+ * Which fact decided a probe's verdict — the checkable half of a probe result.
+ *
+ * {@link probeOutcome} says what LabView concluded. This says what it saw and which clause
+ * of {@link readGate} that satisfied or fell short of, so a reader can disagree with the
+ * conclusion on the strength of the observation instead of taking it on trust.
+ *
+ * **The negative verdict is the one this exists for.** A gate takes a service out of the
+ * exposed count, so a reader who doubts one can go and look; `gate: undefined` *leaves* a
+ * service in the count, and until now the record of that was `HTTP 302 — answered with no
+ * login page` — a conclusion with the fact behind it thrown away. A 302 to `/dashboard` and a
+ * 302 to `/login` are the same sentence there. So for a service that answered and did not
+ * gate, this names the clause that came closest and what it lacked: the header a bare 401
+ * did not carry, the origin a redirect did not leave, the page an `application/json` answer
+ * never was, the login intent a signup form does not have.
+ *
+ * Pure, and therefore assertable — which is the whole reason it is here and not written in
+ * `enrich/probe.ts` where the response is in hand. A sentence composed at probe time can only
+ * be tested by mocking the network, and the two fixtures that exist to catch word-matching
+ * (`meta-refresh/home`, `passwordless/news`) are pinned by *what this says about them*.
+ */
+export function probeReasonText(probe: ProbeReasonInput): string {
+  if (probe.phase !== "connected") {
+    return `Nothing answered, so nothing about this service was measured: ${probe.detail}.`;
+  }
+  const at = probe.status === undefined ? "It answered" : `It answered HTTP ${probe.status}`;
+  if (probe.gate) return GATE_REASON[probe.gate](probe, at);
+  // The caveat rides only on a negative verdict. On a gate it would read as doubt about a
+  // verdict that is not in doubt — the signal was found in what *was* read.
+  const caveat = probe.truncated
+    ? " The read stopped at the probe's body cap before the end of the page, so a login form below that point was never searched for."
+    : "";
+  return openReason(probe, at) + caveat;
+}
+
+/**
+ * One sentence per signal, naming the fact that fired rather than restating the label.
+ *
+ * A `Record<ProbeGate, …>` for the same reason `GATE_TEXT` is one: a new member of the union
+ * is a compile error here until it has been explained, so a signal can never ship with its
+ * reason left as the generic case.
+ */
+const GATE_REASON: Record<ProbeGate, (p: ProbeReasonInput, at: string) => string> = {
+  challenge: (_p, at) =>
+    `${at} with a WWW-Authenticate header, so a credential was asked for before anything was served.`,
+  "redirect-origin": (p, at) =>
+    `${at} and sent the request to ${p.redirect?.to ?? "another origin"}, which is off its own origin — the shape of a hand-off to an identity provider.`,
+  "redirect-login": (p, at) =>
+    `${at} and sent the request to ${p.redirect?.to ?? "a login path"}, a login path on its own origin, instead of serving it.`,
+  "meta-refresh-login": (p, at) =>
+    `${at} with a page whose <meta refresh> sends the browser to ${p.refresh?.to ?? "a login"} instead of serving any content of its own.`,
+  "sso-form": (_p, at) =>
+    `${at} with a form carrying a SAMLRequest or SAMLResponse field, which is the SAML POST binding — nothing else emits one.`,
+  "password-form": (_p, at) => `${at} with an HTML page carrying a password field.`,
+  "credential-form": (p, at) =>
+    `${at} with one form carrying ${credentialMarkers(p.form)}, and no password field — a magic-link or passkey sign-in.`,
+};
+
+/** The three facts `credential-form` rests on, in the words of the form they were read from. */
+function credentialMarkers(form: LoginFormShape | undefined): string {
+  if (!form) return "a username field and a submit button";
+  const intent = form.otp ? "a one-time-code field" : `an action of ${form.action}`;
+  return `a username field, a submit button and ${intent}`;
+}
+
+/**
+ * Why the answer that arrived was not a login page — the clause that came closest, and what
+ * it lacked.
+ *
+ * Ordered by status the way {@link readGate} is, so the near-miss named is the one the rule
+ * actually got furthest through rather than the first thing that happened to be absent.
+ */
+function openReason(probe: ProbeReasonInput, at: string): string {
+  const status = probe.status ?? 0;
+  if (status === 401 || status === 407) {
+    return `${at} but sent no WWW-Authenticate header, so nothing asked for a credential — a bare ${status} is also what an API returns to a call it will not serve.`;
+  }
+  if (status >= 300 && status < 400) {
+    return probe.redirect
+      ? `${at} and sent the request to ${probe.redirect.to}, which is on its own origin and is not a login path — routing rather than a gate.`
+      : `${at} with no Location that could be read, so where it was sending the request cannot be judged.`;
+  }
+  if (status !== 200) {
+    return `${at}, which is neither a credential request, a redirect, nor a page served — there is nothing in it that a login page is recognised by.`;
+  }
+  if (!isHtmlMediaType(probe.mediaType)) {
+    const was = probe.mediaType ? `a body of ${probe.mediaType}` : "no content type at all";
+    return `${at} with ${was} rather than an HTML page, so it was never read as one — an application answering its API cannot be shown to have a login page in front of it.`;
+  }
+  // HTML came back and nothing in it fired. Name whatever came nearest, because a page with a
+  // form on it and a page with nothing on it are both "no signals found" and only one of them
+  // is worth a second look.
+  const near = [
+    probe.refresh
+      ? `its <meta refresh> points at ${probe.refresh.to}, which is neither off the origin nor a login path`
+      : undefined,
+    probe.form ? formShortfall(probe.form) : undefined,
+  ].filter((s): s is string => s !== undefined);
+  const closest = near.length ? ` The nearest thing to a signal on it: ${joinAnd(near)}.` : "";
+  return `${at} and served an HTML page carrying none of the signals — no password field, no SAML hand-off, no refresh to a login and no form with login intent.${closest}`;
+}
+
+/**
+ * Which part of a passwordless login the form on the page did not have.
+ *
+ * Nothing when it had all of them, which cannot happen for a page that reached here — the
+ * `credential-form` clause reads the same {@link readLoginForm} answer — so rather than emit a
+ * sentence contradicting its own verdict, the clause is left out.
+ */
+function formShortfall(form: LoginFormShape): string | undefined {
+  const missing: string[] = [];
+  if (!form.username) missing.push("no username field");
+  if (!form.submit) missing.push("no submit control");
+  if (form.action === undefined && !form.otp) {
+    missing.push("no login intent, since its action is not a login path and it asks for no one-time code");
+  }
+  return missing.length ? `a form was read with ${joinAnd(missing)}` : undefined;
+}
+
+/** `a, b and c`. Used only where the parts are already worded. */
+function joinAnd(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+/** One probed service, with enough of its identity to be found again. */
+export interface ProbeReportEntry {
+  stackId: string;
+  stackName: string;
+  service: string;
+  probe: ServiceProbe;
+}
+
+/**
+ * Every probe result in the fleet, split by the three outcomes that must never be conflated.
+ *
+ * The order of the fields is the order the panel shows them, and it is the answers that
+ * cleared nothing first: `open` is the half of the measurement that left every finding
+ * standing and is the reason to open the panel at all, `gated` is the half that withdrew one,
+ * and `silent` is neither — a service nothing was measured about, which a UI must not let
+ * read as "no login page found".
+ *
+ * `open` is **not** a list of exposures, on `OverviewStats.probeOpen`'s own terms: a service
+ * behind a detected gate that answers LabView from inside the fleet is in here too, because
+ * the request may simply have gone around the edge that gates real visitors. What every entry
+ * has in common is that asking withdrew nothing, not that anything is wrong.
+ */
+export interface ProbeReport {
+  /** Answered, and no signal fired — so nothing was taken out of the exposed count. */
+  open: ProbeReportEntry[];
+  /** Answered with a login page, by one of the seven signals. */
+  gated: ProbeReportEntry[];
+  /** Nothing answered, so nothing was measured. */
+  silent: ProbeReportEntry[];
+  /** Every service asked — the three lists' total, and what the tile counts. */
+  probed: number;
+}
+
+/**
+ * Collect what the probe found, for a reader who has counts and wants the cases.
+ *
+ * Derived from `stacks` rather than carried in `ScanMeta`, exactly as
+ * `collectDeclarationDrift` is and for the same reason: the results are already on
+ * `svc.probe`, and a second copy in the payload would be a second thing to keep in step with
+ * the first. Nothing is re-worded here either — `probeOutcome` and {@link probeReasonText} own
+ * what a result says, so the panel and the service drawer give one fact one voice.
+ *
+ * In `src/model/` rather than in the component that renders it so it can be asserted: smoke
+ * never mounts a DOM, and "the panel lists exactly the services the tile counted" — that
+ * `gated.length` and `open.length` equal `OverviewStats.probeGated` and `.probeOpen` — is
+ * precisely the claim worth pinning.
+ *
+ * Sorted by stack name then service name, matching the fleet list, so a reader arriving from
+ * it finds a service where they left it and the same scan produces the same panel twice (I7).
+ */
+export function collectProbeReport(stacks: readonly AppStack[]): ProbeReport {
+  const open: ProbeReportEntry[] = [];
+  const gated: ProbeReportEntry[] = [];
+  const silent: ProbeReportEntry[] = [];
+  for (const stack of [...stacks].sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const svc of [...stack.services].sort((a, b) => a.name.localeCompare(b.name))) {
+      const probe = svc.probe;
+      if (!probe) continue;
+      const entry: ProbeReportEntry = {
+        stackId: stack.id,
+        stackName: stack.name,
+        service: svc.name,
+        probe,
+      };
+      // The same three-way split `enrichWithProbe` counts by, and in the same order of tests:
+      // a transport failure first, because `gate` is necessarily absent on one and reading it
+      // as "answered, no gate" is the one mistake this stage must never make by accident.
+      if (probe.phase !== "connected") silent.push(entry);
+      else if (probe.gate) gated.push(entry);
+      else open.push(entry);
+    }
+  }
+  return { open, gated, silent, probed: open.length + gated.length + silent.length };
+}
+
+/**
+ * The report as one line — `5 services asked · 3 gated · 2 answered with no login page`.
+ *
+ * Shared by the tile's tooltip and the panel's subtitle so the two cannot count the same fleet
+ * differently. `did not answer` appears only when some service did not, because a zero there
+ * is a fact about nothing and every fleet on a good day would carry it.
+ */
+export function probeReportSummaryText(report: ProbeReport): string {
+  if (report.probed === 0) return "no service was asked";
+  const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+  return [
+    `${plural(report.probed, "service")} asked`,
+    `${report.gated.length} gated`,
+    `${report.open.length} answered with no login page`,
+    ...(report.silent.length ? [`${report.silent.length} did not answer`] : []),
+  ].join(" · ");
 }

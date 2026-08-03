@@ -4,6 +4,8 @@ export type {
   OverviewStats,
   ScanMeta,
   AppStack,
+  BuildStamp,
+  BuildStampSource,
   Service,
   EnvVar,
   PortMapping,
@@ -64,6 +66,14 @@ export type {
  * line about the same failure, and adding a phase updates both at once.
  */
 export { phaseText, shouldBanner } from "../src/model/connections";
+
+/**
+ * What the topbar says about the build, from the same module the startup line uses — so the
+ * tooltip cannot claim the commit describes the running bytes while the log says it only
+ * describes a working tree. `src/build.ts`, which finds the commit, is not re-exported and
+ * is not reachable from here: it reads the filesystem.
+ */
+export { buildLabel, buildTitle } from "../src/model/build";
 
 /**
  * What a rescan found, compared and worded by the same module the server logs through —
@@ -171,17 +181,25 @@ export type { NoAuthReason, NoAuthText } from "../src/model/auth";
  * cannot describe it in two different ways. `probeOutcome` in particular is a rule and not
  * a rendering detail: it is the one place that keeps "did not answer" from ever reading as
  * "answered with no login page".
+ *
+ * `probeReasonText` and `collectProbeReport` are here for the same reason and are what the
+ * `Login probe` tile and its panel are built out of: the panel groups nothing of its own and
+ * words nothing of its own, so a result read there and the same result read in the service
+ * drawer are the same sentence rather than two versions of it.
  */
 export {
   PROBE_GATES,
   PROBE_VANTAGES,
+  collectProbeReport,
   probeFormText,
   probeGateText,
   probeOutcome,
+  probeReasonText,
+  probeReportSummaryText,
   probeToggleText,
   probeVantageText,
 } from "../src/model/probe";
-export type { ProbeGateText, ProbeOutcome } from "../src/model/probe";
+export type { ProbeGateText, ProbeOutcome, ProbeReport, ProbeReportEntry } from "../src/model/probe";
 
 /**
  * The tri-state tag filter. In `src/` rather than here because the web bundle is never

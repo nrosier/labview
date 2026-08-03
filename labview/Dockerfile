@@ -30,13 +30,22 @@ COPY config.example.yml ./
 # The passwd format, in the image, because that is where `node dist/hashpw.js` runs.
 COPY passwd.example ./
 
+# Which commit this image was built from, baked in at build time.
+#
+# It has to be an argument: `.git` is at the repository root, this build context is
+# ./labview, and .dockerignore excludes .git anyway — so the image can never read it.
+# Unset is a supported state, not a build failure: LabView then reports that it does
+# not know its revision, which is honest and is what a local `docker build` gets.
+ARG LABVIEW_BUILD_SHA=""
+
 # Container defaults. Only paths LabView owns are set here: the Docker endpoint
 # is deliberately left unset, because any default TCP host would be a guess about
 # someone else's container names. Unset means the conventional local socket, and
 # a socket-proxy endpoint is opted into with LABVIEW_DOCKER_HOST (or the standard
 # DOCKER_HOST) — see compose.yml for the recommended proxy setup.
 ENV LABVIEW_APPS_ROOT=/data/apps \
-    LABVIEW_PORT=8080
+    LABVIEW_PORT=8080 \
+    LABVIEW_BUILD_SHA=${LABVIEW_BUILD_SHA}
 
 EXPOSE 8080
 # Run as an unprivileged user. With a socket proxy no socket mount is needed at
