@@ -8,10 +8,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "build:web": "node scripts/build-web.mjs",
+    "build:web": "vite build --config web/vite.config.ts",
     "build:server": "tsc -p tsconfig.json",
     "build": "npm run build:web && npm run build:server",
-    "dev:web": "node scripts/build-web.mjs --watch",
+    "dev:web": "vite --config web/vite.config.ts",
     "dev": "npm run build:web && tsx watch src/index.ts",
     "start": "node dist/index.js",
     "scan": "tsx src/cli.ts",
@@ -27,13 +27,14 @@
     "yaml": "^2.6.1"
   },
   "devDependencies": {
+    "@preact/preset-vite": "^2.10.2",
     "@types/dockerode": "^4.0.1",
     "@types/node": "^22.10.1",
     "cytoscape": "^3.30.2",
-    "esbuild": "^0.28.1",
     "mermaid": "^11.4.0",
     "preact": "^10.25.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vite": "^7.1.5"
   }
 }

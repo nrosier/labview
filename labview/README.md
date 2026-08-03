@@ -169,7 +169,15 @@ connect things. Without `--summary` the same scan prints the whole `Overview` as
 Live-reloading development:
 
 ```bash
-npm run dev              # esbuild --watch for the UI + tsx server with reload
+npm run dev              # build the UI once, then tsx server with reload
+```
+
+For UI work, add the Vite dev server in a second terminal. It serves the app with
+hot module replacement and proxies `/api` and `/auth` to the server above, so point
+the browser at Vite's port rather than LabView's:
+
+```bash
+npm run dev:web          # Vite dev server with HMR
 ```
 
 ---

@@ -60,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           # All application code lives in labview/, so the build context is scoped
-          # there. The Dockerfile COPYs package.json, src/, web/ and scripts/ as
+          # there. The Dockerfile COPYs package.json, src/ and web/ as
           # context-relative paths, so a repo-root context finds neither the
           # Dockerfile nor those directories.
           context: ./labview

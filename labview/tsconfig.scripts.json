@@ -19,5 +19,9 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
-  "include": ["scripts/**/*.ts", "src/**/*.ts"]
+  // web/vite.config.ts is here rather than in tsconfig.web.json for the same reason:
+  // it is Node code (it reads `process.env` and resolves a path from `import.meta.url`)
+  // that nothing typechecks unless a project claims it, and the web project is
+  // deliberately without node types.
+  "include": ["scripts/**/*.ts", "src/**/*.ts", "web/vite.config.ts"]
 }

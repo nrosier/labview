@@ -6,9 +6,10 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install
 
-# Build the web bundle and compile the server.
+# Build the web bundle and compile the server. `scripts/` is deliberately absent:
+# nothing in `npm run build` reads it any more, and the Vite config ships inside
+# web/ with the sources it builds.
 COPY tsconfig.json tsconfig.web.json ./
-COPY scripts ./scripts
 COPY web ./web
 COPY src ./src
 RUN npm run build
