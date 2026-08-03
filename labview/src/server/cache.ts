@@ -17,9 +17,12 @@
  * injected, every ordering is assertable without a listening socket or a real clock.
  */
 
-export interface ScanCacheDeps<T> {
-  /** Produce a fresh value. Called at most once per concurrent wave of requests. */
-  build: () => Promise<T>;
+export interface ScanCacheDeps<T, R = void> {
+  /**
+   * Produce a fresh value. Called at most once per concurrent wave of requests, and given
+   * the request that *started* this build — see {@link ScanCache.get} for who that is.
+   */
+  build: (req: R) => Promise<T>;
   /** How long a value may be served without rebuilding. `0` disables reuse. */
   ttlMs: number;
   /** Injected for determinism in tests. Defaults to `Date.now`. */
@@ -34,27 +37,39 @@ export interface ScanCacheDeps<T> {
   onBuilt?: (next: T, prev: T | undefined, info: { forced: boolean }) => void;
 }
 
-export interface ScanCache<T> {
+export interface ScanCache<T, R = void> {
   /**
    * The current value, rebuilding when it is stale or when `force` is set.
    *
    * Rejects when the build rejects; the previously cached value is left intact, so the
    * next caller reads the old value or triggers a fresh attempt rather than inheriting
    * the failure.
+   *
+   * `req` is handed to `build` **only if this call is the one that starts a build.** A
+   * caller that joins an in-flight build gets that build's value, decided by whoever
+   * started it, and its own `req` is discarded — which is the existing coalescing rule and
+   * not a new wrinkle. It is stated here because `req` now carries a behaviour choice
+   * rather than nothing at all, so the value returned may not be the one this caller asked
+   * for. What keeps that honest is that the result says which was used: `ScanMeta.probe`
+   * reports what the build that produced it actually did.
+   *
+   * Passing it per call rather than holding it on the cache is the point. Shared mutable
+   * state would let a passive TTL rebuild pick up a caller's override, or two callers
+   * overwrite each other's — and either way the value that ran would be nobody's request.
    */
-  get(force: boolean): Promise<T>;
+  get(force: boolean, req: R): Promise<T>;
   /** The cached value without ever building. For callers that only want what is already known. */
   peek(): T | undefined;
 }
 
-export function createScanCache<T>(deps: ScanCacheDeps<T>): ScanCache<T> {
+export function createScanCache<T, R = void>(deps: ScanCacheDeps<T, R>): ScanCache<T, R> {
   const now = deps.now ?? Date.now;
   let value: T | undefined;
   let builtAt = 0;
   let inflight: Promise<T> | null = null;
   let inflightStartedAt = 0;
 
-  async function get(force: boolean): Promise<T> {
+  async function get(force: boolean, req: R): Promise<T> {
     const requestedAt = now();
     if (!force && value !== undefined && now() - builtAt < deps.ttlMs) return value;
 
@@ -76,7 +91,7 @@ export function createScanCache<T>(deps: ScanCacheDeps<T>): ScanCache<T> {
 
     inflightStartedAt = now();
     const build = deps
-      .build()
+      .build(req)
       .then((next) => {
         const prev = value;
         value = next;

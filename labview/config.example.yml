@@ -240,17 +240,34 @@ traefik:
 # answering is evidence. The other half is just as useful: a service that answers
 # with its homepage turns an exposure you inferred into one that was measured.
 #
-# One GET per service, at `/`, with no credential and no redirect followed. A login
-# page is recognised from 401/407 with a WWW-Authenticate header, a redirect off the
-# origin or to a login path, or an HTML page with a password field — and nothing
-# else. Anything not on that list leaves the finding standing, on purpose: a finding
-# you dismiss costs you a look, false comfort costs you the point of the tool.
+# One GET per service, at `/`, with no credential and no redirect followed. Seven
+# things count as a login page: 401/407 with a WWW-Authenticate header; a redirect
+# off the origin; a redirect to a login path; a `<meta http-equiv="refresh">` that
+# goes to either of those; a hidden SAMLRequest/SAMLResponse field (the SAML POST
+# binding); an HTML page with a password field; and a form with a username field, a
+# submit button and a login-intent marker but no password, which is how magic-link
+# and passkey sign-in look. Anything else leaves the finding standing, on purpose: a
+# finding you dismiss costs you a look, false comfort costs you the point of the tool.
+# So a refresh to `/dashboard` is routing, and a newsletter box posting to a hosted
+# list service is not a hand-off.
 #
 # Only services where HTTP was *observed* are asked — a tunnel route with an
 # http/https origin, or a `traefik.http.routers.*` label. A service that only
 # publishes a port is never touched, which is what keeps this off your databases.
 probe:
   # Or set LABVIEW_PROBE_ENABLED=true.
+  #
+  # This is the default, not the last word: the switch beside Rescan in the UI turns
+  # probing on or off for that one rescan, either way, whatever is set here. The
+  # override is not sticky — the next scheduled scan comes back to this value — and
+  # the payload says which of the two decided, so the UI can show the switch moving
+  # back rather than leave it claiming something untrue.
+  #
+  # Worth knowing before you leave this off and rely on it: if you have not
+  # configured LabView's own login (`auth` above), `POST /api/rescan` is
+  # unauthenticated, so anyone who can reach the page can ask for a probing scan.
+  # The same visitor can already read the whole inventory, so the thing that closes
+  # this is the login, not the switch.
   enabled: false
   # Your host's LAN address, for probing published ports at `<lanHost>:<port>`.
   # LabView runs in a container and can only see the container's interfaces, so it

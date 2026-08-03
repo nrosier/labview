@@ -214,6 +214,39 @@ code, .mono {
 .btn:disabled { opacity: 0.55; cursor: default; }
 .btn.icon { padding: 7px 9px; }
 
+/* A switch that sets what the button beside it will do — the same box as `.btn` so the
+   two sit level in the header, but a `label` wrapping a real checkbox rather than
+   anything drawn: the native control carries the checked state, the keyboard handling and
+   the screen-reader role for free, and the label being the box is what makes the whole
+   thing a hit target. `accent-color` is the entire theming needed, and it follows the
+   palette in both schemes without a second rule.
+
+   Deliberately not styled as a filter chip. A chip narrows what is on screen and can be
+   undone by looking again; this one decides whether the next scan sends requests to the
+   fleet, so it reads as a control rather than as a view. */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 7px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: help;
+  user-select: none;
+}
+.toggle:hover { background: var(--surface-2); }
+.toggle input { accent-color: var(--c1); margin: 0; cursor: pointer; }
+.toggle:has(input:disabled) { opacity: 0.55; cursor: default; }
+.toggle:has(input:disabled) input { cursor: default; }
+.toggle:has(input:focus-visible) { outline: 2px solid var(--c1); outline-offset: 2px; }
+/* Says which way it is set without reading the box — the label alone is ambiguous at a
+   glance, and this is the state that decides whether a scan generates traffic. */
+.toggle input:checked + span { color: var(--ink); }
+.toggle input:not(:checked) + span { color: var(--muted); }
+
 /* A control that reads as part of its sentence rather than as a button: the topbar
    count that opens an integration panel, the service name inside one that jumps to that
    service. Inherits the type and colour of wherever it sits — a 12px muted header line

@@ -311,7 +311,7 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** — not an API token, see [`config.example.yml`](config.example.yml). See [Where the credentials go](#where-the-credentials-go) |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues from the labels alone |
-| `LABVIEW_PROBE_ENABLED` | `false` | Whether a scan **asks** each HTTP service for its front page. Off until you turn it on — this is the only stage that sends a request to a scanned service. See [Probing a service directly](#probing-a-service-directly) |
+| `LABVIEW_PROBE_ENABLED` | `false` | Whether a scan **asks** each HTTP service for its front page. Off until you turn it on — this is the only stage that sends a request to a scanned service. It is also the *default* rather than the last word: the switch beside Rescan decides one rescan either way. See [Probing a service directly](#probing-a-service-directly) |
 | `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces and cannot work this out. Unset means published ports are not asked |
 | `LABVIEW_PROBE_TIMEOUT` | `5000` | Per-request timeout, ms. A service that does not answer in time is recorded as a timeout, which is its own finding |
 | `LABVIEW_PROBE_MAX_CONCURRENCY` | `4` | Services asked at once. Kept low because these requests fan out across the fleet and many of them land on one reverse proxy |
@@ -491,9 +491,10 @@ described it, with the reason in `meta.traefik.error`.
 
 ### Probing a service directly
 
-**Off by default.** With `LABVIEW_PROBE_ENABLED=true`, a scan stops only reading
-configuration and starts *asking*: one `GET /` per eligible service, and it reads what
-comes back for the signs of a login page.
+**Off by default.** With `LABVIEW_PROBE_ENABLED=true` — or the switch beside **Rescan**,
+for one rescan at a time — a scan stops only reading configuration and starts *asking*:
+one `GET /` per eligible service, and it reads what comes back for the signs of a login
+page.
 
 This exists because the largest class of real protection there is — an application's
 own login form — leaves no trace anywhere a compose scan can look. No middleware, no
@@ -522,7 +523,7 @@ that keeps the probe off your database ports — a Postgres port is never asked,
 no route stays inferred rather than measured. So does a `tcp://` tunnel, which is not
 HTTP no matter what is behind it.
 
-**What counts as a login page.** Four signals, all of them things in the response
+**What counts as a login page.** Seven signals, all of them things in the response
 itself:
 
 | Signal | Fires on |
@@ -530,13 +531,24 @@ itself:
 | Credential requested | 401 or 407 **with** a `WWW-Authenticate` header |
 | Redirected off-site | a 3xx whose `Location` is a different origin |
 | Redirected to a login path | a 3xx to `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` |
-| Login form served | a 200 whose HTML carries an `<input type="password">` |
+| Sent to a login by refresh | a 200 whose HTML carries a `<meta http-equiv="refresh">` pointing at either of the two above |
+| SSO hand-off served | a 200 carrying a hidden `SAMLRequest` or `SAMLResponse` input — the SAML POST binding *is* that page |
+| Login form served | a 200 whose HTML carries an `<input type="password">` (or `autocomplete="current-password"`) |
+| Passwordless login form served | a 200 with a form that has a username field, a submit control and a login-intent marker — an `action` on one of the login paths above, or a `one-time-code` field — and no password anywhere. This is what magic-link and passkey sign-in look like |
 
-Nothing else. A bare 401 with no challenge header, a 403, a `/` → `/dashboard` redirect,
-a homepage with the words "Sign in" on it — all read as *not* a gate. They still show in
-the drawer as what was measured, but they do not clear an exposure. That asymmetry is
-deliberate: a false finding costs you a look, while false comfort is the thing this tool
-exists to remove.
+Nothing else. A bare 401 with no challenge header, a 403, a `/` → `/dashboard` redirect —
+whether by `Location` or by refresh — a homepage with the words "Sign in" on it, a
+newsletter box that posts an email address to a hosted list service: all read as *not* a
+gate. They still show in the drawer as what was measured, but they do not clear an
+exposure. That asymmetry is deliberate: a false finding costs you a look, while false
+comfort is the thing this tool exists to remove.
+
+Six of the seven rest on a single fact. The last one cannot — a username field and a
+button are also a newsletter signup — so it requires three things together, and the
+login-intent marker is what separates the two. Where a form was found, the drawer says
+what it was made of (`a password field, a username field and a submit button`) whether or
+not anything was concluded from it, so a page that looks like a login and did not count
+shows you why.
 
 When a signal does fire, the service leaves the exposed count and its badge reads
 **Login page answered**. What it does *not* get is a mechanism: `auth.method` stays
@@ -561,6 +573,34 @@ aggregate reads like `31 services probed — 12 gated, 17 open, 2 did not answer
 that mixed case is reported as `partial` rather than as a success: some of the fleet
 answered, and what was read is sound, but part of the picture is missing and the line
 says which part.
+
+#### The switch beside Rescan
+
+`probe.enabled` decides what a startup scan and every scheduled rebuild do. The
+checkbox in the header decides what **one** rescan does, in either direction and
+whatever the configuration says — probing on for a fleet configured with it off, or off
+for one configured with it on. It sends an optional body with the rescan:
+
+```bash
+curl -X POST localhost:8080/api/rescan -H 'content-type: application/json' -d '{"probe":true}'
+```
+
+No body, or anything that is not a JSON boolean, means "use the configuration" — so
+existing `POST /api/rescan` callers are unaffected.
+
+Two things worth knowing before you use it:
+
+- **It is not sticky.** The next scheduled rebuild comes back to `probe.enabled`, which
+  means probe results appear when you ask and leave again when the cache expires. So the
+  payload says what actually happened — `meta.probe` carries `enabled` and whether
+  `config` or the `request` decided it — and the checkbox re-syncs from that on every
+  scan it receives. The switch moving back on its own is the revert, not a bug. To have
+  probing on for good, set `probe.enabled: true`.
+- **`POST /api/rescan` needs a session only while [access
+  control](#access-control) is configured.** Without a passwd file or an OIDC issuer,
+  anyone who can reach the page can ask for a probing scan — a request per eligible
+  service, some of them to public hostnames. They can already read your whole inventory
+  from `/api/overview`, so the login is what closes this, not the switch.
 
 ---
 
@@ -1150,13 +1190,21 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   into any error string.
 - **The one read that goes to a scanned service is off by default.** The
   [direct probe](#probing-a-service-directly) is the only stage that sends a request to
-  something in your fleet, and it does nothing until `LABVIEW_PROBE_ENABLED=true`. Turned
+  something in your fleet, and it does nothing until `LABVIEW_PROBE_ENABLED=true` or a
+  rescan asks for it. Turned
   on it is `GET /` with no credential in scope on that code path, redirects read rather
   than followed, at most four addresses per service, a body read only when it is HTML and
   under a size cap, and only ever to a service where HTTP was *observed* — a database
   port is never asked. A public hostname means the request leaves the fleet and comes
   back through your edge, which is the point of that vantage and worth knowing before you
   switch it on.
+- **[The switch beside Rescan](#the-switch-beside-rescan) overrides that setting, both
+  ways, for one rescan.** `POST /api/rescan` needs a session only while access control is
+  configured — so with no passwd file and no OIDC issuer, anyone who can reach the page
+  can ask for a probing scan. The same visitor can already read your entire inventory from
+  `/api/overview`, which is why the answer is to configure the login rather than to narrow
+  the switch. If you are relying on `enabled: false` to mean *no traffic leaves, ever*,
+  configure the login too.
 - **LabView's own login is off until configured, and gates the data when it is.** With a
   `/config/passwd` entry or an OIDC issuer, `/api` needs a session; the SPA shell stays
   public because it carries nothing fleet-specific. Passwords are bcrypt, failed attempts
@@ -1397,7 +1445,7 @@ The classification always stands. Drift is a report, never an override.
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/overview` | GET | **Needs a session.** The full analyzed model (JSON) |
-| `/api/rescan` | POST | **Needs a session.** Re-read the apps root and return the rebuilt overview |
+| `/api/rescan` | POST | **Needs a session.** Re-read the apps root and return the rebuilt overview. Optional JSON body `{"probe": true \| false}` decides active probing for that one scan; no body, or anything that is not a boolean, uses the configuration ([the switch](#the-switch-beside-rescan)) |
 | `/api/healthz` | GET | Liveness probe |
 | `/api/session` | GET | The posture and who you are: `{enforced, methods, notes, user?, oidcLabel?}` |
 | `/api/login` | POST | `{username, password}` → a session cookie. `401 {error:"credentials"}`, or `429 {error:"throttled", retryAfterSeconds}` |
@@ -1561,6 +1609,12 @@ running. Concurrent requests still coalesce into one sweep, so a double click do
 not double the load on the socket proxy, and a failed scan leaves the previous
 overview readable and is retried by the next caller.
 
+A `{"probe": …}` body rides along the same machinery, and coalescing decides who gets
+their way: the build that *starts* owns the override, and a caller that arrived while it
+was already running gets that build's result rather than its own. `meta.probe` therefore
+describes the scan you were handed, not the request you sent — which is also what makes
+the checkbox in the header correct after a rebuild it did not ask for.
+
 ---
 
 ## Development
@@ -1642,12 +1696,14 @@ directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
 both directions, so the contribution is measured rather than assumed.
 
-The `probe` root is a fleet of eleven stacks built so that every login-page signal
+The `probe` root is a fleet of fourteen stacks built so that every login-page signal
 and every near-miss appears exactly once, and it is run **twice** — once with the probe
 off and once on — so what the stage contributes is measured rather than assumed. It
-pins: each of the four signals clearing an exposure, and each near-miss (a bare 401
-with no challenge header, a 403, a same-origin `/dashboard` redirect, a page with
-"Sign in" on it and no password field) leaving the exposure standing; the vantage walk
+pins: each of the seven signals clearing an exposure, and each near-miss (a bare 401
+with no challenge header, a 403, a same-origin `/dashboard` redirect — by `Location` and
+again by meta refresh — a page with "Sign in" on it and no password field, and a
+newsletter box with the same email field and button as a magic-link login but nothing
+marking it as one) leaving the exposure standing; the vantage walk
 stopping at the first address that answers, and falling through only on a transport
 failure; a `tcp://` tunnel and a service with `ports:` and no route never being asked
 at all; a service that does not answer coming back as a third outcome rather than
@@ -1679,6 +1735,17 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   intent, and a middleware in Traefik's runtime chain is the config the proxy is
   actually running — but it is still configuration, not a request being challenged.
   LabView never sends a request through a gate to see what happens.
+- **A login page the probe cannot recognise reads as an exposure**, and that direction is
+  deliberate: a gate can only ever take a service *out* of the exposed count, so a rule
+  loose enough to catch the rest would clear exposures that are real. Four known misses.
+  A login shell built by JavaScript in an empty `<div id="root">` has no form in the HTML
+  and there is no headless browser here. A form below the 64 KiB the probe reads is never
+  seen — and if the read stops mid-tag, that element is simply not counted rather than
+  raising anything. A magic-link form posting to a path nothing recognises as a login
+  (NextAuth's `/api/auth/callback/email` and its neighbours) looks exactly like a
+  newsletter box. And the *shape* of a 401/403 page is never read, since bodies are only
+  parsed on a 200 — no exposure is missed there, because a challenge is already a gate,
+  but the drawer cannot say what such a form was made of.
 - The reverse-proxy integration is Traefik-specific: it reads Traefik's runtime API.
   Another proxy (Caddy, nginx, HAProxy) is still classified from its labels, and its
   routers are simply not verified. Traefik's static config file is not parsed —

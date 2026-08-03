@@ -1,0 +1,31 @@
+# Regression fixture: a 200 that tells the browser to leave is a redirect, and is judged
+# like one.
+#
+# Two services whose HTML differs in a single URL, because the whole rule is that URL.
+#
+# `docs` answers 200 with `<meta http-equiv="refresh">` pointing at `/login`. Nothing was
+# served: the status code is 200 only because the application chose to redirect in markup
+# instead of in a header, and a rule that read status codes alone would call this an open
+# application. Where it points is the evidence, exactly as it is for a 302 — the same
+# `resolveLocation` decides both, so the two ways of redirecting cannot disagree.
+#
+# `home` is the near miss, and it is the reason this pair exists rather than one stack. It
+# refreshes to `/dashboard`, which is an application sending a visitor to its landing page.
+# A rule that treated any meta refresh as a gate would take this service out of the exposed
+# count on the strength of a redirect to content.
+services:
+  docs:
+    image: example/docs:2.1.0
+    container_name: probe-refresh-docs
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=docs.probe.example.com"
+      - "dockflare.service=http://probe-refresh-docs:3000"
+
+  home:
+    image: example/home:2.1.0
+    container_name: probe-refresh-home
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=home.probe.example.com"
+      - "dockflare.service=http://probe-refresh-home:3000"

@@ -1,0 +1,29 @@
+# Regression fixture: the SAML POST binding is a hand-off, and it arrives as a 200.
+#
+# The service answers with a page whose only content is a form carrying a `SAMLRequest`
+# hidden field, submitted by script to an identity provider on another host. That field is
+# the SAML 2.0 binding's own parameter name — nothing else in the world emits one — so the
+# page *is* the hand-off, and no second fact is needed to read it as one.
+#
+# Worth its own stack because it is the shape that defeats every simpler rule at once. There
+# is no password field, so the password clause misses it. There is no `Location`, so the
+# redirect clauses miss it. The form's `action` leaves the origin, so the login-path rule
+# refuses it deliberately — a cross-origin action is what a hosted newsletter box has too.
+# What is left is the hidden input, and the assertion is that it alone is enough.
+#
+# TLS on the router, so this one is asked over https.
+services:
+  erp:
+    image: example/erp:5.2.0
+    container_name: probe-saml-post
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.samlpost.rule=Host(`erp.probe.example.com`)"
+      - "traefik.http.routers.samlpost.entrypoints=websecure"
+      - "traefik.http.routers.samlpost.tls=true"
+
+networks:
+  proxy:
+    external: true

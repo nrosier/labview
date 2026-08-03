@@ -224,6 +224,13 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     // the server and the CLI turn these into lines, exactly as they already do for
     // `dockerError`.
     connections: [snapshot.connection, ak.connection, tf.connection, pr.connection],
+    // What *this* build did about probing, reported unconditionally for the same reason
+    // `connections` is: silence would have to be interpreted. `source` is `config` here
+    // and can only be `config` here — this function reads a `LabViewConfig` and cannot
+    // tell one that was rewritten for a single request from one that came off disk. The
+    // server's build closure is the only place that knows, so it is the only place that
+    // says otherwise.
+    probe: { enabled: cfg.probe.enabled, source: "config" },
     durationMs: Date.now() - started,
     warnings,
     version: VERSION,

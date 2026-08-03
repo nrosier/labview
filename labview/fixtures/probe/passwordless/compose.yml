@@ -1,0 +1,33 @@
+# Regression fixture: a login page with no password on it, and the signup box that looks
+# identical.
+#
+# The one gate LabView reads from several facts at once rather than from one, so the pair is
+# not optional — it is what keeps the composite from degenerating into word-matching.
+#
+# `magic` serves a magic-link sign-in: an email field, a submit button, and a form that
+# posts to `/login`. There is no password input anywhere on the page, which is the entire
+# problem — passwordless sign-in is a growing class and the one-fact rules cannot see it at
+# all, so this service would otherwise be reported as reachable without authentication while
+# serving nothing but a login form.
+#
+# `news` is the near miss, and the false positive it guards against is common enough to be
+# the default on a static site: a newsletter box. It has the same email field and the same
+# submit button, and it posts to a hosted list service on another origin. Nothing marks it
+# as a login, so nothing about it is a gate — and a rule that accepted a cross-origin action
+# as a hand-off would clear this exposure on the strength of a footer.
+services:
+  magic:
+    image: example/magic:1.2.0
+    container_name: probe-passwordless-magic
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=magic.probe.example.com"
+      - "dockflare.service=http://probe-passwordless-magic:8080"
+
+  news:
+    image: example/news:1.2.0
+    container_name: probe-passwordless-news
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=news.probe.example.com"
+      - "dockflare.service=http://probe-passwordless-news:8080"

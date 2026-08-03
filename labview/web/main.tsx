@@ -24,6 +24,7 @@ import {
   formatExposureCount,
   parseLoginFailure,
   phaseText,
+  probeToggleText,
   shouldBanner,
 } from "./model";
 import {
@@ -297,10 +298,36 @@ function App() {
    * every use to say which of the two it is.
    */
   const [panel, setPanel] = useState<"authentik" | "traefik" | "drift" | null>(null);
+  /**
+   * Whether the next Rescan asks the services themselves what they answer.
+   *
+   * Not a filter and not a preference: it decides whether a scan sends requests to every
+   * service whose labels show an HTTP address, and for a service on a public hostname
+   * those requests leave the fleet. So it is deliberately *not* remembered in
+   * `localStorage` the way the theme is — a stored `true` would make every future visitor
+   * to this browser generate fleet-wide traffic by pressing a button labelled Rescan.
+   *
+   * It holds the server's answer instead, re-synced below from whatever the last payload
+   * says actually ran.
+   */
+  const [probeOn, setProbeOn] = useState(false);
 
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  /**
+   * Follow the server, every time a payload arrives.
+   *
+   * The override lasts one scan: an automatic refresh after the cache TTL has no request
+   * behind it and goes back to `probe.enabled`. Left to itself the switch would then show
+   * `on` over a scan that did not probe — the reader would see no probe results, the
+   * control insisting otherwise, and nothing to tell them which was true. Reading the
+   * state off `meta.probe` instead makes the revert something they watch happen.
+   */
+  useEffect(() => {
+    if (ov) setProbeOn(ov.meta.probe.enabled);
+  }, [ov]);
 
   /**
    * Whether the fleet may be read: either nothing is enforced — the default, and how
@@ -365,7 +392,11 @@ function App() {
     // the new scan compared against, and it is about to be replaced.
     const before = ov;
     try {
-      const next = await rescan();
+      // Always stated, never left to the server's default: the switch on screen is what
+      // the operator is looking at, so it is what this scan has to do — including when it
+      // agrees with the configuration, since agreeing by coincidence and agreeing on
+      // purpose look the same here and only one of them survives a config edit.
+      const next = await rescan(probeOn);
       setOv(next);
       setDiff(before ? diffStacks(before.stacks, next.stacks) : null);
       setApiDiff(before ? diffIntegrations(before, next) : null);
@@ -703,6 +734,17 @@ function App() {
         >
           {themeIcon[theme]}
         </button>
+        {/* Immediately before Rescan, because it is a setting for that button and not a
+            control of its own: nothing happens when it is flipped. */}
+        <label class="toggle" title={probeToggleText(ov.meta.probe)}>
+          <input
+            type="checkbox"
+            checked={probeOn}
+            disabled={busy}
+            onChange={(e) => setProbeOn((e.currentTarget as HTMLInputElement).checked)}
+          />
+          <span>Login probe</span>
+        </label>
         <button class="btn" onClick={doRescan} disabled={busy}>
           {busy ? <span class="spinner" /> : "↻"} Rescan
         </button>

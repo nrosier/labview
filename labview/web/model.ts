@@ -19,8 +19,11 @@ export type {
   AuthMethod,
   AuthConfidence,
   AuthPosture,
+  LoginFormShape,
   ProbeGate,
+  ProbeRun,
   ProbeVantage,
+  ScanRequest,
   ServiceProbe,
   Declaration,
   DeclaredAuth,
@@ -169,7 +172,15 @@ export type { NoAuthReason, NoAuthText } from "../src/model/auth";
  * a rendering detail: it is the one place that keeps "did not answer" from ever reading as
  * "answered with no login page".
  */
-export { PROBE_GATES, PROBE_VANTAGES, probeGateText, probeOutcome, probeVantageText } from "../src/model/probe";
+export {
+  PROBE_GATES,
+  PROBE_VANTAGES,
+  probeFormText,
+  probeGateText,
+  probeOutcome,
+  probeToggleText,
+  probeVantageText,
+} from "../src/model/probe";
 export type { ProbeGateText, ProbeOutcome } from "../src/model/probe";
 
 /**

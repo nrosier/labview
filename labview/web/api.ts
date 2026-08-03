@@ -32,9 +32,26 @@ export function fetchOverview(): Promise<Overview> {
   return getJson<Overview>("api/overview", "GET /api/overview");
 }
 
-/** Trigger a fresh scan on the server, returning the rebuilt overview. */
-export async function rescan(): Promise<Overview> {
-  const res = await fetch("api/rescan", { method: "POST", headers: { accept: "application/json" } });
+/**
+ * Trigger a fresh scan on the server, returning the rebuilt overview.
+ *
+ * `probe` forces active probing on or off for this scan only, overriding `probe.enabled`.
+ * Omit it and the server uses its configuration, which is what every caller did before the
+ * body existed — hence the body is sent only when there is something to say, so a rescan
+ * with no opinion is byte-for-byte the request it always was.
+ *
+ * What actually ran is on `meta.probe` of the value returned, not inferred from the
+ * argument: the server may have joined this request to a scan already in flight.
+ */
+export async function rescan(probe?: boolean): Promise<Overview> {
+  const res = await fetch("api/rescan", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      ...(probe === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(probe === undefined ? {} : { body: JSON.stringify({ probe }) }),
+  });
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error(`POST /api/rescan failed: ${res.status} ${res.statusText}`);
   return (await res.json()) as Overview;

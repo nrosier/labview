@@ -104,8 +104,9 @@ labview/
     model/ingress.ts  the ingress vocabulary and every pure operation on it (pure, web-safe)
     model/declarations.ts  the values a `.labview` may use, and how each is worded (pure, web-safe)
     model/ports.ts    reading a compose port mapping for the published host port (pure)
-    model/probe.ts    which addresses a service may be asked at, and what counts as a
-                      login page answering (pure, web-safe)
+    model/probe.ts    which addresses a service may be asked at, what counts as a
+                      login page answering, and what a login form is made of
+                      (pure, web-safe)
     model/filter.ts   the dashboard's tri-state tag filter (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
@@ -143,7 +144,8 @@ labview/
       oidc.ts         discovery, PKCE, token exchange, ID-token verification (now + fetch injected)
       throttle.ts     failed sign-ins per username (now injected)
       index.ts        resolveAccessMode, isPublicPath, requiresSession, config resolution
-    server/cache.ts   scan cache: TTL, coalescing, force semantics (§3.11)
+    server/cache.ts   scan cache: TTL, coalescing, force semantics, and the per-request
+                      value a forced build is given (§3.11)
     server/auth.ts    the gate: one onRequest hook, one onSend hook, five routes (§3.13)
     server/server.ts  Fastify: buildApp() -> /api/* + static UI, with a TTL cache
   web/                Preact UI (see §3.9)
@@ -159,7 +161,9 @@ labview/
     authentik-api.json  canned API responses driven through an injected fetch
     traefik/          a fleet whose labels and live proxy config disagree
     traefik-api.json    canned proxy + identity responses, same injected fetch
-    probe/            what a service answers when it is asked, one address per stack
+    probe/            what a service answers when it is asked, one address per stack —
+                      including the pages that gate without a password field, and the
+                      two near-misses that must stay ungated
     auth/             passwd files the access-control assertions parse: ok, messy, empty
     outside-root.env      the `env_file` escape target; outside every scan root on purpose
     outside-root.labview  the sidecar-symlink escape target, same reason (I8)
@@ -659,10 +663,11 @@ exposed count was a `.labview` declaration — a claim LabView cannot check (§3
 asks: one GET to the service's own address, and a login page answering is evidence in the
 sense I1 means it, because LabView made the request and read the answer.
 
-It is the only integration that **defaults to off**, and it is the only one that sends a
-request to something the fleet's own documents named. Both facts drive the design.
+It is the only integration that **defaults to off**, the only one that sends a request to
+something the fleet's own documents named, and the only one a reader can turn on from the UI
+for a single rescan. All three facts drive the design.
 
-**Two pure rules, in [model/probe.ts](labview/src/model/probe.ts).** Neither lives in the
+**Three pure rules, in [model/probe.ts](labview/src/model/probe.ts).** None lives in the
 client that does the fetching, because a rule inside an I/O module can only be tested by
 mocking the I/O.
 
@@ -688,23 +693,79 @@ configuration rather than measured. `lanHost` is the operator's answer to a ques
 cannot answer for itself — it runs in a container and cannot see its host's LAN address. Empty
 means no LAN vantage, not a guessed one.
 
-`readGate(res)` is the recognition rule. Four signals, strongest first, each one fact:
+`readGate(res)` is the recognition rule. Seven signals, strongest first:
 
-| Signal | Fires on |
-|---|---|
-| `challenge` | 401 or 407 **with** a `WWW-Authenticate` header |
-| `redirect-origin` | a 3xx whose `Location` resolves to a different origin |
-| `redirect-login` | a 3xx that stayed on the origin and landed on `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` (prefix match) |
-| `password-form` | a 200 whose HTML body carries an `<input type="password">` |
+| Signal | Fires on | Why it is a fact |
+|---|---|---|
+| `challenge` | 401 or 407 **with** a `WWW-Authenticate` header | The header *is* a request for a credential |
+| `redirect-origin` | a 3xx whose `Location` resolves to a different origin | This origin declined to serve the request itself — the shape of every external SSO hand-off |
+| `redirect-login` | a 3xx that stayed on the origin and landed on `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` (prefix match) | It sent the browser to its own login instead of serving |
+| `meta-refresh-login` | a 200 whose HTML carries `<meta http-equiv="refresh">` whose `url=` resolves cross-origin or onto one of those same paths | A redirect written in markup. The page served no content; the 200 is an accident of *how* it redirected, and the same `resolveLocation` judges it as judges a `Location` |
+| `sso-form` | a 200 carrying a hidden `SAMLRequest` or `SAMLResponse` input | Those are the SAML 2.0 POST binding's own parameter names. Nothing else emits one |
+| `password-form` | a 200 whose HTML carries `<input type="password">` or `autocomplete="current-password"`, **anywhere on the page** | A password input is unambiguous alone, which is why it outranks the composite below |
+| `credential-form` | a 200 where **one** form has a username field *and* a submit control *and* a login-intent marker, with no password field | Magic-link and passkey sign-in. See below — this is the one clause that is not a single fact |
+
+Clauses 4–7 read a 200's body, which is the only condition under which a body was kept at
+all, so `res.body` being present is itself the evidence that HTML answered.
 
 Nothing else is a gate. A bare 401 with no challenge header is an API saying "not signed in"
 while its UI serves the whole application; a 403 refuses without asking for anything; a
-same-origin redirect to `/dashboard` is routing; a homepage with the words "Sign in" and no
-password field is a homepage. All of them read as *answered, no gate observed*, which leaves
-the exposure finding standing. The asymmetry is deliberate and it is the whole reason the rule
-is strict: this function can only ever take a service **out** of the exposed count, so a
-clause that is merely likely would manufacture the one thing this project exists to remove.
-Half the `readGate` table in `scripts/smoke.ts` is near-misses for that reason.
+same-origin redirect to `/dashboard` is routing, and so is a meta refresh to it; a refresh
+with no `url=` is a live dashboard reloading itself on a timer; a homepage with the words
+"Sign in" and no form to go with them is a homepage. All of them read as *answered, no gate
+observed*, which leaves the exposure finding standing. The asymmetry is deliberate and it is
+the whole reason the rule is strict: this function can only ever take a service **out** of the
+exposed count, so a clause that is merely likely would manufacture the one thing this project
+exists to remove. Half the `readGate` table in `scripts/smoke.ts` is near-misses for that
+reason.
+
+**`readLoginForm(body, requestUrl)`** is the third rule and the answer to the plainest question
+about a 200: *is there a username field, a password field and a login button?* It reports
+composition **per `<form>` element**, never page-wide — a footer search box and a nav "Sign in"
+link are each real, and a page-wide scan would hold them up together as a login form that does
+not exist. When several forms qualify the strongest wins, and the first of equals, so one page
+yields one answer and yields it twice (I7).
+
+| Field | Read from |
+|---|---|
+| `password` | `type="password"`, or `autocomplete="current-password"` — **not** `new-password`, which is a signup |
+| `username` | `type="email"`, or a `text`/`tel` input whose `name`, `id` or `autocomplete` contains a word from a closed list (`user`, `login`, `email`, `identifier`, `account`, …). `q`, `search` and `query` are absent on purpose |
+| `submit` | `<input type="submit">`, `type="image"`, or a `<button>` whose `type` is `submit` or absent — absent submits, by the HTML default |
+| `otp` | `autocomplete="one-time-code"` — a 2FA-first page |
+| `action` | the form's `action`, **only** when it stays on this origin and prefix-matches a login path |
+
+Two of those deserve their reasons stated. The username match is loose, and that is affordable
+only because it is never sufficient alone: `credential-form` also demands a submit control and
+an intent marker, so a search box named `account_query` costs nothing. And a **cross-origin
+action is rejected** rather than read as a hand-off, which is narrower than the redirect rules
+deliberately: hosted newsletter signup is a form posting an email address to somebody else's
+domain, the shape is identical to a hosted login and the meaning is the opposite, so reading it
+as evidence would clear an exposure for every site with a Mailchimp box in its footer.
+
+The shape is attached to `ServiceProbe.form` whenever a form was found — **including when
+nothing was concluded from it**. A verdict a reader cannot inspect is one they have to take on
+trust; a form of `username + submit` with no intent marker is exactly the case where they will
+want to look, and the drawer shows the sentence beside the pill.
+
+**`credential-form` is the one clause that holds several facts together, and that is a
+deliberate exception.** Every other signal here is a single unambiguous marker; this one is a
+conjunction, because passwordless sign-in has no single marker to find — there is no password
+input, no `Location`, and often no distinguishing text. The class is large and growing, and
+without this clause every magic-link and passkey login in a fleet reads as *reachable without
+authentication*, which is a false finding in the noisy direction. The compensation is that all
+three parts must be present on **one** form; the `news` service in `fixtures/probe/passwordless`
+is the fixture that holds the line.
+
+**Signals considered and rejected.** Each is tempting and each would buy false comfort, which
+in this rule is the expensive kind of wrong:
+
+| Rejected | Because |
+|---|---|
+| `<title>` or body text matching — "Sign in", "Log in" | `PROBE_APP_HTML` in the smoke pass exists to defeat exactly this: an open dashboard that says "Sign in" twice and links to an account page |
+| Product-name markers — Keycloak, Authelia, oauth2-proxy | A *link* to one matches. A page mentioning an identity provider is not a page served by it |
+| A `Set-Cookie` on a 200 | Every application sets a cookie |
+| A cross-origin form `action` with no `SAMLRequest` | Indistinguishable from hosted newsletter signup, as above |
+| A 401/403 that serves a login form | The body is read as evidence on a 200 only, so this is a known miss (§11) rather than a clause — loosening it would let any 401 rendering a form bypass the challenge clause's header requirement |
 
 **Both findings are findings.** A login page answering means the service is not reachable
 without authenticating: it leaves `exposedWithoutAuth`, is counted in `probeGated`, and
@@ -743,6 +804,56 @@ The report is the fourth `meta.connections` entry (§3.10), using existing phase
 `disabled` when off, `not-found` when nothing was eligible, `partial` when part of the fleet
 did not answer — which stays `ok`, because what was read is sound — and `connected` otherwise,
 reading like `31 services probed — 12 gated, 17 open, 2 did not answer`.
+
+#### The switch beside Rescan
+
+`probe.enabled` in the configuration is the **default**, not the authority. A `Login probe`
+checkbox sits beside the Rescan button, and `POST /api/rescan` takes an optional body:
+
+```json
+{ "probe": true }
+```
+
+The value is fully authoritative for that build: `true` probes even where the configuration
+says off, `false` skips it even where the configuration says on. That second direction is the
+half a config default cannot express — an operator with probing on and no other way to ask for
+one quiet rescan.
+
+**It lasts for exactly one rescan.** A TTL rebuild, a timer, and a page load all carry no
+request and fall back to the configured value. That has a consequence worth stating rather than
+leaving to be discovered: probe results reappear or vanish on their own when the cache expires.
+So the payload says what it did —
+
+```ts
+meta.probe: { enabled: boolean; source: "config" | "request" }
+```
+
+— always present, on the same reasoning §3.10 rests on: silence is indistinguishable from a
+read that found nothing, and here it would be indistinguishable from a fleet with no login
+pages in it. `source` is what keeps a reverted override from looking like a broken switch, and
+the checkbox re-syncs from `meta.probe.enabled` on every overview it receives, so the revert
+*moves the switch* instead of leaving it lying about what happened.
+
+Three mechanics behind that, each chosen against a plausible alternative:
+
+- **`withProbeEnabled(cfg, enabled)`** in [config.ts](labview/src/config.ts) returns a clone,
+  never a mutation. The configuration object is captured by the cache's build closure, read
+  again by the next timer rebuild, and still being read by a build already in flight when the
+  click arrives — so `cfg.probe.enabled = true` would turn probing on *permanently* for every
+  later scan with nobody having asked, and would break I7 besides.
+- **`ScanCache<T, R>`** threads the value as a parameter of `build(req)` rather than through
+  shared state, so the build that *starts* owns the override. A caller that coalesced onto an
+  in-flight build has its own value discarded — deliberately, and visibly, which is again why
+  `meta.probe` describes the build rather than the switch.
+- **`readScanRequest`** validates rather than coerces: one known key, one known type. A missing
+  body, an array, a JSON `null`, `{"probe":"yes"}` and `{"probe":1}` all mean *use
+  configuration*. Ignoring an unknown field rather than rejecting it is the choice
+  `parseSidecar` makes for the same reason (I4), and body-less POSTs — every client before this
+  existed — keep working unchanged.
+
+The security consequence is real and is in §7: when LabView is not enforcing a login, `POST
+/api/rescan` is unauthenticated, so this switch lets any visitor start fleet-wide outbound
+requests.
 
 ### 3.7 The data contract
 
@@ -793,6 +904,16 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   across scans to report an edited file, so a resolved target inside it would make a rename
   in *another* stack read as this sidecar having changed. A reference that stops resolving
   becomes `drift`, which that comparison already excludes.
+- **A field that describes the build is on `meta`, and is never optional.** `meta.probe`
+  states whether the active probe ran and which of configuration or request decided it, in
+  every payload — including the overwhelming majority where probing is off. An optional
+  field would make a reader infer from silence, and the two things it could infer from an
+  absent `probe` ("probing is off" and "this build predates the field") are not the same
+  fact. `meta.dockerError` and `meta.connections` are the precedent; the difference is that
+  those describe a failure and this describes a choice, which is exactly why it must appear
+  when nothing went wrong. It also has a second job: the probe switch (§3.6b) lasts one
+  rescan, and `meta.probe` is what lets the UI show a TTL rebuild reverting to config
+  rather than leave the checkbox lying.
 - Adding or renaming a member of a union (`AuthMethod`, `IngressKind`) is a
   **breaking UI change**: the palette in `web/lib/palette.ts` maps every member to
   a colour and a label, and an unmapped member silently renders grey. For
@@ -809,7 +930,7 @@ gate's (§3.13):
 | Route | Needs a session | Behaviour |
 |---|---|---|
 | `GET /api/overview` | yes | cached scan; rebuilds when older than `cacheTtlSeconds` |
-| `POST /api/rescan` | yes | forces a rebuild that re-reads the apps root, and returns it (§3.11) |
+| `POST /api/rescan` | yes | forces a rebuild that re-reads the apps root, and returns it (§3.11). Optional JSON body `{"probe": true \| false}` overrides `probe.enabled` for that one build (§3.6b); absent or non-boolean means "use the configuration" |
 | `GET /api/healthz` | no | `{ok: true}`, no scan |
 | `GET /api/session` | no | `SessionInfo`: the posture, the live methods, and the signed-in user if any |
 | `POST /api/login` | no | username + password → a session cookie |
@@ -819,7 +940,9 @@ gate's (§3.13):
 | `GET /*` | no | the built UI from `web/dist`, SPA-style fallback to `index.html`; a 404 under `/api/` stays JSON |
 
 "Needs a session" is conditional on enforcement being on; with none configured every
-route answers as it did before R10.
+route answers as it did before R10 — which for `POST /api/rescan` now means any visitor
+can turn the active probe on for a scan. §7 states what that costs and why the switch was
+given full authority anyway.
 
 `startServer` is split into **`buildApp(cfg, opts) → {app, scan}`** and a `startServer`
 that calls it and listens. The split exists for the tests: the hooks in §3.13 are the one
@@ -833,6 +956,14 @@ by a build that started after it arrived, or it would return a scan taken before
 edit that prompted it (§3.11). The cache is warmed in the background at startup so
 the first page load is instant. If `web/dist` is absent the server still runs and
 says how to build it — the API is the primary product, the UI is a view of it.
+
+The probe override rides that same machinery as a **per-request value**, not as state on
+the server: `ScanCache<T, R>` hands whatever the caller passed to the build it starts, and
+a coalesced caller's value is discarded along with its build. That is why the reported
+`meta.probe` is a statement about the build that ran rather than about the request that
+was answered, and why a timer rebuild — which passes nothing — falls back to the
+configuration. A mutable "probe next time" flag on the server would have been shorter and
+would have let one caller's override be consumed by an unrelated passive build.
 
 ### 3.9 Frontend
 
@@ -1170,6 +1301,10 @@ are each asserted —
   than sweeping the Engine twice to answer one question;
 - two simultaneous forced callers still coalesce into one build (the second's
   `startedAt >= requestedAt`);
+- the value a forced caller passes reaches the build it starts, and a caller that
+  coalesced onto that build has its own value **discarded** — the build owns the
+  override, which is why `meta.probe` can only ever describe what ran (§3.6b) — while a
+  timer rebuild, passing nothing, gets `undefined` and falls back to the configuration;
 - a failed build rejects its caller and leaves the previous value readable.
 
 **A rescan says what it found.** `onBuilt(next, prev, {forced})` fires once per
@@ -2581,6 +2716,10 @@ Key knobs (`labview/config.example.yml` documents all of them):
 | `LABVIEW_TRAEFIK_PASSWORD` | `traefik.password` | an **app password**, not an API token. In `secrets.keysAlways`, so LabView scanning its own stack cannot print it. Set and empty = a `credential` fault |
 | `LABVIEW_TRAEFIK_ENABLED` | `traefik.enabled` | `false` = never contact the proxy. Unlike Authentik this stage is on by default, because it needs no credential |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `traefik.timeoutMs` | per request; the whole exchange is three GETs and is not paginated |
+| `LABVIEW_PROBE_ENABLED` | `probe.enabled` | the **default**, not the authority: it decides what a startup scan and every timer rebuild do, and `POST /api/rescan` can override it either way for one build (§3.6b). Any value other than `false` turns it on, because a variable someone set to `0` meaning "off" is the rarer mistake than one set to `yes` meaning "on" |
+| `LABVIEW_PROBE_LAN_HOST` | `probe.lanHost` | the host LabView's own LAN vantage is at. Empty skips that vantage entirely — a guessed host produces connection failures that read as services being down (§3.6b) |
+| `LABVIEW_PROBE_TIMEOUT` | `probe.timeoutMs` | per request. Short on purpose: a service that does not answer promptly is reported as not having answered, which is a third outcome and not an exposure |
+| `LABVIEW_PROBE_MAX_CONCURRENCY` | `probe.maxConcurrency` | the fan-out over scanned services. How many addresses are tried *per* service is not configurable — `MAX_PROBE_TARGETS` is a constant in `model/probe.ts`, because the vantage list is derived from evidence and the cap is part of the rule, not a knob |
 | `LABVIEW_AUTH_PASSWD_ENABLED` | `auth.passwd.enabled` | `false` = the password form is off and the file is not read at all. The explicit off switch for an operator who wants only OIDC, or only their edge |
 | `LABVIEW_AUTH_PASSWD_FILE` | `auth.passwd.file` | `user:hash` lines. One usable entry is what turns enforcement on (§3.13) |
 | `LABVIEW_AUTH_MAX_FAILED_ATTEMPTS` | `auth.maxFailedAttempts` | failed sign-ins per **username** before a `429`; keyed on the name, not the address |
@@ -2662,6 +2801,30 @@ The one asymmetry is `enabled`: this stage defaults **on**, because the recommen
 setup needs no credential at all and an unreachable endpoint costs one failed
 connection and a reason string. `LABVIEW_TRAEFIK_ENABLED=false` opts out entirely.
 
+**`probe.enabled` is the only setting a request can override**, and the exception is
+narrow by construction. Every other value in the config is fixed for the life of the
+process, which is what makes a scan reproducible from a config file and a fleet (I7);
+`probe.enabled` decides whether traffic leaves for a scanned service at all, and that is a
+question an operator wants to answer for *one* rescan without editing a file and
+restarting. So the setting is the default that a startup scan and every timer rebuild use,
+and `POST /api/rescan` may say otherwise for the single build it starts. Three things keep
+that from eroding I7:
+
+- the override is a **per-request value**, never state — it reaches the build the caller
+  started and nothing else (§3.11);
+- it is not sticky: the next timer rebuild is a config scan again, which is why the payload
+  has to say what happened rather than leave it inferred (§3.7);
+- `withProbeEnabled(cfg, enabled)` returns a **clone**, so a build already in flight
+  holding the old config is unaffected. It is pure and asserted as such — that the copy
+  carries the new value, that neither the config nor its `probe` block is the same object,
+  and that the copy is otherwise byte-identical to the original. A mutating version passes
+  every behavioural test in the suite and corrupts a concurrent scan, so the identity is
+  asserted directly (§8).
+
+Nothing else follows this pattern, and adding a second such setting is a decision about
+I7, not a convenience: the reason this one is defensible is that it changes what LabView
+*sends*, not how it reads what it got.
+
 ---
 
 ## 7. Security model
@@ -2738,6 +2901,32 @@ must never be handed a credential.
   Where the address is a public hostname, that request leaves the fleet, which is the plainest
   reason this one defaults to off.
 
+**Who can switch the probe on, stated plainly.** The switch beside Rescan sends
+`{"probe": true}` to `POST /api/rescan`, and that route needs a session only when
+enforcement is configured (§3.13). **With no passwd file and no OIDC issuer, anybody who
+can reach the page can start a probing scan** — a `GET /` to every eligible service in the
+fleet, at addresses out of the operator's own compose files, some of them public hostnames
+that resolve outside it. Two things are worth separating there:
+
+- What it does *not* give away. A visitor who can reach `POST /api/rescan` can already
+  reach `GET /api/overview`, which lists every hostname, every published port and every
+  service with no gate in front of it. The inventory is not what probing adds; measurement
+  is. The boundary that protects any of this is the login, not the switch — which is why
+  the honest mitigation is §3.13 rather than a narrower switch.
+- What it does add. Requests attributable to the operator's address reach third-party
+  hostnames on an anonymous visitor's say-so, and each rescan can be repeated: LabView rate
+  limits the login route and nothing else (a deliberate non-goal, below), and forced builds
+  coalesce only while one is in flight, so sequential rescans mean sequential scans. That
+  was already true of a probe-less rescan against the Docker socket; the change is that the
+  traffic now leaves the host.
+
+The switch was given full authority over `probe.enabled` in both directions anyway, and the
+reason is that the alternative is worse in a way that is harder to see: a control the
+configuration could veto is a control that shows a state it does not have. An operator who
+wants probing to stay off for everyone has a sound answer — configure the login — and one
+who has not configured it is already showing the whole inventory to the same visitor. The
+default remains off, so this costs nothing until someone reaches for it.
+
 A fourth stage reaches outward only when OIDC is configured, and it is not part of a
 scan: discovery, the token exchange and the JWKS, to the one issuer the operator named
 (§3.13). It shares the timeout and file-backed-credential rules, and adds two of its own —
@@ -2760,8 +2949,8 @@ limiting beyond the login route; no CSP, because mermaid and cytoscape both inje
 at runtime and a policy that breaks the graph tab is worse than none; no TLS termination
 (the proxy does it); no persistence, so nothing to leak at rest — which also means
 sessions do not survive a restart (§11); no writes of any kind; and no outbound network
-calls beyond the three scan reads above — the third only when the operator switches it on —
-and, when configured, the one issuer.
+calls beyond the three scan reads above — the third only when it is switched on, by the
+configuration or by a rescan that asked — and, when configured, the one issuer.
 
 ---
 
@@ -2973,7 +3162,7 @@ No posture number moves with them. `matchedServices` on both roots and the
 exposed-without-auth pair asserted with and without the API are unchanged by the reason
 model, which adds reporting and nothing else.
 
-**`fixtures/probe`** — eleven stacks, fourteen services, driven twice: once with probing off
+**`fixtures/probe`** — fourteen stacks, nineteen services, driven twice: once with probing off
 and once on, against a URL-keyed `probeStub` in `scripts/smoke.ts` rather than a JSON payload,
 because a probe reads status codes, three headers and a fragment of HTML, not a document. The
 LAN host is `192.0.2.10` — documentation range, so a request that escaped the stub could not
@@ -2985,6 +3174,9 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `proxy-challenge` | `challenge`, and that a router's own `tls` setting decides the scheme it is asked on |
 | `sso-redirect` | `redirect-origin`, at the `http` address a router with no TLS implies |
 | `own-login` | `redirect-login`, and — with its sidecar — the one service where `probed-gate` and `declared` are both true: the reader gets the measured one, and the same service falls back to `declared` with the probe off |
+| `meta-refresh` | a **pair**, differing in one URL, because that URL is the whole rule: `docs` refreshes to `/login` and is `meta-refresh-login`; `home` refreshes to `/dashboard` and is a **trap** — an application routing to its own landing page, which a rule reading "any meta refresh" would take out of the exposed count |
+| `saml-post` | `sso-form` — the shape that defeats every simpler rule at once: no password field, no `Location`, and a cross-origin `action` the form rule refuses on purpose. The hidden `SAMLRequest` alone is the evidence. TLS on the router, so it is asked over `https` |
+| `passwordless` | a **pair**, and the reason `credential-form` cannot degenerate into word-matching: `magic` serves an email field, a submit button and `action="/login"` with no password anywhere; `news` is the **trap** — the same three tags as a newsletter box, posting to a list service on another origin, which marks nothing and clears nothing |
 | `open-app` | the **guard**, two services: `dash` answers 200 with a homepage and stays exposed with the finding now measured; `routing` redirects same-origin to `/dashboard`, which is application routing and clears nothing |
 | `gated-open` | a detected gate answered 200 with no login page: posture unchanged, note names the vantage the request came from |
 | `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
@@ -2993,21 +3185,36 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `dbonly` | a Postgres and an Adminer publishing ports and nothing else: **no request at all**, which is the rule that keeps the probe off a database |
 | `tcp-tunnel` | a `tcp://` and an `ssh://` tunnel origin: never resolved, let alone asked, and both stay honestly in the exposed count |
 
-Three groups of assertions carry what is not about one stack. The **rules**, driven pure: an
-18-row `readGate` table where half the rows are near-misses, plus two meta-assertions — that
+Four groups of assertions carry what is not about one stack. The **rules**, driven pure: a
+33-row `readGate` table where half the rows are near-misses, plus two meta-assertions — that
 every signal in the union is reached, and that the near-misses outnumber the signals, which is
-what "strict" means here; and `probeTargets` over hand-built routes for scheme, order, the
-per-service cap, dedupe, the bind-address guard, a port range, and each arm of
-`isHttpObservable` separately. **Containment**, asserted on the recorded requests rather than
-on the code: every request a GET at `/` with no query, no credential on any of them, no address
-asked twice, nothing at `:15432` or `:18081`, nothing named `pg.probe` or `ssh.probe`, and the
-total exactly 11 — one for each of the ten eligible services plus the single fallthrough.
-**Reconstruction** (I1): each service exposed exactly when it was with probing off minus the
-ones a login page answered for, asserted per service because two offsetting errors would
-satisfy a total; the aggregate adding back up; `probeGated` being deliberately one *more* than
-that, since it counts login pages and one belongs to a service already out of the count on its
-declaration; and no `auth.method`, `confidence`, `authProtected` or `byAuthMethod` differing
-between the two runs at all.
+what "strict" means here; a 14-row `readLoginForm` table, which earns its own because a
+composite rule's interesting cases are the ones where *some* parts are present, and a gate
+assertion collapses all of those to `undefined`; and `probeTargets` over hand-built routes for
+scheme, order, the per-service cap, dedupe, the bind-address guard, a port range, and each arm
+of `isHttpObservable` separately. **Containment**, asserted on the recorded requests rather
+than on the code: every request a GET at `/` with no query, no credential on any of them, no
+address asked twice, nothing at `:15432` or `:18081`, nothing named `pg.probe` or `ssh.probe`,
+and the total exactly 16 — one for each of the fifteen eligible services plus the single
+fallthrough. **Reconstruction** (I1): each service exposed exactly when it was with probing off
+minus the ones a login page answered for, asserted per service because two offsetting errors
+would satisfy a total; the aggregate adding back up; `probeGated` being deliberately one *more*
+than that, since it counts login pages and one belongs to a service already out of the count on
+its declaration; and no `auth.method`, `confidence`, `authProtected` or `byAuthMethod`
+differing between the two runs at all. **The switch**: that `withProbeEnabled` clones and
+leaves its input alone; that a `ScanCache` hands each build the request that started it and
+discards a coalescing caller's; that `meta.probe` states both what the build did and which of
+configuration or request decided it; and, through `app.inject`, that `{"probe":true}`,
+`{"probe":false}`, `{"probe":"yes"}`, an array, a JSON `null` and no body at all each land
+where they should. Those route cases run against `fixtures/auth`, which carries no route on
+anything — so `probe: true` is *observable* there while remaining incapable of sending a
+request, because a body that turns the probe on must never be a body that makes the test suite
+talk to the network.
+
+One assertion in that group is a rule about the whole vocabulary rather than about any stack:
+between them the fixture services must answer with **every** member of `PROBE_GATES`. The
+literal table proves each signal is reachable from some response; this proves the fleet
+exercises it end to end, so a new signal cannot be added with only a literal behind it.
 
 **The connection taxonomy** (§3.10) is asserted the same way, but without a fixture
 root: the classifiers are pure, so each is driven directly. Every transport code,
@@ -3488,6 +3695,34 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   outpost assignment is enforcement rather than intent, and a middleware in the
   proxy's runtime chain is the config it is demonstrably running — but it is still
   configuration. LabView never sends a request through a gate to see what happens.
+- **A login page the probe cannot recognise reads as an exposure — and that is the
+  direction the error has to run in.** Every gate rule fires on something present in the
+  response, so a page that gates by means no rule names is reported as exposed without
+  authentication. That is a false finding in the noisy direction, and it is the tolerable
+  one: a gate can only ever take a service *out* of the exposed count, so a rule loose
+  enough to catch the remaining cases would clear real exposures instead. Four known
+  misses, each left open deliberately:
+  - **A login shell rendered by script.** A single-page app that ships an empty
+    `<div id="root">` and builds its form in the browser has no form in the HTML, and
+    nothing else in the response distinguishes it from an open dashboard. There is no
+    headless browser and there will not be one — that is a different program.
+  - **A form past the body cap.** `MAX_BODY_BYTES` is 64 KiB and the read stops there, so
+    a login form below an inlined stylesheet or a base64 hero image is never seen. The cut
+    may also land inside a tag, in which case that element is simply not counted: a
+    partial read yields a partial shape, never an exception (I4), and both halves of that
+    are asserted (§8).
+  - **A login action nothing recognises as one.** `credential-form` needs a login-intent
+    marker, and one of the two is the form's action resolving onto a `LOGIN_PATHS` path.
+    NextAuth-style endpoints — `/api/auth/callback/email` and its neighbours — are outside
+    that list, so a magic-link form posting there, with no `one-time-code` field either,
+    looks exactly like a newsletter box. Adding an `/api/auth/` prefix would recognise it
+    and would also accept whatever else an app happens to serve under that path, which is
+    the trade the asymmetry above forbids on a likelihood.
+  - **The shape of a challenge page is never read.** `readGate` reads a body only on a
+    200. No exposure is missed by that — a 401 or 403 is already `challenge`, for a
+    stronger reason than any body could give — but `svc.probe.form` is absent for those
+    services even though a login form was served, so the drawer cannot say what the form
+    was made of.
 - **The proxy integration is Traefik-specific.** Another reverse proxy is still
   classified from its labels and simply not verified; there is no second client.
   Only `/api/rawdata` is used, with no fallback to the paginated granular endpoints,
@@ -3585,6 +3820,16 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   as this service's connections while saying nothing about this service at all.
 - **No history.** Every scan is a snapshot; nothing is persisted, so there is no
   drift detection or change log.
+- **The probe switch lasts one rescan, so probe results appear and then leave on their
+  own.** A timer rebuild passes no override and falls back to `probe.enabled`, which means
+  a fleet scanned with the switch on shows gates until the TTL expires and then shows the
+  configuration's answer again. This is mitigated rather than fixed: `meta.probe` states
+  what *this* build did and which of configuration or request decided it, and the checkbox
+  re-syncs from it on every overview, so the revert moves the switch instead of leaving it
+  claiming something untrue. The two ways to actually fix it are both worse — persisting a
+  runtime setting, when nothing else here is persisted (above), or letting one visitor's
+  click change what every later scan does, including scans nobody asked for. An operator
+  who wants probing on for good sets `probe.enabled` and gets it on every build.
 - **The Docker snapshot lists all containers**, including ones with no compose
   file under `appsRoot`; those simply do not match a service and are not reported.
 - **Sessions do not survive a restart.** There is no session store, and the revocation
@@ -3760,7 +4005,10 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | The probe is **opt-in, default off** — the only integration that is | Every other read goes to an address the operator configured; this one goes to services out of their own compose files, and where that address is a public hostname the request leaves the fleet. A scan that started dozens of outbound requests unasked would be doing something the operator did not ask for, however benign each request is. The Authentik read set the precedent for opt-in; this is the stronger case for it. |
 | Eligibility is **observable HTTP only**, never a port number or an image name | The request said "http/https services, not databases", and the only way to honour that without a heuristic is to require evidence: a tunnel route whose own `service:` origin is http/https, or a `traefik.http.routers.*` label. A service with `ports:` and no route yields no address at all — so nothing is ever sent at a database port, and the rule needs no list of ports or images to keep out of I2's way. The cost is real and stated: a LAN-only web UI stays inferred rather than measured. Guessing from `5432` would be a fleet-recognising heuristic that is wrong on the first service that moves its port. |
 | The LAN address is **configured**, not discovered | LabView runs in a container and cannot observe its host's LAN address. `probe.lanHost` is the operator's answer; empty means the LAN vantage is skipped, because a guessed host would produce connection failures that read as services being down. |
-| Only four signals count as a login page, and everything else leaves the finding standing | `readGate` can only ever take a service **out** of the exposed count, so a clause that is merely likely manufactures false comfort — the one thing this project exists to remove. Hence a challenge header is required for a 401 (a bare 401 is an API saying "not signed in" while its UI serves the whole app), a same-origin redirect must land on a login path (`/dashboard` is routing), and a password field must arrive on a 200 whose body was HTML. A finding a reader dismisses costs them a look; the reverse error costs them the exposure. |
+| Every signal that counts as a login page is a fact, and everything else leaves the finding standing | `readGate` can only ever take a service **out** of the exposed count, so a clause that is merely likely manufactures false comfort — the one thing this project exists to remove. Hence a challenge header is required for a 401 (a bare 401 is an API saying "not signed in" while its UI serves the whole app), a same-origin redirect must land on a login path (`/dashboard` is routing), a `<meta http-equiv="refresh">` is resolved through the same rule rather than trusted for existing, a `SAMLRequest` input counts because nothing but the SAML POST binding emits one, and a password field must arrive on a 200 whose body was HTML. A finding a reader dismisses costs them a look; the reverse error costs them the exposure. The signals grew from four to seven; the bar did not move. |
+| `credential-form` reads **several** facts at once, and it is the only gate that does | Passwordless sign-in — magic links, passkey-first pages — has no password field, no redirect and no hidden binding parameter. One-fact rules cannot see it at all, so a growing class of services that serve nothing but a login form was being counted as exposed. No single fact on such a page is sufficient either: a username field and a submit button are also a newsletter box, which is the default footer on a static site. So this one clause requires a username field, a submit button, and a login-intent marker — an action resolving onto a login path, or a `one-time-code` field — and `fixtures/probe/passwordless` carries the near-miss beside the real thing so the composite cannot drift into word-matching. `types.ts` used to say a fifth member would be an inference; that prose was rewritten to say which fact combination is admitted and why, rather than left to contradict the code. |
+| The switch overrides `probe.enabled` in **both** directions, not just off | A control the configuration can veto is a control that displays a state it does not have — the operator turns it on, nothing probes, and nothing on the page explains it. Full authority also makes the useful case work: trying probing once, on a fleet where it is off by default, without editing a file and restarting. The cost is stated rather than hidden (§7): when no login is configured, `POST /api/rescan` is unauthenticated, so any visitor can start a probing scan. The mitigation is the login, because the same visitor can already read the entire inventory — a narrower switch would protect nothing that `GET /api/overview` does not already give away. |
+| The override lasts one build, and the payload says what that build did | Sticky would mean either persisting a runtime setting, in a program that persists nothing, or letting one click decide what every later scan does — including timer scans nobody asked for, which is precisely the "outbound requests unasked" the default-off row exists to prevent. Per-build keeps the blast radius at one rescan and costs one visible oddity: the TTL expires and probe results leave on their own. `meta.probe` is what pays for it — it records whether *this* build probed and which of configuration or request decided it, and the checkbox re-syncs from it on every overview, so the revert moves the switch rather than leaving it lying (§11). |
 | A probe result joins `hasEdgeAuth`, where a declaration may not | They look alike — both remove a service from the count without naming a mechanism — and the difference is I1 exactly. A declaration is a claim nothing in the scan can check, so it stays a separate term. A probe result is something LabView observed, the same kind of fact as a middleware definition, so it belongs in the evidence term. What keeps it honest is the `unnamed-gate` discipline it borrows: its own counter, its own reason, `auth.method` untouched, and the count reconstructible with the term dropped. |
 | The walk **stops at the first address that answers** | An answer is an answer, whatever the status — a 401 is the best outcome available here — so continuing to a weaker vantage would spend requests to learn something less. Only a transport failure falls through, which is what makes the LAN vantage useful at all: a public hostname routinely does not resolve from inside the container. Vantage order is `INGRESS_KINDS` order, most-exposed first, so the answer a reader is shown is the one an outsider would get. |
 | "Did not answer" is a **third** outcome, never folded into "no login page" | They are the same absence of a gate and completely different findings: one measured an exposure, the other measured nothing. Folding them would let a firewalled service read as "answered, open" — or, worse in the other direction, a timeout read as protection. So it counts in neither statistic, `probeOutcome` words it as `No answer`, and its note claims no measurement. |

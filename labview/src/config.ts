@@ -506,6 +506,27 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   return cfg;
 }
 
+/**
+ * The same configuration with active probing forced on or off, as a new object.
+ *
+ * For the one setting a caller may decide per scan. `probe.enabled` is the operator's
+ * *default* — what a startup scan and every timer rebuild use — and this is how a single
+ * rescan is allowed to disagree with it.
+ *
+ * A **clone, never a mutation**, and that is the whole reason this exists as a function
+ * instead of an assignment at the call site. The scan cache coalesces callers onto one
+ * in-flight build, so at the moment a request arrives another build may already be holding
+ * this config and reading `probe.enabled` off it. Editing it in place would reach into that
+ * build and change its behaviour halfway through, which would make the run non-reproducible
+ * and the report untrue about itself (**I7**). Shallow at the top and fresh only for the
+ * `probe` block, because nothing else is being changed and the rest is read-only anyway.
+ *
+ * It cannot record *who* decided — see `ScanMeta.probe` and the note in `buildOverview`.
+ */
+export function withProbeEnabled(cfg: LabViewConfig, enabled: boolean): LabViewConfig {
+  return { ...cfg, probe: { ...cfg.probe, enabled } };
+}
+
 export function loadConfig(): LabViewConfig {
   const path = process.env.LABVIEW_CONFIG ?? "config.yml";
   let cfg = merge(DEFAULTS, {}) as LabViewConfig;

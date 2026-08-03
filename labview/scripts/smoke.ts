@@ -37,6 +37,7 @@ import type {
   DeclaredAuthMechanism,
   DockerState,
   IngressKind,
+  LoginFormShape,
   Overview,
   PortMapping,
   ProbeGate,
@@ -120,7 +121,7 @@ delete process.env.LABVIEW_SESSION_SECRET_FILE;
 delete process.env.LABVIEW_SESSION_TTL_MINUTES;
 delete process.env.LABVIEW_SESSION_COOKIE_NAME;
 
-const { loadConfig, retiredSettings } = await import("../src/config.js");
+const { loadConfig, retiredSettings, withProbeEnabled } = await import("../src/config.js");
 const { buildOverview } = await import("../src/analyze/index.js");
 // Used directly by the container-IP assertions: the trap is not reachable through the
 // pipeline, because a container IP only exists in live docker state and smoke runs
@@ -175,21 +176,30 @@ const {
 // dashboard that says "No proxy auth" about every internal database and gets believed.
 const { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } = await import("../src/model/auth.js");
 const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
-// The active probe's two rules — which addresses may be asked, and what counts as a login
-// page — plus the wording of an answer. In `src/` and asserted here for the reason the
-// module's own docstring gives: a rule that lived in the client doing the fetching could
-// only be tested by mocking the fetching, and the cap and the ordering need no fleet at
-// all to pin. The fixture root below then drives the same rules through the whole pipeline.
+// The active probe's three rules — which addresses may be asked, what counts as a login
+// page, and what a login form is made of — plus the wording of an answer. In `src/` and
+// asserted here for the reason the module's own docstring gives: a rule that lived in the
+// client doing the fetching could only be tested by mocking the fetching, and the cap and
+// the ordering need no fleet at all to pin. The fixture root below then drives the same
+// rules through the whole pipeline.
+//
+// `readLoginForm` is the third and is asserted hardest, because it is the only rule here
+// that reads several facts at once. Every other gate rests on a single unambiguous marker;
+// a composite can be talked into a false positive by a newsletter box, and a false positive
+// here removes a service from the exposed count.
 const {
   MAX_PROBE_TARGETS,
   PROBE_GATES,
   PROBE_VANTAGES,
   isHttpOrigin,
+  probeFormText,
   probeGateText,
   probeOutcome,
   probeTargets,
+  probeToggleText,
   probeVantageText,
   readGate,
+  readLoginForm,
 } = await import("../src/model/probe.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
@@ -544,6 +554,52 @@ const PROBE_APP_HTML = `<!doctype html><html><head><title>Dashboard</title></hea
 </body></html>`;
 
 /**
+ * A redirect written in markup instead of in a header — and its near miss.
+ *
+ * The two differ in one URL and nothing else, which is the whole rule: where the browser is
+ * being sent decides, exactly as it does for a `Location`. A `/dashboard` refresh is an
+ * application routing to its own landing page.
+ */
+const PROBE_REFRESH_LOGIN_HTML = `<!doctype html><html><head><title>Docs</title>
+<meta http-equiv="refresh" content="0; url=/login?next=%2F"></head>
+<body><p>Redirecting…</p></body></html>`;
+const PROBE_REFRESH_ROUTING_HTML = `<!doctype html><html><head><title>Home</title>
+<meta http-equiv="refresh" content="0; url=/dashboard"></head>
+<body><p>Redirecting…</p></body></html>`;
+
+/**
+ * The SAML POST binding, which defeats every other clause at once.
+ *
+ * No password field, no `Location`, and an `action` that leaves the origin — which the form
+ * rule refuses on purpose, since a hosted newsletter box has one too. The hidden
+ * `SAMLRequest` is all that is left, and it is a parameter name only the SAML binding emits.
+ */
+const PROBE_SAML_HTML = `<!doctype html><html><head><title>Redirecting</title></head>
+<body onload="document.forms[0].submit()">
+<form method="post" action="https://idp.probe.example.com/sso/post">
+<input type="hidden" name="SAMLRequest" value="PHNhbWxwOkF1dGhuUmVxdWVzdD4=">
+<input type="hidden" name="RelayState" value="/erp/">
+<noscript><input type="submit" value="Continue"></noscript></form></body></html>`;
+
+/**
+ * A magic-link login — and a newsletter box, which is the same three tags.
+ *
+ * Both have an email field and a submit button, so what separates them is the one thing the
+ * composite requires beyond a shape: a marker of intent. `magic` posts to `/login` on its own
+ * origin. `news` posts to somebody else's domain, which is not evidence of a login and is the
+ * false positive `readLoginForm` rejects a cross-origin action to avoid.
+ */
+const PROBE_PASSWORDLESS_HTML = `<!doctype html><html><head><title>Portal</title></head><body>
+<h1>Sign in</h1><form method="post" action="/login">
+<input type="email" name="email" autocomplete="username" required>
+<button type="submit">Email me a link</button></form></body></html>`;
+const PROBE_SIGNUP_HTML = `<!doctype html><html><head><title>News</title></head><body>
+<h1>Latest posts</h1><p>Nothing here is behind anything.</p>
+<form method="post" action="https://lists.example.net/subscribe/post">
+<input type="email" name="EMAIL" placeholder="you@example.com">
+<button type="submit">Subscribe</button></form></body></html>`;
+
+/**
  * Every address the fixture fleet answers at, keyed by the exact URL the probe builds.
  *
  * Keyed on the whole URL rather than the host, because the scheme and the trailing `/` are
@@ -577,6 +633,36 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
   "https://gated.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
   // Open, and declared as authenticating itself — the drift case.
   "https://portal.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
+  // Gated: a redirect to a login written in markup, so it arrives wearing a 200.
+  "https://docs.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_REFRESH_LOGIN_HTML,
+  },
+  // Open, and the trap for the rule above: a refresh to the application's own landing page.
+  "https://home.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_REFRESH_ROUTING_HTML,
+  },
+  // Gated: the SAML POST binding, on a TLS router so `https`.
+  "https://erp.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_SAML_HTML,
+  },
+  // Gated: a login page with no password on it.
+  "https://magic.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_PASSWORDLESS_HTML,
+  },
+  // Open, and the trap for the rule above: the same three tags, as a newsletter box.
+  "https://news.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_SIGNUP_HTML,
+  },
   // The LAN fallback. Its public hostname is absent from this table on purpose: the tunnel
   // name does not resolve from inside the fleet, so the walk falls through to the port.
   [`http://${PROBE_LAN_HOST}:18099/`]: {
@@ -4271,6 +4357,30 @@ const gateCases: { name: string; res: ProbeResponse; gate: ProbeGate | undefined
     gate: "password-form",
   },
   {
+    // Two things at once, and both are why this clause is read across the whole page rather
+    // than inside a form. The WHATWG token is what a custom widget writes instead of
+    // `type="password"`, and a client-rendered login screen often has no `<form>` at all —
+    // so a form-scoped rule would lose the gate on a page that is nothing but a login.
+    name: "...including the autocomplete token, on a page with no form element at all",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<div id=app><input autocomplete="current-password" data-v-1><div role=button>Sign in</div></div>`,
+    },
+    gate: "password-form",
+  },
+  {
+    // `new-password` is a registration form. Reading it as a gate would clear an open signup
+    // page, which is the opposite of protection.
+    name: "...but not the new-password token, which is a signup",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<input autocomplete="new-password"><input autocomplete="new-password">`,
+    },
+    gate: undefined,
+  },
+  {
     name: "a homepage that says `Sign in` and asks for nothing is not a login page",
     res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_APP_HTML },
     gate: undefined,
@@ -4288,6 +4398,114 @@ const gateCases: { name: string; res: ProbeResponse; gate: ProbeGate | undefined
     res: { requestUrl: "https://a.example.com/", status: 401, body: PROBE_LOGIN_HTML },
     gate: undefined,
   },
+  {
+    name: "a 200 that meta-refreshes to a login path is a redirect written in markup",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_REFRESH_LOGIN_HTML },
+    gate: "meta-refresh-login",
+  },
+  {
+    name: "...and one leaving the origin is a hand-off, exactly as a Location would be",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<meta http-equiv=refresh content="0;url=https://sso.example.com/start">`,
+    },
+    gate: "meta-refresh-login",
+  },
+  {
+    name: "a refresh to a landing page is the application routing itself",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_REFRESH_ROUTING_HTML },
+    gate: undefined,
+  },
+  {
+    // The `content` is `<seconds>` alone, which reloads this same page. A live dashboard
+    // does it every 30s, and reading it as a gate would clear every one of them.
+    name: "...and a refresh with no url= is a page reloading itself on a timer",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<meta http-equiv="refresh" content="30"><h1>Grafana</h1>`,
+    },
+    gate: undefined,
+  },
+  {
+    name: "...nor does a meta tag that is not a refresh point anywhere",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<meta name="description" content="url=/login">`,
+    },
+    gate: undefined,
+  },
+  {
+    name: "a hidden SAMLRequest is the POST binding and needs no second fact",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_SAML_HTML },
+    gate: "sso-form",
+  },
+  {
+    name: "...as is the SAMLResponse half of the same exchange",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<form method=post><input type=hidden name=SAMLResponse value=x></form>`,
+    },
+    gate: "sso-form",
+  },
+  {
+    // The composite: an email field, a submit button and a login-path action, with no
+    // password anywhere. This is the entire class `password-form` cannot see.
+    name: "a passwordless login form is a gate when something marks it as a login",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_PASSWORDLESS_HTML },
+    gate: "credential-form",
+  },
+  {
+    name: "...and a one-time-code field is that marker too, with no action to read",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<form><input name=user><input autocomplete="one-time-code"><button>Verify</button></form>`,
+    },
+    gate: "credential-form",
+  },
+  {
+    // The trap. `name="EMAIL"` is a username word and the button submits, so the shape is
+    // there — what is missing is any sign the form is a login, and a cross-origin action is
+    // not one. Loosening this clause clears an exposure for every site with a footer box.
+    name: "a newsletter box posting off-origin is not a login form",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_SIGNUP_HTML },
+    gate: undefined,
+  },
+  {
+    name: "...nor is one posting to /subscribe on this very origin",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<form action="/subscribe"><input type=email name=email><button>Join</button></form>`,
+    },
+    gate: undefined,
+  },
+  {
+    // Both halves of the shape, on one form, with no marker — the case a reader will want
+    // to inspect, which is why the shape is still reported on the probe result.
+    name: "...nor a username and a button with nothing at all to say what they are for",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<form><input name=username><button type=submit>Go</button></form>`,
+    },
+    gate: undefined,
+  },
+  {
+    // Two forms, and the parts of a login split across them. Page-wide matching would
+    // hold the search box and the mailing-list button up together as a login page.
+    name: "...and parts spread across two forms are two forms, not one login",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<form action="/login"><input name=email></form><form action="/x"><button>Go</button></form>`,
+    },
+    gate: undefined,
+  },
 ];
 for (const c of gateCases) {
   check(c.name, readGate(c.res) === c.gate, `got ${String(readGate(c.res))}, wanted ${String(c.gate)}`);
@@ -4303,6 +4521,138 @@ check(
   `${gateCases.filter((c) => c.gate === undefined).length} near misses, ${PROBE_GATES.length} signals`,
 );
 
+console.log("\nwhat a login form is made of");
+/*
+ * The composition rule on its own, not only through the gate that consults it.
+ *
+ * Two reasons it earns its own table. It is the one rule here that reads several facts at
+ * once, so the interesting cases are the ones where some parts are present and some are
+ * not — a gate assertion collapses all of those to `undefined` and cannot tell a form with
+ * two parts from no form at all. And the shape is reported on every probed 200, gate or no
+ * gate, so it is what a reader inspects when they want to check a verdict rather than
+ * accept it.
+ *
+ * `PUSO` reads password / username / submit / otp, then the action if one qualified.
+ */
+function shapeKey(s: LoginFormShape | undefined): string {
+  if (!s) return "(no form)";
+  const parts = `${s.password ? "P" : "-"}${s.username ? "U" : "-"}${s.submit ? "S" : "-"}${s.otp ? "O" : "-"}`;
+  return `${parts} ${s.action ?? "(no login action)"}`;
+}
+const formCases: { name: string; body: string; want: string }[] = [
+  {
+    name: "a whole login form is read part by part",
+    body: PROBE_LOGIN_HTML,
+    want: "PUS- /login",
+  },
+  {
+    name: "a magic-link form has every part but the password",
+    body: PROBE_PASSWORDLESS_HTML,
+    want: "-US- /login",
+  },
+  {
+    // The shape is still reported, which is the point: the reader sees a username and a
+    // button and no login action, and can see for themselves why nothing was concluded.
+    name: "a newsletter box is a shape, and reporting it is how the trap stays visible",
+    body: PROBE_SIGNUP_HTML,
+    want: "-US- (no login action)",
+  },
+  {
+    name: "a page with no form at all yields nothing rather than an empty shape",
+    body: PROBE_APP_HTML,
+    want: "(no form)",
+  },
+  {
+    // An `<input>` with no `type` is a text field and a `<button>` with none submits, both
+    // by the HTML default. Requiring the attributes would miss most hand-written markup.
+    name: "the HTML defaults count: a typeless input is text, a typeless button submits",
+    body: `<form action="/signin"><input name="user"><button>Continue</button></form>`,
+    want: "-US- /signin",
+  },
+  {
+    name: "the WHATWG autocomplete tokens are read as the fields they name",
+    body: `<form><input autocomplete="username"><input autocomplete="current-password"></form>`,
+    want: "PU-- (no login action)",
+  },
+  {
+    // `new-password` is a signup or a password change. Neither is a gate in front of an
+    // application, and treating it as one would clear a wide-open registration page.
+    name: "...but new-password is a signup, and is not a password field",
+    body: `<form action="/login"><input autocomplete="new-password"><button>Register</button></form>`,
+    want: "--S- /login",
+  },
+  {
+    name: "a one-time-code field is recognised on its own",
+    body: `<form><input autocomplete="one-time-code" inputmode="numeric"></form>`,
+    want: "---O (no login action)",
+  },
+  {
+    // The reason `q`, `search` and `query` are absent from the vocabulary.
+    name: "a site search is a text input and a button, and names nobody",
+    body: `<form action="/search"><input type="text" name="q"><button>Search</button></form>`,
+    want: "--S- (no login action)",
+  },
+  {
+    // Substring matching, because real markup writes compound names.
+    name: "...while compound names are matched as the words inside them",
+    body: `<form><input type="text" id="login_email"></form>`,
+    want: "-U-- (no login action)",
+  },
+  {
+    // Ordering, not thresholds: the password form wins over the mailing-list box whichever
+    // way round the page puts them, so one page yields one answer (I7).
+    name: "the most login-like form on a page wins, whatever the source order",
+    body: `<form action="/x"><input type=email name=email><button>Join</button></form>
+<form action="/login"><input type=password></form>`,
+    want: "P--- /login",
+  },
+  {
+    // Bodies are cut at MAX_BODY_BYTES, so a large login page arrives with its form opened
+    // and never closed. Reading the tail is the difference between measuring a truncated
+    // login page and reporting that it had none — and the latter would remove a gate.
+    name: "a form the body cap cut off is still read, from the tail",
+    body: `<html><body><form action="/login"><input type="password" name="pw">`,
+    want: "P--- /login",
+  },
+  {
+    // The other half of I4: a cut that lands *inside* a tag leaves nothing readable, and
+    // the flag is false rather than guessed. False here leaves the exposure standing.
+    name: "...and a cut that lands mid-tag reads as absent, not as present",
+    body: `<html><body><form action="/login"><input type="password" name="pw`,
+    want: "---- /login",
+  },
+  {
+    name: "a cross-origin action is not a login action, however login-like the path",
+    body: `<form action="https://idp.example.net/login"><input name=user><button>Go</button></form>`,
+    want: "-US- (no login action)",
+  },
+];
+for (const c of formCases) {
+  const got = shapeKey(readLoginForm(c.body, "https://a.example.com/"));
+  check(c.name, got === c.want, `got ${got}, wanted ${c.want}`);
+}
+check(
+  "the drawer's sentence names the parts it found and nothing it did not",
+  probeFormText({ password: true, username: true, submit: true, otp: false }) ===
+    "The page carried a form with a password field, a username field and a submit button.",
+  probeFormText({ password: true, username: true, submit: true, otp: false }),
+);
+check(
+  "...and names the action, because that is the marker the composite verdict rests on",
+  probeFormText({ password: false, username: true, submit: true, otp: true, action: "/login" }) ===
+    "The page carried a form with a username field, a one-time-code field, a submit button and an action of /login.",
+  probeFormText({ password: false, username: true, submit: true, otp: true, action: "/login" }),
+);
+check(
+  // `readLoginForm` never returns this shape — a form with no recognisable part ranks zero
+  // and is dropped — but the wording rule is total on its own type, so the empty case says
+  // something rather than trailing off into "a form with .".
+  "...and does not produce a sentence with nothing in it, whatever it is handed",
+  probeFormText({ password: false, username: false, submit: false, otp: false }) ===
+    "The page carried a form with none of the parts a login form is made of.",
+  probeFormText({ password: false, username: false, submit: false, otp: false }),
+);
+
 /* -------------------------------------------------------------------------- */
 /* The stage, off                                                             */
 /* -------------------------------------------------------------------------- */
@@ -4313,13 +4663,13 @@ const idleProbe = probeStub();
 const unasked = await overviewFor(probeRoot, { fetchImpl: idleProbe.fetchImpl });
 const pbSvcOff = lookup(unasked);
 check(
-  "found 11 stacks, 14 services",
-  unasked.stats.stacks === 11 && unasked.stats.services === 14,
+  "found 14 stacks, 19 services",
+  unasked.stats.stacks === 14 && unasked.stats.services === 19,
   `${unasked.stats.stacks}/${unasked.stats.services}`,
 );
 check(
-  "...11 of which are reachable without detected authentication before anything is asked",
-  unasked.stats.exposedWithoutAuth === 11,
+  "...16 of which are reachable without detected authentication before anything is asked",
+  unasked.stats.exposedWithoutAuth === 16,
   String(unasked.stats.exposedWithoutAuth),
 );
 check("not one request was sent", idleProbe.calls.length === 0, idleProbe.calls.map((c) => c.url).join(" "));
@@ -4375,7 +4725,7 @@ const probeFlat = (ov: Overview): [string, Service][] =>
   ov.stacks.flatMap((st) => st.services.map((s) => [`${st.id}/${s.name}`, s] as [string, Service]));
 
 console.log("\na login page answering is protection LabView measured");
-// Each of the four signals, once, through the whole pipeline rather than on a literal: the
+// Each of the seven signals, once, through the whole pipeline rather than on a literal: the
 // stub answers as the service, the rule reads it, and the verdict changes.
 check(
   "a tunnel service served its own login form",
@@ -4409,17 +4759,58 @@ check(
   result("own-login", "wiki").gate === "redirect-login",
   JSON.stringify(result("own-login", "wiki")),
 );
-// The verdict, for all four at once, and the two halves of it that must not merge.
-const gatedFour = [
+// The three signals a 200 can carry besides a password field. Each is here because a real
+// class of service is invisible to the other six, and each is asserted through the pipeline
+// so that reverting its clause in `readGate` fails the run rather than the table alone.
+check(
+  "a service that answered 200 and told the browser to go to a login was read as a redirect",
+  result("meta-refresh", "docs").gate === "meta-refresh-login" &&
+    result("meta-refresh", "docs").status === 200,
+  JSON.stringify(result("meta-refresh", "docs")),
+);
+check(
+  "a service that answered with a SAML POST binding handed the request to an identity provider",
+  result("saml-post", "erp").gate === "sso-form" &&
+    result("saml-post", "erp").endpoint === "https://erp.probe.example.com",
+  JSON.stringify(result("saml-post", "erp")),
+);
+check(
+  "a service whose login page has no password on it is still behind a login page",
+  result("passwordless", "magic").gate === "credential-form",
+  JSON.stringify(result("passwordless", "magic")),
+);
+check(
+  // The composite is the one verdict a reader is most likely to want to check, so the shape
+  // it rests on travels with it — the action in particular, which is the marker.
+  "...and the form it rests on is reported with it, so the verdict can be checked",
+  result("passwordless", "magic").form?.action === "/login" &&
+    result("passwordless", "magic").form?.username === true &&
+    result("passwordless", "magic").form?.submit === true &&
+    result("passwordless", "magic").form?.password === false,
+  JSON.stringify(result("passwordless", "magic").form),
+);
+// The verdict, for all seven at once, and the two halves of it that must not merge.
+const gatedAll = [
   pbSvc("tunnel-login", "app"),
   pbSvc("proxy-challenge", "api"),
   pbSvc("sso-redirect", "crm"),
   pbSvc("own-login", "wiki"),
+  pbSvc("meta-refresh", "docs"),
+  pbSvc("saml-post", "erp"),
+  pbSvc("passwordless", "magic"),
 ];
 check(
-  "all four stop counting as reachable without authentication",
-  gatedFour.every((s) => s.auth.exposedWithoutAuth === false),
-  gatedFour.filter((s) => s.auth.exposedWithoutAuth).map((s) => s.name).join(", "),
+  "all seven stop counting as reachable without authentication",
+  gatedAll.every((s) => s.auth.exposedWithoutAuth === false),
+  gatedAll.filter((s) => s.auth.exposedWithoutAuth).map((s) => s.name).join(", "),
+);
+check(
+  // The table above proves each member is reachable from *some* response. This proves the
+  // fixture fleet exercises every one of them end to end, so a new signal cannot be added
+  // with only a literal behind it.
+  "...and between them the fixture fleet answers with every signal in the vocabulary",
+  PROBE_GATES.every((g) => probeFlat(probed).some(([, s]) => s.probe?.gate === g)),
+  PROBE_GATES.filter((g) => !probeFlat(probed).some(([, s]) => s.probe?.gate === g)).join(", ") || "(all)",
 );
 // A response is evidence of a gate and never a name for one, so neither half of the posture
 // moves: not `method`, and not `confidence` either. `observed` is what a service with nothing
@@ -4427,19 +4818,19 @@ check(
 // scan knows which mechanism answered, which is the one thing it cannot know.
 check(
   "...and none of them acquired a mechanism, because a response cannot name one",
-  gatedFour.every((s) => s.auth.method === "none" && s.auth.confidence === "observed"),
-  gatedFour.map((s) => `${s.name}=${s.auth.method}/${s.auth.confidence}`).join(" "),
+  gatedAll.every((s) => s.auth.method === "none" && s.auth.confidence === "observed"),
+  gatedAll.map((s) => `${s.name}=${s.auth.method}/${s.auth.confidence}`).join(" "),
 );
 check(
   "...so the reason a reader is given is the measurement, not a gate that was never found",
-  gatedFour.every((s) => noAuthReason(s) === "probed-gate"),
-  gatedFour.map((s) => `${s.name}=${String(noAuthReason(s))}`).join(" "),
+  gatedAll.every((s) => noAuthReason(s) === "probed-gate"),
+  gatedAll.map((s) => `${s.name}=${String(noAuthReason(s))}`).join(" "),
 );
 check(
   "...and it says which address answered and that the mechanism is unknown",
-  gatedFour.every((s) => /LabView requested https?:\/\/\S+ and was answered with a login page/.test(noteText(s))) &&
-    noteText(gatedFour[0]!).includes("Which mechanism is behind that page is unknown"),
-  noteText(gatedFour[0]!),
+  gatedAll.every((s) => /LabView requested https?:\/\/\S+ and was answered with a login page/.test(noteText(s))) &&
+    noteText(gatedAll[0]!).includes("Which mechanism is behind that page is unknown"),
+  noteText(gatedAll[0]!),
 );
 // `own-login/wiki` declares the same login the probe found, so both reasons are true of it.
 // The measured one is what a reader hears: a declaration is taken on trust and a login page
@@ -4496,6 +4887,37 @@ check(
     noAuthReason(pbSvc("open-app", "routing")) === "gap",
   `${String(result("open-app", "routing").gate)} / ${String(noAuthReason(pbSvc("open-app", "routing")))}`,
 );
+/*
+ * The two traps, and the reason the new fixtures come in pairs.
+ *
+ * Each of these differs from a service the probe just cleared in one detail, and each is a
+ * shape real services answer with by the thousand. A rule that fired on them would be
+ * removing wide-open applications from the exposed count on the strength of a redirect to
+ * content and a newsletter box in a footer — the failure mode that costs a reader something,
+ * as against a finding they dismiss in a glance.
+ */
+check(
+  "a 200 that refreshes to the application's own landing page is routing, not a gate",
+  pbSvc("meta-refresh", "home").auth.exposedWithoutAuth === true &&
+    result("meta-refresh", "home").gate === undefined,
+  `exposed=${pbSvc("meta-refresh", "home").auth.exposedWithoutAuth} gate=${String(result("meta-refresh", "home").gate)}`,
+);
+check(
+  "a newsletter signup is a username field and a button, and clears nothing",
+  pbSvc("passwordless", "news").auth.exposedWithoutAuth === true &&
+    result("passwordless", "news").gate === undefined,
+  `exposed=${pbSvc("passwordless", "news").auth.exposedWithoutAuth} gate=${String(result("passwordless", "news").gate)}`,
+);
+check(
+  // The shape is reported even though it cleared nothing, and this is the case that makes
+  // that worth doing: a reader looking at an exposure finding can see the form LabView found
+  // and see for themselves that no action on a login path went with it.
+  "...and its shape is still reported, with no login action to justify a verdict",
+  result("passwordless", "news").form?.username === true &&
+    result("passwordless", "news").form?.submit === true &&
+    result("passwordless", "news").form?.action === undefined,
+  JSON.stringify(result("passwordless", "news").form),
+);
 
 console.log("\na read that may not have gone through a gate does not supersede the gate");
 // The `chainComplete` rule in another guise. LabView asked from inside the fleet, where the
@@ -4528,7 +4950,7 @@ check(
 );
 check(
   "it counts in neither of the two counters",
-  probed.stats.probeGated + probed.stats.probeOpen === 9,
+  probed.stats.probeGated + probed.stats.probeOpen === 14,
   `${probed.stats.probeGated} gated + ${probed.stats.probeOpen} open`,
 );
 check(
@@ -4572,6 +4994,75 @@ check(
   new Set(PROBE_VANTAGES.map(probeVantageText)).size === PROBE_VANTAGES.length &&
     PROBE_VANTAGES.every((v) => probeVantageText(v).length > 0),
   PROBE_VANTAGES.map((v) => `${v}=${probeVantageText(v).slice(0, 20)}`).join(" | "),
+);
+check(
+  // `GATE_TEXT` being an exhaustive record makes an unworded signal a compile error, which
+  // is most of the job. What it cannot catch is two signals worded the same way — and a
+  // reader who sees "Login form served" on a SAML hand-off has been told something false.
+  "every signal is worded, and no two of them are worded alike",
+  new Set(PROBE_GATES.map((g) => probeGateText(g).label)).size === PROBE_GATES.length &&
+    new Set(PROBE_GATES.map((g) => probeGateText(g).title)).size === PROBE_GATES.length &&
+    PROBE_GATES.every((g) => probeGateText(g).label.length > 0 && probeGateText(g).title.length > 0),
+  PROBE_GATES.map((g) => `${g}=${probeGateText(g).label}`).join(" | "),
+);
+
+console.log("\nwhether the probe ran is part of the payload, not something a reader infers");
+/*
+ * The switch beside Rescan makes "did this scan probe?" a question with two answers, and the
+ * dashboard is where they are told apart. So the build states what it did, always — the same
+ * reasoning `connections` rests on: silence is indistinguishable from a read that found
+ * nothing, and here it would be indistinguishable from a fleet with no login pages in it.
+ *
+ * `source` matters for one reason and it is a scoping reason: the override lasts for one
+ * rescan, so a TTL rebuild reverts to configuration on its own, and a reader who was not told
+ * which of the two decided the scan they are looking at would read the revert as a bug.
+ */
+check(
+  "a build with the probe off says so, and names the configuration as what decided it",
+  unasked.meta.probe.enabled === false && unasked.meta.probe.source === "config",
+  JSON.stringify(unasked.meta.probe),
+);
+check(
+  "...and a build that probed says that, still crediting the configuration when nobody asked",
+  probed.meta.probe.enabled === true && probed.meta.probe.source === "config",
+  JSON.stringify(probed.meta.probe),
+);
+// The tooltip. Wording, and therefore in `src/` and asserted here — a switch that sends
+// requests at somebody's fleet has to say so before it is flipped, not after.
+const toggleOff = probeToggleText({ enabled: false, source: "config" });
+check(
+  "the switch says what flipping it does, and that the requests leave the fleet",
+  /sends requests to the scanned services/.test(toggleOff) && /leave the fleet/.test(toggleOff),
+  toggleOff,
+);
+check(
+  "...and that it applies to the next Rescan and to nothing else",
+  /applies to the next Rescan and to nothing else/.test(toggleOff) && /goes back to the configured value/.test(toggleOff),
+  toggleOff,
+);
+check(
+  // Four endings, and the distinction the last two draw is the one that keeps a reverted
+  // override from looking like a broken switch: "and the configuration has probing off" is a
+  // different sentence from "because this switch asked it to".
+  "...and ends with what the scan on screen did, which is not always what the switch says",
+  toggleOff.endsWith("The scan on screen did not probe and the configuration has probing off.") &&
+    probeToggleText({ enabled: true, source: "config" }).endsWith(
+      "The scan on screen probed because the configuration has probing on.",
+    ) &&
+    probeToggleText({ enabled: true, source: "request" }).endsWith(
+      "The scan on screen probed because this switch asked it to.",
+    ) &&
+    probeToggleText({ enabled: false, source: "request" }).endsWith(
+      "The scan on screen did not probe because this switch asked it to.",
+    ),
+  [
+    { enabled: false, source: "config" } as const,
+    { enabled: true, source: "config" } as const,
+    { enabled: true, source: "request" } as const,
+    { enabled: false, source: "request" } as const,
+  ]
+    .map((r) => probeToggleText(r).split(" ").slice(-6).join(" "))
+    .join(" | "),
 );
 
 console.log("\na measurement against a declaration that was holding a finding back");
@@ -4668,17 +5159,17 @@ check(
   probeCalls.filter((u, i) => probeCalls.indexOf(u) !== i).join(" "),
 );
 /*
- * The total, spelled out as the sum it is. Ten eligible services get one request each, and
- * exactly one of them — `lan-fallback/vault`, whose public hostname does not resolve — gets a
- * second from the next vantage. `silent/ghost` does *not* get a second: it also fails, but it
- * publishes no port, so there is no LAN address to fall through to. That asymmetry is the
- * assertion worth having here, because "walk the vantages until one answers" and "walk them
- * all" produce the same verdicts on this root and differ only in this number.
+ * The total, spelled out as the sum it is. Fifteen eligible services get one request each,
+ * and exactly one of them — `lan-fallback/vault`, whose public hostname does not resolve —
+ * gets a second from the next vantage. `silent/ghost` does *not* get a second: it also fails,
+ * but it publishes no port, so there is no LAN address to fall through to. That asymmetry is
+ * the assertion worth having here, because "walk the vantages until one answers" and "walk
+ * them all" produce the same verdicts on this root and differ only in this number.
  */
 const eligibleCount = probeFlat(probed).filter(([, s]) => s.probe !== undefined).length;
 check(
-  "11 requests: one for each of the 10 eligible services, plus one fallthrough",
-  eligibleCount === 10 && probeCalls.length === 11,
+  "16 requests: one for each of the 15 eligible services, plus one fallthrough",
+  eligibleCount === 15 && probeCalls.length === 16,
   `${eligibleCount} eligible, ${probeCalls.length} requests: ${probeCalls.join(" ")}`,
 );
 
@@ -4712,15 +5203,15 @@ const removedByProbe = probeFlat(probed).filter(
   ([k, s]) => s.probe?.gate && offExposed.get(k) === true,
 ).length;
 check(
-  "...so the aggregate adds back up: 7 exposed + 4 the probe removed = the 11 counted with it off",
-  probed.stats.exposedWithoutAuth === 7 &&
-    removedByProbe === 4 &&
+  "...so the aggregate adds back up: 9 exposed + 7 the probe removed = the 16 counted with it off",
+  probed.stats.exposedWithoutAuth === 9 &&
+    removedByProbe === 7 &&
     probed.stats.exposedWithoutAuth + removedByProbe === unasked.stats.exposedWithoutAuth,
   `${probed.stats.exposedWithoutAuth} + ${removedByProbe} vs ${unasked.stats.exposedWithoutAuth}`,
 );
 check(
   "...and `probeGated` counts login pages, which is one more — the service already declared",
-  probed.stats.probeGated === 5 && probed.stats.probeGated === removedByProbe + 1,
+  probed.stats.probeGated === 8 && probed.stats.probeGated === removedByProbe + 1,
   `${probed.stats.probeGated} gated, ${removedByProbe} removed`,
 );
 const offPosture = new Map(probeFlat(unasked).map(([k, s]) => [k, `${s.auth.method}/${s.auth.confidence}`]));
@@ -4748,7 +5239,7 @@ check(
 );
 check(
   "...and says what it found, in counts",
-  probeConn.read === "10 services probed — 5 gated, 4 open, 1 did not answer",
+  probeConn.read === "15 services probed — 8 gated, 6 open, 1 did not answer",
   probeConn.read ?? "no read line",
 );
 check(
@@ -5400,6 +5891,57 @@ const retried = h.cache.get(false);
 check("...and the next caller tries again", h.started === 7);
 await h.finish("scan-7");
 check("...successfully", (await retried) === "scan-7");
+
+console.log("\na per-rescan override travels with the caller that started the build");
+/*
+ * The login-probe switch is a value one click carries, and the cache is a thing that answers
+ * several callers with one build. The two meet here, and the reason the value is a parameter
+ * of `build` rather than a field somewhere is exactly this test: shared mutable state would
+ * let whichever caller wrote last decide what a build already in flight does, so a passive
+ * timer rebuild could consume a click's override — or a click's override could ride along on
+ * a passive rebuild and probe the fleet with nobody having asked.
+ *
+ * A coalescing caller's own value is therefore *discarded*, deliberately and visibly. That
+ * is a real limitation rather than a tidy one, and it is why the payload states what the
+ * build on screen actually did instead of leaving a reader to assume the switch decided it.
+ */
+const reqs: Array<{ probe?: boolean } | undefined> = [];
+const overrideWaiting: Array<(v: string) => void> = [];
+let overrideClock = 1_000;
+const overrideCache = createScanCache<string, { probe?: boolean }>({
+  ttlMs: 5_000,
+  now: () => overrideClock,
+  build: (req) => {
+    reqs.push(req);
+    return new Promise<string>((ok) => overrideWaiting.push(ok));
+  },
+});
+const finishOverride = (v: string) => {
+  const ok = overrideWaiting.shift();
+  if (!ok) throw new Error("no build is waiting — the assertion would be vacuous");
+  ok(v);
+  return settle();
+};
+
+const askedOn = overrideCache.get(true, { probe: true });
+check("the value the caller passed is the value the build is handed", reqs.length === 1 && reqs[0]?.probe === true, JSON.stringify(reqs));
+const tagAlong = overrideCache.get(true, { probe: false });
+check(
+  "...and a caller that coalesced onto it did not start a second build with its own",
+  reqs.length === 1,
+  JSON.stringify(reqs),
+);
+await finishOverride("probed");
+check("both are answered by the build that ran", (await askedOn) === "probed" && (await tagAlong) === "probed");
+overrideClock += 6_000;
+const timerRebuild = overrideCache.get(false, {});
+check(
+  "a rebuild nobody clicked carries no override at all, so it falls back to the configuration",
+  reqs.length === 2 && reqs[1]?.probe === undefined,
+  JSON.stringify(reqs),
+);
+await finishOverride("configured");
+check("...and that is what the next reader sees", (await timerRebuild) === "configured");
 
 console.log("\nwhat a rescan found, compared over the parsed configuration");
 
@@ -6944,6 +7486,44 @@ console.log("\nthe posture comes from the file, read as configured");
   clearPasswdCache();
 }
 
+console.log("\nan override is a copy of the configuration, never an edit to it");
+{
+  /*
+   * A one-line function with one rule, and the rule is the whole reason it exists: the
+   * configuration object outlives the rescan that overrode it. It is captured by the cache's
+   * build closure, read again by the next timer rebuild, and — the case that decides this —
+   * still being read by a build already in flight when the click arrives.
+   *
+   * So a mutation is not untidiness here. `probe.enabled = true` written into the shared
+   * object would make one click turn probing on *permanently*, for every later scan, with
+   * nobody having asked and nothing on screen to say so: precisely the outcome the switch's
+   * per-rescan scope was chosen to avoid. It would also break I7, since the same
+   * configuration would then produce different scans depending on what had been clicked.
+   */
+  const base = loadConfig();
+  const asked = withProbeEnabled(base, true);
+  check(
+    "the copy carries the new value",
+    asked.probe.enabled === true,
+    String(asked.probe.enabled),
+  );
+  check(
+    "...and the configuration it was made from is untouched, so the next rebuild sees the operator's value",
+    base.probe.enabled === false && asked !== base && asked.probe !== base.probe,
+    `base=${base.probe.enabled} sameObject=${asked === base} sameProbe=${asked.probe === base.probe}`,
+  );
+  check(
+    "...and nothing else about the configuration moved with it",
+    JSON.stringify({ ...asked, probe: base.probe }) === JSON.stringify(base),
+    JSON.stringify({ ...asked, probe: base.probe }),
+  );
+  check(
+    "turning it off is the same operation, not a special case",
+    withProbeEnabled(asked, false).probe.enabled === false && asked.probe.enabled === true,
+    `${withProbeEnabled(asked, false).probe.enabled} / ${asked.probe.enabled}`,
+  );
+}
+
 console.log("\nsettings LabView no longer reads");
 {
   // The four `*_FILE` variables and their config-file keys are recognised for one purpose:
@@ -7336,8 +7916,16 @@ console.log("\nthe gate itself, driven through real requests");
     return {
       get: (url: string, extra: Record<string, string> = {}) =>
         app.inject({ method: "GET", url, headers: { host: HOST, ...extra } }),
-      post: (url: string, payload: Record<string, unknown>, extra: Record<string, string> = {}) =>
-        app.inject({ method: "POST", url, payload, headers: { host: HOST, ...extra } }),
+      // `payload` is optional because a body-less POST is a case worth injecting: every
+      // client of `/api/rescan` sent one before it took a body, and they must keep working.
+      // A string payload goes through verbatim, which is how a body that is valid JSON but
+      // not an object — `null`, `[]`, `"probe"` — can be put in front of the validator.
+      post: (url: string, payload?: string | object, extra: Record<string, string> = {}) => {
+        const headers = { host: HOST, ...extra };
+        return payload === undefined
+          ? app.inject({ method: "POST", url, headers })
+          : app.inject({ method: "POST", url, headers, payload });
+      },
     };
   }
 
@@ -7570,6 +8158,71 @@ console.log("\nthe gate itself, driven through real requests");
   check("an unknown API path is a 404 again once nothing is enforced", openMissing.statusCode === 404, String(openMissing.statusCode));
 
   await open.app.close();
+
+  // ---- the one request in LabView that decides anything ---------------------------
+  //
+  // `POST /api/rescan` takes a body, and it is the only writable thing in this API. Driven
+  // through `app.inject` rather than through `readScanRequest` alone because the interesting
+  // failures are all above that function: a body Fastify did not parse, a value that reaches
+  // the validator and then not the build, a `source` nobody set.
+  //
+  // Against `fixtures/auth`, which carries no route on anything — so `probe: true` is
+  // *observable* here while remaining incapable of sending a request. A body that turns the
+  // probe on must never be a body that makes this test suite talk to the network.
+  process.env.LABVIEW_APPS_ROOT = authRoot;
+  probeEnv({});
+  const rescanApp = await buildApp(loadConfig(), { now: () => T0 });
+  const rc = driver(rescanApp.app);
+  const JSON_BODY = { "content-type": "application/json" };
+  const probeOf = async (body?: string | object): Promise<string> => {
+    const res = await rc.post("/api/rescan", body, typeof body === "string" ? JSON_BODY : {});
+    const meta = (res.json() as Overview).meta.probe;
+    return `${res.statusCode} ${meta.enabled} ${meta.source}`;
+  };
+
+  check("a rescan with no body at all behaves as it always did: configuration decides", (await probeOf()) === "200 false config", await probeOf());
+  check(
+    "a body asking for the probe turns it on for that build, and says a request decided",
+    (await probeOf({ probe: true })) === "200 true request",
+    await probeOf({ probe: true }),
+  );
+  check(
+    // The direction that matters more. An operator with probing on in `config.yml` who wants
+    // one quiet rescan has no other way to ask, and `false` reaching the build as `undefined`
+    // would silently ignore them.
+    "...and one asking for it off turns it off, which is the half a default cannot express",
+    (await probeOf({ probe: false })) === "200 false request",
+    await probeOf({ probe: false }),
+  );
+  check(
+    "a probe that is not a boolean is not an answer, so configuration decides again",
+    (await probeOf({ probe: "yes" })) === "200 false config",
+    await probeOf({ probe: "yes" }),
+  );
+  check(
+    "...and neither is an array, an unknown key, or a JSON null where an object goes",
+    (await probeOf([true])) === "200 false config" &&
+      (await probeOf({ probing: true })) === "200 false config" &&
+      (await probeOf("null")) === "200 false config",
+    `${await probeOf([true])} / ${await probeOf({ probing: true })} / ${await probeOf("null")}`,
+  );
+  // The consequence of the override being per-request, stated as an assertion rather than
+  // left for an operator to discover: a page load has no body, so it cannot ask for anything
+  // — and inside the TTL it is answered by whatever build is current, override and all. That
+  // is why `meta.probe` describes the build rather than the switch, and why the switch in the
+  // UI re-syncs from it instead of holding its own opinion.
+  const asked = await rc.post("/api/rescan", { probe: true });
+  const reloaded = await rc.get("/api/overview");
+  check(
+    "a page load carries no request, and is answered by the build in hand — which the payload states",
+    (asked.json() as Overview).meta.probe.source === "request" &&
+      (reloaded.json() as Overview).meta.probe.source === "request" &&
+      (reloaded.json() as Overview).meta.probe.enabled === true,
+    JSON.stringify((reloaded.json() as Overview).meta.probe),
+  );
+
+  await rescanApp.app.close();
+  process.env.LABVIEW_APPS_ROOT = appsRoot;
 
   delete process.env.LABVIEW_AUTH_PASSWD_FILE;
   clearPasswdCache();

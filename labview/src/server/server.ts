@@ -3,8 +3,8 @@ import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
-import { retiredSettings, type LabViewConfig } from "../config.js";
-import type { ConnectionReport, Overview } from "../model/types.js";
+import { retiredSettings, withProbeEnabled, type LabViewConfig } from "../config.js";
+import type { ConnectionReport, Overview, ScanRequest } from "../model/types.js";
 import { buildOverview } from "../analyze/index.js";
 import {
   changedConnections,
@@ -46,18 +46,33 @@ export async function buildApp(cfg: LabViewConfig, access: AccessControlOptions 
   // the one that changed — which is the only one worth a reader's attention.
   const lastConnections = new Map<string, string>();
 
-  const cache = createScanCache<Overview>({
-    build: () => buildOverview(cfg, new Date()),
+  const cache = createScanCache<Overview, ScanRequest>({
+    build: async (req) => {
+      const overview = await buildOverview(
+        // A clone with `probe.enabled` replaced, never an edit to `cfg`: the next timer
+        // rebuild has to see the operator's value again, and a build already in flight is
+        // still reading this object.
+        req.probe === undefined ? cfg : withProbeEnabled(cfg, req.probe),
+        new Date(),
+      );
+      // `buildOverview` can only report `config` — a rewritten config is indistinguishable
+      // from one off disk once it is in there. This closure is the only place that knows a
+      // caller asked, so it is the only place that may say so.
+      if (req.probe !== undefined) overview.meta.probe.source = "request";
+      return overview;
+    },
     ttlMs: cfg.cacheTtlSeconds * 1000,
     onBuilt: (next, prev, { forced }) => {
       logConnections(app.log, lastConnections, next.meta.connections);
       logScan(app.log, cfg.appsRoot, next, prev, forced);
     },
   });
-  const getOverview = (force: boolean) => cache.get(force);
+  const getOverview = (force: boolean, req: ScanRequest = {}) => cache.get(force, req);
 
+  // A page load never carries a request: reading the dashboard must not be able to change
+  // what the next scan does, and a TTL rebuild it happens to trigger is configuration's.
   app.get("/api/overview", async () => getOverview(false));
-  app.post("/api/rescan", async () => getOverview(true));
+  app.post("/api/rescan", async (request) => getOverview(true, readScanRequest(request.body)));
   app.get("/api/healthz", async () => ({ ok: true }));
 
   // Serve the built web UI when present; otherwise a helpful message.
@@ -90,7 +105,26 @@ export async function buildApp(cfg: LabViewConfig, access: AccessControlOptions 
  */
 export interface BuiltApp {
   app: FastifyInstance;
-  scan: (force: boolean) => Promise<Overview>;
+  scan: (force: boolean, req?: ScanRequest) => Promise<Overview>;
+}
+
+/**
+ * What a `POST /api/rescan` body asked for, ignoring everything it is not.
+ *
+ * The only place in LabView where a request decides anything, so it is read the way every
+ * other untrusted document here is read: one known key, one known type, and no attempt to
+ * interpret the rest. A missing body, an array, a string, `{"probe":"yes"}` and
+ * `{"probe":1}` all come back empty — which means *use configuration*, the behaviour every
+ * client had before the body existed.
+ *
+ * Ignoring rather than rejecting is the same choice `parseSidecar` makes about a key it
+ * does not know: a 400 would break a client for sending a field a future version might
+ * add, and there is nothing here worth failing a scan over (**I4**).
+ */
+function readScanRequest(body: unknown): ScanRequest {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const probe = (body as Record<string, unknown>).probe;
+  return typeof probe === "boolean" ? { probe } : {};
 }
 
 export async function startServer(cfg: LabViewConfig): Promise<void> {

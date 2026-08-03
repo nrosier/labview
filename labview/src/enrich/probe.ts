@@ -42,7 +42,13 @@ import type {
 } from "../model/types.js";
 import type { LabViewConfig } from "../config.js";
 import { dominantAttempt, hintFor, phaseText, plural } from "../model/connections.js";
-import { probeGateText, probeTargets, readGate, type ProbeTarget } from "../model/probe.js";
+import {
+  probeGateText,
+  probeTargets,
+  readGate,
+  readLoginForm,
+  type ProbeTarget,
+} from "../model/probe.js";
 import { getResponse, safeOrigin, type FetchLike, type HttpResponse } from "./http.js";
 import { mapWithConcurrency } from "./pool.js";
 
@@ -220,6 +226,11 @@ async function probeOne(
       ...(res.wwwAuthenticate ? { wwwAuthenticate: res.wwwAuthenticate } : {}),
       ...(res.body ? { body: res.body } : {}),
     });
+    // Read independently of the verdict, and reported even when nothing was cleared: it is
+    // what lets a reader see *why* — a form of username plus a button and no login action
+    // is the case where the answer is arguable, and hiding it would make the verdict
+    // something they have to take on trust.
+    const form = res.body ? readLoginForm(res.body, target.url) : undefined;
     const detail = gate
       ? `HTTP ${res.status} — ${lowerFirst(probeGateText(gate).label)}`
       : `HTTP ${res.status} — answered with no login page`;
@@ -230,6 +241,7 @@ async function probeOne(
       phase: "connected",
       status: res.status,
       ...(gate ? { gate } : {}),
+      ...(form ? { form } : {}),
       detail,
       attempts: tried,
     };

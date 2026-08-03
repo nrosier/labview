@@ -575,10 +575,20 @@ export type ProbeVantage = "public" | "traefik" | "lan";
 /**
  * Why a probe response was read as a login page — the strongest signal that fired.
  *
- * Four members and no fifth: each is a single observable fact about one response, and a
- * signal that needed two facts held together would be an inference. `readGate` in
- * `model/probe.ts` is the whole rule, and everything it does not recognise leaves the
- * exposure finding standing.
+ * Six of the seven are a single observable fact about one response, which is the bar this
+ * union was built to: a gate can only ever take a service *out* of the exposed count, so
+ * a member that is merely likely buys false comfort at the price of the finding.
+ *
+ * `credential-form` is the deliberate exception, and it is worth saying why rather than
+ * leaving the asymmetry to be discovered. Passwordless sign-in — a magic link, a passkey,
+ * an emailed code — serves a login page with no password field on it, so the one-fact
+ * rule cannot see it at all, and the class is growing. It therefore reads three facts
+ * about *one form* held together, and every one of them is required. What keeps that from
+ * becoming word-matching is the intent marker: without it a newsletter signup would
+ * qualify, which is exactly the mistake `fixtures/probe/signup-form` exists to catch.
+ *
+ * `readGate` in `model/probe.ts` is the whole rule, and everything it does not recognise
+ * leaves the exposure finding standing.
  */
 export type ProbeGate =
   /** 401 or 407 *with* a `WWW-Authenticate` header: a credential was asked for. */
@@ -587,8 +597,49 @@ export type ProbeGate =
   | "redirect-origin"
   /** A redirect to a login path on the same origin, i.e. the app's own sign-in page. */
   | "redirect-login"
+  /**
+   * A 200 whose HTML sends the browser to a login path or off the origin by
+   * `<meta http-equiv="refresh">` — a redirect by another means.
+   */
+  | "meta-refresh-login"
+  /**
+   * A 200 carrying a `SAMLRequest`/`SAMLResponse` hidden input: the SAML POST binding,
+   * which is a hand-off to an identity provider and nothing else.
+   */
+  | "sso-form"
   /** A 200 whose HTML carries a password field. The application's own login form. */
-  | "password-form";
+  | "password-form"
+  /**
+   * A 200 with a passwordless login form: a username field, a submit control and a
+   * login intent marker on one form, with no password input. See the note above.
+   */
+  | "credential-form";
+
+/**
+ * What one HTML `<form>` on a probed page is made of.
+ *
+ * The composition is reported separately from the verdict because the two answer
+ * different questions. `ProbeGate` says whether the exposure finding stands;
+ * this says what LabView actually saw on the page, which is what a reader needs in
+ * order to disagree with it — a form with a username field and a submit button and no
+ * password field is a fact worth showing whether or not it cleared anything.
+ *
+ * Read per form rather than per page (`readLoginForm` in `model/probe.ts`). A footer
+ * search box and a nav "Sign in" link are each real, and a page-wide scan would hold
+ * them up together as a login form that does not exist.
+ */
+export interface LoginFormShape {
+  /** An `<input type="password">`, or an `autocomplete="current-password"` field. */
+  password: boolean;
+  /** An email input, or a text input named like a username. */
+  username: boolean;
+  /** A submit control: `<input type="submit">`, or a `<button>` in the form. */
+  submit: boolean;
+  /** An `autocomplete="one-time-code"` field — a page asking for a second factor. */
+  otp: boolean;
+  /** The form's `action`, when it pointed at a login path. Absent when it did not. */
+  action?: string;
+}
 
 /**
  * What one service's active probe observed.
@@ -626,6 +677,15 @@ export interface ServiceProbe {
   status?: number;
   /** Which signal fired. Absent means no gate was observed, not that none exists. */
   gate?: ProbeGate;
+  /**
+   * What the most login-like form on the answering page was made of, when HTML came back
+   * carrying one.
+   *
+   * Independent of `gate`: a page can show a form that cleared nothing (a signup form),
+   * and a page can be gated with no form at all (a challenge header, a redirect). Present
+   * means a form was read, and the reader can see which parts of one were there.
+   */
+  form?: LoginFormShape;
   /** What happened, in one line, with no credential in the text. */
   detail: string;
   /** Every address tried, in vantage order, whether it answered or not. */
@@ -1189,9 +1249,32 @@ export interface ScanMeta {
    * Always present, so a reader never has to infer silence.
    */
   connections: ConnectionReport[];
+  /**
+   * Whether the active probe ran for *this* build, and what decided that.
+   *
+   * Always present, on the same reasoning `connections` is: a reader must never have to
+   * infer it from silence. It matters more here than for the other stages because the
+   * answer can differ between two consecutive scans of an unedited fleet — `POST
+   * /api/rescan` may carry a one-off override, and the rebuild after it falls back to
+   * configuration. Without this field, probe results appearing and disappearing on their
+   * own would be indistinguishable from a fleet that changed.
+   */
+  probe: ProbeRun;
   durationMs: number;
   warnings: string[];
   version: string;
+}
+
+/** Whether the probe stage ran, and on whose say-so. */
+export interface ProbeRun {
+  enabled: boolean;
+  /**
+   * `config` — `probe.enabled` from the config file or environment, which is what a
+   * timer rebuild and the scan at boot always use. `request` — a one-off value on the
+   * rescan that produced this build, which outranks the configured one for that build
+   * and no other.
+   */
+  source: "config" | "request";
 }
 
 /** The full payload served at /api/overview. */
@@ -1200,6 +1283,29 @@ export interface Overview {
   stats: OverviewStats;
   stacks: AppStack[];
   graph: Graph;
+}
+
+/**
+ * What a caller may decide about one scan — the optional body of `POST /api/rescan`.
+ *
+ * The only writable thing in LabView's API, and deliberately the smallest one that could
+ * be: everything else about a scan comes from configuration, which no request can reach.
+ * An empty object, an absent body and a body of nonsense all mean the same thing — use
+ * configuration — so a client that sends nothing keeps working and one that sends rubbish
+ * cannot make a scan do something unnamed here.
+ *
+ * The answer is not the echo. What the build actually did is on {@link ScanMeta.probe},
+ * because a request can be coalesced onto a build that was already running under someone
+ * else's terms.
+ */
+export interface ScanRequest {
+  /**
+   * Force the active probe on or off for this one build, whatever `probe.enabled` says.
+   *
+   * Absent means configuration decides, which is also what every rebuild after this one
+   * will do — a TTL expiry has no request behind it to remember.
+   */
+  probe?: boolean;
 }
 
 /* ------------------------------------------------------------------------- *

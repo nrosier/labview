@@ -15,6 +15,7 @@ import {
   networkMembershipText,
   networkScopeMeta,
   noAuthReason,
+  probeFormText,
   probeVantageText,
   relationLabel,
   serviceConnections,
@@ -557,6 +558,12 @@ export function AppDetail({
                       <span class="mono">{svc.probe.endpoint}</span> ·{" "}
                       {probeVantageText(svc.probe.vantage)}
                     </div>
+                    {/* Shown whether or not it cleared anything, and that is the point: the
+                        pill above is a conclusion, and this is the observation it was drawn
+                        from. A form with a username field and a button but nothing marking
+                        it as a login is reported here and gates nothing — which is a reader
+                        being handed the arguable case rather than a verdict to trust. */}
+                    {svc.probe.form && <div class="muted-inline">{probeFormText(svc.probe.form)}</div>}
                     {/* Only where nothing answered. On a success the earlier candidates
                         are addresses that lost a race, and listing them would read as
                         problems — the same rule `formatConnection` keeps for the log. */}
