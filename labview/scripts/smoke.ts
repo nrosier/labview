@@ -4579,6 +4579,17 @@ console.log("\na measurement against a declaration that was holding a finding ba
 // service was not counted, and LabView has now been served the application. It is still not
 // an override — one address, at `/`, once — so the verdict stands and the disagreement is
 // reported as drift, which is what an operator wants from a file they wrote long ago.
+function messageContainsExactUrlHost(message: string, protocol: string, hostname: string): boolean {
+  const urlCandidates = message.match(/https?:\/\/[^\s)]+/g) ?? [];
+  return urlCandidates.some((candidate) => {
+    try {
+      const parsed = new URL(candidate);
+      return parsed.protocol === protocol && parsed.hostname === hostname;
+    } catch {
+      return false;
+    }
+  });
+}
 const portal = pbSvc("declared-open", "portal");
 check(
   "the declaration still decides the verdict, because a probe asked one address once",
@@ -4590,7 +4601,7 @@ check(
   (portal.declared?.drift ?? []).some(
     (d) =>
       d.includes("declares the service authenticates itself") &&
-      d.includes("https://portal.probe.example.com") &&
+      messageContainsExactUrlHost(d, "https:", "portal.probe.example.com") &&
       d.includes("either the declaration is out of date"),
   ),
   (portal.declared?.drift ?? []).join(" | ") || "no drift",
