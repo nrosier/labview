@@ -1,4 +1,11 @@
-import type { AuthFamily, AuthMethod, DeclaredAuth, DeclaredAuthAgreement, DeclaredAuthMechanism } from "./types.js";
+import type {
+  AppStack,
+  AuthFamily,
+  AuthMethod,
+  DeclaredAuth,
+  DeclaredAuthAgreement,
+  DeclaredAuthMechanism,
+} from "./types.js";
 
 /**
  * The runtime side of the declaration vocabulary: the values a `.labview` file may
@@ -213,4 +220,99 @@ const FAMILY_SUBJECT: Record<AuthFamily, string> = {
 export function detectedAuthSubject(detected: AuthMethod): string {
   const family = DETECTED_FAMILY[detected];
   return family ? FAMILY_SUBJECT[family] : "the same mechanism";
+}
+
+/* -------------------------------------------------------------------------- */
+/* Every disagreement in the fleet, collected for the reader                   */
+/* -------------------------------------------------------------------------- */
+
+/** One service's disagreements, in the words the analyzer wrote them. */
+export interface ServiceDrift {
+  service: string;
+  /** The file the declaration was read from, e.g. `.labview`. Never a full path. */
+  file: string;
+  /** `ServiceDeclaration.drift`, carried through unchanged. */
+  entries: readonly string[];
+}
+
+/** The drifting services of one stack, and how many disagreements they hold between them. */
+export interface StackDrift {
+  stackId: string;
+  stackName: string;
+  services: ServiceDrift[];
+  entries: number;
+}
+
+/**
+ * Every `.labview` disagreement in the fleet, grouped the way the fleet is organised.
+ *
+ * Two counts, because there are two questions and one number cannot answer both.
+ * `services` is how many services disagree with their sidecar — the figure
+ * `OverviewStats.declarationDrift` counts and the dashboard tile shows. `entries` is how
+ * many disagreements there are, which is the larger of the two: one service can have a
+ * stale acceptance *and* an expectation the scan contradicts, and a stack card's badge
+ * already counts that way. Naming both here is what keeps the tile and the panel behind
+ * it from looking like they disagree about the same fleet.
+ */
+export interface DeclarationDriftReport {
+  stacks: StackDrift[];
+  services: number;
+  entries: number;
+}
+
+/**
+ * Collect the drift the analyzer recorded, for a reader who has a count and wants the case.
+ *
+ * Derived from `stacks` rather than carried in the payload, for the reason every roll-up in
+ * the UI is: the disagreements are already on `svc.declared.drift`, and a second copy in
+ * `ScanMeta` would be a second thing to keep in step with the first. Nothing here is
+ * re-worded or re-derived either — the analyzer owns what a disagreement says, and a panel
+ * that paraphrased it would give one fact two voices.
+ *
+ * Grouped by stack because drift is a *service* fact with no stack-level counterpart —
+ * `ServiceDeclaration` has `drift`, `Declaration` does not — so the stack is a heading the
+ * services imply, not a source of its own.
+ *
+ * In `src/model/` rather than in the component that renders it so it can be asserted:
+ * smoke never mounts a DOM, and "the panel lists exactly the services the tile counted" is
+ * precisely the claim worth pinning.
+ */
+export function collectDeclarationDrift(stacks: readonly AppStack[]): DeclarationDriftReport {
+  const out: StackDrift[] = [];
+  let services = 0;
+  let entries = 0;
+  // Sorted rather than taken in scan order, and by name rather than by count: the fleet
+  // list is alphabetical, so a reader arriving from it finds the stack where they left it,
+  // and the same scan produces the same panel twice (I7).
+  for (const stack of [...stacks].sort((a, b) => a.name.localeCompare(b.name))) {
+    const drifting: ServiceDrift[] = [];
+    for (const svc of [...stack.services].sort((a, b) => a.name.localeCompare(b.name))) {
+      const declared = svc.declared;
+      if (!declared?.drift.length) continue;
+      drifting.push({ service: svc.name, file: declared.file, entries: declared.drift });
+    }
+    if (!drifting.length) continue;
+    const stackEntries = drifting.reduce((n, s) => n + s.entries.length, 0);
+    out.push({ stackId: stack.id, stackName: stack.name, services: drifting, entries: stackEntries });
+    services += drifting.length;
+    entries += stackEntries;
+  }
+  return { stacks: out, services, entries };
+}
+
+/**
+ * The report as one line — `3 services in 2 stacks · 4 disagreements`.
+ *
+ * Shared by the panel's subtitle and the tile's tooltip so the two cannot count the same
+ * fleet differently, and worded with both figures because the tile shows only the first:
+ * a reader who sees `3` and then a panel listing four warnings needs the sentence that
+ * says why those are the same thing.
+ */
+export function driftSummaryText(report: DeclarationDriftReport): string {
+  if (report.services === 0) return "no declaration disagrees with this scan";
+  const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+  return [
+    `${plural(report.services, "service")} in ${plural(report.stacks.length, "stack")}`,
+    plural(report.entries, "disagreement"),
+  ].join(" · ");
 }

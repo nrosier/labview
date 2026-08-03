@@ -887,6 +887,52 @@ that failed, the address and where it came from, the code, the detail, the fix, 
 one row per candidate tried with its own phase — read from the `ConnectionReport` in
 `meta.connections` (§3.10) rather than from a second source.
 
+**The drift panel.** `Declaration drift 3` is the same shape of problem one tile
+further down: an outcome with the case behind it withheld. The sentences are already
+written — the analyzer puts one in `svc.declared.drift` per disagreement, in the
+operator's own terms (§3.12) — and the only way to reach them was the `⚠ Declaration
+drift` chip, which narrows the stack list and still leaves the reader opening service
+drawers one at a time. So the tile is a control and the sentences are a panel
+(`web/components/DriftDetail.tsx`): one `Section` per stack, and per drifting service a
+`.linkbtn` reading `stack / service`, a pill naming the file it was declared in, and one
+`.note crit` per entry — the same class and the same string `AppDetail` shows, so the
+panel and the drawer cannot word one disagreement two ways.
+
+Four rules shape it, three of them borrowed from the row above:
+
+- **The grouping is a model function, not component code.** `collectDeclarationDrift`
+  and `driftSummaryText` live in [model/declarations.ts](labview/src/model/declarations.ts)
+  for the reason `matchesTagFilter` lives in `model/filter.ts`: a rule that only exists
+  inside a `.tsx` file cannot be asserted, because smoke never mounts a DOM (§8). What
+  is worth asserting here is specifically that the panel lists exactly the services the
+  tile counted.
+- **Two counts, because there are two questions.** `report.services` is by construction
+  the figure `computeStats` puts in `stats.declarationDrift` — services that disagree
+  with their sidecar — and `report.entries` is the larger one a stack card's badge
+  already shows, since one service can drift several ways at once. Both are stated in a
+  single `driftSummaryText`, shared by the tile's tooltip and the panel's subtitle, so a
+  reader who sees `3` and then four warnings gets the sentence that says why those are
+  the same fleet. Sorted by stack name then service name, matching the fleet list (I7).
+- **The stack grouping is derived, not declared.** Drift is service-level only —
+  `ServiceDeclaration` has `drift`, `Declaration` does not — so the stack is a heading
+  the services imply. Same reasoning as the matched side of the integration panels being
+  walked out of `ov.stacks` rather than rolled up into `ScanMeta`.
+- **The tile becomes a control without becoming a `<button>`.** `StatTile` takes an
+  optional `onClick` and, when it has one, carries `role="button"`, `tabIndex={0}` and
+  the Enter/Space handler `.stack-head`, `.svc-row` and `.tagrow` already use; its
+  content is block elements, which a real button may not contain. Only the drift tile
+  passes it — a count a reader can take off the payload has nothing further to say, and
+  a tile that looked clickable without being so would be worse than a plain one.
+
+The drawer shell itself (`.drawer-scrim`, the sticky `.dhead`, the scrolling `.dbody`)
+moved out of `ApiDetail.tsx` into `web/components/Panel.tsx`, on the `Section.tsx`
+precedent, so the drift panel inherits the scroll, close and Escape behaviour rather
+than restating it. `main.tsx` holds one `panel` state for all three — `"authentik" |
+"traefik" | "drift" | null` — which is what guarantees two are never stacked and fixes
+the Escape order: the panel closes first, the service drawer second. A row handing over
+to a service drawer clears the panel through the same `openService` the integration
+panels use.
+
 ### 3.10 Connection diagnostics
 
 Every outbound read degrades softly (§4 I4), which leaves the operator with a
@@ -2820,6 +2866,18 @@ bundle is never rendered by smoke, so this is the only coverage the filter can h
 and it is the reason the predicate lives in `model/filter.ts` rather than inside a
 component (§3.9).
 
+**The drift panel is asserted through its report, for the same reason.**
+`collectDeclarationDrift` is called on both drifting roots and the clean one, and the
+assertion that matters is `report.services === stats.declarationDrift` — the panel
+cannot list a different set from the one the tile counted, in either root. Beside it:
+the entry total against an independently summed one (the second, larger count), each
+entry string identical to the service's own `declared.drift` so nothing is paraphrased
+on the way to the screen, the stack/service grouping as a joined string, a clean fleet
+producing an empty report rather than empty groups, and the three `driftSummaryText`
+wordings including both singulars. Ordering is pinned against *reversed* clones of the
+stacks and two renamed services, because fixture discovery is already alphabetical and
+an assertion over the natural order would pass with no sort at all.
+
 **Ingress is asserted as a set, in canonical order, as a joined string.** `ing(svc)`
 returns `svc.ingress.join(", ")` so a failing assertion prints both sets — `got
 "public, lan"` against an expected `"public, traefik, lan"` names the kind that went
@@ -2830,8 +2888,8 @@ complements the per-service ones: over every service in both roots, no set carri
 that are `internal` alone — so a stack added later, or a fourth external kind, is
 covered without anyone remembering to extend a list.
 
-**Access control** (§3.13) is asserted at the end of the file and at length — 221 of the
-236 of the 756 checks — because it is the only part of LabView where a silent regression is a security
+**Access control** (§3.13) is asserted at the end of the file and at length — 253 of the
+902 checks — because it is the only part of LabView where a silent regression is a security
 hole rather than a wrong label. `fixtures/auth/` is not a fifth scan root: it holds three
 passwd files, and nothing in the section reads a compose document. The modules are
 imported locally at the bottom, for the reason `node:net` is, so the sections above do not
@@ -3403,6 +3461,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Reachability is decided before any count is compared | An unreachable read reports zeros, so a count comparison across it announces `-40 applications`: a claim about Authentik's *contents* from a scan that never reached Authentik, and the clearest possible I1 violation. `started` and `stopped` therefore carry no numbers at all, and two failed reads in a row produce no entry — the banner and the connection line already state a standing failure, and repeating it as a change every rescan would make it read as news. |
 | The counts are compared, but the diff is still not the connection line | `read` stays out of `changedConnections`'s signature: a count that moves on every scan must not log three connection lines a minute, and that trade is still right. The difference is that a *rescan* is an event somebody asked about, so stating what the read returned there costs one line per press instead of one line per minute. |
 | The matched side is derived in the browser, not duplicated into `ScanMeta` | Every matched pair is already on `svc.authentik` / `svc.traefikLive`, so adding a roll-up to the payload would mean two representations of one join, kept in step by nothing. A `useMemo` over `ov.stacks` reads the same source the service drawer reads, which is also what makes a row in the panel able to open that drawer. The unmatched side has no such home — it is by definition attached to no service — so that half genuinely lives on `meta`. |
+| The drift count opens a panel, rather than only driving the filter chip | The `⚠ Declaration drift` chip already existed and is not the same answer: it narrows the stack list to the stacks involved and leaves the reader opening service drawers one at a time to find sentences the analyzer had already written. What a count owes its reader is the case behind it — the same argument that made the integration counts buttons — and here the case is one string per disagreement, addressed to the operator, with a file to go and edit. So the tile opens the list and the chip keeps the filtered-in-place view; each row in the panel is a link into the service's own drawer, where the declaration sits beside the evidence, so the panel adds a route rather than a second version of the fact. The counts are the reason this needed a model function: the tile shows *services* and a stack badge shows *disagreements*, and one shared wording naming both figures is what stops the pair looking like a contradiction. |
 | LabView gets a login of its own, reversing the §7 non-goal | The original posture assumed the deployment LabView documents: always behind a tunnel, a proxy and an SSO gate. It is a fair assumption about *this* fleet and a bad default for the product, because the two ways a request reaches LabView without traversing that gate — a published host port, and a tunnel origin pointed at the container — are invisible from inside the container, and what is served past them is the fleet's whole inventory. The non-goal is therefore replaced rather than narrowed, and §7 says so instead of accumulating a caveat. What is *not* reversed is authorization: there are still no roles and nothing to write. |
 | Enforcement follows what is configured, rather than a switch | An `auth.enabled` an operator could set with no usable method is a lock-out, and a default-on gate would lock people out of a running deployment on an image pull. So `enforced` is `methods.length > 0` and each method is live only when it is usable — one entry in the passwd file, or an issuer with a client id. `enabled: false` remains as the explicit *off* switch the feature was asked for, and the unconfigured posture is exactly today's behaviour plus one line in the log saying the surface is open (I4). |
 | The posture is re-resolved on a TTL, not captured at startup | Adding the first user to `/config/passwd` is the moment an operator expects the gate to close, and a startup-only read makes that require a restart of the thing they are trying to protect. The file is stat-keyed and cached, so the steady state costs one `stat` per window, and `POSTURE_TTL_MS` bounds how stale the answer can be. It also makes the failure recoverable in the direction that matters: a passwd file fixed after a bad edit takes effect on its own. |

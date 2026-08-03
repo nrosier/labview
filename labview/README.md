@@ -40,7 +40,11 @@ live state from the Docker API, and never needs an agent inside each app.
   switch decides whether the required tags are OR'd or AND'd, exclusions are
   always AND-NOT, and a line beside `Clear filters` reads the whole expression
   back — `ingress: all of Public, LAN; not Internal` — so a three-part filter
-  never has to be inferred from which chips look bright.
+  never has to be inferred from which chips look bright. Where a `.labview` has gone
+  out of date the tiles carry a **declaration drift** count too, and that one is a
+  button: it opens a panel naming every drifting service under its stack, with the
+  file it was declared in and each disagreement spelled out, and each row opens that
+  service's own drawer.
 - **Stack list** — one card per stack, which is the unit you actually deploy. It
   rolls up its services: live status dots, hostnames, every distinct **ingress** tag and
   **auth mechanism** present, and a count of anything reachable without auth. A missing
@@ -1253,6 +1257,16 @@ expectation is read through the same rule that builds the classification, so an
 `internal` written beside `public`, `traefik` or `lan` is dropped from it quietly rather
 than drifting against a rule the file has no way of knowing — writing down everything
 that is true of a service is not a mistake worth a warning.
+
+On the dashboard that counter is a button. The **Declaration drift** tile opens a panel
+listing every drifting service under the stack it belongs to, with the file it was
+declared in and its disagreements in the wording above — so reading them does not mean
+opening one service drawer after another, and each row is a link into the drawer where
+the declaration sits beside the evidence the scan collected. The tile counts *services*
+and one service can drift several ways at once, so the panel states both figures —
+`3 services in 3 stacks · 4 disagreements`. The `⚠ Declaration drift` filter is still
+there and still does the other thing: it holds the same services in the stack list, in
+place, with everything else the scan says about them.
 
 The classification always stands. Drift is a report, never an override.
 

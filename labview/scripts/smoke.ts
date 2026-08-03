@@ -116,10 +116,12 @@ const { MAX_AUTH_ENTRIES, MAX_LIST_ENTRIES, MAX_SIDECAR_BYTES, MAX_TEXT_CHARS, p
 // assert the layer rule is to enumerate the pairs rather than click through a browser.
 const {
   DECLARED_AUTH_MECHANISMS,
+  collectDeclarationDrift,
   compareDeclaredAuth,
   declaredAuthFamily,
   declaredAuthLabel,
   detectedAuthFamily,
+  driftSummaryText,
   formatExposureCount,
   showsDeclaredAuth,
 } = await import("../src/model/declarations.js");
@@ -1118,6 +1120,112 @@ check(
 check("drift has its own counter too", edge.stats.declarationDrift === 3, `got ${edge.stats.declarationDrift}`);
 
 /* -------------------------------------------------------------------------- */
+/* The drift the dashboard's tile opens: what the panel behind it lists        */
+/* -------------------------------------------------------------------------- */
+
+// `collectDeclarationDrift` decides what that panel says, so it lives in `src/model/` and
+// is asserted here: smoke never mounts a DOM, and "the list names exactly the services the
+// tile counted" is the one claim a reader takes on trust the moment they click.
+const edgeDrift = collectDeclarationDrift(edge.stacks);
+check(
+  "the drift panel lists exactly as many services as the tile counts",
+  edgeDrift.services === edge.stats.declarationDrift,
+  `report ${edgeDrift.services} vs tile ${edge.stats.declarationDrift}`,
+);
+// The other count, and the reason there are two: `staledecl/worker` drifts twice, so a
+// panel showing four warnings under a tile reading three is correct — and the subtitle
+// that says so is built from these two numbers.
+check(
+  "...and counts disagreements separately, which is the larger figure",
+  edgeDrift.entries === 4 &&
+    edgeDrift.entries ===
+      edge.stacks.reduce(
+        (n, s) => n + s.services.reduce((m, v) => m + (v.declared?.drift.length ?? 0), 0),
+        0,
+      ),
+  `${edgeDrift.entries} entries over ${edgeDrift.services} services`,
+);
+check(
+  "...grouped under the stacks the drifting services are in, and no others",
+  edgeDrift.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", ") ===
+    "declcompare:1, partialdrift:1, staledecl:2",
+  edgeDrift.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", "),
+);
+// The analyzer owns the wording of a disagreement — the panel and the service drawer show
+// the same sentence, so a reader following a row through to the drawer is not handed a
+// second version of the same finding.
+check(
+  "...each entry the analyzer's own sentence, carried through unchanged",
+  edgeDrift.stacks.every((s) =>
+    s.services.every(
+      (v) =>
+        JSON.stringify(v.entries) === JSON.stringify(eSvc(s.stackId, v.service).declared?.drift) &&
+        v.file === eSvc(s.stackId, v.service).declared?.file,
+    ),
+  ),
+  JSON.stringify(edgeDrift.stacks.flatMap((s) => s.services.map((v) => v.entries))),
+);
+// A fleet whose sidecars all agree is the common case, and the tile is absent for it. The
+// report has to be empty rather than a list of stacks with nothing in them, or the panel
+// would open on a page of headings.
+const appsDrift = collectDeclarationDrift(ov.stacks);
+check(
+  "a fleet whose declarations all agree produces an empty report, not empty groups",
+  appsDrift.stacks.length === 0 && appsDrift.services === 0 && appsDrift.entries === 0,
+  JSON.stringify(appsDrift),
+);
+// Order is the panel's own, and pinned against *reversed* input on purpose: discovery
+// already walks the fixture directories alphabetically, so a report built in scan order
+// would pass every assertion above while listing a real fleet in whatever order the
+// filesystem answered in.
+const sdStack = structuredClone(edge.stacks.find((s) => s.id === "staledecl")!);
+const pdStack = structuredClone(edge.stacks.find((s) => s.id === "partialdrift")!);
+check(
+  "stacks are ordered by name, whatever order the scan hands them over in",
+  collectDeclarationDrift([sdStack, pdStack])
+    .stacks.map((s) => s.stackId)
+    .join(", ") === "partialdrift, staledecl",
+  collectDeclarationDrift([sdStack, pdStack])
+    .stacks.map((s) => s.stackId)
+    .join(", "),
+);
+// Same for the services inside one stack. No fixture has two drifting services in the same
+// stack — the drift cases are one per stack by design — so the pair is built here from the
+// one that does drift, which is also the only way to reverse it.
+const twoDrifters = structuredClone(sdStack);
+const zz = structuredClone(sdStack.services.find((s) => s.declared?.drift.length)!);
+const aa = structuredClone(zz);
+zz.name = "zz-worker";
+aa.name = "aa-worker";
+twoDrifters.services = [zz, aa];
+check(
+  "...and services within a stack by name, for the same reason",
+  collectDeclarationDrift([twoDrifters])
+    .stacks[0]?.services.map((s) => s.service)
+    .join(", ") === "aa-worker, zz-worker",
+  JSON.stringify(collectDeclarationDrift([twoDrifters]).stacks[0]?.services.map((s) => s.service)),
+);
+// The subtitle over the list, and the tooltip on the tile that opens it: one wording, so
+// the two cannot count the same fleet differently. Singulars matter — "1 services in 1
+// stacks" is the sort of line that makes a reader doubt the number in front of it.
+check(
+  "the drift summary states both figures, with the stacks they are spread over",
+  driftSummaryText(edgeDrift) === "3 services in 3 stacks · 4 disagreements",
+  driftSummaryText(edgeDrift),
+);
+const oneDrifter = driftSummaryText(collectDeclarationDrift([{ ...twoDrifters, services: [zz] }]));
+check(
+  "...in the singular where there is one service in one stack",
+  oneDrifter === "1 service in 1 stack · 2 disagreements",
+  oneDrifter,
+);
+check(
+  "...and says so plainly when nothing drifts at all",
+  driftSummaryText(appsDrift) === "no declaration disagrees with this scan",
+  driftSummaryText(appsDrift),
+);
+
+/* -------------------------------------------------------------------------- */
 /* Declared against detected: which declarations are reported, and which warn  */
 /* -------------------------------------------------------------------------- */
 
@@ -2061,6 +2169,18 @@ check(
   "...and every failure is reported as drift, which a rescan comparison excludes",
   nSvc("badref", "caller").declared?.drift?.length === 2 && nets.stats.declarationDrift === 2,
   JSON.stringify({ drift: nSvc("badref", "caller").declared?.drift, fleet: nets.stats.declarationDrift }),
+);
+// The drift panel over a second root, where the two counts differ in the other direction:
+// two services drift, one of them twice, so three warnings sit under a tile reading two.
+// A root whose figures were equal could not tell the two counts apart at all.
+const netsDrift = collectDeclarationDrift(nets.stacks);
+check(
+  "...and the drift panel still lists exactly the services the tile counts",
+  netsDrift.services === nets.stats.declarationDrift &&
+    netsDrift.entries === 3 &&
+    netsDrift.stacks.map((s) => `${s.stackId}/${s.services.map((v) => v.service).join("+")}`).join(", ") ===
+      "badref/caller, disjoint/front",
+  JSON.stringify({ services: netsDrift.services, entries: netsDrift.entries, tile: nets.stats.declarationDrift }),
 );
 
 console.log("\nnetworks that connect nothing");

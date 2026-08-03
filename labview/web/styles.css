@@ -268,6 +268,14 @@ code, .mono {
 .tile .value .unit { font-size: 14px; color: var(--ink-2); font-weight: 400; margin-left: 4px; }
 .tile.alert .value { color: var(--critical); }
 .tile .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+/* A tile that opens the case behind its number. Only the hover tint and the pointer say
+   so — no extra chrome, because most tiles are not clickable and a shared affordance
+   drawn on all of them would promise a panel that eleven of them do not have. Same
+   surface and outline as `.svc-row`, which is the fleet's other "this row leads
+   somewhere" control. */
+.tile.click { cursor: pointer; }
+.tile.click:hover { background: var(--surface-2); border-color: var(--c1); }
+.tile.click:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; }
 
 /* ---- Distribution bars ---------------------------------------------- */
 
@@ -604,6 +612,11 @@ table.data tr:last-child td { border-bottom: none; }
   background: color-mix(in srgb, var(--critical) 12%, transparent);
   border-color: color-mix(in srgb, var(--critical) 40%, transparent);
 }
+/* Where else the same set of services can be read, said once under the drift panel's
+   list. Its own class rather than `.muted-inline`, which is only ever styled by the
+   container it sits in — the same reason `.netnote` has one. Not a `.note`: it is not a
+   warning, and tinting it like one would put a third register beside the entries above it. */
+.driftnote { color: var(--muted); font-size: 12px; margin-top: 18px; }
 
 .mermaid-wrap {
   background: var(--surface);

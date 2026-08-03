@@ -13,6 +13,7 @@ import type {
 } from "../model";
 import { phaseText } from "../model";
 import { qualifyRouter, serviceKey } from "../lib/format";
+import { Panel } from "./Panel";
 import { Section } from "./Section";
 
 /**
@@ -30,44 +31,6 @@ import { Section } from "./Section";
 
 /** How a caller opens a service's own drawer from a matched row. */
 type OpenService = (stackId: string, serviceName: string) => void;
-
-/**
- * The drawer shell both panels use.
- *
- * The same markup as the service drawer — a `.drawer-scrim` under a `.drawer`, a sticky
- * `.dhead`, a scrolling `.dbody` — so a panel inherits its scroll behaviour, its close
- * affordance and the Escape handling in `App` without a second set of rules to keep in
- * step with the first.
- */
-function Panel({
-  title,
-  sub,
-  onClose,
-  children,
-}: {
-  title: string;
-  sub: string;
-  onClose: () => void;
-  children: preact.ComponentChildren;
-}) {
-  return (
-    <>
-      <div class="drawer-scrim" onClick={onClose} />
-      <aside class="drawer" role="dialog" aria-label={`${title} detail`}>
-        <div class="dhead">
-          <div class="title">
-            <h2>{title}</h2>
-            <div class="sub">{sub}</div>
-          </div>
-          <button class="btn icon" onClick={onClose} aria-label="Close">
-            ✕
-          </button>
-        </div>
-        <div class="dbody">{children}</div>
-      </aside>
-    </>
-  );
-}
 
 /**
  * One subject in a list: a title line, then whatever describes it.

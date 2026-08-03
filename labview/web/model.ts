@@ -74,12 +74,20 @@ export { phaseText, shouldBanner } from "../src/model/connections";
  * different ways. `formatExposureCount` is here for the same reason: the tile and the
  * CLI line print the same figure.
  */
+/**
+ * `collectDeclarationDrift` is here for a third reason: it decides what the drift panel
+ * lists and how many services it claims, which has to equal the number the tile beside it
+ * shows. A grouping that lived in the component could not be asserted at all.
+ */
 export {
+  collectDeclarationDrift,
   declaredAuthLabel,
   declaredAuthSummary,
+  driftSummaryText,
   formatExposureCount,
   showsDeclaredAuth,
 } from "../src/model/declarations";
+export type { DeclarationDriftReport, ServiceDrift, StackDrift } from "../src/model/declarations";
 
 /**
  * The ingress vocabulary and the operations on it, from the same module the analyzer

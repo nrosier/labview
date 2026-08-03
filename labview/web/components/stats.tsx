@@ -2,21 +2,54 @@ import type { ComponentChildren } from "preact";
 import type { TagFilter, TagMode } from "../model";
 import { tagFilterActive } from "../model";
 
+/**
+ * One number from the scan, with what it is and — where a tile has one — the detail
+ * behind it.
+ *
+ * `onClick` is optional and most tiles do not pass it: a count that can be read off the
+ * payload has nothing further to say, and a tile that looked clickable without being so
+ * would be worse than a plain one. Where a count *does* stand in for a case — the
+ * declaration-drift tile, whose number is a set of services with sentences attached — the
+ * tile becomes a control, in the same shape `.stack-head`, `.svc-row` and `.tagrow`
+ * already use: `role="button"`, in the tab order, and Enter/Space doing what a click does.
+ * A real `<button>` is not used because the tile's content is block elements, which a
+ * button may not contain.
+ */
 export function StatTile({
   label,
   value,
   unit,
   sub,
   alert = false,
+  title,
+  onClick,
 }: {
   label: string;
   value: number | string;
   unit?: string;
   sub?: ComponentChildren;
   alert?: boolean;
+  title?: string;
+  onClick?: () => void;
 }) {
   return (
-    <div class={`tile${alert ? " alert" : ""}`}>
+    <div
+      class={`tile${alert ? " alert" : ""}${onClick ? " click" : ""}`}
+      title={title}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onClick={onClick}
+      onKeyDown={
+        onClick
+          ? (e: KeyboardEvent) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
+    >
       <div class="label">{label}</div>
       <div class="value">
         {value}

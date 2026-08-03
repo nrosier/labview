@@ -13,7 +13,15 @@ import type {
   TagFilter,
   TraefikSummary,
 } from "./model";
-import { declaredAuthLabel, formatExposureCount, parseLoginFailure, phaseText, shouldBanner } from "./model";
+import {
+  collectDeclarationDrift,
+  declaredAuthLabel,
+  driftSummaryText,
+  formatExposureCount,
+  parseLoginFailure,
+  phaseText,
+  shouldBanner,
+} from "./model";
 import {
   EMPTY_TAG_FILTER,
   cycleTag,
@@ -39,6 +47,7 @@ import { StatTile, DistributionBar, TagBars, type DistSegment } from "./componen
 import { StackCard } from "./components/StackCard";
 import { AppDetail } from "./components/AppDetail";
 import { AuthentikDetail, TraefikDetail } from "./components/ApiDetail";
+import { DriftDetail } from "./components/DriftDetail";
 import { GraphView } from "./components/GraphView";
 import { NetworksSection } from "./components/NetworksSection";
 
@@ -273,13 +282,17 @@ function App() {
   const [network, setNetwork] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /**
-   * Which integration's detail panel is open, if any.
+   * Which side panel is open, if any: an integration's detail, or the declaration drift.
    *
-   * Separate from `selected` rather than folded into one "what is in the drawer" state:
-   * the two are opened from different places and closed in a defined order, and a single
-   * union would have to be unpacked at every use to say which of the two it is.
+   * One state for all three rather than one flag each, so opening a panel closes whichever
+   * was open and the Escape order below has a single thing to dismiss — two panels stacked
+   * on one scrim is a reader closing one to find another underneath.
+   *
+   * Separate from `selected` rather than folded into it: the two are opened from different
+   * places and closed in a defined order, and a single union would have to be unpacked at
+   * every use to say which of the two it is.
    */
-  const [apiPanel, setApiPanel] = useState<"authentik" | "traefik" | null>(null);
+  const [panel, setPanel] = useState<"authentik" | "traefik" | "drift" | null>(null);
 
   useEffect(() => {
     applyTheme(theme);
@@ -334,12 +347,12 @@ function App() {
       // panel, so the two are not normally both open — but the order is defined here
       // rather than relying on that, since the cost of being wrong is a key that looks
       // dead because it dismissed something behind what the reader was looking at.
-      if (apiPanel) setApiPanel(null);
+      if (panel) setPanel(null);
       else setSelected(null);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [apiPanel]);
+  }, [panel]);
 
   async function doRescan() {
     setBusy(true);
@@ -460,15 +473,20 @@ function App() {
     return AUTH_META.map((m) => ({ key: m.key, label: m.label, cssVar: m.cssVar, count: counts[m.key] ?? 0 }));
   }, [ov]);
 
+  // Every `.labview` disagreement, grouped by stack. One report, read by the tile's
+  // tooltip and by the panel it opens, so the number on the front and the list behind it
+  // are the same object rather than two counts of one fleet.
+  const drift = useMemo(() => collectDeclarationDrift(ov?.stacks ?? []), [ov]);
+
 
   const selectedFlat = selected ? flat.find((f) => f.key === selected) : undefined;
 
   function openService(stackId: string, serviceName: string) {
     setSelected(serviceKey(stackId, serviceName));
-    // A service can be reached from inside an integration panel. Two stacked drawers
-    // would leave the reader closing one to find another underneath, so the panel that
-    // sent them here gets out of the way.
-    setApiPanel(null);
+    // A service can be reached from inside a panel — an integration's matched row, or a
+    // drifting service. Two stacked drawers would leave the reader closing one to find
+    // another underneath, so the panel that sent them here gets out of the way.
+    setPanel(null);
   }
 
   function toggleStack(stackId: string) {
@@ -594,8 +612,8 @@ function App() {
               {ov.meta.authentik.reachable ? (
                 <button
                   class="linkbtn"
-                  aria-expanded={apiPanel === "authentik"}
-                  onClick={() => setApiPanel("authentik")}
+                  aria-expanded={panel === "authentik"}
+                  onClick={() => setPanel("authentik")}
                   title={[authentikTitle(ov.meta.authentik), conn("authentik")?.hint]
                     .filter(Boolean)
                     .join("\n")}
@@ -616,8 +634,8 @@ function App() {
                    one word of it. */
                 <button
                   class="linkbtn"
-                  aria-expanded={apiPanel === "authentik"}
-                  onClick={() => setApiPanel("authentik")}
+                  aria-expanded={panel === "authentik"}
+                  onClick={() => setPanel("authentik")}
                   title={connTitle(conn("authentik"), ov.meta.authentik.error)}
                 >
                   {conn("authentik")?.phase ?? "unreachable"}
@@ -634,8 +652,8 @@ function App() {
               {ov.meta.traefik.reachable ? (
                 <button
                   class="linkbtn"
-                  aria-expanded={apiPanel === "traefik"}
-                  onClick={() => setApiPanel("traefik")}
+                  aria-expanded={panel === "traefik"}
+                  onClick={() => setPanel("traefik")}
                   title={[traefikTitle(ov.meta.traefik), conn("traefik")?.hint]
                     .filter(Boolean)
                     .join("\n")}
@@ -648,8 +666,8 @@ function App() {
               ) : (
                 <button
                   class="linkbtn"
-                  aria-expanded={apiPanel === "traefik"}
-                  onClick={() => setApiPanel("traefik")}
+                  aria-expanded={panel === "traefik"}
+                  onClick={() => setPanel("traefik")}
                   title={connTitle(conn("traefik"), ov.meta.traefik.error)}
                 >
                   {conn("traefik")?.phase ?? "unreachable"}
@@ -760,12 +778,18 @@ function App() {
             sub="unverified"
           />
         )}
+        {/* The one tile whose number stands for a set of sentences rather than a
+            measurement, so it is the one tile that opens: a count of stale declarations
+            is unactionable until it says which file, about which service, and in which
+            direction — all of which the analyzer already wrote. */}
         {ov.stats.declarationDrift > 0 && (
           <StatTile
             label="Declaration drift"
             value={ov.stats.declarationDrift}
             alert
             sub="⚠ stale .labview"
+            title={`${driftSummaryText(drift)}\nclick for the service-by-service detail`}
+            onClick={() => setPanel("drift")}
           />
         )}
       </div>
@@ -944,23 +968,29 @@ function App() {
       {/* The integration panels read the payload already in memory — `ov.stacks` for the
           matched pairs, the summary for the unplaced ones — so opening one costs no
           request and can never disagree with the drawer behind it. */}
-      {apiPanel === "authentik" && ov.meta.authentik && (
+      {panel === "authentik" && ov.meta.authentik && (
         <AuthentikDetail
           summary={ov.meta.authentik}
           stacks={ov.stacks}
           conn={conn("authentik")}
-          onClose={() => setApiPanel(null)}
+          onClose={() => setPanel(null)}
           onOpenService={openService}
         />
       )}
-      {apiPanel === "traefik" && ov.meta.traefik && (
+      {panel === "traefik" && ov.meta.traefik && (
         <TraefikDetail
           summary={ov.meta.traefik}
           stacks={ov.stacks}
           conn={conn("traefik")}
-          onClose={() => setApiPanel(null)}
+          onClose={() => setPanel(null)}
           onOpenService={openService}
         />
+      )}
+      {/* Same shell, same source: the drift panel reads the report built from `ov.stacks`
+          above, so it can no more disagree with the tile that opened it than the
+          integration panels can with the drawer behind them. */}
+      {panel === "drift" && (
+        <DriftDetail report={drift} onClose={() => setPanel(null)} onOpenService={openService} />
       )}
     </div>
   );
