@@ -524,7 +524,8 @@ security-sensitive.
 ```bash
 cd labview
 npm install
-npm run dev          # esbuild --watch for the UI + tsx server with reload
+npm run dev          # build the UI once, then tsx server with reload
+npm run dev:web      # in a second terminal: Vite dev server with HMR for the UI
 
 npm run typecheck    # tsc for both server and web
 npm run smoke        # runs the full pipeline against fixtures/ and asserts results

@@ -24,7 +24,7 @@ orchestrator, or a security scanner with opinions: it reports what the
 configuration says, marks what it could not establish, and never edits anything.
 
 - Backend: Node ≥ 20, TypeScript (ESM, `NodeNext`), Fastify 5, `dockerode`, `yaml`.
-- Frontend: Preact bundled by esbuild into one self-contained `app.js`.
+- Frontend: Preact bundled by Vite into `web/dist` — one self-contained `app.js`.
 - Distribution: a two-stage Alpine image, run as an unprivileged user.
 
 ---
@@ -101,11 +101,19 @@ labview/
     model/auth.ts     when a missing gate may be reported at all, and its wording (pure, web-safe)
     model/networks.ts which network nodes are drawn, dependency vs. membership, the two
                       caps and all of the wording (pure, web-safe)
+    model/ingress.ts  the ingress vocabulary and every pure operation on it (pure, web-safe)
+    model/declarations.ts  the values a `.labview` may use, and how each is worded (pure, web-safe)
+    model/ports.ts    reading a compose port mapping for the published host port (pure)
+    model/probe.ts    which addresses a service may be asked at, and what counts as a
+                      login page answering (pure, web-safe)
+    model/filter.ts   the dashboard's tri-state tag filter (pure, web-safe)
     hashpw.ts         CLI: password -> a `user:hash` line for the passwd file
     scan/
       discover.ts     appsRoot -> stack directories
       compose.ts      compose YAML -> normalized AppStack/Service
       env.ts          dotenv parsing + Compose-compatible interpolation
+      paths.ts        path containment for every file read out of a stack directory (I8)
+      sidecar.ts      the `.labview` file: parse, clamp, refuse anything outside the root
       index.ts        scanStacks(): discover + parse, collecting warnings
     labels/
       dockflare.ts    labels -> CloudflareRoute[]
@@ -122,9 +130,12 @@ labview/
       graph.ts        nodes/edges for the relationship graph
     enrich/
       http.ts         fetch wrapper: timeouts, JSON, injectable fetchImpl (no I/O policy)
+      pool.ts         bounded concurrency for many independent round-trips (no I/O policy)
       docker.ts       Docker Engine snapshot (never throws)
       authentik.ts    Authentik REST API snapshot (never throws; all network I/O)
       traefik.ts      Traefik runtime-API snapshot (never throws; all network I/O)
+      probe.ts        asks each scanned HTTP service what it answers, and reads a login
+                      page as evidence (never throws; all network I/O)
     auth/
       hash.ts         modular-crypt dispatch over bcryptjs (`$2a$`/`$2b$`/`$2y$`)
       passwd.ts       parsePasswd (pure) + readPasswd (fs, re-read on stat change)
@@ -136,8 +147,8 @@ labview/
     server/auth.ts    the gate: one onRequest hook, one onSend hook, five routes (§3.13)
     server/server.ts  Fastify: buildApp() -> /api/* + static UI, with a TTL cache
   web/                Preact UI (see §3.9)
+    vite.config.ts    the web build: root, single-bundle output, dev-server proxy
   scripts/
-    build-web.mjs     esbuild bundle
     smoke.ts          pipeline assertions over the fixtures
   fixtures/
     apps/             a representative happy-path fleet
@@ -148,6 +159,10 @@ labview/
     authentik-api.json  canned API responses driven through an injected fetch
     traefik/          a fleet whose labels and live proxy config disagree
     traefik-api.json    canned proxy + identity responses, same injected fetch
+    probe/            what a service answers when it is asked, one address per stack
+    auth/             passwd files the access-control assertions parse: ok, messy, empty
+    outside-root.env      the `env_file` escape target; outside every scan root on purpose
+    outside-root.labview  the sidecar-symlink escape target, same reason (I8)
 ```
 
 Repo root holds the README, LICENSE, CI workflows and this document. All code is
@@ -821,10 +836,31 @@ says how to build it — the API is the primary product, the UI is a view of it.
 
 ### 3.9 Frontend
 
-Preact + esbuild, bundled to a single `web/dist/app.js` with mermaid and cytoscape
-inlined; `web/index.html` and `web/styles.css` are copied verbatim. There is no
-CDN dependency and no network access beyond same-origin `api/*` (relative, so it
-works under a path prefix).
+Preact + Vite (`web/vite.config.ts`), built to `web/dist`: a single `app.js` with
+mermaid and cytoscape inlined, one minified `styles.css`, and the `index.html`
+shell. There is no CDN dependency and no network access beyond same-origin `api/*`
+(relative, so it works under a path prefix).
+
+Vite owns asset bundling, module resolution and stylesheet injection, which moves
+three facts out of a build script and into the graph:
+
+- **The stylesheet is an import, not a copied file.** `main.tsx` does
+  `import "./styles.css"`, so Vite minifies it and writes the `<link>` into the
+  built shell itself. `web/index.html` therefore carries no stylesheet tag and
+  points at the *source* entry, `/main.tsx` — the one thing a hand-maintained tag
+  could disagree with the build about.
+- **The output names are pinned, not hashed.** `entryFileNames: "app.js"` and
+  `assetFileNames: "styles.css"`, because the public artifact list is a documented
+  security fact in §3.13, §7 and §12 rather than an implementation detail: exactly
+  three files are served before sign-in, and they are named in prose.
+- **`inlineDynamicImports` is load-bearing.** mermaid reaches for its diagram types
+  through some 38 dynamic imports. Rollup's default is a chunk each, which would
+  both break the three-file list above and make rendering a diagram a second
+  request.
+
+`base: "./"` for the same reason `api.ts` uses relative URLs: Vite's default emits
+absolute `/app.js`, which is precisely the assumption that breaks a LabView served
+under a path prefix. The shell and the API agree about this, and neither is absolute.
 
 **View hierarchy.** The Stacks tab lists one card per stack — the unit a compose
 fleet is organised in — which expands to its services, each opening the detail
@@ -1376,7 +1412,7 @@ each disagreement is one entry in `svc.declared.drift`, counted in
   never report (§5).
 
 **Agreement is silent, in both directions.** The `Expected ingress` row renders only
-when `expectedMatches` is false, and `DeclaredAuthBadge` and the declared
+when `ingressMatchesExpectation` is false, and `DeclaredAuthBadge` and the declared
 `Authentication` row render nothing for `redundant`. A sidecar that is right about
 everything is invisible beyond the prose in it — which is what makes the rows that *do*
 appear worth reading.
@@ -1693,6 +1729,14 @@ names and English connectives only. No application name, vendor or image belongs
 that would be recognising a fleet rather than reading it. `authentik` is absent for the
 same reason in reverse: a stack named after the identity provider means that service.
 
+**It bounds the build config too.** `web/vite.config.ts` names a host — the dev
+proxy's loopback target — and that is the whole reason `server:` and `build:` are
+separate concerns: dev-server configuration never reaches a built artifact. The web
+sources read no `process.env` and no `import.meta.env`, so there is no path by which
+an operator's environment could be inlined either. A change that reads a `VITE_`
+variable in `web/` is a change to this invariant, because such a value *is* baked
+into `app.js` at build time.
+
 ### I3 — Mechanism and provider are separate conclusions
 
 The mechanism is usually certain; the provider usually is not. A `forwardauth`
@@ -1825,6 +1869,15 @@ endpoint, and needs no privileged access:
   requests leave the fleet. A change that gives the probe a credential, a second method, or a
   path from a scanned document is a change to this invariant.
 - The image runs as `USER node`.
+- **No build tooling in the runtime image.** Vite, the Preact preset and every
+  bundled library are `devDependencies`, so `npm prune --omit=dev` in the build stage
+  removes them and the runtime stage copies only `dist/`, `web/dist/` and production
+  deps. There is no build server, no dev server and no compiler in the shipped
+  container — `web/dist` is three static files behind `@fastify/static`.
+- **The bundle ships without its sourcemap.** `build.sourcemap` is `false`: the map is
+  ~13 MB, it would land in the image, and `@fastify/static` serves whatever is in
+  `web/dist` to anyone who asks, pre-sign-in (§7). The dev server keeps its own maps,
+  where the tradeoff runs the other way.
 - Its own compose example publishes **no `ports:`** — see §7.
 - **Its own login is read-only too.** LabView authenticates people; it authorizes
   nobody, because there is nothing to authorize — every signed-in user gets the same
@@ -1876,6 +1929,17 @@ from the clock, stacks are sorted by id, routers are sorted by name, env is sort
 by key, and Docker keys are applied in list order so two containers colliding on a
 key do not race. Keep it that way: the smoke test and any future golden-file test
 depend on it.
+
+**The web build holds the same line.** Two `npm run build:web` runs over an unchanged
+tree produce byte-identical `app.js`, `styles.css` and `index.html` — pinned output
+names mean no content hash moves, `sourcemap: false` means no absolute path is
+embedded, and nothing in `web/` reads a clock or an environment variable. It is
+checkable in one command, which is the only reason to claim it:
+
+```
+npm run build:web && shasum -a 256 web/dist/* > /tmp/a && \
+npm run build:web && shasum -a 256 web/dist/* | diff /tmp/a -
+```
 
 This is also why `buildOverview` has **no logger**. Diagnostics are data: a
 connection's outcome is returned on `meta.connections` and the *callers* print it,
@@ -3111,8 +3175,14 @@ a simplification:
   assert against their own credential, and a real `LABVIEW_AUTH_PASSWD_FILE` would put
   their users' hashes in front of assertions that print what they compared.
 
-`fixtures/outside-root.env` sits outside every scan root on purpose: it is the
-target of the `env_file` escape attempt that must be refused.
+`fixtures/outside-root.env` and `fixtures/outside-root.labview` sit outside every scan
+root on purpose: they are the targets of the two escape attempts that must be refused —
+an `env_file` reaching out of the stack (`fixtures/edge/dbstack`) and a `.labview`
+symlinked out of it (`fixtures/edge/escapedecl`). Both are deliberately *valid* files
+carrying a `LEAKED_FROM_OUTSIDE_ROOT` marker, and both are asserted by that marker's
+absence from the output rather than by a warning's wording: a containment regression
+then surfaces as fixture data appearing where a reader would see it, which no rephrasing
+of a message can hide (I8).
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
 rather than inside one so the scanned trees stay purely compose stacks.
 
@@ -3130,11 +3200,31 @@ network nor change a result.
 ```
 npm run typecheck   # tsc --noEmit for server, web and scripts (three tsconfigs)
 npm run smoke       # pipeline assertions over the fixtures
-npm run build       # esbuild web bundle + tsc server -> dist/
+npm run build       # vite build -> web/dist, then tsc server -> dist/
+npm run build:web   # just the UI: vite build --config web/vite.config.ts
+npm run build:server # just the server: tsc -p tsconfig.json -> dist/
 npm run dev         # build web once, then tsx watch on the server
+npm run dev:web     # Vite dev server with HMR, proxying /api and /auth
+npm run start       # node dist/index.js — what the image runs, after a build
 npm run scan        # one-shot JSON to stdout; --summary for the digest
 npm run hashpw -- <user>   # prompt for a password, print one `user:hash` line
 ```
+
+**The two dev commands are a pair, not alternatives.** `npm run dev` is the whole
+product: it builds `web/dist` once and reloads the server on a source change, which
+is what you want when the change is in `src/`. `npm run dev:web` adds HMR for the
+half where a full rebuild is the slow part — Vite serves `main.tsx` and its imports
+as modules, patches a component or a rule in `styles.css` into the running page
+without a reload, and proxies `/api` and `/auth` to the server started by
+`npm run dev`. So the UI loop is both, in two terminals, with the browser pointed at
+Vite's port rather than LabView's.
+
+`/auth` is in that proxy alongside `/api` because the OIDC round-trip is registered
+outside `/api` on purpose (§3.13) and the login flow cannot complete without it. The
+proxy target is loopback on `LABVIEW_PORT` (default 8080) and lives under `server:`
+in the Vite config, which is dev-only configuration and is never inlined into a
+bundle — see **I2**. Vite binds `localhost`, so on a host that resolves that to IPv6
+the dev server answers on `::1` and not on `127.0.0.1`.
 
 `hashpw` is the second entry point in `dist/`, so the same tool exists in the image as
 `node dist/hashpw.js <user>` — which is how an operator hashes a password without
@@ -3142,10 +3232,24 @@ installing Node on the host. The password is prompted with echo off or read from
 **never taken from argv**, because `ps` shows argv to every user on the box.
 
 `tsc` runs with `strict` and `noUncheckedIndexedAccess`; the web tsconfig uses
-`moduleResolution: Bundler` since esbuild resolves. **All three** projects must
+`moduleResolution: Bundler` since Vite resolves. **All three** projects must
 typecheck — the web build imports backend types directly, so a model change can
 break the UI without touching a `.tsx` file, and the same is true of the assertions
 (§8).
+
+Two details about which project owns what, both of which exist because `tsc` never
+sees Vite's own resolution:
+
+- **`tsconfig.web.json` sets `types: ["vite/client"]`**, replacing the previous
+  `types: []`. That declaration is what makes `import "./styles.css"` a typed import
+  rather than an unresolved module, and it brings `import.meta.env` with it. Node's
+  types stay out on purpose: this is the browser half, and a `process` or `Buffer`
+  that typechecks here would be a runtime error in the bundle.
+- **`web/vite.config.ts` is typechecked by `tsconfig.scripts.json`, not by
+  `tsconfig.web.json`**, which excludes it explicitly. It reads `process.env` and
+  resolves its own directory from `import.meta.url`, so it needs exactly the node
+  types the web project refuses — and the alternative, leaving it out of every
+  project, is how a build config quietly stops being checked at all.
 
 The gate before any commit:
 

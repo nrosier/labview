@@ -11,7 +11,14 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": []
+    // `vite/client` and nothing else. It is what declares the ambient module for a
+    // `.css` import (main.tsx imports the stylesheet) and `import.meta.env`. Node's
+    // types stay out deliberately: this project is the browser half, and a `process`
+    // or `Buffer` that typechecks here would be a runtime error in the bundle.
+    "types": ["vite/client"]
   },
-  "include": ["web/**/*.ts", "web/**/*.tsx", "src/model/types.ts"]
+  "include": ["web/**/*.ts", "web/**/*.tsx", "src/model/types.ts"],
+  // The build config is Node code that happens to live under web/. It is typechecked
+  // by tsconfig.scripts.json, which has the node types it needs.
+  "exclude": ["web/vite.config.ts"]
 }

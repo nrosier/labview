@@ -1,5 +1,9 @@
 import { render } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
+// The stylesheet is a dependency of the app, not a file that happens to sit beside
+// it: importing it here is what puts it in the graph, so Vite minifies it, hashes
+// nothing it does not have to, and injects the <link> itself (§3.9).
+import "./styles.css";
 import type {
   AppStack,
   AuthMethod,
