@@ -1801,9 +1801,13 @@ web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
 tools/
   probe-lab/  a diagnostic, not part of the scan: point it at a URL and it reports
               what the login rule read there, why each of the seven signals did or
-              did not fire, and what an eighth would have to be. It imports the real
-              rules rather than reimplementing them, so its verdict is the pipeline's
-              verdict. Not in the image — see its own README
+              did not fire, and what an eighth would have to be. It also looks where
+              the scan does not — down a redirect chain, and at a fixed list of
+              current-user addresses — since that is where the login pages it misses
+              turn out to be. It imports the real rules rather than reimplementing
+              them, so its verdict is the pipeline's verdict, and nothing it finds
+              past the first response is allowed to change that verdict. Not in the
+              image — see its own README
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
@@ -1835,6 +1839,18 @@ eighth signal would have to be. It writes a `.json` per target that drops into
 `scripts/smoke.ts` as a fixture, so a proposed rule is replayed offline with nobody's
 service involved. `--from-scan overview.json` picks its targets out of a saved payload:
 exactly the services LabView found neither authentication nor a login page for.
+
+Run against a real fleet, it answered the question the same way most times: **the login was
+not misread, it was somewhere the scan does not look.** So it now also follows a redirect
+chain to its end — stopping the moment a signal fires, so a hand-off to an identity provider
+is recognised rather than walked into — and, where a page came back with no gate and no form
+at all, asks a fixed list of eight current-user addresses. A `401` there, from a request
+carrying no credential, is an application refusing an anonymous caller at an address the
+probe does not ask: the service is gated, and the dashboard cannot know it. Neither of those
+findings changes what the report says LabView concluded, which is the whole point of the
+tool — but both say plainly what would have to change for it to conclude otherwise, and
+which of the two kinds of change it is (a clause needs a fixture; a second request needs a
+decision).
 
 `npm run smoke` runs the whole pipeline against six fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
@@ -1946,7 +1962,10 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   but the drawer cannot say what such a form was made of. When one of your own services
   lands in the wrong half of this, [`tools/probe-lab`](tools/probe-lab/README.md) is how
   you find out which miss it is: point it at the address and it reports what the rule read
-  and what an eighth signal would have to be.
+  and what an eighth signal would have to be. For the JavaScript-rendered case it will
+  usually settle it outright — a client-rendered login screen is invisible in the markup,
+  but the application behind it still answers `401` to an anonymous request at its
+  current-user address, and the tool asks.
 - **A service behind a detected gate is no longer measured at all.** It is not asked, so
   there is no answer to report and its drawer carries no probe block — the posture rests
   on the configuration that already established it. What that costs is a corroboration

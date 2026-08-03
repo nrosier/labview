@@ -617,7 +617,11 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   clear exposures that are real. When one of your own services lands on the wrong side of
   it, [`labview/tools/probe-lab`](labview/tools/probe-lab/README.md) is the diagnostic:
   point it at the address and it reports what the rule read, why each of the seven signals
-  did not fire, and what an eighth would have to be.
+  did not fire, and what an eighth would have to be. It also looks where the scan does not
+  — down the redirect chain, and at a fixed list of current-user addresses — because that is
+  where the misses turn out to be: a service whose login screen is drawn by JavaScript still
+  answers `401` to an anonymous request at its own API, which is a gate LabView cannot see
+  from `/`.
 - Authentik's applications endpoint filters itself by what the token's user may
   launch, so a least-privilege token is not shown every application. LabView reports
   the total and rebuilds the withheld ones from their providers, but an application

@@ -250,7 +250,9 @@ const { buildLabel, buildSummary, buildTitle } = await import("../src/model/buil
 // anyway — its whole value is the claim that a report says what the pipeline said, and a claim
 // like that is worth exactly as much as the check behind it. Only the pure half is reachable
 // from here, which is why the pure half is where all the reasoning lives.
-const { buildReport, renderJson, renderMarkdown } = await import("../tools/probe-lab/report.js");
+const { AUTH_STATE_PATHS, buildReport, renderJson, renderMarkdown, wantsSweep } = await import(
+  "../tools/probe-lab/report.js"
+);
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -5228,6 +5230,182 @@ check(
   "a page that gated has no next steps at all",
   loginReport.next.length === 0 && signupReport.next.length > 0,
   `${loginReport.next.length} / ${signupReport.next.length}`,
+);
+
+/*
+ * The two places a login page hides from a rule that reads one response.
+ *
+ * Both were found by pointing the lab at real services whose sign-in screens it reported as
+ * absent, and both are about *where* rather than *what*: a chain of same-origin redirects ending
+ * at a sign-in screen several responses past the one the scan reads, and a client-rendered shell
+ * whose markup is silent by construction while the application behind it refuses anonymous
+ * callers at an address nobody asked.
+ *
+ * The load-bearing assertion in this block is the same one twice: **neither can move the
+ * verdict.** A report that upgraded itself because the tool looked further than the scan does
+ * would be describing a dashboard nobody has — the exact failure the whole lab is built to avoid.
+ * The rest is that each finding is *stated*, since a fact gathered and not reported is a request
+ * sent for nothing.
+ */
+console.log("\nand what it finds where the rule does not look");
+
+const SPA_SHELL_HTML =
+  '<!doctype html><html><head><title>App</title></head><body><div id="app"></div><script src="/assets/index-9f1.js"></script></body></html>';
+const shellObs = asObservation({ requestUrl: "https://a.example.com/", status: 200, body: SPA_SHELL_HTML });
+/** `/` → `/account/authenticate` → `/account/authenticate/form`, which serves a password field. */
+const chainReport = buildReport(
+  { requestUrl: "https://a.example.com/", status: 302, headers: { location: "/account/authenticate" } },
+  {
+    chain: [
+      {
+        requestUrl: "https://a.example.com/account/authenticate",
+        status: 302,
+        headers: { location: "/account/authenticate/form" },
+      },
+      asObservation({
+        requestUrl: "https://a.example.com/account/authenticate/form",
+        status: 200,
+        body: PROBE_LOGIN_HTML,
+      }),
+    ],
+  },
+);
+check(
+  "a login page two hops down a chain is found, and is not allowed to become the verdict",
+  chainReport.verdict.gate === undefined &&
+    chainReport.verdict.withdrawsExposure === false &&
+    chainReport.chain.length === 2 &&
+    chainReport.chain[0]!.gate === undefined &&
+    chainReport.chain[1]!.gate === "password-form",
+  `${String(chainReport.verdict.gate)} / ${chainReport.chain.map((h) => String(h.gate)).join(",")}`,
+);
+check(
+  // Order matters here and is asserted for that reason: a gate down the chain settles what the
+  // path observation only raises, so it leads. And the line has to argue *against* following in
+  // the scan — the first `Location` is a string the scan already holds, so the cheap change is to
+  // recognise the path, not to spend a second request per service.
+  "...and section 4 leads with it, without proposing that the scan follow redirects",
+  chainReport.next[0]!.includes("Following the chain finds") &&
+    chainReport.next[0]!.includes("password-form") &&
+    chainReport.next[0]!.includes("not to follow") &&
+    chainReport.next[1]!.includes("/account/authenticate"),
+  chainReport.next.join(" | "),
+);
+check(
+  "...and the hops are rendered as hops the scan does not read",
+  (() => {
+    const md = renderMarkdown(chainReport);
+    return (
+      md.includes("## Where the chain went") &&
+      md.includes("LabView reads the first response and stops") &&
+      md.includes("`password-form`")
+    );
+  })(),
+);
+check(
+  // An absent chain and an absent sweep are empty arrays, not missing keys: a report is a fixture
+  // a future rule gets replayed against, and a shape that changes with the run is a bad one.
+  "a target with nothing followed and nothing swept still has both, empty",
+  loginReport.chain.length === 0 &&
+    loginReport.sweep.length === 0 &&
+    renderJson(loginReport).includes('"chain": []'),
+);
+
+check(
+  // Eight extra requests are eight requests at somebody's service, so where they are sent is a
+  // rule rather than a judgement call — and it is the one place the rule can be *proved* right:
+  // a shell's body is silent by construction, so no reading of it could have worked.
+  "the sweep is offered at the form-less shell and nowhere else",
+  wantsSweep(buildReport(shellObs)) === true &&
+    wantsSweep(loginReport) === false &&
+    wantsSweep(signupReport) === false &&
+    wantsSweep(jsonReport) === false &&
+    wantsSweep(chainReport) === false &&
+    wantsSweep(silentReport) === false,
+  [buildReport(shellObs), loginReport, signupReport, jsonReport, chainReport, silentReport]
+    .map((r) => String(wantsSweep(r)))
+    .join(","),
+);
+check(
+  "the auth-state list is fixed, rooted and unique",
+  AUTH_STATE_PATHS.length > 0 &&
+    AUTH_STATE_PATHS.every((p) => p.startsWith("/") && !p.includes("://") && !p.includes("*")) &&
+    new Set(AUTH_STATE_PATHS).size === AUTH_STATE_PATHS.length,
+  AUTH_STATE_PATHS.join(" "),
+);
+
+const refusedReport = buildReport(shellObs, {
+  sweep: [
+    // The catch-all: 200, and the same bytes as the page. Read as an endpoint this would be the
+    // one wrong conclusion this section could produce — an open API on a gated service.
+    {
+      requestUrl: "https://a.example.com/api/",
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: SPA_SHELL_HTML,
+    },
+    {
+      requestUrl: "https://a.example.com/api/v1/users/me",
+      status: 401,
+      headers: {
+        "content-type": "application/json",
+        "www-authenticate": 'Basic realm="Realm"',
+        "set-cookie": "sid=SWEEPSECRET; Path=/",
+      },
+    },
+  ],
+});
+check(
+  "a 401 at a current-user address is found, and is not allowed to become the verdict either",
+  refusedReport.verdict.gate === undefined &&
+    refusedReport.verdict.withdrawsExposure === false &&
+    refusedReport.sweep[1]!.status === 401 &&
+    refusedReport.sweep[1]!.wwwAuthenticate === 'Basic realm="Realm"',
+  String(refusedReport.verdict.gate),
+);
+check(
+  "...and the catch-all 200 is reported as a catch-all rather than as an open endpoint",
+  refusedReport.sweep[0]!.sameAsRoot === true &&
+    renderMarkdown(refusedReport).includes("a catch-all, not an endpoint"),
+);
+check(
+  // The finding, and the size of the change it implies. A refusal one path away from where the
+  // scan looks is not a new clause — every clause reads a response, and this one needs a second
+  // request. Saying which kind of change it is, in the report, is what keeps it from being
+  // mistaken for a one-word fix.
+  "...and section 4 leads with the refusal, naming it as a change to what the probe requests",
+  refusedReport.next[0]!.includes("/api/v1/users/me") &&
+    refusedReport.next[0]!.includes("401") &&
+    refusedReport.next[0]!.includes("challenge") &&
+    refusedReport.next[0]!.includes("what the probe requests") &&
+    refusedReport.next.some((n) => n.includes("no body-only signal can see it")),
+  refusedReport.next.join(" | "),
+);
+check(
+  // I6 on the new path. A `SweepStep` has no headers field at all — status, content type, the
+  // challenge and a byte count — so a cookie on a swept response cannot reach a report by any
+  // route, which is the same structural answer as reducing `Set-Cookie` to names on the target.
+  "...and a cookie set on a swept address never enters the report",
+  !renderJson(refusedReport).includes("SWEEPSECRET") && !renderMarkdown(refusedReport).includes("SWEEPSECRET"),
+);
+check(
+  // The other direction, and the more common one. A reader who came here suspecting a false
+  // positive gets an answer rather than an open question — with the evidence it rests on named,
+  // because "nothing refused us at eight addresses" is not proof of an open service.
+  "a shell that refuses nothing is reported as reachable, on evidence that is named",
+  (() => {
+    const clean = buildReport(shellObs, {
+      sweep: AUTH_STATE_PATHS.map((p) => ({
+        requestUrl: `https://a.example.com${p}`,
+        status: 404,
+        headers: {},
+      })),
+    });
+    return (
+      clean.next[0]!.includes(`None of the ${AUTH_STATE_PATHS.length} auth-state addresses refused`) &&
+      clean.next[0]!.includes("on the evidence available")
+    );
+  })(),
 );
 
 /*

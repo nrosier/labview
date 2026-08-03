@@ -20,12 +20,20 @@
  *  - **No credential, ever.** Nothing on the call path into `getResponse` has one in scope,
  *    and there is no option to supply one. What an unauthenticated visitor gets is the whole
  *    measurement.
- *  - **No redirect followed** unless `--follow`, and then exactly one hop, reported as its
- *    own target. Where a 3xx points is the evidence.
- *  - **Nothing discovered on a page is ever fetched.** No asset, no form action, no link.
- *    `--paths` exists so that an extra address is something the operator typed rather than
- *    something a scanned page suggested.
- *  - One request per target, sequentially by default (`--concurrency`), each with a timeout.
+ *  - **A redirect chain is followed to its end** (`--max-hops`, default 5, `--no-follow` to
+ *    stop at the first answer) — but **only while no gate has been found**. A 3xx that already
+ *    satisfies a clause is where following stops, which is what keeps this tool from sending a
+ *    request at somebody's identity provider: a cross-origin redirect *is* `redirect-origin`,
+ *    so the hand-off is recognised and never walked into.
+ *  - **The auth-state sweep is the one place more is asked than was given.** Where a page came
+ *    back with no gate and no `<form>` at all — the client-rendered shell, where reading the
+ *    body cannot work even in principle — the eight fixed addresses in `AUTH_STATE_PATHS` are
+ *    asked as well. Fixed list, `GET`, no credential, sequential, and `--no-sweep` turns it off.
+ *  - **Nothing discovered on a page is ever fetched.** No asset, no form action, no link. Both
+ *    additions above are addresses the *service* named in a `Location` header or that this tool
+ *    holds in a reviewed constant — never something parsed out of a page's markup.
+ *  - Each request has a timeout, and targets are asked sequentially by default
+ *    (`--concurrency`).
  *  - **Header values are redacted by default.** A report is a file somebody pastes into an
  *    issue; `Set-Cookie` is reduced to names and anything that names a credential is elided
  *    before the observation record is built, so a value the tool decided not to keep cannot
@@ -41,9 +49,11 @@ import { hasDetectedAuth } from "../../src/labels/auth.js";
 import { probeTargets } from "../../src/model/probe.js";
 import type { ConnectionPhase, Overview } from "../../src/model/types.js";
 import {
+  AUTH_STATE_PATHS,
   buildReport,
   renderJson,
   renderMarkdown,
+  wantsSweep,
   type ProbeLabObservation,
   type ProbeLabReport,
 } from "./report.js";
@@ -60,8 +70,24 @@ interface Options {
   lanHost: string;
   /** Extra paths per origin, e.g. `/login`. Operator-supplied, never page-derived. */
   paths: string[];
-  /** Follow one hop of a 3xx, as its own target. Off by default. */
+  /**
+   * Walk a redirect chain past the first answer. **On by default**, which is the change a real
+   * fleet forced: a service that hands an anonymous visitor three same-origin 3xx before showing
+   * its sign-in screen is invisible to a rule that reads one response, and the only way to know
+   * that is what happened is to walk it once, in a diagnostic, on purpose.
+   */
   follow: boolean;
+  /** How far. Bounds the walk whatever a service does, including a redirect loop. */
+  maxHops: number;
+  /**
+   * Whether to ask {@link AUTH_STATE_PATHS} as well.
+   *
+   * `auto` — only where `wantsSweep` says reading the body could not have worked: a page served,
+   * no gate, no `<form>`. `always` — every target that answered, for when the shape is not
+   * obviously a shell but the suspicion is there. `never` — the older bound, one address per
+   * target, for a run against services somebody else operates.
+   */
+  sweep: "auto" | "always" | "never";
   timeoutMs: number;
   concurrency: number;
   out: string;
@@ -89,16 +115,21 @@ Options
                        the scan itself would ask (probeTargets)
   --lan-host <host>    host address for --from-scan's LAN vantage (default: none)
   --paths a,b          also ask these paths on each origin (default: only the URL given)
-  --follow             follow one hop of a 3xx, as its own target (default: off)
+  --no-follow          stop at the first answer (default: follow the redirect chain)
+  --max-hops <n>       how far to follow a chain (default: 5)
+  --sweep              ask the auth-state addresses on every target that answered
+  --no-sweep           never ask them (default: only where a page had no gate and no form)
   --timeout <ms>       per request (default: 8000)
-  --concurrency <n>    requests in flight (default: 1)
+  --concurrency <n>    targets in flight (default: 1)
   --out <dir>          report directory (default: tools/probe-lab/reports)
   --raw-headers        do not redact header values (default: redacted)
   -h, --help           this
 
-It sends one unauthenticated GET per target and nothing else: no credential, no method
-other than GET, no redirect followed unless asked, and nothing a page suggests is ever
-fetched. Two files per target under --out, plus an index.
+Every request is an unauthenticated GET with a timeout, and no credential exists anywhere on
+the call path. Beyond the address given it will follow a redirect chain while no gate has been
+found, and — where a page came back with no gate and no form at all, the one case reading the
+body cannot solve — ask ${AUTH_STATE_PATHS.length} fixed current-user addresses. Nothing parsed
+out of a page is ever fetched. Two files per target under --out, plus an index.
 `.trimStart();
 
 /* -------------------------------------------------------------------------- */
@@ -116,7 +147,9 @@ export function parseArgs(argv: readonly string[]): Options {
     urls: [],
     lanHost: "",
     paths: [],
-    follow: false,
+    follow: true,
+    maxHops: 5,
+    sweep: "auto",
     timeoutMs: 8_000,
     concurrency: 1,
     out: resolvePath(import.meta.dirname, "reports"),
@@ -155,8 +188,24 @@ export function parseArgs(argv: readonly string[]): Options {
         );
         i++;
         break;
+      // `--follow` is kept and still means what it said: follow. It is now the default, so the
+      // flag is a no-op rather than an error — a command somebody has in their shell history
+      // should not start failing to say it asked for what it already gets.
       case "--follow":
         opts.follow = true;
+        break;
+      case "--no-follow":
+        opts.follow = false;
+        break;
+      case "--max-hops":
+        opts.maxHops = positive(need(i, arg), arg);
+        i++;
+        break;
+      case "--sweep":
+        opts.sweep = "always";
+        break;
+      case "--no-sweep":
+        opts.sweep = "never";
         break;
       case "--timeout":
         opts.timeoutMs = positive(need(i, arg), arg);
@@ -339,6 +388,66 @@ async function observe(url: string, opts: Options): Promise<ProbeLabObservation>
   };
 }
 
+/**
+ * Ask an address, then keep asking where it says to go, until it stops saying.
+ *
+ * Returns the whole chain, first response first. **The first element is the only one the verdict
+ * is ever built from** — everything after it is the answer to "and then what happened", which is a
+ * question the scan does not ask and this tool exists to answer.
+ *
+ * Four things stop the walk, and each is a bound rather than a heuristic:
+ *
+ *  - **A gate.** `buildReport(...).verdict.gate` is the pipeline's own rule, so following stops
+ *    exactly where the scan would already have concluded something. This is what keeps a
+ *    cross-origin hand-off from being walked: an off-origin `Location` *is* `redirect-origin`, so
+ *    the request at somebody's identity provider is never sent.
+ *  - **Anything that is not a 3xx with a readable `Location`.** There is nowhere to go.
+ *  - **`--max-hops`.** Whatever the service does, including a loop that varies its path.
+ *  - **A repeat.** A `Location` already asked in this chain is a loop, and asking it twice would
+ *    describe the loop by growing the report instead of by naming it.
+ */
+async function observeChain(url: string, opts: Options): Promise<ProbeLabObservation[]> {
+  const chain: ProbeLabObservation[] = [await observe(url, opts)];
+  if (!opts.follow) return chain;
+  const asked = new Set([url]);
+  for (let hop = 0; hop < opts.maxHops; hop++) {
+    const last = chain[chain.length - 1]!;
+    if (last.status === undefined || last.status < 300 || last.status >= 400) break;
+    if (buildReport(last).verdict.gate !== undefined) break;
+    const location = last.headers["location"];
+    if (!location?.trim()) break;
+    let next: string | undefined;
+    try {
+      next = normalize(new URL(location.trim(), last.requestUrl).toString());
+    } catch {
+      break;
+    }
+    if (!next || asked.has(next)) break;
+    asked.add(next);
+    chain.push(await observe(next, opts));
+  }
+  return chain;
+}
+
+/**
+ * Ask the fixed auth-state addresses on one origin.
+ *
+ * Sequential regardless of `--concurrency`, which applies to targets: eight requests at one
+ * service in parallel is a burst somebody's rate limiter is entitled to read as an attack, and
+ * there is nothing here worth being in a hurry about.
+ *
+ * The list is `AUTH_STATE_PATHS` and nothing else. No expansion, no path read off the page, and
+ * the same eight every run — so what this sent is knowable from the constant rather than from the
+ * report.
+ */
+async function sweepAuthState(url: string, opts: Options): Promise<ProbeLabObservation[]> {
+  const origin = originOf(url);
+  if (!origin) return [];
+  const out: ProbeLabObservation[] = [];
+  for (const path of AUTH_STATE_PATHS) out.push(await observe(`${origin}${path}`, opts));
+  return out;
+}
+
 /** A `Headers` as a plain record, names lowercased, repeats joined the way `Headers` does. */
 function headerMap(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
@@ -390,25 +499,48 @@ function slug(url: string): string {
  * The `Next` column is the count of section-4 lines rather than their text: a row per target
  * is a map, and the reason it points at is in the target's own file.
  */
-function renderIndex(rows: { target: Target; report: ProbeLabReport; file: string }[], at: string): string {
+function renderIndex(rows: Row[], at: string): string {
   const L = [
     "# probe-lab",
     "",
     `${rows.length} target${rows.length === 1 ? "" : "s"}, ${at}.`,
     "",
-    "| Target | Verdict | Signal | Withdraws exposure | Next steps | Report |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| Target | Verdict | Signal | Withdraws exposure | Chain | Auth-state | Next steps | Report |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
   for (const { target, report, file } of rows) {
+    // Two columns for the two ways a login page hides from the verdict beside them, so a run over
+    // twenty services shows at a glance which rows are worth opening. Both read `—` when there
+    // was nothing to say, and neither is ever the same cell as a gate: the verdict column is what
+    // LabView concluded and these are what it could not see.
+    const ahead = report.chain.find((h) => h.gate !== undefined);
+    const refused = report.sweep.filter((s) => s.status === 401 || s.status === 403);
     L.push(
       `| ${target.url} | ${report.verdict.label} | ${report.verdict.gate ?? "—"} | ${
         report.verdict.withdrawsExposure ? "yes" : "no"
+      } | ${
+        report.chain.length === 0
+          ? "—"
+          : `${report.chain.length} hop${report.chain.length === 1 ? "" : "s"}${ahead ? ` → \`${ahead.gate}\`` : ""}`
+      } | ${
+        report.sweep.length === 0
+          ? "—"
+          : refused.length
+            ? `**${refused[0]!.status} at ${refused[0]!.path}**`
+            : `${report.sweep.length} asked, none refused`
       } | ${report.next.length} | [${file}](${file}) |`,
     );
   }
   L.push("", "## Where each target came from", "");
   for (const { target } of rows) L.push(`- ${target.url} — ${target.why}`);
   return `${L.join("\n")}\n`;
+}
+
+/** One finished target: where it came from, what it answered, and the file that says so. */
+interface Row {
+  target: Target;
+  report: ProbeLabReport;
+  file: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -425,32 +557,72 @@ async function main(): Promise<void> {
   }
 
   await mkdir(opts.out, { recursive: true });
-  const rows: { target: Target; report: ProbeLabReport; file: string }[] = [];
-  // A worklist rather than a fixed fan-out, because `--follow` appends to it: one hop, and the
-  // hop is a target in its own right with its own report, so nothing is followed twice.
+  const rows: Row[] = [];
   const queue = [...targets];
   const asked = new Set<string>();
   const inFlight: Promise<void>[] = [];
+  // Counted rather than derived from the rows, because what a run *sent* is the number that
+  // matters for I8 and two of the three kinds of request do not become a row of their own.
+  let hopRequests = 0;
+  let sweptTargets = 0;
+  let sweepRequests = 0;
 
-  const ask = async (target: Target): Promise<void> => {
-    const obs = await observe(target.url, opts);
-    const report = buildReport(obs);
+  /**
+   * The report for one answer, with the auth-state sweep attached if this run calls for it.
+   *
+   * The sweep decision is `wantsSweep`'s, which is in `report.ts` — so what got asked is a
+   * function of the report rather than of a condition written twice, and the smoke pass can pin
+   * it without a network.
+   */
+  const reportOn = async (
+    obs: ProbeLabObservation,
+    hops: ProbeLabObservation[],
+  ): Promise<ProbeLabReport> => {
+    const first = buildReport(obs, { chain: hops });
+    const wanted =
+      opts.sweep === "always" ? obs.status !== undefined : opts.sweep === "auto" && wantsSweep(first);
+    if (!wanted) return first;
+    const sweep = await sweepAuthState(obs.requestUrl, opts);
+    sweptTargets++;
+    sweepRequests += sweep.length;
+    return buildReport(obs, { chain: hops, sweep });
+  };
+
+  const emit = async (target: Target, report: ProbeLabReport): Promise<void> => {
     const file = `${slug(target.url)}.md`;
     await writeFile(resolvePath(opts.out, file), renderMarkdown(report), "utf8");
     await writeFile(resolvePath(opts.out, `${slug(target.url)}.json`), renderJson(report), "utf8");
     rows.push({ target, report, file });
+    const ahead = report.chain.find((h) => h.gate !== undefined);
+    const refused = report.sweep.find((s) => s.status === 401 || s.status === 403);
     process.stdout.write(
-      `${report.verdict.gate ? "gated " : obs.status === undefined ? "silent" : "open  "} ${
-        obs.status ?? "—"
-      }  ${target.url}  ${report.verdict.label}\n`,
+      `${report.verdict.gate ? "gated " : report.read.status === undefined ? "silent" : "open  "} ${
+        report.read.status ?? "—"
+      }  ${target.url}  ${report.verdict.label}${
+        report.chain.length ? ` [+${report.chain.length} hop${report.chain.length === 1 ? "" : "s"}]` : ""
+      }${ahead ? ` [${ahead.gate} down the chain]` : ""}${
+        refused ? ` [${refused.status} at ${refused.path}]` : ""
+      }\n`,
     );
-    // One hop, and only where the operator asked for it. The hop's own report says where it
-    // went, so following further would add pages nobody named.
-    if (opts.follow && report.read.redirect) {
-      const next = normalize(new URL(report.read.location!, target.url).toString());
-      if (next && !asked.has(next)) {
-        queue.push({ url: next, why: `--follow, one hop from ${target.url}` });
-      }
+  };
+
+  const ask = async (target: Target): Promise<void> => {
+    const chain = await observeChain(target.url, opts);
+    const obs = chain[0]!;
+    const hops = chain.slice(1);
+    hopRequests += hops.length;
+    await emit(target, await reportOn(obs, hops));
+    // The end of a chain gets a report of its own, built from the answer already in hand rather
+    // than from a second request. It is the page an operator's browser actually shows them, so it
+    // is the one they will want the seven rows for — and where the chain ended on a shell, it is
+    // also the observation the sweep has something to say about.
+    const end = hops[hops.length - 1];
+    if (end && !asked.has(end.requestUrl)) {
+      asked.add(end.requestUrl);
+      await emit(
+        { url: end.requestUrl, why: `the end of ${target.url}'s redirect chain` },
+        await reportOn(end, []),
+      );
     }
   };
 
@@ -477,11 +649,37 @@ async function main(): Promise<void> {
   // "no login page found" would report a conclusion about a service nothing was learned about.
   const gated = rows.filter((r) => r.report.verdict.gate).length;
   const silent = rows.filter((r) => r.report.read.status === undefined).length;
-  process.stdout.write(
-    `\n${rows.length} asked — ${gated} gated, ${rows.length - gated - silent} with no login page found${
+  const L = [
+    `\n${rows.length} reported — ${gated} gated, ${rows.length - gated - silent} with no login page found${
       silent ? `, ${silent} did not answer` : ""
-    }\nreports in ${opts.out}\n`,
-  );
+    }`,
+  ];
+  // What was sent, in full. The one address per target this tool started with is no longer the
+  // whole story, so a run says how much more it asked and for what — I8 is a claim somebody has to
+  // be able to check against the output rather than against the source.
+  if (hopRequests) L.push(`${hopRequests} redirect hop${hopRequests === 1 ? "" : "s"} followed`);
+  if (sweptTargets) {
+    L.push(
+      `${sweptTargets} form-less page${sweptTargets === 1 ? "" : "s"} asked ${sweepRequests} auth-state address${
+        sweepRequests === 1 ? "" : "es"
+      }`,
+    );
+  }
+  // The two findings this whole tool exists to surface, and the reason they are last: they are
+  // what somebody scrolls back for. Both name a login page LabView cannot see from where it looks
+  // — one further down a chain than it reads, one at an address it does not ask.
+  const aheadRows = rows.filter((r) => r.report.chain.some((h) => h.gate !== undefined));
+  const refusedRows = rows.filter((r) => r.report.sweep.some((s) => s.status === 401 || s.status === 403));
+  for (const r of aheadRows) {
+    const h = r.report.chain.find((x) => x.gate !== undefined)!;
+    L.push(`gated further down the chain: ${r.target.url} → ${h.gate} at ${h.url}`);
+  }
+  for (const r of refusedRows) {
+    const s = r.report.sweep.find((x) => x.status === 401 || x.status === 403)!;
+    L.push(`gated at an address the probe does not ask: ${r.target.url} → ${s.status} at ${s.path}`);
+  }
+  L.push(`reports in ${opts.out}`);
+  process.stdout.write(`${L.join("\n")}\n`);
 }
 
 main().catch((err: unknown) => {

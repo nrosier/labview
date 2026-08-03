@@ -21,6 +21,14 @@
  * section 3 dumps the evidence no signal reads yet, and section 4 says what an eighth signal
  * would have to be. Fine-tuning happens against sections 3 and 4.
  *
+ * **Two of those sections are about addresses the rule never asks**, because the two ways a login
+ * page hides from a body-reading rule are both about *where* rather than *what*. A same-origin
+ * redirect chain can end at a sign-in screen three responses past the one the scan reads
+ * ({@link ChainStep}). A client-rendered shell has no sign-in screen in its markup at any depth,
+ * but the application behind it still refuses an anonymous caller somewhere, and that somewhere is
+ * an address ({@link AUTH_STATE_PATHS}). Both appear as evidence in the report and as a proposal in
+ * section 4. Neither can move the verdict — see {@link buildReport}.
+ *
  * **Nothing here decides anything about a fleet.** This is a diagnostic; it writes files a
  * person reads. It is not imported by `src/`, it is not in the image, and no scan consults it.
  */
@@ -125,6 +133,66 @@ export interface AssetRef {
   href: string;
 }
 
+/**
+ * One hop of a redirect chain the tool walked past the first response.
+ *
+ * **The scan does not walk this.** `getResponse` sends `redirect: "manual"` and `readGate` reads
+ * one response, so a chain is not evidence LabView could act on — it is evidence about *why* the
+ * one response LabView reads said what it said. A service can hand out three same-origin 3xx in a
+ * row and land on its sign-in screen, and all the scan gets is the first `Location`. Recording
+ * the hops is how a reader sees the difference between "no gate" and "the gate is further down a
+ * chain nobody followed", which are the same row on the dashboard.
+ */
+export interface ChainStep {
+  /** The address asked at this hop. */
+  url: string;
+  status?: number;
+  /** The raw `Location`, and where it resolved to — the same reading `readRedirect` does. */
+  location?: string;
+  to?: string;
+  crossOrigin?: boolean;
+  contentType?: string;
+  /** `<title>`, when HTML came back. Often the only thing naming what the page is. */
+  title?: string;
+  bodyBytes?: number;
+  error?: string;
+  /**
+   * What `readGate` would find *at this hop*, applied to the hop's own response.
+   *
+   * The load-bearing field. A gate here and none on the first response is the finding: the
+   * service is gated and the scan cannot see it from where it looks.
+   */
+  gate?: ProbeGate;
+}
+
+/**
+ * One address from {@link AUTH_STATE_PATHS}, and what it answered.
+ *
+ * The evidence a client-rendered login leaves at the HTTP level. A shell's markup carries no
+ * gate by construction, but the application behind it still has to refuse an anonymous caller
+ * somewhere — and where it does that is an address, which can be asked.
+ */
+export interface SweepStep {
+  /** The path, as it appears in {@link AUTH_STATE_PATHS}. */
+  path: string;
+  url: string;
+  status?: number;
+  contentType?: string;
+  /** Kept verbatim, for `challenge`'s reason: a challenge is evidence, not a secret. */
+  wwwAuthenticate?: string;
+  bodyBytes?: number;
+  error?: string;
+  /**
+   * Whether the body was byte-identical to the one served at the target address.
+   *
+   * The tell for a catch-all: a single-page application whose server answers every unmatched
+   * path with the same shell will return 200 here, and that 200 means *nothing was matched*
+   * rather than *an anonymous caller was served*. Without this, a catch-all reads as an open
+   * endpoint, which is the one wrong conclusion this whole section could produce.
+   */
+  sameAsRoot?: boolean;
+}
+
 /** The whole report for one address. `renderMarkdown`/`renderJson` are views of this. */
 export interface ProbeLabReport {
   url: string;
@@ -163,6 +231,20 @@ export interface ProbeLabReport {
     form?: LoginFormShape;
     signals: SignalRow[];
   };
+  /**
+   * 2b — every hop past the first, when the first was a 3xx and carried no gate.
+   *
+   * Empty when nothing was followed, which is also what it is for every response the scan itself
+   * could have judged. Reported beside section 2 rather than in it, because none of it is what
+   * the rule read.
+   */
+  chain: ChainStep[];
+  /**
+   * 3b — what {@link AUTH_STATE_PATHS} answered, when the served page carried nothing.
+   *
+   * Empty unless the sweep ran. See {@link wantsSweep} for when that is.
+   */
+  sweep: SweepStep[];
   /** 3 — the evidence no signal reads yet, which is what an eighth one would be built from. */
   unread: {
     title?: string;
@@ -181,6 +263,72 @@ export interface ProbeLabReport {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The addresses the rule never asks                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Where an application is asked whether it knows who is calling, when its markup will not say.
+ *
+ * The blind spot this exists for: a 200 whose body is a script tag and an empty `<div>` is not a
+ * page without a login form, it is a page whose login form has not been drawn yet — and **no
+ * amount of reading that body can tell the difference.** The information is not in the markup at
+ * any depth, and it is not in a redirect either, because there is no redirect: the application
+ * serves its shell at every path and routes in the browser.
+ *
+ * But the shell is only the front. Whatever it draws has to fetch state, and the fetch has to be
+ * refused when nobody is signed in. So there is an HTTP-level gate; it is simply at a different
+ * address than the one the scan asks. These are the addresses that refusal is conventionally at:
+ * an `/api` root, and a current-user or session resource under nothing, one path segment, or a
+ * version segment. Nothing here is any product's endpoint — it is the shape the convention takes,
+ * and the reason the list can be short is that the convention is narrow.
+ *
+ * **Bounds, because this is the one place the tool asks for more than it was given** (I8):
+ *
+ *  - **Fixed.** Nothing derived from a fetched page, no pattern expansion, no crawl. Eight
+ *    addresses, the same eight every run, and adding one is a commit somebody reviews.
+ *  - **Only where reading failed.** {@link wantsSweep} restricts it to the case above — a page
+ *    served, no gate found, no `<form>` in the markup. A response the rule could judge is never
+ *    swept, because the answer could not change anything.
+ *  - **`GET`, no credential.** Which is the whole point: a 401 here is what an anonymous visitor
+ *    gets, and a credential would turn the one useful answer into a useless one.
+ *
+ * What comes back is never a verdict. It goes in section 3 as evidence and section 4 as a
+ * proposal, and a proposal to ask a second address is a change to what the probe *requests* —
+ * a different and larger argument than a change to how it reads a response.
+ */
+export const AUTH_STATE_PATHS: readonly string[] = [
+  "/api/",
+  "/api/me",
+  "/api/user",
+  "/api/session",
+  "/api/auth/session",
+  "/api/v1/me",
+  "/api/v1/user",
+  "/api/v1/users/me",
+];
+
+/**
+ * Whether asking {@link AUTH_STATE_PATHS} could tell this target's reader anything.
+ *
+ * True for exactly one shape: a page was served, the rule found no gate in it, and there is no
+ * `<form>` in the markup at all. That is the client-rendered shell — the only case where the
+ * served body is known to be silent rather than known to be negative.
+ *
+ * False for everything else, and each exclusion is deliberate. A gate that fired needs no further
+ * evidence. A 3xx has a `Location`, which is evidence, and following it is the chain's job. A
+ * non-HTML answer says the address is not a UI. A page *with* forms said something the reader can
+ * act on, so section 3's dump is the next thing to look at rather than eight more requests.
+ */
+export function wantsSweep(report: ProbeLabReport): boolean {
+  return (
+    report.verdict.gate === undefined &&
+    report.read.status === 200 &&
+    report.read.html &&
+    report.unread.forms.length === 0
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* The report                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -190,8 +338,18 @@ export interface ProbeLabReport {
  * The order below is the order the sections are read in, and it is not arbitrary: the verdict
  * comes from `readGate` first, so everything after it is an account of a decision already made
  * rather than a second derivation that could disagree with it.
+ *
+ * `extra` is what the caller went on to ask after the first answer — hops of a redirect chain,
+ * and the auth-state sweep. **Neither can move the verdict**, and that is structural rather than
+ * promised: the verdict is computed from `obs` alone, above the line where `extra` is read. A
+ * chain that ends at a login page still reports "no login page", because that is what LabView
+ * would conclude from the same first response, and a report whose verdict improved on the
+ * pipeline's would be describing a dashboard nobody has.
  */
-export function buildReport(obs: ProbeLabObservation): ProbeLabReport {
+export function buildReport(
+  obs: ProbeLabObservation,
+  extra: { chain?: readonly ProbeLabObservation[]; sweep?: readonly ProbeLabObservation[] } = {},
+): ProbeLabReport {
   const contentType = obs.headers["content-type"];
   const mediaType = readMediaType(contentType);
   const location = obs.headers["location"];
@@ -199,13 +357,7 @@ export function buildReport(obs: ProbeLabObservation): ProbeLabReport {
 
   // The exact record the pipeline would have handed `readGate`. Built once and reused for the
   // verdict, the reason and every signal row, so the three cannot describe different responses.
-  const res = {
-    requestUrl: obs.requestUrl,
-    status: obs.status ?? 0,
-    ...(location ? { location } : {}),
-    ...(wwwAuthenticate ? { wwwAuthenticate } : {}),
-    ...(obs.body ? { body: obs.body } : {}),
-  };
+  const res = asProbeResponse(obs);
   const answered = obs.status !== undefined;
   const gate = answered ? readGate(res) : undefined;
 
@@ -233,6 +385,8 @@ export function buildReport(obs: ProbeLabObservation): ProbeLabReport {
   };
 
   const signals = signalRows(obs, { mediaType, redirect, refresh, form, wwwAuthenticate });
+  const chain = buildChain(extra.chain ?? []);
+  const sweep = buildSweep(extra.sweep ?? [], obs.body);
   return {
     url: obs.requestUrl,
     verdict: {
@@ -258,9 +412,92 @@ export function buildReport(obs: ProbeLabObservation): ProbeLabReport {
       ...(form ? { form } : {}),
       signals,
     },
+    chain,
+    sweep,
     unread: readUnread(obs),
-    next: nextSteps(obs, signals, { mediaType, form, redirect, refresh }),
+    next: nextSteps(obs, signals, { mediaType, form, redirect, refresh, chain, sweep }),
   };
+}
+
+/**
+ * One observation as the record `readGate` takes.
+ *
+ * Shared by the verdict and by every hop of a chain, so a hop is judged by exactly the rule the
+ * target was judged by. `status ?? 0` is how "nothing answered" reaches a rule that requires a
+ * number; every clause tests the status against something, and 0 matches none of them.
+ */
+function asProbeResponse(obs: ProbeLabObservation) {
+  const location = obs.headers["location"];
+  const wwwAuthenticate = obs.headers["www-authenticate"];
+  return {
+    requestUrl: obs.requestUrl,
+    status: obs.status ?? 0,
+    ...(location ? { location } : {}),
+    ...(wwwAuthenticate ? { wwwAuthenticate } : {}),
+    ...(obs.body ? { body: obs.body } : {}),
+  };
+}
+
+/**
+ * Each followed hop, read by the same rule the target was read by.
+ *
+ * `gate` is the reason this function exists. Applying `readGate` to a hop answers the question a
+ * chain raises — *would the scan have found something if it looked here?* — with the pipeline's
+ * own rule rather than an impression, so the answer is comparable to the verdict it sits beside.
+ */
+export function buildChain(observations: readonly ProbeLabObservation[]): ChainStep[] {
+  return observations.map((o) => {
+    const location = o.headers["location"];
+    const redirect = location ? readRedirect(location.trim(), o.requestUrl) : undefined;
+    const gate = o.status !== undefined ? readGate(asProbeResponse(o)) : undefined;
+    return {
+      url: o.requestUrl,
+      ...(o.status !== undefined ? { status: o.status } : {}),
+      ...(location ? { location } : {}),
+      ...(redirect ? { to: redirect.to, crossOrigin: redirect.crossOrigin } : {}),
+      ...(o.headers["content-type"] ? { contentType: o.headers["content-type"] } : {}),
+      ...(o.body ? { title: tagText(o.body, "title") } : {}),
+      ...(o.bodyBytes !== undefined ? { bodyBytes: o.bodyBytes } : {}),
+      ...(o.error ? { error: o.error } : {}),
+      ...(gate ? { gate } : {}),
+    };
+  });
+}
+
+/**
+ * Each swept address, and whether its answer is the shell again.
+ *
+ * `rootBody` is the target's own body, and comparing against it is not an optimisation — a
+ * catch-all router answers 200 with the same shell at every unmatched path, and a 200 read as "an
+ * anonymous caller was served" when it means "nothing matched" is the one way this section could
+ * mislead somebody into calling a gated service open.
+ */
+export function buildSweep(
+  observations: readonly ProbeLabObservation[],
+  rootBody?: string,
+): SweepStep[] {
+  return observations.map((o) => {
+    const same = rootBody !== undefined && o.body !== undefined && o.body === rootBody;
+    return {
+      path: pathOf(o.requestUrl),
+      url: o.requestUrl,
+      ...(o.status !== undefined ? { status: o.status } : {}),
+      ...(o.headers["content-type"] ? { contentType: o.headers["content-type"] } : {}),
+      ...(o.headers["www-authenticate"] ? { wwwAuthenticate: o.headers["www-authenticate"] } : {}),
+      ...(o.bodyBytes !== undefined ? { bodyBytes: o.bodyBytes } : {}),
+      ...(o.error ? { error: o.error } : {}),
+      ...(same ? { sameAsRoot: true } : {}),
+    };
+  });
+}
+
+/** The path of an address, or the whole address if it will not parse. */
+function pathOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
 }
 
 /** What each clause turned on, whether or not it fired. Facts derived once and passed in. */
@@ -556,7 +793,14 @@ function attrOf(tag: string, name: string): string | undefined {
 function nextSteps(
   obs: ProbeLabObservation,
   signals: SignalRow[],
-  ctx: { mediaType?: string; form?: LoginFormShape; redirect?: ProbeRedirect; refresh?: ProbeRedirect },
+  ctx: {
+    mediaType?: string;
+    form?: LoginFormShape;
+    redirect?: ProbeRedirect;
+    refresh?: ProbeRedirect;
+    chain: ChainStep[];
+    sweep: SweepStep[];
+  },
 ): string[] {
   if (signals.some((s) => s.fired)) return [];
   const out: string[] = [];
@@ -571,13 +815,24 @@ function nextSteps(
   // service did not serve the request, so *something* stands in front of it, and whether that
   // something is a gate turns entirely on one path name.
   if (obs.status >= 300 && obs.status < 400) {
+    const ahead = chainLines(ctx.chain);
+    // A gate further down the chain outranks the path observation, because it settles what the
+    // path observation only raises: there *is* a sign-in screen, and the scan looked one response
+    // too early to see it. Where no hop gated, the path is still the whole of the evidence and
+    // goes first.
+    const gatedAhead = ctx.chain.some((h) => h.gate !== undefined);
+    if (gatedAhead) out.push(...ahead);
     out.push(
       ctx.redirect
         ? `The redirect stayed on this origin and went to ${ctx.redirect.to}, which is not a login path — so LabView read it as routing. If that path *is* this service's sign-in screen under a name the login-path list does not have, adding the name is the smallest possible change and needs a fixture; if it is not, then ${ctx.redirect.to} is the address worth asking, and --paths will ask it.`
         : `A ${obs.status} whose Location could not be read, so where the service was sending the request is unknown. Nothing can be concluded from a redirect whose target is unavailable — check the raw header in section 3.`,
     );
+    if (!gatedAhead) out.push(...ahead);
     return out;
   }
+  // Before anything about the markup, because it is about something stronger than markup: an
+  // address that refused an anonymous caller is a gate that exists, whatever the page said.
+  out.push(...sweepLines(ctx.sweep));
   if (obs.status !== 200 && obs.status !== 401 && obs.status !== 407) {
     out.push(
       `HTTP ${obs.status} is none of the three shapes a gate is recognised in — a credential request, a redirect, or a page served. If this status is how the service refuses an anonymous visitor, that is a new clause and it needs a fact beyond the number: a WWW-Authenticate header, a body, or a redirect.`,
@@ -637,6 +892,91 @@ function nextSteps(
     );
   }
   return out;
+}
+
+/**
+ * What a followed chain adds, in one or two lines.
+ *
+ * The line worth writing this function for is the first one. A same-origin 3xx to a path the list
+ * does not have, followed twice more, ending on a page that carries a password field — that is a
+ * gated service the dashboard shows as exposed, and the distance between the two is *the number
+ * of responses the scan reads*. Saying so is the point.
+ *
+ * What it deliberately does not say is "follow redirects in the scan". Following is a second
+ * request per service and a second address to be wrong about, and the chain's own evidence is
+ * cheaper: the first `Location` is a string the scan already has, so recognising the sign-in
+ * screen by its path costs nothing and needs no extra request.
+ */
+function chainLines(chain: ChainStep[]): string[] {
+  if (!chain.length) return [];
+  const out: string[] = [];
+  const hops = chain.length;
+  const plural = hops === 1 ? "hop" : "hops";
+  const gated = chain.find((h) => h.gate !== undefined);
+  const last = chain[chain.length - 1]!;
+
+  if (gated) {
+    const at = chain.indexOf(gated) + 1;
+    out.push(
+      `**Following the chain finds \`${gated.gate}\` at ${gated.url}**, ${at} ${at === 1 ? "hop" : "hops"} on. The service is gated and the scan cannot see it: \`getResponse\` sends \`redirect: "manual"\` and \`readGate\` reads one response, so everything past the first is invisible by design. The cheap fix is not to follow — it is that the *first* Location already pointed here, so a rule recognising that path would reach the same conclusion with the request it already makes.`,
+    );
+  }
+  if (last.status !== undefined && last.status >= 300 && last.status < 400) {
+    out.push(
+      `The chain was still redirecting after ${hops} ${plural} (${last.url} → ${last.to ?? last.location ?? "unread Location"}), so where it ends is unknown — raise \`--max-hops\` to find out.`,
+    );
+  } else if (last.status === undefined) {
+    out.push(
+      `The chain ran ${hops} ${plural} and then nothing answered at ${last.url} (${last.error ?? "no detail"}). A service that redirects an anonymous visitor to an address that does not answer is worth knowing about on its own.`,
+    );
+  } else if (!gated) {
+    out.push(
+      `The chain ended after ${hops} ${plural} at ${last.url} — HTTP ${last.status}${last.title ? `, titled “${last.title}”` : ""} — and no hop carried a signal either. That address is a target in its own right and has its own report; if a sign-in screen is there, it is drawn after the markup arrives, which is the blind spot rather than a rule to widen.`,
+    );
+  }
+  return out;
+}
+
+/**
+ * What the auth-state sweep adds — the strongest evidence available about a shell, in both
+ * directions.
+ *
+ * **A refusal is the finding.** A 401 or 403 at a current-user address, from a request carrying no
+ * credential, is an application saying it does not know who is calling. That is a gate, at the
+ * HTTP level, on the same origin the dashboard calls exposed. It says nothing about `/` — which is
+ * exactly why the line is careful to describe the change it implies as a change to *what the probe
+ * asks*, not to how the rule reads. Those are different sizes of decision: one more address per
+ * service is a request budget and a list to argue about; a new clause is a fixture.
+ *
+ * **No refusal is also a finding**, and the more common one worth trusting. If nothing anywhere
+ * near a current-user endpoint refuses an anonymous caller, the shell is not hiding a gate — and
+ * a reader who came here suspecting a false positive can stop.
+ */
+function sweepLines(sweep: SweepStep[]): string[] {
+  if (!sweep.length) return [];
+  const refused = sweep.filter((s) => s.status === 401 || s.status === 403);
+  if (!refused.length) {
+    const answered = sweep.filter((s) => s.status !== undefined);
+    const shells = sweep.filter((s) => s.sameAsRoot).length;
+    return [
+      `None of the ${sweep.length} auth-state addresses refused an anonymous caller (${
+        answered.length
+          ? answered.map((s) => `${s.path} → ${s.status}`).join(", ")
+          : "none of them answered at all"
+      }${shells ? `; ${shells} answered with the same bytes as the page itself, which is a catch-all rather than an endpoint` : ""}). So there is no gate hiding behind this shell at any address this tool knows to ask, and on the evidence available the service is reachable without authenticating.`,
+    ];
+  }
+  const challenged = refused.find((s) => s.wwwAuthenticate?.trim());
+  const first = challenged ?? refused[0]!;
+  return [
+    `**${first.path} answered ${first.status} while the page answered 200** — a request with no credential on it, refused${
+      refused.length > 1 ? `, as were ${refused.length - 1} more of the addresses asked` : ""
+    }. This service *is* gated; the gate is at an address the probe does not ask.${
+      challenged
+        ? ` It even named its scheme: \`WWW-Authenticate: ${challenged.wwwAuthenticate}\`, which is \`challenge\` — the first clause in the list, satisfied one path away from where the scan looks.`
+        : ""
+    } Acting on this means changing **what the probe requests**, not how it reads an answer: a second address per service, from a fixed list, sent only where the first answer was a form-less shell. That is a request-budget decision and an I8 argument, and it is the one change that would close this blind spot without rendering a page.`,
+  ];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -709,6 +1049,34 @@ export function renderMarkdown(report: ProbeLabReport): string {
   }
   L.push("");
 
+  // Its own section rather than part of section 2, because none of it is what the rule read — and
+  // the heading has to say so before the first row, or a hop that gated reads as a verdict.
+  if (report.chain.length) {
+    L.push("## Where the chain went", "");
+    L.push(
+      `**LabView reads the first response and stops.** These ${report.chain.length} hop${
+        report.chain.length === 1 ? "" : "s"
+      } are this tool's, followed because the answer above was a redirect the rule found nothing in. A signal on any row below is a signal the scan does not see.`,
+      "",
+    );
+    L.push("| Hop | Address | Status | Location → resolved | Signal there |", "| --- | --- | --- | --- | --- |");
+    report.chain.forEach((h, i) => {
+      const where = h.location
+        ? `${h.location} → ${h.to ? `${h.to}${h.crossOrigin ? " (off origin)" : " (same origin)"}` : "would not parse"}`
+        : "—";
+      const status = h.status === undefined ? `— (${h.error ?? "no answer"})` : String(h.status);
+      L.push(`| ${i + 1} | ${h.url} | ${status} | ${cell(where)} | ${h.gate ? `\`${h.gate}\`` : "—"} |`);
+    });
+    L.push("");
+    for (const h of report.chain) {
+      if (h.title === undefined && h.contentType === undefined) continue;
+      L.push(
+        `- ${h.url} — ${[h.title ? `titled “${h.title}”` : undefined, h.contentType, h.bodyBytes === undefined ? undefined : `${h.bodyBytes} bytes`].filter(Boolean).join(", ")}`,
+      );
+    }
+    if (report.chain.some((h) => h.title !== undefined || h.contentType !== undefined)) L.push("");
+  }
+
   L.push("## What the rule did not consider", "");
   const u = report.unread;
   const notes: string[] = [];
@@ -752,6 +1120,35 @@ export function renderMarkdown(report: ProbeLabReport): string {
   if (u.headers.length) {
     L.push("### Response headers", "");
     for (const [name, value] of u.headers) L.push(`- \`${name}\`: ${value}`);
+    L.push("");
+  }
+  // Last in the section, and inside it rather than above it: this is evidence no clause reads,
+  // which is what section 3 is. The heading names the credential situation because a reader
+  // seeing 401s in a report needs to know immediately that nothing was ever sent to earn them.
+  if (report.sweep.length) {
+    L.push("### Auth-state addresses", "");
+    L.push(
+      `The served markup carried no gate, so a fixed list of current-user addresses was asked too — \`GET\`, **no credential on any of them**. A refusal below is an application declining an anonymous caller at an address the scan does not ask.`,
+      "",
+    );
+    L.push("| Path | Status | Content-Type | WWW-Authenticate | Body |", "| --- | --- | --- | --- | --- |");
+    for (const s of report.sweep) {
+      L.push(
+        `| \`${s.path}\` | ${s.status === undefined ? `— (${s.error ?? "no answer"})` : String(s.status)} | ${
+          s.contentType ?? "—"
+        } | ${s.wwwAuthenticate ? cell(s.wwwAuthenticate) : "—"} | ${
+          s.sameAsRoot
+            ? "the same bytes as the page — a catch-all, not an endpoint"
+            : s.bodyBytes !== undefined
+              ? `${s.bodyBytes} bytes`
+              : s.status === undefined
+                ? "—"
+                : // The pipeline's own rule, and worth saying rather than dashing: a body is read
+                  // only when the media type is HTML, so an API's answer is a status and headers.
+                  "not read (not HTML)"
+        } |`,
+      );
+    }
     L.push("");
   }
 
