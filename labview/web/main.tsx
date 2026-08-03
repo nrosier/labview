@@ -522,7 +522,14 @@ function App() {
   // `ov.stacks` the drawers read rather than carried in `ScanMeta`, for the reason the drift
   // collector states: a second copy of a grouping is a second thing to keep in step, and
   // `stats.probeGated`/`stats.probeOpen` are already the counts this has to agree with.
-  const probeReport = useMemo(() => collectProbeReport(ov?.stacks ?? []), [ov]);
+  //
+  // `probe.skipped` is the exception and has to be passed in: a service that was never asked
+  // leaves nothing on `ov.stacks` to derive it from, and without it the tile would count
+  // fewer services than the fleet has HTTP addresses with nothing to explain the difference.
+  const probeReport = useMemo(
+    () => collectProbeReport(ov?.stacks ?? [], ov?.meta.probe.skipped ?? 0),
+    [ov],
+  );
 
   const selectedFlat = selected ? flat.find((f) => f.key === selected) : undefined;
 
@@ -863,10 +870,10 @@ function App() {
             services with no gate *detected*, and putting a probe result into it would make an
             observation stand where a mechanism belongs, which I3 forbids. And deliberately
             not `alert` — `probeOpen` is documented as no subset of the exposure count (a
-            service behind a detected gate that answers LabView from inside the fleet is in
-            it), so a red tile here would claim a fleet finding the tile beside it may
-            correctly deny. */}
-        {probeReport.probed > 0 && (
+            service whose `.labview` file declares a mechanism is asked anyway, since a
+            declaration is a claim rather than detection, and lands in it), so a red tile here
+            would claim a fleet finding the tile beside it may correctly deny. */}
+        {(probeReport.probed > 0 || probeReport.notAsked > 0) && (
           <StatTile
             label="Login probe"
             value={probeReport.probed}
@@ -875,7 +882,13 @@ function App() {
                 ? `${probeReport.open.length} with no login page`
                 : probeReport.gated.length > 0
                   ? `${probeReport.gated.length} gated`
-                  : "none answered"
+                  : // A well-run fleet where everything with an HTTP address is already
+                    // behind a gate reaches here: nothing needed asking. Without the tile an
+                    // operator who turned the stage on would see no sign it had run at all,
+                    // which is why `notAsked` alone is enough to draw it.
+                    probeReport.probed === 0
+                    ? `${probeReport.notAsked} already authenticated`
+                    : "none answered"
             }
             title={`${probeReportSummaryText(probeReport)}\nclick for the address tried, what came back and why`}
             onClick={() => setPanel("probe")}

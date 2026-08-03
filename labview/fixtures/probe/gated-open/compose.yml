@@ -1,14 +1,21 @@
-# Regression fixture: a probe that got through may not downgrade a detected gate.
+# Regression fixture: a service whose gate this scan already detected is never asked.
 #
-# The router carries an Authentik forward-auth middleware, so the labels do name a gate and
-# `auth.method` is `forward-auth`. The probe then reaches this service and is answered `200`
-# with no login page — because LabView asked from inside the fleet, where the request may
-# simply not have travelled the path the middleware sits on.
+# The router carries an Authentik forward-auth middleware, so the labels name a gate and
+# `auth.method` is `authentik-forward-auth`. No definition for `authentik@docker` exists in any stack
+# under this root, so the posture is `inferred` — recognised by the middleware's *name* and not
+# by anything the scan could read. That is deliberate, and it is the harder half of the rule:
+# an inferred gate is still authentication detected through Traefik, and it already makes
+# `hasEdgeAuth` true, so a probe could not have changed this service's verdict in either
+# direction. It is therefore not asked, exactly as a confirmed gate would not be.
 #
-# The posture stands. This is the `chainComplete` rule in another guise: a read that might not
-# have gone through the gate is not evidence about the gate. What the probe earns here is a
-# note, saying where LabView asked from and what it got — which is a genuine thing to know,
-# and not grounds for calling a configured gate absent.
+# What withholding the request costs is a note that used to say where LabView asked from and
+# what it got, which was a genuine thing to know. What it buys is not putting an unauthenticated
+# GET on a gated address to learn something that could not alter the report. The exchange is
+# stated in §12 of the implementation guide.
+#
+# The smoke stub still has an answer waiting for `https://gated.probe.example.com/`, and that is
+# the trap: a revert that drops the eligibility check does not fail on a missing stub entry — it
+# fails because the request was recorded.
 services:
   app:
     image: example/app:1.0.0

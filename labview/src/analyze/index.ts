@@ -13,7 +13,7 @@ import { parseDockflare } from "../labels/dockflare.js";
 import { parseTraefik } from "../labels/traefik.js";
 import {
   deriveAuth,
-  hasEnforcedAuthentikGate,
+  hasDetectedAuth,
   isAuthMiddlewareRef,
   providerEnforces,
 } from "../labels/auth.js";
@@ -157,14 +157,15 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
   // reassurance about the very case being reported.
   flagUnreachableDependencies(stacks, nets, declaredDeps);
 
-  // The probe joins these two rather than running after them, because it needs the same
-  // thing they do and nothing more: pass 1's parsed routes. It asks the *services* instead
-  // of an API, so it is the one exchange here that is off unless the operator turned it on —
-  // and when it is off, `probeServices` returns its `disabled` report without a request.
-  const [ak, tf, pr] = await Promise.all([
+  // The two API reads go out together. The probe does not join them, and the reason is
+  // ordering rather than politeness: it only asks services for which this scan found *no*
+  // authentication, and whether it found any is not known until both of these have landed
+  // and `deriveAuth` has run over them. So the probe costs its own wall-clock now instead
+  // of hiding inside these — the price of not asking an SSO endpoint a question whose
+  // answer could not have changed anything.
+  const [ak, tf] = await Promise.all([
     configuredAk ?? snapshotAuthentik(cfg, discoverAuthentikEndpoints(stacks), deps.fetchImpl),
     configuredTf ?? snapshotTraefik(cfg, discoverTraefikEndpoints(stacks), deps.fetchImpl),
-    probeServices(cfg, stacks, deps.fetchImpl),
   ]);
 
   // Authentik hostnames can only be discovered once routes are parsed. An endpoint
@@ -197,15 +198,36 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     },
   };
 
-  // Pass 2: derive auth posture, finalize exposure, mask secrets.
+  // Pass 2a: the posture, from configuration and the two reads above. Nothing measured yet,
+  // and nothing concluded about exposure — this pass exists so the probe has something to
+  // decide eligibility on.
+  //
+  // `detectedAuth` is computed once and used twice: to withhold the request, and to word
+  // the notes that explain what the probe did or did not establish. One set, so the two
+  // cannot disagree.
+  const detectedAuth = new Set<string>();
+  for (const stack of stacks) {
+    for (const svc of stack.services) {
+      svc.auth = deriveAuth(svc, cfg, registry, authHints, live.chainComplete);
+      if (hasDetectedAuth(svc)) detectedAuth.add(`${stack.id}/${svc.name}`);
+    }
+  }
+
+  // The probe. It asks the *services* instead of an API, so it is the one exchange here
+  // that is off unless the operator turned it on — and when it is off, `probeServices`
+  // returns its `disabled` report without a request.
+  const pr = await probeServices(cfg, stacks, detectedAuth, deps.fetchImpl);
+
+  // Pass 2b: attach the measurement, finalize exposure, mask secrets.
   for (const stack of stacks) {
     for (const svc of stack.services) {
       const key = `${stack.id}/${svc.name}`;
-      // Attached before the posture is settled, because `finalizeAuth` reads it as
+      // Attached before the exposure verdict is settled, because `finalizeAuth` reads it as
       // evidence. Absent on most services: only the ones whose own labels showed an HTTP
-      // address were asked, and only when probing was enabled at all.
+      // address *and* for which no authentication was detected were asked, and only when
+      // probing was enabled at all.
       svc.probe = pr.byKey.get(key);
-      finalizeAuth(svc, key, cfg, registry, authHints, live);
+      finalizeAuth(svc, key, cfg, live, detectedAuth.has(key));
     }
   }
 
@@ -238,7 +260,7 @@ export async function buildOverview(cfg: LabViewConfig, now: Date, deps: BuildDe
     // tell one that was rewritten for a single request from one that came off disk. The
     // server's build closure is the only place that knows, so it is the only place that
     // says otherwise.
-    probe: { enabled: cfg.probe.enabled, source: "config" },
+    probe: { enabled: cfg.probe.enabled, source: "config", skipped: pr.skipped },
     durationMs: Date.now() - started,
     warnings,
     build: deps.buildStamp ?? buildStamp(),
@@ -321,34 +343,32 @@ function parseRoutes(stack: AppStack, svc: Service, snapshot: DockerSnapshot, cf
     undefined;
 }
 
-/** Pass 2: derive auth posture, finalize exposure, then mask secrets. */
+/**
+ * Pass 2b: finalize exposure from the posture pass 2a derived, then mask secrets.
+ *
+ * @param configuredEdgeAuth `hasDetectedAuth` for this service, decided in pass 2a and
+ * passed in rather than recomputed — it is what decided whether the probe was allowed to
+ * ask, and the notes below have to be worded from the same answer.
+ */
 function finalizeAuth(
   svc: Service,
   key: string,
   cfg: LabViewConfig,
-  registry: MiddlewareRegistry,
-  authHints: string[],
   live: TraefikLiveContext,
+  configuredEdgeAuth: boolean,
 ): void {
-  svc.auth = deriveAuth(svc, cfg, registry, authHints, live.chainComplete);
-
-  const hasCloudflareAccess = svc.cloudflare.some(
-    (r) => r.access && (r.access.policy || r.access.group || r.access.emails?.length),
-  );
   // A login page LabView was answered with, which is protection it *measured* — the same
-  // kind of thing as the other three terms and unlike a declaration, which is a claim.
+  // kind of thing as `configuredEdgeAuth` and unlike a declaration, which is a claim.
   // It names no mechanism, and does not become one: `svc.auth` is untouched by it, the
   // service is counted in `probeGated`, and `noAuthReason` reports it as `probed-gate`,
   // exactly as an Authentik gate with no readable method is reported as `unnamed-gate`.
   const probeGate = svc.probe?.gate !== undefined;
-  // A confirmed gate counts even when it has no `AuthMethod` to be reported as —
-  // a SAML application is protected, and calling it exposed would be plainly wrong.
-  //
-  // Kept as two terms so the notes can tell "the probe is the only protection LabView
-  // found" from "the probe agrees with a gate that was already detected". Those are
-  // different things to a reader, and only the first is load-bearing for the count.
-  const configuredEdgeAuth =
-    svc.auth.method !== "none" || hasCloudflareAccess || hasEnforcedAuthentikGate(svc);
+  // Kept as two terms even though `hasDetectedAuth` now makes them disjoint — a service
+  // with detected authentication is never asked, so `probeGate` can only be true where
+  // `configuredEdgeAuth` is false. The split is what keeps `probeGated` subtractable from
+  // `exposedWithoutAuth` (**I1**): a reader can drop the measured term and recover the
+  // figure a scan with probing off would report. Collapsing it into one boolean would
+  // destroy that, and the disjointness is asserted in smoke rather than assumed here.
   const hasEdgeAuth = configuredEdgeAuth || probeGate;
   // Answerable by someone outside the container network: via the tunnel, via the
   // proxy, or straight at a published port on the LAN. `internal` and `none` are
@@ -388,7 +408,7 @@ function finalizeAuth(
       `Auth posture (${svc.auth.method}) inferred from a middleware name — its definition was not found in any scanned stack, so it could not be confirmed.`,
     );
   }
-  noteProbe(svc, configuredEdgeAuth);
+  noteProbe(svc);
   noteDeclarations(svc, wouldBeExposed);
   noteHostPortBypass(svc);
   noteAuthentikGaps(svc);
@@ -633,44 +653,35 @@ function probeOpenClause(svc: Service): string {
 /**
  * What the probe observed, where the exposure note has not already said it.
  *
- * Two cases, and neither changes a verdict on its own:
+ * One case now: **a gate answered**. The service is not counted as exposed, and this is
+ * the note that says why — the same discipline the `supplies` declaration branch keeps,
+ * since both are cases where the report withholds a finding and therefore owes the reader
+ * its grounds.
  *
- *  - **A gate answered.** The service is not counted as exposed, and this is the note
- *    that says why — the same discipline the `supplies` declaration branch keeps, since
- *    both are cases where the report withholds a finding and therefore owes the reader
- *    its grounds. Worded differently depending on whether a gate had already been
- *    detected: then the probe corroborates a mechanism that is already named, and there
- *    is nothing being withheld on its strength.
- *  - **No gate, and a gate was detected anyway.** The posture stands untouched, on the
- *    `chainComplete` precedent in `labels/auth.ts`: a read that may not have travelled
- *    the gated path may not supersede a label. LabView's request came from inside the
- *    fleet — or straight at a published port, which is what `noteHostPortBypass` is
- *    about — so it may simply have gone around the edge that gates real visitors. That
- *    is worth knowing and is not grounds for downgrading anything.
+ * There is no "the probe corroborates a gate that was already detected" wording any more,
+ * and there cannot be: a service `hasDetectedAuth` was true for is never asked, so
+ * `svc.probe` being present *is* the evidence that this scan found no authentication for
+ * it. That disjointness is asserted in smoke rather than defended with a branch here.
+ *
+ * A service that answered with no gate gets nothing from here either: with no detected
+ * authentication and an HTTP address, it is reachable and unprotected, so the exposure
+ * note has already been pushed and `probeOpenClause` has already appended the
+ * measurement to it. The one exception is a service held back by a `.labview`
+ * declaration, where `noteDeclarations` reports the disagreement as drift.
  *
  * A service that did not answer gets no note. Its `ServiceProbe` is on the payload with
  * the phase and every attempt, the aggregate report says how many were silent, and a
  * fleet whose container cannot resolve its own public hostnames would otherwise collect
  * one identical note per service.
  */
-function noteProbe(svc: Service, configuredEdgeAuth: boolean): void {
+function noteProbe(svc: Service): void {
   const probe = svc.probe;
-  if (!probe || probe.phase !== "connected") return;
+  if (!probe || probe.phase !== "connected" || !probe.gate) return;
 
-  if (probe.gate) {
-    const what = `${probeGateText(probe.gate).label.toLowerCase()}, HTTP ${probe.status}`;
-    svc.notes.push(
-      configuredEdgeAuth
-        ? `LabView requested ${probe.endpoint} and was answered with a login page (${what}), which is what the detected gate looks like from outside.`
-        : `LabView requested ${probe.endpoint} and was answered with a login page (${what}), so this service is not reachable without authenticating and is not counted as exposed. Which mechanism is behind that page is unknown — one address answering at one moment is the whole of the evidence.`,
-    );
-    return;
-  }
-  if (configuredEdgeAuth) {
-    svc.notes.push(
-      `A gate is detected for this service, and LabView's own request to ${probe.endpoint} was answered without a login page (HTTP ${probe.status}). The posture stands: the request came from LabView's vantage point, which may not be the path a visitor from outside takes.`,
-    );
-  }
+  const what = `${probeGateText(probe.gate).label.toLowerCase()}, HTTP ${probe.status}`;
+  svc.notes.push(
+    `LabView requested ${probe.endpoint} and was answered with a login page (${what}), so this service is not reachable without authenticating and is not counted as exposed. Which mechanism is behind that page is unknown — one address answering at one moment is the whole of the evidence.`,
+  );
 }
 
 /**

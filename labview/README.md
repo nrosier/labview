@@ -120,18 +120,22 @@ live state from the Docker API, and never needs an agent inside each app.
   service drawer second.
 - **A scan that can ask, not only read** — everything above comes from configuration.
   Switch the [probe](#probing-a-service-directly) on and the scan also sends one
-  `GET /` per HTTP service and reads the answer for a login page, which is the largest
-  class of protection no compose file mentions. A login page takes the service out of
-  the exposed count with its own badge; an answer *without* one turns an exposure that
-  was inferred into one that was measured. Off by default, since it is the only stage
-  that sends a request to your own services.
+  `GET /` per HTTP service **it found no authentication for**, and reads the answer for a
+  login page, which is the largest class of protection no compose file mentions. A login
+  page takes the service out of the exposed count with its own badge; an answer *without*
+  one turns an exposure that was inferred into one that was measured. Off by default,
+  since it is the only stage that sends a request to your own services — and even when
+  it is on, a service already behind a detected gate is left alone, because its answer
+  could not change the verdict.
 - **Login probe panel** — the `Login probe 12` tile is a button for the same reason the
   integration counts are: the number is an outcome and the cases are behind it. Click it
   for one row per service asked — the address tried and the vantage it came from, what
   came back, and **why** that was or was not read as a login page, naming the fact the
   verdict rested on rather than restating the verdict. Grouped with the answers that
   cleared nothing first, and the services that never answered kept separate from both,
-  since nothing was measured about those at all.
+  since nothing was measured about those at all. The tile also says how many services
+  were **not** asked, so a count of 13 in a fleet of 14 HTTP services reads as a fleet
+  with a gate rather than a service that got lost.
 - **Rescan** — re-reads every `compose.yml` and `.env` under the apps root *and*
   re-runs both API exchanges, then reports what moved on each side, inline beside
   `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, with
@@ -324,7 +328,7 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** — not an API token, see [`config.example.yml`](config.example.yml). See [Where the credentials go](#where-the-credentials-go) |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues from the labels alone |
-| `LABVIEW_PROBE_ENABLED` | `false` | Whether a scan **asks** each HTTP service for its front page. Off until you turn it on — this is the only stage that sends a request to a scanned service. It is also the *default* rather than the last word: the switch beside Rescan decides one rescan either way. See [Probing a service directly](#probing-a-service-directly) |
+| `LABVIEW_PROBE_ENABLED` | `false` | Whether a scan **asks** each HTTP service it found no authentication for — services already behind a detected gate are never asked, since the answer could not change the verdict. Off until you turn it on: this is the only stage that sends a request to a scanned service. It is also the *default* rather than the last word: the switch beside Rescan decides one rescan either way. See [Probing a service directly](#probing-a-service-directly) |
 | `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces and cannot work this out. Unset means published ports are not asked |
 | `LABVIEW_PROBE_TIMEOUT` | `5000` | Per-request timeout, ms. A service that does not answer in time is recorded as a timeout, which is its own finding |
 | `LABVIEW_PROBE_MAX_CONCURRENCY` | `4` | Services asked at once. Kept low because these requests fan out across the fleet and many of them land on one reverse proxy |
@@ -525,8 +529,25 @@ It cuts both ways, and the second half matters just as much: a service that answ
 with **no** login page turns an exposure that was inferred from configuration into one
 that was measured.
 
-**What gets asked, and at which address.** Only services where LabView has already
-*observed* HTTP — an `http`/`https` tunnel origin, or a `traefik.http.routers.*` label.
+**What gets asked, and at which address.** Two conditions, and a service has to meet
+both.
+
+First, LabView must have already *observed* HTTP for it — an `http`/`https` tunnel origin,
+or a `traefik.http.routers.*` label.
+
+Second, **this scan must have found no authentication for it.** A Traefik auth middleware,
+an OIDC issuer in its environment, an enforced Authentik provider, a Cloudflare Access
+policy on its route — any one of those and the service is not asked at all. The reason is
+arithmetic rather than politeness: authentication LabView detected already keeps the
+service out of the exposed count, so the probe's answer could not move the verdict either
+way. What the request *could* do is put traffic on somebody's SSO endpoint to confirm
+something already known. There is no setting for this, because a setting to turn it off
+would only buy extra requests with no answer attached.
+
+A service that merely [*declares*](#declaring-what-the-scan-cannot-see) authentication is
+still asked. A declaration is a claim, not detection, and checking claims is what the
+probe is for.
+
 Addresses are tried most- to least-exposed, and the walk stops at the first one that
 answers:
 
@@ -574,9 +595,12 @@ When a signal does fire, the service leaves the exposed count and its badge read
 `none`, because a password field does not say whose login form it is. A probe is
 evidence of a gate and never a name for one.
 
-Two things it will not do. It will not contradict a gate your labels declare — a
+Two things it will not do. It will not contradict a gate your configuration declares — a
 response from LabView's own vantage point may not have travelled the gated path, so an
-answer with no login page becomes a note, not a downgrade. And it will not make a stale
+answer with no login page could only ever be a note, never a downgrade. That rule is now
+also the reason such a service is not asked in the first place: eligibility and the
+non-downgrade both read the same predicate, so a service can never be skipped for a
+reason its own notes contradict. And it will not make a stale
 [declaration](#declaring-what-the-scan-cannot-see) look right: an acceptance for an
 exposure the probe now finds gated is reported as drift.
 
@@ -588,16 +612,28 @@ your compose files, so they are treated as untrusted input.
 Failures are soft here too, and reported as their own outcome rather than folded into
 either verdict: a service that does not resolve, refuses the connection or times out is
 **No answer**, and its posture rests on configuration exactly as it did before. The
-aggregate reads like `31 services probed — 12 gated, 17 open, 2 did not answer`, and
-that mixed case is reported as `partial` rather than as a success: some of the fleet
-answered, and what was read is sound, but part of the picture is missing and the line
-says which part.
+aggregate reads like `31 services probed — 12 gated, 17 open, 2 did not answer — 9
+services not asked (authentication already detected)`, and that mixed case is reported as
+`partial` rather than as a success: some of the fleet answered, and what was read is
+sound, but part of the picture is missing and the line says which part.
+
+The last segment appears only when something was withheld — `0 not asked` on every
+unauthenticated fleet would be a fact about nothing. A fleet where *everything* with an
+HTTP address is already authenticated reads
+`9 services not asked — authentication was already detected for every service with an
+HTTP address` and is a **success**, not a failure: the stage ran, decided about every
+candidate, and the decision was that none of them needed asking. Only a fleet with the
+probe on and no HTTP address anywhere is reported as having found nothing, since that is
+a fact about the labels.
 
 #### Reading the results
 
-A **Login probe** tile appears on the overview whenever a scan asked anything, showing
-how many services were asked. Clicking it opens a panel with one row per service, and
-each row answers the three questions a count cannot:
+A **Login probe** tile appears on the overview whenever a scan asked anything — or
+*decided not to*, since a fleet where everything with an HTTP address is already behind a
+gate would otherwise show no sign the stage had run at all. It shows how many services
+were asked, and where that is none, its subtitle says how many were already
+authenticated. Clicking it opens a panel with one row per service, and each row answers
+the three questions a count cannot:
 
 - **the address tried**, with the vantage it came from — a public hostname answering
   means something a published host port answering does not
@@ -613,11 +649,17 @@ gated ones. Then, separately and last, the ones that did not answer — nothing 
 from those addresses, so the probe added nothing either way, and the panel says so rather
 than letting an empty result read as "no login page found".
 
+The panel's own header says how many services were **not** asked and why, so the count of
+rows is never mistaken for the size of the HTTP fleet. A service that was not asked has no
+row: there is nothing to report about a request that was never sent, and its drawer shows
+its posture with no probe block at all.
+
 Nothing in the panel is tinted red, deliberately. A service in the first group is not by
-itself a finding: one that already has a detected gate can land there too, because
-LabView's request may have gone around the edge that gates real visitors. The panel is
-where you check *what was measured*; **Exposed, no auth** is where a fleet finding is
-claimed. Every row links through to that service's own drawer, which shows the same
+itself a finding: a service whose `.labview` file *declares* a mechanism is asked anyway —
+a declaration is a claim, not detection — so it can land there while staying out of the
+exposed count. And a signal that did not fire is not a fact about anything: the rule is
+strict, so a page it does not recognise may still be a login page. The panel is where you
+check *what was measured*; **Exposed, no auth** is where a fleet finding is claimed. Every row links through to that service's own drawer, which shows the same
 result beside everything else known about it — and the drawer carries the same "why"
 line, so following a row through reads as one result rather than a second account of it.
 
@@ -1756,6 +1798,12 @@ src/
               networks.ts — which network connections are drawn, and their wording
   server/     fastify server + static hosting, scan cache and force semantics
 web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
+tools/
+  probe-lab/  a diagnostic, not part of the scan: point it at a URL and it reports
+              what the login rule read there, why each of the seven signals did or
+              did not fire, and what an eighth would have to be. It imports the real
+              rules rather than reimplementing them, so its verdict is the pipeline's
+              verdict. Not in the image — see its own README
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
@@ -1771,10 +1819,22 @@ fixtures/
 ```
 
 ```bash
-npm run typecheck    # tsc for both server and web
+npm run typecheck    # tsc for server, web, and scripts/ + tools/
 npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
+npm run probe-lab -- <url>   # diagnostic: what the login rule reads at a URL
 ```
+
+`probe-lab` is not part of the product and is documented on its own, in
+[tools/probe-lab/README.md](tools/probe-lab/README.md). It exists for the case the probe
+cannot settle: a service reported as answering with **no** login page is either genuinely
+unprotected or running a login screen this rule cannot see, and those look identical on the
+dashboard. Point it at the address and it prints the verdict, then all seven signals with
+the fact that decided each, then every piece of evidence no signal reads yet, then what an
+eighth signal would have to be. It writes a `.json` per target that drops into
+`scripts/smoke.ts` as a fixture, so a proposed rule is replayed offline with nobody's
+service involved. `--from-scan overview.json` picks its targets out of a saved payload:
+exactly the services LabView found neither authentication nor a login page for.
 
 `npm run smoke` runs the whole pipeline against six fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
@@ -1814,7 +1874,7 @@ directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
 both directions, so the contribution is measured rather than assumed.
 
-The `probe` root is a fleet of fourteen stacks built so that every login-page signal
+The `probe` root is a fleet of fifteen stacks built so that every login-page signal
 and every near-miss appears exactly once, and it is run **twice** — once with the probe
 off and once on — so what the stage contributes is measured rather than assumed. It
 pins: each of the seven signals clearing an exposure, and each near-miss (a bare 401
@@ -1826,12 +1886,30 @@ stopping at the first address that answers, and falling through only on a transp
 failure; a `tcp://` tunnel and a service with `ports:` and no route never being asked
 at all; a service that does not answer coming back as a third outcome rather than
 either verdict; a configured gate that is *not* downgraded by an open answer, and a
-stale acceptance that *is* reported as drift. Three cross-cutting checks run over both
-passes: that the exposed count with the probe on equals the count with it off minus
-exactly the services a login page answered for (I1), that no service's mechanism or
-confidence moved between the two runs (I3), and that the whole set of requests the stage
-sent was `GET /` and nothing else, with no credential, no address asked twice, and
-nothing sent anywhere near a published database port (I8).
+stale acceptance that *is* reported as drift.
+
+**Two stacks are there to be left alone.** A service with a Traefik auth middleware named
+by an unfound definition and one with a Cloudflare Access policy both have HTTP addresses
+and are both eligible on every other count — and neither is asked, because this scan
+already found authentication for them. Their entries in the URL-keyed stub stay in place,
+which is what makes the check a trap rather than a tautology: the stub *would* have
+answered, so an empty call log proves the request was withheld rather than that there was
+nothing to withhold. Their verdicts are asserted byte-identical with the probe on and off,
+which is the safety argument for the restriction stated as a test. The counted outcome is
+pinned too — `skipped` is exact and the connection line names it — and no service
+anywhere in the root carries both detected authentication and a probe result.
+
+Three cross-cutting checks run over both passes: that the exposed count with the probe on
+equals the count with it off minus exactly the services a login page answered for (I1),
+that no service's mechanism or confidence moved between the two runs (I3), and that the
+whole set of requests the stage sent was `GET /` and nothing else, with no credential, no
+address asked twice, and nothing sent anywhere near a published database port (I8).
+
+A separate group runs the `tools/probe-lab` report over the same canned bodies and asserts
+its verdict equals `readGate`'s on every one of them. That is the only thing standing
+between the diagnostic and a report describing a decision LabView would not make, which
+would be worse than no report at all — it would send somebody to change a rule that was
+never the problem.
 
 Every fixture is written so it fails if the corresponding logic is reverted — for both
 API integrations and for the probe that was checked by actually backing each rule out
@@ -1865,7 +1943,19 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   (NextAuth's `/api/auth/callback/email` and its neighbours) looks exactly like a
   newsletter box. And the *shape* of a 401/403 page is never read, since bodies are only
   parsed on a 200 — no exposure is missed there, because a challenge is already a gate,
-  but the drawer cannot say what such a form was made of.
+  but the drawer cannot say what such a form was made of. When one of your own services
+  lands in the wrong half of this, [`tools/probe-lab`](tools/probe-lab/README.md) is how
+  you find out which miss it is: point it at the address and it reports what the rule read
+  and what an eighth signal would have to be.
+- **A service behind a detected gate is no longer measured at all.** It is not asked, so
+  there is no answer to report and its drawer carries no probe block — the posture rests
+  on the configuration that already established it. What that costs is a corroboration
+  LabView used to print and no longer does. What it buys is that no request is sent to
+  somebody's SSO endpoint to confirm something already known, and the direction is the
+  safe one: not asking can only ever leave a service *in* the exposed count, never take
+  one out. The count is reported rather than hidden, on the read line and on the tile, so
+  a fleet where nothing needed asking says so instead of looking like a stage that did not
+  run.
 - The reverse-proxy integration is Traefik-specific: it reads Traefik's runtime API.
   Another proxy (Caddy, nginx, HAProxy) is still classified from its labels, and its
   routers are simply not verified. Traefik's static config file is not parsed —

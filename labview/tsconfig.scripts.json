@@ -23,5 +23,9 @@
   // it is Node code (it reads `process.env` and resolves a path from `import.meta.url`)
   // that nothing typechecks unless a project claims it, and the web project is
   // deliberately without node types.
-  "include": ["scripts/**/*.ts", "src/**/*.ts", "web/vite.config.ts"]
+  // tools/ is here for the same reason scripts/ is: it runs through tsx, it imports `src/`
+  // heavily, and a stale property name in it would read `undefined` at runtime rather than
+  // fail to build. `tools/probe-lab` in particular exists to report what the pipeline's own
+  // rules decided, so a drifted import there would describe a decision LabView never made.
+  "include": ["scripts/**/*.ts", "src/**/*.ts", "tools/**/*.ts", "web/vite.config.ts"]
 }

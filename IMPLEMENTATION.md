@@ -157,6 +157,12 @@ labview/
     vite.config.ts    the web build: root, single-bundle output, dev-server proxy
   scripts/
     smoke.ts          pipeline assertions over the fixtures
+  tools/
+    probe-lab/        a diagnostic, not part of the scan: point it at a URL and it reports
+      report.ts       what the login rule read there, why each of the seven signals did or
+      cli.ts          did not fire, and what an eighth would have to be. `report.ts` is
+      README.md       pure and imports the real rules; `cli.ts` is argv and one GET, on the
+                      pipeline's own transport. Not in the image (§3.6b)
   fixtures/
     apps/             a representative happy-path fleet
     edge/             one stack per previously-fixed defect
@@ -195,11 +201,11 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 6b. Declared dependencies | `analyze/dependencies.ts` | resolved `.labview` `depends_on` pairs, each with the network they share; `declared.drift` for every reference that named nothing, two things or itself |
 | 7. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
 | 8. Reverse proxy API | `enrich/traefik.ts` | `TraefikSnapshot` — the routers the proxy is serving with their resolved middleware chains and backends, or a reason it is absent. Runs concurrently with step 7 |
-| 8b. Active probe | `enrich/probe.ts` | `ProbeSnapshot` — `svc.probe` for each service where HTTP was *observed*: which address answered, and whether a login page did. Off unless switched on; runs concurrently with steps 7 and 8 (§3.6b) |
+| 8b. Active probe | `enrich/probe.ts` | `ProbeSnapshot` — `svc.probe` for each service where HTTP was *observed* **and this scan found no authentication**: which address answered, and whether a login page did. Off unless switched on; runs between the halves of step 12, which is what lets it skip (§3.6b) |
 | 9. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
 | 10. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
 | 11. Live router matching | `analyze/traefik.ts` | `svc.traefikLive` — which live routers belong to which service, and which matched nothing |
-| 12. Pass 2 — auth | `labels/auth.ts` | `svc.auth`, `exposedWithoutAuth`, notes; then secrets masked |
+| 12. Pass 2 — auth | `labels/auth.ts` | **2a** `svc.auth` for every service, and the set of keys with detected authentication — the probe's eligibility (§3.6b). **2b**, after the probe: `exposedWithoutAuth`, notes; then secrets masked |
 | 13. Graph | `analyze/graph.ts` | `Graph` of services, networks, shared volumes, resolved ingress paths, auth hubs — with every dependency, observed or declared, tied to the network it travels over |
 | 14. Stats | `computeStats` | `OverviewStats` for the dashboard header |
 
@@ -245,10 +251,14 @@ awaited after, overlapping the two. A *discovered* endpoint cannot be found unti
 pass 1 has parsed the routes, so it runs after. Either way the result is one value
 with the same shape.
 
-The probe joins those two under the same `Promise.all` rather than running after them, for the
-same reason: its addresses come from pass 1, and it needs nothing either read produces. When it
-is off — the default — it returns its `disabled` report without sending a request, so the
-concurrency is free (§3.6b).
+**The probe does not join them**, and the reason is ordering rather than politeness. It only
+asks services for which this scan found *no* authentication (§3.6b), and whether it found any
+is not known until both reads have landed and `deriveAuth` has run over them — so pass 2 splits
+in two and the probe goes between the halves. Pass 2a derives every `svc.auth` and collects the
+keys with detected authentication; the probe runs; pass 2b attaches each result and settles
+exposure. The price is stated rather than hidden: an enabled probe now adds its own wall-clock
+to a scan instead of overlapping the two API reads. What it buys is not asking an SSO endpoint a
+question whose answer could not have changed anything.
 
 Origin resolution runs **ahead** of the discovered reads for two reasons. A
 resolved origin structurally identifies the service acting as reverse proxy, which
@@ -677,8 +687,55 @@ client that does the fetching, because a rule inside an I/O module can only be t
 mocking the I/O. Three decide (`probeTargets`, `readGate`, `readLoginForm`); the fourth,
 `probeReasonText`, says which fact a decision rested on.
 
-`probeTargets(svc, lanHost)` decides eligibility and try-order, from evidence already on the
-service — never from a port number and never from an image name:
+**Only services this scan found no authentication for are asked.** Two questions decide whether
+a request goes out, and they are separate on purpose: `probeTargets` says whether there is an
+HTTP address to ask at, and `hasDetectedAuth` says whether asking could tell anyone anything.
+
+`hasDetectedAuth(svc)` in [labels/auth.ts](labview/src/labels/auth.ts) is true when
+authentication was **detected** — a mechanism `deriveAuth` read from the labels or the live
+Traefik chain (`svc.auth.method !== "none"`), a Cloudflare Access policy on the tunnel route, or
+an Authentik provider the API reports as enforced. It is deliberately not one of the terms in
+`finalizeAuth`; it *is* that term. The `configuredEdgeAuth` expression there was replaced by a
+call to this function, so eligibility and the notes that explain the outcome cannot come apart —
+a service can never be skipped for a reason its own notes contradict.
+
+Neither a probe result nor a `.labview` declaration counts. The first is the measurement being
+decided about, and the second is a claim LabView cannot check (§3.12) — which is exactly the
+case worth measuring, and `fixtures/probe/declared-open` exists to catch it drifting.
+
+An `inferred` posture counts as detected. A router naming `authentik@docker` whose definition
+was never found is still authentication detected *through Traefik*, and since
+`svc.auth.method !== "none"` its verdict already rests on that mechanism rather than on anything
+a request could return. `fixtures/probe/gated-open` is that case.
+
+**Why this is free of I1 risk, in the only direction that matters.** `finalizeAuth` computes
+`hasEdgeAuth = configuredEdgeAuth || probeGate`. Where `configuredEdgeAuth` is true the probe
+term cannot change the result, so withholding the request can only ever leave a service *in*
+the exposed count — never take one out. The two terms stay written as two even though they are
+now provably disjoint, because that is what keeps `probeGated` a subtractable statistic (§11);
+the disjointness gets an assertion in the smoke pass instead of a rewrite.
+
+The cost is the reordering in §3.2 — an enabled probe no longer overlaps the two API reads — and
+one real loss: a service behind a detected gate is no longer *measured*, so a gate that has
+silently stopped working is no longer visible as an open answer behind a configured mechanism.
+That was never reported as a finding (the posture won either way); it was only ever visible in
+the drawer's probe block, and it is the price of not sending requests at somebody's SSO
+endpoint on every scan.
+
+**Not asked and no address are different facts**, and they read differently. `probeTargets` runs
+first, so a service with no HTTP address is not counted as skipped — it was never a candidate.
+`ProbeRun.skipped` counts the candidates that were withheld, and the connection report says so:
+`13 services probed — 4 gated, 8 open, 1 did not answer — 1 service not asked (authentication
+already detected)`. A run whose candidates were *all* skipped is `ok: true`, not the `not-found`
+failure it would otherwise be mistaken for. The `Login probe` tile carries the same number
+through `ProbeReport.notAsked`, so a fleet of 14 HTTP services showing a probe count of 13 says
+where the fourteenth went.
+
+No new `NoAuthReason`: a skipped service has detected authentication, so `noAuthReason` is never
+asked about it.
+
+`probeTargets(svc, lanHost)` decides the other half — the addresses and their try-order, from
+evidence already on the service, never from a port number and never from an image name:
 
 | Vantage | Eligible on | Asked at |
 |---|---|---|
@@ -849,6 +906,50 @@ The report is the fourth `meta.connections` entry (§3.10), using existing phase
 did not answer — which stays `ok`, because what was read is sound — and `connected` otherwise,
 reading like `31 services probed — 12 gated, 17 open, 2 did not answer`.
 
+#### Sharpening the rule: `tools/probe-lab`
+
+`readGate`'s seven signals were written against seven hand-authored fixtures, and the services
+that come back **open** in a real fleet are exactly the ones the rule may be wrong about. An
+`open` verdict has two completely different meanings — a genuinely unprotected application, or a
+login page this rule cannot see — and they are the same row on the dashboard.
+
+[tools/probe-lab](labview/tools/probe-lab/README.md) is how they are told apart. Point it at a
+URL and it writes a Markdown report and a JSON record: the verdict, then **every one of the seven
+signals and the fact that made each fire or not**, then all the evidence no signal reads yet
+(every form and input unranked, `<title>`, scripts, headers, `Set-Cookie` *names*), then one line
+per thing standing between that page and a verdict. `--from-scan overview.json` reads a saved
+payload and asks exactly the services this stage found neither authentication nor a login page
+for, at the addresses `probeTargets` gives — the same selection the skip rule above makes, so the
+tool's worklist and the scan's are one rule rather than two.
+
+Three properties, and the first is the whole point:
+
+- **The verdict is the pipeline's verdict.** `report.ts` imports `readGate`, `readLoginForm`,
+  `readRedirect`, `readRefresh`, `readMediaType`, `probeGateText`, `probeOutcome`,
+  `probeReasonText` and the clause predicates from `model/probe.ts` and reimplements none of
+  them. A report describing a decision LabView would not make would be worse than no report — it
+  would send somebody to change a rule that was never the problem — so the smoke pass drives
+  every row of its own `readGate` table through `buildReport` and asserts the two agree (§8).
+  The questions are shared; the *patterns* stay private to `model/probe.ts`.
+- **The transport is the pipeline's transport.** `cli.ts` calls the same `getResponse`
+  `enrich/probe.ts` calls, through a `FetchLike` wrapper whose only job is to keep the headers
+  `getResponse` discards. So the timeout, `redirect: "manual"`, the HTML-only body read and the
+  64 KiB cap are inherited rather than restated, and tightening a bound in the pipeline tightens
+  the tool in the same commit. On top of that: `GET` only, no credential and no option that
+  supplies one, one hop only under `--follow`, nothing a page *suggests* is ever fetched, and
+  header values redacted by default because a report is a file somebody pastes into an issue —
+  `Set-Cookie` values are not read at all, only names (I6).
+- **It is not part of the product.** Nothing in `src/` imports it, no scan consults it, and the
+  `Dockerfile` COPYs named paths, so `tools/` never enters the image. `reports/` is gitignored:
+  it is the one place in this repository where a fleet's own hostnames would otherwise end up
+  committed (I2).
+
+The pure/I-O split is the same one `resolveBuildStamp`/`buildStamp` and `parsePasswd`/`readPasswd`
+use, and for the same reason — `buildReport` is a function of an observation record, so the whole
+report is assertable against canned bodies with no network and nobody's service involved. Which
+is also what makes the JSON the real deliverable: it is a fixture a proposed eighth signal can be
+replayed against offline.
+
 #### The switch beside Rescan
 
 `probe.enabled` in the configuration is the **default**, not the authority. A `Login probe`
@@ -958,6 +1059,13 @@ backend and frontend, and `/api/overview` serves exactly an `Overview`. Rules:
   when nothing went wrong. It also has a second job: the probe switch (§3.6b) lasts one
   rescan, and `meta.probe` is what lets the UI show a TTL rebuild reverting to config
   rather than leave the checkbox lying.
+  **`skipped` is on the same rule and needs it more than the other two.** A service that was
+  not asked carries no `ServiceProbe` at all, so its silence is indistinguishable from "no HTTP
+  address was observed" unless the number is stated — and 0 is a real answer, and the commonest
+  one: a fleet with probing on and no gate anywhere in front of anything reports it. Made
+  optional, a probe count of 13 in a fleet of 14 HTTP services would have no explanation
+  anywhere in the payload. `ProbeReport.notAsked` carries it to the tile for the same reason
+  (§3.9).
 - **`meta.build` is the second field under that rule, and it replaced one that was not.**
   `ScanMeta.version` used to carry a hardcoded copy of `package.json`'s version — read by no
   code, rendered nowhere and mentioned in no document, so it could not answer the question a
@@ -1278,10 +1386,18 @@ Four rules shape it, three of them borrowed from the row above:
 tile rather than a line added to an existing one for a reason I3 states: `Exposed, no auth`
 would drop every *gated* result, which is half of what the probe measured, and `Auth-protected`
 or `Declared auth` would file a probe result where a mechanism belongs. So the probe gets the
-tile whose number *is* its measurement, rendered only when `report.probed > 0`, and the panel
-(`web/components/ProbeDetail.tsx`) answers the three questions the tile cannot: the address
-tried, what came back, and which fact the verdict rested on. Four rules, two of them specific
-to this tile:
+tile whose number *is* its measurement, rendered when `report.probed > 0` **or**
+`report.notAsked > 0`, and the panel (`web/components/ProbeDetail.tsx`) answers the three
+questions the tile cannot: the address tried, what came back, and which fact the verdict rested
+on. Four rules, two of them specific to this tile:
+
+The `notAsked` half of that condition is not defensive. A well-run fleet where everything with
+an HTTP address is already behind a detected gate probes *nothing* (§3.6b), and without it an
+operator who had just turned the stage on would see no sign it had run at all — the one reading
+worse than a wrong number. So the tile draws with a `0` and a subtitle of
+`N already authenticated`, the panel's opening note says how many were withheld and why in the
+same breath as what was asked, and its empty state distinguishes the two ways `probed === 0`
+happens: everything eligible was already authenticated, or nothing was asked at all.
 
 - **Nothing here is tinted by severity except the pill.** The tile is not `alert` and no row
   is `crit`, and that is `OverviewStats.probeOpen`'s own doing: it is documented as **not** a
@@ -3066,6 +3182,14 @@ must never be handed a credential.
   only for a service where HTTP was observed — so no request is ever sent at a database port.
   Where the address is a public hostname, that request leaves the fleet, which is the plainest
   reason this one defaults to off.
+  **It also asks fewer services than it could.** A service this scan already found
+  authentication for is not asked at all, because `hasEdgeAuth` is
+  `configuredEdgeAuth || probeGate` and the answer could not have changed its verdict (§3.6b).
+  The traffic that removes is the traffic aimed at exactly the wrong place: an SSO endpoint, a
+  forward-auth-protected admin UI, a tunnel hostname behind a Cloudflare Access policy — the
+  addresses in a fleet where an unexplained anonymous `GET` is most likely to be noticed, rate
+  limited or logged as an intrusion attempt. What remains asked is the set of services nothing
+  was found in front of, which is the set the stage exists to measure.
 
 **Who can switch the probe on, stated plainly.** The switch beside Rescan sends
 `{"probe": true}` to `POST /api/rescan`, and that route needs a session only when
@@ -3124,10 +3248,13 @@ configuration or by a rescan that asked — and, when configured, the one issuer
 
 `npm run smoke` runs the entire pipeline against six fixture roots with Docker
 disabled and asserts on the resulting `Overview`. It exits non-zero on any
-failure and gates CI. `npm run typecheck` covers `scripts/` too
+failure and gates CI. `npm run typecheck` covers `scripts/` and `tools/` too
 (`tsconfig.scripts.json`): `tsx` strips types without checking them, so an
 assertion reading a renamed field would silently read `undefined` — and an
-assertion on `undefined` can pass while proving nothing.
+assertion on `undefined` can pass while proving nothing. `tools/probe-lab` is in that
+project for the sharper version of the same reason: it exists to report what the
+pipeline's own rules decided, so a drifted import there would describe a decision
+LabView never made.
 
 **`fixtures/apps`** — a representative happy-path fleet: a tunnel + proxy service,
 a proxy-bypassing service, cross-stack middleware resolution, LDAP and OIDC
@@ -3328,7 +3455,7 @@ No posture number moves with them. `matchedServices` on both roots and the
 exposed-without-auth pair asserted with and without the API are unchanged by the reason
 model, which adds reporting and nothing else.
 
-**`fixtures/probe`** — fourteen stacks, nineteen services, driven twice: once with probing off
+**`fixtures/probe`** — fifteen stacks, twenty-one services, driven twice: once with probing off
 and once on, against a URL-keyed `probeStub` in `scripts/smoke.ts` rather than a JSON payload,
 because a probe reads status codes, three headers and a fragment of HTML, not a document. The
 LAN host is `192.0.2.10` — documentation range, so a request that escaped the stub could not
@@ -3344,14 +3471,15 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `saml-post` | `sso-form` — the shape that defeats every simpler rule at once: no password field, no `Location`, and a cross-origin `action` the form rule refuses on purpose. The hidden `SAMLRequest` alone is the evidence. TLS on the router, so it is asked over `https` |
 | `passwordless` | a **pair**, and the reason `credential-form` cannot degenerate into word-matching: `magic` serves an email field, a submit button and `action="/login"` with no password anywhere; `news` is the **trap** — the same three tags as a newsletter box, posting to a list service on another origin, which marks nothing and clears nothing, and whose reason must say so in those terms: the form shows no login intent and its action is not a login path |
 | `open-app` | the **guard**, two services: `dash` answers 200 with a homepage and stays exposed with the finding now measured; `routing` redirects same-origin to `/dashboard`, which is application routing and clears nothing |
-| `gated-open` | a detected gate answered 200 with no login page: posture unchanged, note names the vantage the request came from |
+| `gated-open` | **a service whose gate was already detected is never asked.** An `authentik@docker` middleware whose definition is in no scanned stack, so the posture is `inferred` — the harder half of the eligibility rule, since a rule that only withheld `confirmed` postures would still send this request. Its entry in `PROBE_ANSWERS` stays, so the assertion fails on a *recorded request* rather than on a fixture with nothing to say |
+| `access-gate` | the same withholding reached without a Traefik label at all: a tunnel hostname behind a Cloudflare Access policy, which is the second of `hasDetectedAuth`'s three terms. Its sibling `db` is a `tcp://` origin under the same policy — detected auth *and* no address, which is what pins the order of the two questions: counted as neither asked nor withheld |
 | `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
 | `lan-fallback` | the vantage walk: a public hostname that does not resolve falls through to `http://<lanHost>:18099/`, with the failed attempt kept in the order it was tried |
 | `declared-open` | a declaration that `supplies` the only protection, contradicted by an open answer — the verdict stands (the probe asked one address once) and the disagreement is reported as drift |
 | `dbonly` | a Postgres and an Adminer publishing ports and nothing else: **no request at all**, which is the rule that keeps the probe off a database |
 | `tcp-tunnel` | a `tcp://` and an `ssh://` tunnel origin: never resolved, let alone asked, and both stay honestly in the exposed count |
 
-Five groups of assertions carry what is not about one stack. The **rules**, driven pure: a
+Seven groups of assertions carry what is not about one stack. The **rules**, driven pure: a
 33-row `readGate` table where half the rows are near-misses, plus two meta-assertions — that
 every signal in the union is reached, and that the near-misses outnumber the signals, which is
 what "strict" means here; a 14-row `readLoginForm` table, which earns its own because a
@@ -3369,11 +3497,25 @@ wording could over-claim (a probe that never connected must not say "login page"
 meta-assertions that every gate has a row and that no two gates are worded alike; and
 `probeTargets` over hand-built routes for
 scheme, order, the per-service cap, dedupe, the bind-address guard, a port range, and each arm
-of `isHttpObservable` separately. **Containment**, asserted on the recorded requests rather
+of `isHttpObservable` separately. **Eligibility**, which decides whether a request is sent at
+all: a table over `hasDetectedAuth` on hand-built services for all three of its terms —
+including the enforced-Authentik one, which this root cannot produce because it has no Authentik
+snapshot, and the two negatives that matter most, an *empty* Access block (a gate nothing stands
+at) and a proxy provider with no outpost — plus the assertion that over the whole edge fleet the
+predicate is exactly the negation of the exposure partition's own test, so eligibility and
+posture cannot drift apart. Then, fleet-wide and revert-proof: **no service carries both
+detected authentication and a probe result**; the two withheld services' `auth.method`,
+`confidence` and `exposedWithoutAuth` are identical to the run where nothing was asked at all,
+which is the safety argument for the whole rule asserted rather than reasoned about; and
+`meta.probe.skipped` is exactly 2 with probing on and 0 with it off. The arithmetic is pinned
+too — services with an address = asked + withheld — which is what fixes the *order* of the two
+questions: `access-gate/db` has detected auth and no HTTP address, and counting it as withheld
+would inflate the number. **Containment**, asserted on the recorded requests rather
 than on the code: every request a GET at `/` with no query, no credential on any of them, no
 address asked twice, nothing at `:15432` or `:18081`, nothing named `pg.probe` or `ssh.probe`,
-and the total exactly 16 — one for each of the fifteen eligible services plus the single
-fallthrough. **Reconstruction** (I1): each service exposed exactly when it was with probing off
+neither withheld address anywhere in the list, and the total exactly 15 — one for each of the
+fourteen services asked plus the single fallthrough. **Reconstruction** (I1): each service
+exposed exactly when it was with probing off
 minus the ones a login page answered for, asserted per service because two offsetting errors
 would satisfy a total; the aggregate adding back up; `probeGated` being deliberately one *more*
 than that, since it counts login pages and one belongs to a service already out of the count on
@@ -3387,14 +3529,35 @@ where they should. Those route cases run against `fixtures/auth`, which carries 
 anything — so `probe: true` is *observable* there while remaining incapable of sending a
 request, because a body that turns the probe on must never be a body that makes the test suite
 talk to the network. **The panel**, which is one claim in eight checks: it lists exactly the
-services the tile counted. `collectProbeReport(probed.stacks)` must put `stats.probeGated`
-services in `gated` and `stats.probeOpen` in `open`, `silent` must be the one service nothing
-answered from, the three lists must sum to `probed` with no key appearing twice, and every entry
-must be findable back in `probed.stacks` by object identity (`s.probe === e.probe`) rather than
-by matching a copy. Determinism is asserted the way the fleet's other groupings are — the same
+services the tile counted. `collectProbeReport(probed.stacks, meta.probe.skipped)` must put
+`stats.probeGated` services in `gated` and `stats.probeOpen` in `open`, `silent` must be the one
+service nothing answered from, the three lists must sum to `probed` with no key appearing twice,
+and every entry must be findable back in `probed.stacks` by object identity
+(`s.probe === e.probe`) rather than by matching a copy. `notAsked` is the one field there that
+*cannot* be derived from the stacks, so it is asserted both ways: 2 when the payload's count is
+carried in, 0 when the argument is left off — a withheld service leaves no trace in `stacks` to
+recover it from. Determinism is asserted the way the fleet's other groupings are — the same
 input twice and the input reversed all produce identical JSON (I7) — the tile's tooltip and the
-panel's subtitle are asserted to be one shared string, and `collectProbeReport(unasked.stacks)`
-must report `probed === 0`, which is what keeps the tile off a scan that probed nothing.
+panel's subtitle are asserted to be one shared string, `probeReportSummaryText` is pinned on an
+empty report, on a report that asked nothing *and* withheld some, and on the full one, and
+`collectProbeReport(unasked.stacks, unasked.meta.probe.skipped)` must report `probed === 0` and
+`notAsked === 0`, which is what keeps the tile off a scan that probed nothing.
+
+**The diagnostic** is the seventh group, and it asserts one claim about `tools/probe-lab`: a
+report says what the pipeline said (§3.6b). Every row of the 33-row `readGate` table above is
+put through `buildReport` and the report's gate must equal the row's expected gate, so the tool
+and the rule cannot drift by construction *and* cannot drift by accident — a clause added to
+`readGate` and mirrored wrongly in the lab fails here. The labels are asserted to be
+`probeOutcome`'s, the seven rows to be in `PROBE_GATES` order, and `withdrawsExposure` to be
+true exactly when a gate fired. Beyond the equality, what a gate assertion cannot reach: that a
+login page's *two* satisfied clauses both appear with the deciding one marked; that the
+newsletter box is declined with a reason naming the part it lacks; that a non-HTML answer says
+the body was never read rather than that a password field was missing from markup nobody
+fetched; that a service which did not answer is never reported as having no login page; that a
+same-origin redirect elsewhere names the path and asks for a fixture rather than a looser
+clause; that a client-rendered shell is named as the known blind spot; and that a rendered
+report carries no cookie value and no redacted header value (I6). All of it runs against the
+canned bodies already in the file — no network, no temporary directory, nobody's service.
 
 One assertion in that group is a rule about the whole vocabulary rather than about any stack:
 between them the fixture services must answer with **every** member of `PROBE_GATES`. The
@@ -3629,6 +3792,7 @@ npm run dev:web     # Vite dev server with HMR, proxying /api and /auth
 npm run start       # node dist/index.js — what the image runs, after a build
 npm run scan        # one-shot JSON to stdout; --summary for the digest
 npm run hashpw -- <user>   # prompt for a password, print one `user:hash` line
+npm run probe-lab -- <url> # diagnostic: what the login rule reads at a URL (§3.6b)
 ```
 
 **The two dev commands are a pair, not alternatives.** `npm run dev` is the whole
@@ -3949,6 +4113,22 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
     stronger reason than any body could give — but `svc.probe.form` is absent for those
     services even though a login form was served, so the drawer cannot say what the form
     was made of.
+
+  `tools/probe-lab` exists to work these misses down one at a time (§3.6b): pointed at a URL
+  it reports why each of the seven signals did not fire and dumps the evidence none of them
+  reads, which is the material an eighth signal would be designed from. It changes nothing
+  about a scan — it is a diagnostic, not in the image, and imports the rules rather than
+  restating them.
+- **A service behind a detected gate is no longer measured at all.** Since the probe skips
+  every service this scan found authentication for (§3.6b), a configured gate that has
+  quietly stopped working — a forward-auth middleware pointing at a dead outpost that now
+  fails open — no longer shows up as an open answer behind a declared mechanism. That was
+  never *reported* as a finding, because the configured posture won either way; it was
+  visible only in the drawer's probe block, to a reader who went looking. The direction of
+  the loss is the important part and it is the safe one: skipping can only ever leave a
+  service **in** the exposed count, never take one out. What was bought is not sending an
+  unauthenticated `GET` at somebody's SSO endpoint on every scan. A reader who wants that
+  measurement can take it with `tools/probe-lab`, at one address, deliberately.
 - **The proxy integration is Traefik-specific.** Another reverse proxy is still
   classified from its labels and simply not verified; there is no second client.
   Only `/api/rawdata` is used, with no fallback to the paginated granular endpoints,
@@ -4256,5 +4436,9 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | "Did not answer" is a **third** outcome, never folded into "no login page" | They are the same absence of a gate and completely different findings: one measured an exposure, the other measured nothing. Folding them would let a firewalled service read as "answered, open" — or, worse in the other direction, a timeout read as protection. So it counts in neither statistic, `probeOutcome` words it as `No answer`, and its note claims no measurement. |
 | The payload carries the facts a verdict rested on, so the reason can be a rule rather than a sentence | `readGate` decides on things the response then goes away with, so a negative verdict was recorded as `HTTP 302 — answered with no login page`: the conclusion, with the fact discarded, and a 302 to `/dashboard` spelled identically to a 302 to `/login`. Composing the fuller sentence in `enrich/probe.ts`, where the response is still in hand, was the smaller change and the wrong one — a string built at probe time can only be tested by mocking the network, and what these sentences say about the two trap fixtures is exactly what the revert contract has to pin. So four observations go into `ServiceProbe` (`mediaType`, `redirect`, `refresh`, `truncated`), read by the same exported readers `readGate` decides through, and `probeReasonText` is a pure rule in `model/probe.ts` with 20 rows behind it (§8). The cost is four more fields in the contract and one more thing to reduce for I6; the gain is that "why" is falsifiable. |
 | The probe gets its own tile, and the tile is not tinted | An existing tile could not hold it. `Exposed, no auth` drops every gated result, which is half the measurement; `Auth-protected` and `Declared auth` name mechanisms, and I3 forbids a probe result becoming one. So the count that *is* the measurement gets the tile. It is deliberately not `alert` and its rows are not `crit`, on `probeOpen`'s own documented terms: a service behind a detected gate that answers LabView from inside the fleet is counted in `probeOpen` too, because the request may have gone around the edge that gates real visitors. Tinting it would assert a fleet finding that `Exposed, no auth` may correctly deny, and the critical tint means one thing only (above). Severity stays with the per-result pill, which `probeOutcome` decides. |
+| Only services with **no detected authentication** are asked, unconditionally and with no config knob | `hasEdgeAuth` is `configuredEdgeAuth \|\| probeGate`, so where a Traefik auth middleware, an OIDC issuer, a Cloudflare Access policy or an enforced Authentik provider was already found, the answer could not have moved the verdict in either direction. What the request could still do is arrive at an SSO endpoint, unauthenticated and unexplained, on every scan. A switch was considered and rejected: its non-default value would send extra traffic to services already known to be authenticated in exchange for a result incapable of changing anything, which is a control with no use case. The direction is what makes it safe — withholding can only ever leave a service **in** the exposed count — and it is asserted rather than argued, on two fixtures whose canned answers stay in the stub so the check fails on a *recorded request*. The price is paid in two places and stated in both: pass 2 splits so the probe no longer overlaps the two API reads (§3.2), and a gate that has silently stopped working is no longer measured (§11). |
+| An **`inferred`** posture counts as detected | A router naming `authentik@docker` whose definition is in no scanned stack is still authentication detected through Traefik — the request asked for it in those words — and `svc.auth.method` is not `none`, so `configuredEdgeAuth` is already true and the probe could not have changed that service's verdict either. Restricting the skip to `confirmed` postures would have sent exactly the requests this change exists to stop, at the services where a name was all LabView could read. `fixtures/probe/gated-open` is that case and asserts the confidence explicitly, so a rule narrowed to `confirmed` fails rather than quietly resuming the traffic. |
+| "Not asked" is a **counted** outcome, not a silence | A withheld service carries no `ServiceProbe` at all, so its absence is indistinguishable from "no HTTP address was observed" — and the tile would read 13 in a fleet of 14 HTTP services with nothing anywhere to explain the fourteenth. So `ProbeRun.skipped` is non-optional (§3.7), the connection line gains a third segment, `ProbeReport.notAsked` carries it to the panel, and a run whose candidates were *all* withheld is `ok: true` rather than the `not-found` failure it would otherwise be mistaken for. `probeTargets` is asked first, so a service with no address is never counted as withheld: two different facts, two different numbers. |
+| The fine-tuning tool **imports** the rule instead of reimplementing it | `tools/probe-lab` exists because an `open` verdict has two meanings — genuinely unprotected, or a login page the rule cannot see — and only a look at the page tells them apart (§3.6b). A standalone script with its own parsing would have been quicker and would have been worthless: a report describing a decision LabView would not make sends somebody to change a rule that was never the problem. So `report.ts` imports `readGate` and every reader and wording rule from `model/probe.ts`, `cli.ts` inherits its transport from the same `getResponse` the pipeline calls, and the smoke pass drives the pipeline's own `readGate` table through `buildReport` to assert the two agree (§8). The patterns stay private: the tool can ask what the rule asks and can never ask it differently. It ships nowhere — no `src/` import, not in the image, `reports/` gitignored because it is the one place a fleet's own hostnames would otherwise be committed (I2). |
 | The build stamp on the page is the **short commit**, not the version | A version answers "is the fix in the thing I am running?", and `0.1.0` cannot: it is the same string across every pre-release build, so a page showing it says only that this is LabView. The short commit is the smallest thing that answers the question, and it is the identifier the project already uses everywhere else — the image tag, the workflow's `github.sha`, `git rev-parse --short HEAD` in a terminal — so the stamp reads as the same name a reader already has, rather than a new one to correlate. The version is not discarded; it moves into the tooltip and the log line, where it costs nothing and is there when the pre-release ends. This replaced `meta.version`, a hardcoded copy of `package.json` that no code read and no document mentioned — so the change is a duplicate removed, and a breaking payload change on the `unmatchedRouters` precedent. |
 | `source` sits beside the commit and is never optional | `image` and `checkout` are different claims about the same seven characters, and only one of them is about the bytes that are running. An image was compiled from that commit; a checkout merely *started* in a tree that was at it, and no file read can see the uncommitted edits on top — so a stamp that reported the sha alone would let a developer's half-finished tree spell exactly like a released build, which is the I1 error in the one place a reader trusts most. Recording which source answered makes each claim wordable on its own terms: `buildTitle` is a `Record` over the three, exhaustive, so a fourth way to learn a commit is a compile error until somebody decides what it entitles LabView to say. `commit` is optional for the opposite reason — a build genuinely may not know its revision, and `unknown` is a real outcome with a sentence of its own rather than a blank field to be misread as a bug. |

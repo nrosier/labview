@@ -24,6 +24,11 @@
  *  - **Only where HTTP was observed.** `probeTargets` decides that from the labels, and
  *    a service that merely publishes a port yields no address at all — which is what
  *    keeps this off a database without consulting a port number or an image name.
+ *  - **Only where no authentication was found.** A service this scan already detected a
+ *    gate on is not asked — see `hasDetectedAuth`. The request could not have changed its
+ *    verdict (`hasEdgeAuth` is already true), so all it would do is put an unauthenticated
+ *    GET on somebody's SSO endpoint. The count of withheld requests is on the snapshot,
+ *    because "not asked" and "no address to ask" are different facts about a fleet.
  *
  * And the same rule as every other client: it **cannot throw and cannot fail a scan**
  * (**I4**). Disabled, nothing eligible, nothing answering: every path returns a report
@@ -59,6 +64,16 @@ import { mapWithConcurrency } from "./pool.js";
 export interface ProbeSnapshot {
   /** `${stackId}/${serviceName}` -> what that service answered. Eligible services only. */
   byKey: Map<string, ServiceProbe>;
+  /**
+   * How many services *would* have been asked but were not, because this scan had already
+   * detected authentication for them.
+   *
+   * Carried out of the stage rather than left in the report text because the payload has to
+   * state it: a service that was not asked has no `ServiceProbe`, so without this number the
+   * `Login probe` tile would simply count fewer services than the fleet has HTTP addresses
+   * and leave a reader to guess which of the two reasons applied.
+   */
+  skipped: number;
   connection: ConnectionReport;
 }
 
@@ -80,10 +95,17 @@ const MAX_REPORTED_ATTEMPTS = 8;
  * `ConnectionReport` out. Services are walked in scan order and `mapWithConcurrency`
  * preserves it, so the same fleet produces the same report twice however the network
  * behaved in between (**I7**).
+ *
+ * @param detectedAuth Keys (`${stackId}/${serviceName}`) this scan already found
+ * authentication for — see `hasDetectedAuth`. Those are not asked. A `ReadonlySet` rather
+ * than a predicate so the stage stays deterministic and has no callback to mock, and
+ * decided by the analyzer rather than here because it needs the two API reads this module
+ * knows nothing about.
  */
 export async function probeServices(
   cfg: LabViewConfig,
   stacks: AppStack[],
+  detectedAuth: ReadonlySet<string>,
   fetchImpl?: FetchLike,
 ): Promise<ProbeSnapshot> {
   const attempts: ConnectionAttempt[] = [];
@@ -94,8 +116,9 @@ export async function probeServices(
     attempts,
     ...over,
   });
-  const empty = (conn: Partial<ConnectionReport>): ProbeSnapshot => ({
+  const empty = (conn: Partial<ConnectionReport>, skipped = 0): ProbeSnapshot => ({
     byKey: new Map(),
+    skipped,
     connection: report(conn),
   });
 
@@ -107,16 +130,41 @@ export async function probeServices(
   }
 
   const work: { key: string; targets: ProbeTarget[] }[] = [];
+  let skipped = 0;
   for (const stack of stacks) {
     for (const svc of stack.services) {
+      // `probeTargets` first, and the order is the point: a service with a gate and no HTTP
+      // address was never a candidate, so counting it as withheld would inflate a number
+      // whose whole job is to say how many questions LabView decided not to ask.
       const targets = probeTargets(svc, cfg.probe.lanHost);
-      if (targets.length) work.push({ key: serviceKey(stack, svc), targets });
+      if (!targets.length) continue;
+      const key = serviceKey(stack, svc);
+      if (detectedAuth.has(key)) {
+        skipped++;
+        continue;
+      }
+      work.push({ key, targets });
     }
   }
   if (!work.length) {
-    // Enabled and nothing to ask. Worth saying rather than passing over in silence: the
-    // operator switched the stage on and expects it to have done something, and "no
-    // service was eligible" is a fact about their labels, not about LabView.
+    // Two ways to have nothing to ask, and they are different facts about the fleet.
+    //
+    // Everything eligible already authenticated is a *success*, so it does not wear
+    // `ok: false`: the stage ran, made a decision about every candidate, and the decision
+    // was that none of them needed asking.
+    if (skipped) {
+      return empty(
+        {
+          ok: true,
+          phase: "connected",
+          read: `${plural(skipped, "service")} not asked — authentication was already detected for every service with an HTTP address`,
+        },
+        skipped,
+      );
+    }
+    // Enabled and nothing eligible at all. Worth saying rather than passing over in
+    // silence: the operator switched the stage on and expects it to have done something,
+    // and "no service was eligible" is a fact about their labels, not about LabView.
     return empty({
       phase: "not-found",
       detail:
@@ -154,17 +202,21 @@ export async function probeServices(
       `${open} open`,
       ...(silent.length ? [`${silent.length} did not answer`] : []),
     ].join(", "),
+    // Only when some were. A zero here would put "0 not asked" on the startup line of every
+    // fleet whose services are all unauthenticated, which is a fact about nothing.
+    ...(skipped ? [`${plural(skipped, "service")} not asked (authentication already detected)`] : []),
   ].join(" — ");
 
   // Three outcomes, and the middle one is the ordinary case in any real fleet: some
   // services answer and some do not. `partial` is the phase for exactly that — connected,
   // with part of the read missing — and it stays `ok`, because what was read is sound.
   if (!silent.length) {
-    return { byKey, connection: report({ ok: true, phase: "connected", read }) };
+    return { byKey, skipped, connection: report({ ok: true, phase: "connected", read }) };
   }
   if (gated || open) {
     return {
       byKey,
+      skipped,
       connection: report({
         ok: true,
         phase: "partial",
@@ -182,6 +234,7 @@ export async function probeServices(
   const phase = worst?.phase ?? "connect";
   return {
     byKey,
+    skipped,
     connection: report({
       ok: false,
       phase,

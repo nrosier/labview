@@ -17,7 +17,8 @@
     "scan": "tsx src/cli.ts",
     "hashpw": "tsx src/hashpw.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit && tsc -p tsconfig.scripts.json --noEmit",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "probe-lab": "tsx tools/probe-lab/cli.ts"
   },
   "dependencies": {
     "@fastify/static": "^10.1.2",

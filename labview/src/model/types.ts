@@ -1278,9 +1278,10 @@ export interface OverviewStats {
    *
    * The other half of the value, and the reason the stage is worth running even where it
    * clears nothing: an exposure that was inferred from labels is now one LabView
-   * measured. Not a subset of `exposedWithoutAuth` — a service behind a detected gate
-   * that answers LabView from inside the fleet is counted here too, and the note on it
-   * says so without touching its posture.
+   * measured. Not a subset of `exposedWithoutAuth` — a service whose `.labview` file
+   * declares a mechanism is counted here too, since a declaration is a claim rather than
+   * detection and does not stop the question being asked. Where the two disagree the
+   * declaration still holds the exposure back, and the disagreement is reported as drift.
    */
   probeOpen: number;
   /**
@@ -1348,7 +1349,7 @@ export interface ScanMeta {
   build: BuildStamp;
 }
 
-/** Whether the probe stage ran, and on whose say-so. */
+/** Whether the probe stage ran, on whose say-so, and how much of the fleet it left alone. */
 export interface ProbeRun {
   enabled: boolean;
   /**
@@ -1358,6 +1359,16 @@ export interface ProbeRun {
    * and no other.
    */
   source: "config" | "request";
+  /**
+   * Services that had an HTTP address to ask but were **not** asked, because this scan had
+   * already detected authentication in front of them — see `hasDetectedAuth`.
+   *
+   * Not optional, on the same rule as `source`: a service that was not asked carries no
+   * `ServiceProbe` at all, so its absence is indistinguishable from "no HTTP address was
+   * observed" unless this number is stated. `0` is a real answer, and the commonest one —
+   * a fleet with probing on and no gates anywhere reports it.
+   */
+  skipped: number;
 }
 
 /**

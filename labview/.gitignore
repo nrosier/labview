@@ -4,6 +4,10 @@ web/dist/
 *.log
 .DS_Store
 config.local.yml
+# What probe-lab writes: reports about somebody's real services, at their real addresses.
+# Diagnostic output, not source — and the one place in this repository where a fleet's own
+# hostnames would otherwise end up committed (invariant I2).
+tools/probe-lab/reports/
 # What compose.yml mounts into /config: a real config, a real passwd file, and the
 # secret files beside them. None of it belongs in a repository.
 config/

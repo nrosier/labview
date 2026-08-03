@@ -231,8 +231,45 @@ export function providerEnforces(provider: AuthentikProvider): boolean {
 }
 
 /** Whether the provider's API confirmed at least one enforced gate on this service. */
-export function hasEnforcedAuthentikGate(service: Service): boolean {
+export function hasEnforcedAuthentikGate(service: Pick<Service, "authentik">): boolean {
   return (service.authentik?.applications ?? []).some((app) => app.providers.some(providerEnforces));
+}
+
+/**
+ * Whether this scan **detected** authentication in front of a service, from every source
+ * that is not a measurement and not a claim.
+ *
+ * Three terms, and each of them is a document or an API answering rather than an opinion:
+ * a method {@link deriveAuth} settled on (a Traefik middleware, the live chain, an OIDC
+ * issuer, an LDAP host, the Authentik API), a tunnel route carrying an Access policy, or
+ * an Authentik provider the API reports something actually serves.
+ *
+ * Two things are deliberately *not* here:
+ *
+ *  - **The probe.** A login page LabView was answered with is protection it measured, and
+ *    this predicate is what decides whether to go and measure — folding the answer into
+ *    the question would be circular.
+ *  - **A `.labview` declaration.** `supplies` is the operator's claim about their own
+ *    service. Believing it and then not checking is how a claim quietly becomes a fact,
+ *    which is what `fixtures/probe/declared-open` exists to catch.
+ *
+ * An `inferred` posture counts. A router naming `authentik@docker` whose definition was
+ * in no scanned stack is still a gate this scan detected through Traefik, and it already
+ * makes `hasEdgeAuth` true — so measuring it could not change the verdict either way.
+ *
+ * One definition with two callers, which is the point: `analyze/index.ts` reads it to
+ * decide who gets probed and again to word the notes that explain the outcome. Two copies
+ * could disagree, and a service skipped for a reason its own notes contradict is the one
+ * failure mode this predicate has.
+ */
+export function hasDetectedAuth(service: Pick<Service, "auth" | "cloudflare" | "authentik">): boolean {
+  if (service.auth.method !== "none") return true;
+  // The policy, group or email list — not the mere presence of an `access` block, which
+  // an operator can leave behind empty and which gates nothing on its own.
+  if (service.cloudflare.some((r) => r.access && (r.access.policy || r.access.group || r.access.emails?.length))) {
+    return true;
+  }
+  return hasEnforcedAuthentikGate(service);
 }
 
 /**

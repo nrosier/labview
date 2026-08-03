@@ -48,20 +48,33 @@ export function ProbeDetail({
           fact about one response, and a signal that did not fire is not a fact about
           anything. Said once here rather than repeated per row. */}
       <div class="note">
-        Each service whose own labels showed an HTTP address was asked once, at{" "}
-        <span class="mono">/</span>, with no credential and without following redirects. A login
-        page answering is evidence and takes the service out of the exposed count; anything the
-        rule does not recognise withdraws nothing, so a service listed as answering with no
-        login page may still have one LabView cannot see — and may equally be one whose gate is
-        already detected, since the request can go around the edge that gates real visitors.
-        Each row gives the address tried, what came back and the fact the verdict rested on.
+        Each service whose own labels showed an HTTP address <em>and</em> for which this scan
+        found no authentication was asked once, at <span class="mono">/</span>, with no
+        credential and without following redirects. A login page answering is evidence and takes
+        the service out of the exposed count; anything the rule does not recognise withdraws
+        nothing, so a service listed as answering with no login page may still have one LabView
+        cannot see. Each row gives the address tried, what came back and the fact the verdict
+        rested on.
+        {report.notAsked > 0 && (
+          <>
+            {" "}
+            {count(report.notAsked)} with an HTTP address {report.notAsked === 1 ? "was" : "were"}{" "}
+            not asked, because a gate was already detected in front of{" "}
+            {report.notAsked === 1 ? "it" : "them"} — the answer could not have changed that
+            verdict, so the request was not sent.
+          </>
+        )}
       </div>
 
       {report.probed === 0 ? (
-        /* Reachable only by a payload that arrived while the panel was open — the tile that
-           opens it is not drawn for a scan that probed nothing. A blank body would read as a
-           panel that failed to load. */
-        <div class="note">This scan asked no service, so there is nothing to report.</div>
+        /* Two ways to get here. Everything eligible already authenticated, which the tile does
+           draw — and a payload that arrived while the panel was open, which it does not. A blank
+           body would read as a panel that failed to load. */
+        <div class="note">
+          {report.notAsked > 0
+            ? "Every service with an HTTP address already had authentication detected, so none of them needed asking."
+            : "This scan asked no service, so there is nothing to report."}
+        </div>
       ) : (
         <>
           {report.open.length > 0 && (

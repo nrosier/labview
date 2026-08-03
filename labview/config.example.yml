@@ -254,6 +254,20 @@ traefik:
 # Only services where HTTP was *observed* are asked — a tunnel route with an
 # http/https origin, or a `traefik.http.routers.*` label. A service that only
 # publishes a port is never touched, which is what keeps this off your databases.
+#
+# And only services this scan found *no* authentication for. A Traefik auth
+# middleware, an OIDC issuer in the environment, an enforced Authentik provider, a
+# Cloudflare Access policy on the route — any one of those and the service is not
+# asked, because the answer could not change the verdict. Authentication already
+# detected keeps a service out of the exposed count on its own, so probing it would
+# only put traffic on somebody's SSO endpoint to confirm what is already known. The
+# outcome is reported rather than hidden: the read line and the Login probe tile both
+# say how many services were not asked, so a count of 13 in a fleet of 14 HTTP
+# services never looks like a service that got lost. There is no key for this — a
+# switch to turn it off would send requests that cannot tell you anything.
+#
+# A `.labview` declaration is not detection, so a service that only *claims*
+# authentication is still asked. That is the point of asking.
 probe:
   # Or set LABVIEW_PROBE_ENABLED=true.
   #

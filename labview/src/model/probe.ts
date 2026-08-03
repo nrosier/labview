@@ -347,9 +347,9 @@ export function readGate(res: ProbeResponse): ProbeGate | undefined {
   // hand-off whose entire purpose is to be POSTed onward by script.
   const refresh = readRefresh(res.body, res.requestUrl);
   if (refresh && pointsAtLogin(refresh)) return "meta-refresh-login";
-  if (SAML_FIELD.test(res.body)) return "sso-form";
+  if (hasSamlField(res.body)) return "sso-form";
 
-  if (PASSWORD_INPUT.test(res.body)) return "password-form";
+  if (hasPasswordField(res.body)) return "password-form";
 
   // Passwordless. All three parts are required and they must be on **one** form: a
   // username field and a button with no login intent behind them is a signup box or a
@@ -436,8 +436,22 @@ export function isHtmlMediaType(mediaType: string | undefined): boolean {
   return mediaType === "text/html" || mediaType === "application/xhtml+xml";
 }
 
+/*
+ * The four clause predicates, exported for one reason.
+ *
+ * `readGate` returns the *strongest* signal it found, which is what a verdict needs and is not
+ * what somebody trying to improve the rule needs: they want to know which of the seven clauses
+ * fired, which came close, and on what fact each one turned. `tools/probe-lab` answers that a
+ * clause at a time, and it has to be able to ask each question the way `readGate` asks it —
+ * a report that restated these tests could describe a decision LabView would never make, which
+ * would make it worse than no report at all.
+ *
+ * So the tests are named and shared rather than copied. The regexes and the path list stay
+ * private: what is exported is the question, never the pattern that answers it.
+ */
+
 /** Whether a same-origin path is a login page by name. Cross-origin never reaches here. */
-function isLoginPath(path: string): boolean {
+export function isLoginPath(path: string): boolean {
   const lower = path.toLowerCase();
   return LOGIN_PATHS.some((p) => lower.startsWith(p));
 }
@@ -449,8 +463,18 @@ function isLoginPath(path: string): boolean {
  * two cannot disagree about what counts, and so `probeReasonText` explains a near-miss in the
  * terms this function actually failed on.
  */
-function pointsAtLogin(to: ProbeRedirect): boolean {
+export function pointsAtLogin(to: ProbeRedirect): boolean {
   return to.crossOrigin || isLoginPath(to.to);
+}
+
+/** Whether the page carries a password field, in either spelling. See {@link PASSWORD_INPUT}. */
+export function hasPasswordField(body: string): boolean {
+  return PASSWORD_INPUT.test(body);
+}
+
+/** Whether the page carries the SAML POST binding's own field. See {@link SAML_FIELD}. */
+export function hasSamlField(body: string): boolean {
+  return SAML_FIELD.test(body);
 }
 
 /**
@@ -735,6 +759,7 @@ export function probeToggleText(run: { enabled: boolean; source: "config" | "req
         : "and the configuration has probing off";
   return [
     "Ask each HTTP service what it answers, and read a login page as evidence — this is the only stage that sends requests to the scanned services, and for a service behind a public hostname those requests leave the fleet.",
+    "Only services this scan found no authentication for are asked: where a gate is already detected the answer could not change the verdict, so no request is sent.",
     "It applies to the next Rescan and to nothing else: a refresh after the cache expires has no request behind it and goes back to the configured value.",
     `The scan on screen ${did} ${why}.`,
   ].join(" ");
@@ -928,9 +953,9 @@ export interface ProbeReportEntry {
  * read as "no login page found".
  *
  * `open` is **not** a list of exposures, on `OverviewStats.probeOpen`'s own terms: a service
- * behind a detected gate that answers LabView from inside the fleet is in here too, because
- * the request may simply have gone around the edge that gates real visitors. What every entry
- * has in common is that asking withdrew nothing, not that anything is wrong.
+ * whose `.labview` file declares a mechanism is in here too, since a declaration is a claim
+ * rather than detection and so does not withhold the question. What every entry has in common
+ * is that asking withdrew nothing, not that anything is wrong.
  */
 export interface ProbeReport {
   /** Answered, and no signal fired — so nothing was taken out of the exposed count. */
@@ -941,6 +966,17 @@ export interface ProbeReport {
   silent: ProbeReportEntry[];
   /** Every service asked — the three lists' total, and what the tile counts. */
   probed: number;
+  /**
+   * Services with an HTTP address that were deliberately not asked, because authentication
+   * had already been detected in front of them — `ProbeRun.skipped`, carried in so the tile
+   * and the panel can say it.
+   *
+   * A number rather than a fourth list, and that is a limit worth naming: nothing on
+   * `svc.probe` records a service that was never asked, so there is nothing to list. What
+   * the count buys is that `probed` reading lower than the fleet's HTTP services has a
+   * stated reason instead of looking like results went missing.
+   */
+  notAsked: number;
 }
 
 /**
@@ -959,8 +995,13 @@ export interface ProbeReport {
  *
  * Sorted by stack name then service name, matching the fleet list, so a reader arriving from
  * it finds a service where they left it and the same scan produces the same panel twice (I7).
+ *
+ * @param notAsked `ScanMeta.probe.skipped`. The one thing here that cannot be derived from
+ * `stacks`, because a service that was never asked leaves nothing behind on itself to derive
+ * it from. Defaults to 0 so a caller holding only a fleet — a test, the CLI — still gets a
+ * report, on the understanding that 0 then means "not stated" rather than "none withheld".
  */
-export function collectProbeReport(stacks: readonly AppStack[]): ProbeReport {
+export function collectProbeReport(stacks: readonly AppStack[], notAsked = 0): ProbeReport {
   const open: ProbeReportEntry[] = [];
   const gated: ProbeReportEntry[] = [];
   const silent: ProbeReportEntry[] = [];
@@ -982,23 +1023,31 @@ export function collectProbeReport(stacks: readonly AppStack[]): ProbeReport {
       else open.push(entry);
     }
   }
-  return { open, gated, silent, probed: open.length + gated.length + silent.length };
+  return { open, gated, silent, probed: open.length + gated.length + silent.length, notAsked };
 }
 
 /**
  * The report as one line — `5 services asked · 3 gated · 2 answered with no login page`.
  *
  * Shared by the tile's tooltip and the panel's subtitle so the two cannot count the same fleet
- * differently. `did not answer` appears only when some service did not, because a zero there
- * is a fact about nothing and every fleet on a good day would carry it.
+ * differently. `did not answer` and `not asked` appear only when some service was, because a
+ * zero there is a fact about nothing and every fleet on a good day would carry it.
+ *
+ * A fleet where *everything* eligible was already authenticated is the one case with a count
+ * and no services in it, and it gets its own sentence: `no service was asked` alone would be
+ * true and would read as though the stage had not run.
  */
 export function probeReportSummaryText(report: ProbeReport): string {
-  if (report.probed === 0) return "no service was asked";
   const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
+  const notAsked = report.notAsked
+    ? `${plural(report.notAsked, "service")} not asked (authentication already detected)`
+    : "";
+  if (report.probed === 0) return notAsked || "no service was asked";
   return [
     `${plural(report.probed, "service")} asked`,
     `${report.gated.length} gated`,
     `${report.open.length} answered with no login page`,
     ...(report.silent.length ? [`${report.silent.length} did not answer`] : []),
+    ...(notAsked ? [notAsked] : []),
   ].join(" · ");
 }

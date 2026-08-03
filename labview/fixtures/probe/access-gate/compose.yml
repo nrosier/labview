@@ -1,0 +1,48 @@
+# Regression fixture: a Cloudflare Access policy is authentication, so this service is
+# never asked.
+#
+# The point of this stack, beside `gated-open` next door, is that it has no Traefik router in it
+# at all. The request was worded as "authentication detected through Traefik, OIDC or the
+# Authentik API", and this is the case that shows the rule is not about Traefik: one tunnel label
+# carrying an Access policy is a gate Cloudflare enforces before the request reaches the fleet,
+# and LabView detected it without reading a router.
+#
+# `probeTargets` yields `https://access.probe.example.com/` — a tunnel hostname with an HTTP
+# origin, exactly like `tunnel-login` next door — and the probe declines to send it. That is the
+# whole of the rule: an unauthenticated GET at Cloudflare's edge could only ever be answered with
+# Access's own login page, which would corroborate a verdict already reached and change nothing.
+#
+# `deriveAuth` reads the Access policy as a mechanism (`other-oauth`), so this service is
+# withheld on `hasDetectedAuth`'s first term as well as its second. The second term is therefore
+# a standalone guard rather than the only thing holding the request back, and it is pinned
+# directly against the predicate in the smoke table so it stays asserted on its own.
+#
+# There is an answer waiting for this address in the smoke stub, deliberately. A revert that
+# drops the eligibility check does not fail on a missing stub entry; it fails because the
+# request was recorded, which is the thing being forbidden.
+#
+# `db` is the second half of the fixture and it is about a number rather than a request. It has
+# the same Access policy and a `tcp://` origin, so it is a detected gate with no HTTP address —
+# and `probeServices` consults `probeTargets` *before* the eligibility check precisely so that
+# this service is never a candidate rather than a withheld one. Swap those two lines and nothing
+# extra is requested, but `skipped` reads 3 where 2 questions were declined, which is a counter
+# that has stopped meaning what it says. That is the revert this service exists to fail.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: probe-access-gate
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=access.probe.example.com"
+      - "dockflare.service=http://probe-access-gate:8080"
+      - "dockflare.access.policy=authenticate"
+      - "dockflare.access.group=staff"
+
+  db:
+    image: postgres:16-alpine
+    container_name: probe-access-gate-db
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=access-db.probe.example.com"
+      - "dockflare.service=tcp://probe-access-gate-db:5432"
+      - "dockflare.access.policy=authenticate"

@@ -58,7 +58,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
-| **Active probe (optional, off by default)** | Everything above reads configuration. With `LABVIEW_PROBE_ENABLED=true` — or the switch beside **Rescan**, which decides it for that one rescan either way — the scan also **asks**: one `GET /` per service where HTTP was observed, at its public hostname, else its proxy hostname, else its published port, stopping at the first address that answers. Seven things in the answer count as a login page: 401/407 with a `WWW-Authenticate` header, a redirect to another origin, a redirect to a login path, a `<meta http-equiv="refresh">` to either of those, a hidden `SAMLRequest` field (the SAML POST hand-off *is* that page), an HTML page carrying a password field, and — for magic-link and passkey sign-in, which have no password at all — a form with a username field, a submit button and a login action. Any of them takes the service out of the exposed count with the badge **Login page answered**, and the drawer says what the form was made of. A **Login probe** tile opens the whole measurement in one place — per service, the address tried, what answered, and which fact decided it, so a 302 to `/dashboard` and a 302 to `/login` never read alike. That is the largest class of protection a compose scan cannot see: the application's own login form. It cuts the other way too, which is half the value — a service that answers with no login page turns an exposure that was *inferred* from configuration into one that was *measured*. Nothing weaker counts, because a wrong gate clears a real exposure: a refresh to `/dashboard` is routing, and a newsletter box that posts an email address to a hosted list service is not a hand-off. What it never does is invent a mechanism: `auth.method` stays `none`, because a password field does not say whose form it is. A service with `ports:` and no route is not eligible, so no database port is ever asked. |
+| **Active probe (optional, off by default)** | Everything above reads configuration. With `LABVIEW_PROBE_ENABLED=true` — or the switch beside **Rescan**, which decides it for that one rescan either way — the scan also **asks**: one `GET /` per service where HTTP was observed **and this scan found no authentication**, at its public hostname, else its proxy hostname, else its published port, stopping at the first address that answers. A service already behind a detected gate — a Traefik auth middleware, an OIDC issuer, an enforced Authentik provider, a Cloudflare Access policy — is not asked at all, because its answer could not change the verdict; the read line and the tile both say how many were withheld, so a smaller count never reads as a service that got lost. Seven things in the answer count as a login page: 401/407 with a `WWW-Authenticate` header, a redirect to another origin, a redirect to a login path, a `<meta http-equiv="refresh">` to either of those, a hidden `SAMLRequest` field (the SAML POST hand-off *is* that page), an HTML page carrying a password field, and — for magic-link and passkey sign-in, which have no password at all — a form with a username field, a submit button and a login action. Any of them takes the service out of the exposed count with the badge **Login page answered**, and the drawer says what the form was made of. A **Login probe** tile opens the whole measurement in one place — per service, the address tried, what answered, and which fact decided it, so a 302 to `/dashboard` and a 302 to `/login` never read alike. That is the largest class of protection a compose scan cannot see: the application's own login form. It cuts the other way too, which is half the value — a service that answers with no login page turns an exposure that was *inferred* from configuration into one that was *measured*. Nothing weaker counts, because a wrong gate clears a real exposure: a refresh to `/dashboard` is routing, and a newsletter box that posts an email address to a hosted list service is not a hand-off. What it never does is invent a mechanism: `auth.method` stays `none`, because a password field does not say whose form it is. A service with `ports:` and no route is not eligible, so no database port is ever asked. |
 | **Integration panel** | The `authentik: 13 apps · 9 matched` and `traefik: 10 routers · 8 matched` counts in the topbar are buttons. Click one and you get the whole join: every matched pair with the evidence behind it and how strongly it was established, and every application or router LabView could **not** place — with the reason (`ambiguous` where two services claim it, `no-candidate` where nothing did), plus the rule-by-rule trace of what was tried. Clicking a matched row jumps to that service's drawer. When an integration is unreachable the same panel shows the failure instead: the stage that failed, the address, every candidate that was tried, and the suggested fix. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Tell it what it can't see** | Drop an optional [`.labview`](labview/.labview.example) YAML file next to a `compose.yml` and it is read with it: a description, owner and criticality, links, what lives in the volumes, a `depends_on` naming another scanned service that compose has no way to name — and the two things a scan structurally cannot find. Authentication **inside** the app (Emby's built-in accounts plus its LDAP bind is `auth: [app-local-accounts, app-ldap]`) is shown as *declared*, from a fixed vocabulary of mechanisms rather than product names. An exposure that is **deliberate** is marked accepted, with a required reason. What you declare is then **compared** with what was found, and only the disagreements are shown: a declaration the scan already proved is not repeated, an `expected.ingress` that matches renders nothing, and a declared login that contradicts a detected one *at the same layer* — `app-oidc` where the scan found an LDAP bind — is reported as **drift**, while the same declaration behind a detected proxy gate is defence in depth and says nothing. A declared login on a service with no gate at all takes it out of the exposed count and gives it its own badge and counter, because *reachable and unauthenticated* is a conclusion and you just answered half of it; accepting an exposure, by contrast, never clears it — it annotates it. What was detected is never altered either way. |
@@ -79,10 +79,13 @@ labview/              the application (see labview/README.md for full docs)
   fixtures/           apps/ (happy path), edge/ (regression cases),
                       authentik/ + authentik-api.json (identity provider integration),
                       traefik/ + traefik-api.json (reverse proxy integration),
-                      probe/ (the login pages a scan asks for, and the near-misses)
+                      probe/ (the login pages a scan asks for, the near-misses,
+                      and the services it must never ask at all)
+  tools/probe-lab/    a diagnostic, not part of the scan: what the login rule reads
+                      at a URL, and what an eighth signal would have to be
   scripts/smoke.ts    end-to-end pipeline assertions
   compose.yml         deployment example
-  Dockerfile          two-stage node:22-alpine build, runs as non-root
+  Dockerfile          two-stage node:26-alpine build, runs as non-root
 .github/
   workflows/          CI: security scanning, test-gated image build/push
   dependabot.yml      weekly dependency updates (npm, base image, Actions)
@@ -176,7 +179,7 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Traefik API base URL, e.g. `http://traefik:8080`. Only needed when the proxy is outside `appsRoot`, or when discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through a hostname Authentik gates: an Authentik user, or the reserved `goauthentik.io/token`. An unauthenticated endpoint is used with no credential |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
-| `LABVIEW_PROBE_ENABLED` | `false` | **Off by default.** `true` makes a scan issue one `GET /` per HTTP service and read the answer for a login page. The only stage that sends a request to a scanned service; through a public hostname it leaves your fleet. This is the default for startup and scheduled scans — the switch beside Rescan decides one rescan either way. See [Probing a service directly](labview/README.md#probing-a-service-directly) |
+| `LABVIEW_PROBE_ENABLED` | `false` | **Off by default.** `true` makes a scan issue one `GET /` per HTTP service **it found no authentication for** and read the answer for a login page; a service already behind a detected gate is not asked, since the answer could not change the verdict. The only stage that sends a request to a scanned service; through a public hostname it leaves your fleet. This is the default for startup and scheduled scans — the switch beside Rescan decides one rescan either way. See [Probing a service directly](labview/README.md#probing-a-service-directly) |
 | `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces. Unset means published ports are not asked |
 | `LABVIEW_BUILD_SHA` | *(unset)* | The commit the build came from, so the page can name it. Set at **image build time** (`--build-arg LABVIEW_BUILD_SHA=$(git rev-parse HEAD)`); a full object id is shortened to seven characters. Unset is fine — a checkout is read directly, and failing that LabView says it does not know. The one variable with no config-file key, because it describes the build rather than the fleet. See [Which build am I looking at](labview/README.md#which-build-am-i-looking-at) |
 | `LABVIEW_AUTH_PASSWD_FILE` | `/config/passwd` | `user:hash` lines. One usable entry turns LabView's own login on; no file means it stays off |
@@ -319,25 +322,30 @@ class of real protection there is, and it leaves no trace anywhere a scan can lo
 middleware, no env key, no Authentik application. Until now the only way to keep such a
 service out of the exposed count was to *declare* it, which nothing could check. So
 LabView can simply ask — `LABVIEW_PROBE_ENABLED=true`, one `GET /` per service where
-HTTP was observed, at its public hostname, else its proxy hostname, else
-`LABVIEW_PROBE_LAN_HOST` and the published port, stopping at the first address that
-answers. A challenge header, a redirect off-origin, a redirect to a login path, a
+HTTP was observed and no authentication was found, at its public hostname, else its proxy
+hostname, else `LABVIEW_PROBE_LAN_HOST` and the published port, stopping at the first
+address that answers. A challenge header, a redirect off-origin, a redirect to a login path, a
 `<meta http-equiv="refresh">` to either of those, a hidden `SAMLRequest` field, an HTML
 page with a password field on it, or a passwordless sign-in form — username field, submit
 button, action on a login path, no password anywhere — is a login page and clears the
 exposure; a bare 401, a 403, a `/` → `/dashboard` redirect (by `Location` or by refresh),
 a newsletter box posting an email address off-origin and the words "Sign in" are not, and
 the exposure stands. What it will not do is name a mechanism — a response is evidence of a
-gate and never a name for one — and it will not contradict a gate the labels declare,
-since a request from LabView's own vantage point may not have travelled the gated path.
+gate and never a name for one — and it will not contradict a gate the configuration
+declares, since a request from LabView's own vantage point may not have travelled the
+gated path. That last rule is also why such a service is not asked in the first place: an
+answer that could not move the verdict is not worth a request to somebody's SSO endpoint,
+and not asking can only ever leave a service *in* the exposed count, never take one out.
 The reason it is **off by default** is that it is the one stage that sends a request to
 something in your own fleet, and through a public hostname that request leaves the fleet
 and comes back in through your edge. A service with `ports:` and no route is not
-eligible, which is what keeps it off your database ports; the cost, stated plainly, is
-that such a service stays inferred rather than measured.
+eligible, which is what keeps it off your database ports; the two costs, stated plainly,
+are that such a service stays inferred rather than measured, and that a service behind a
+detected gate is no longer corroborated by a measurement at all.
 
 What came back is not left as a count. A **Login probe** tile appears whenever a scan
-asked anything, and it opens a panel with one row per service: the address tried, what
+asked anything — or decided not to, so a fleet where everything was already gated still
+shows the stage ran — and it opens a panel with one row per service: the address tried, what
 answered, and **why** that was or was not read as a login page — `It answered HTTP 302 and
 sent the request to /dashboard, which is on its own origin and is not a login path —
 routing rather than a gate.` The answers that cleared nothing lead, the gated ones follow,
@@ -466,9 +474,12 @@ output is sensitive.
   credential in scope on that code path, redirects read rather than followed, at most
   four addresses per service, a response body read only when it is HTML and under a
   size cap, and only ever to a service where HTTP was *observed* — a database port is
-  never asked, whatever `LABVIEW_PROBE_LAN_HOST` is set to. Through a public hostname
-  the request leaves the fleet and returns through your edge, which is the point of
-  that vantage and worth knowing before switching it on.
+  never asked, whatever `LABVIEW_PROBE_LAN_HOST` is set to. It also asks fewer services
+  than it could: one this scan already found authentication for is not asked, because the
+  answer could not change the verdict, so no request goes to somebody's SSO endpoint to
+  confirm something already known. Through a public hostname the request leaves the fleet
+  and returns through your edge, which is the point of that vantage and worth knowing
+  before switching it on.
 - **The switch beside Rescan overrides that setting, so it is worth one more sentence.**
   It works both directions for one rescan, and `POST /api/rescan` needs a session only
   while access control is configured. Without a passwd file or an OIDC issuer, anyone who
@@ -603,7 +614,10 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   truncated read is itself observable), or an address only a browser on your LAN can get
   to still reads as exposed. That direction is deliberate: a login page LabView cannot
   recognise costs you a second look, while a rule loose enough to catch the rest would
-  clear exposures that are real.
+  clear exposures that are real. When one of your own services lands on the wrong side of
+  it, [`labview/tools/probe-lab`](labview/tools/probe-lab/README.md) is the diagnostic:
+  point it at the address and it reports what the rule read, why each of the seven signals
+  did not fire, and what an eighth would have to be.
 - Authentik's applications endpoint filters itself by what the token's user may
   launch, so a least-privilege token is not shown every application. LabView reports
   the total and rebuilds the withheld ones from their providers, but an application

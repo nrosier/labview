@@ -33,6 +33,10 @@ import { dirname, join, resolve } from "node:path";
 import type {
   AppStack,
   AuthMethod,
+  AuthentikMatch,
+  AuthentikProvider,
+  AuthentikProviderKind,
+  AuthPosture,
   BuildStamp,
   CloudflareRoute,
   DeclaredAuthMechanism,
@@ -51,6 +55,9 @@ import type {
 // The probe's response record, which is deliberately not a `Response`: the recognition rule
 // is asserted as a table of literals below, and this is the shape one row has.
 import type { ProbeResponse } from "../src/model/probe.js";
+// The same row, as the diagnostic in `tools/probe-lab` records it — one request with no
+// judgement in it, which is what makes a report replayable offline.
+import type { ProbeLabObservation, ProbeLabReport } from "../tools/probe-lab/report.js";
 import type { TagFilter } from "../src/model/filter.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
@@ -180,7 +187,11 @@ const {
 // the same reason as the two above, and asserted here because the alternative is a
 // dashboard that says "No proxy auth" about every internal database and gets believed.
 const { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } = await import("../src/model/auth.js");
-const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
+// What counts as authentication this scan *detected*, as against measured or been told. One
+// definition with two callers — it decides which services the probe may ask, and it decides how
+// the notes explaining the outcome are worded — so a service can never be passed over for a
+// reason its own notes contradict. Asserted as a table below and again over two fixture roots.
+const { hasDetectedAuth, hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
 // The active probe's three rules — which addresses may be asked, what counts as a login
 // page, and what a login form is made of — plus the wording of an answer. In `src/` and
 // asserted here for the reason the module's own docstring gives: a rule that lived in the
@@ -235,6 +246,11 @@ const { MAX_SHA_CHARS, MAX_WALK_LEVELS, SHORT_SHA_CHARS, VERSION, resolveBuildSt
 // seven characters, and a tooltip that conflated them would be an over-claim no browser
 // test would catch (**I1**).
 const { buildLabel, buildSummary, buildTitle } = await import("../src/model/build.js");
+// The diagnostic in `tools/probe-lab`, which is not part of the scan and is asserted here
+// anyway — its whole value is the claim that a report says what the pipeline said, and a claim
+// like that is worth exactly as much as the check behind it. Only the pure half is reachable
+// from here, which is why the pure half is where all the reasoning lives.
+const { buildReport, renderJson, renderMarkdown } = await import("../tools/probe-lab/report.js");
 
 /** Build an overview for one fixture root. loadConfig() re-reads env each call. */
 async function overviewFor(root: string, deps: BuildDeps = {}): Promise<Overview> {
@@ -657,8 +673,17 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
   "https://dash.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
   // Open: a same-origin redirect to a landing page, which is routing and not a gate.
   "https://routing.probe.example.com/": { status: 302, location: "/dashboard" },
-  // Open, behind a configured forward-auth middleware the request did not travel through.
+  /*
+   * The two addresses that are never asked, and they are in this table on purpose.
+   *
+   * Both services carry authentication this scan detected — a forward-auth middleware on the
+   * one, a Cloudflare Access policy on the other — so the probe declines to ask them. An
+   * answer waiting here is what turns that into a test: a revert that drops the eligibility
+   * check does not fail on a missing entry and an `ENOTFOUND`, which would look like a
+   * network fixture problem. It fails because `calls` recorded the request.
+   */
   "https://gated.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
+  "https://access.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
   // Open, and declared as authenticating itself — the drift case.
   "https://portal.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
   // Gated: a redirect to a login written in markup, so it arrives wearing a 200.
@@ -1721,11 +1746,19 @@ check(
 // report altogether — which is precisely the risk in letting a declaration clear a
 // finding. Recomputed from the evidence rather than read off `exposedWithoutAuth`, so it
 // is a partition check and not a restatement of the flag.
+/**
+ * A tunnel route with something in its `access` block that actually gates — a policy, a group
+ * or a non-empty email list, never the mere presence of the block.
+ *
+ * Its own function because two checks need it: the exposure partition below, and the assertion
+ * further down that `hasDetectedAuth` is exactly this partition's negation. Spelled out here
+ * rather than imported, so the two are independent statements of the same rule and a change to
+ * one of them shows up as a disagreement.
+ */
+const hasCfAccess = (s: Pick<Service, "cloudflare">) =>
+  s.cloudflare.some((r) => r.access && Boolean(r.access.policy || r.access.group || r.access.emails?.length));
 const unprotected = (s: Service) =>
-  isExternallyReachable(s.ingress) &&
-  s.auth.method === "none" &&
-  !hasEnforcedAuthentikGate(s) &&
-  !s.cloudflare.some((r) => r.access && (r.access.policy || r.access.group || r.access.emails?.length));
+  isExternallyReachable(s.ingress) && s.auth.method === "none" && !hasEnforcedAuthentikGate(s) && !hasCfAccess(s);
 check(
   "every reachable service with no detected auth is either exposed or declared-protected",
   eAll.filter(unprotected).every((s) => s.auth.exposedWithoutAuth || s.declared?.authAgreement === "supplies"),
@@ -4988,6 +5021,382 @@ check(
 );
 
 /* -------------------------------------------------------------------------- */
+/* The diagnostic that reports on the rule (tools/probe-lab)                  */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * `tools/probe-lab` exists so an operator can look at a page LabView read as open and find out
+ * whether it is unprotected or merely unrecognised. Its whole value rests on one claim: **the
+ * verdict in a report is the pipeline's verdict**. A report that described a decision LabView
+ * would not make would be worse than no report at all — it would send somebody to change a rule
+ * that was never the problem — so the claim is asserted rather than argued for.
+ *
+ * It is asserted the strongest way available: every row of the `gateCases` table above, the same
+ * responses `readGate` is pinned against, is put through `buildReport` and the report's gate must
+ * equal the row's expected gate. So the two cannot drift by construction *and* cannot drift by
+ * accident; a clause added to `readGate` and mirrored wrongly in the lab fails here.
+ *
+ * Only the pure half is covered, which is the reason for the pure/I-O split in the first place:
+ * `report.ts` is a function of an observation record, so all of this runs with no network, no
+ * temporary directory and nobody's service involved. `cli.ts` is argv, one `getResponse` call and
+ * two `writeFile`s, and it inherits every bound it has from the pipeline's own transport.
+ */
+console.log("\nthe report on a rule says what the rule said");
+/**
+ * A `ProbeResponse` as the lab's observation record.
+ *
+ * The one interesting line is the content type: `getResponse` reads a body **only** when the
+ * media type is HTML, so a case carrying a body is by construction a case whose answer was HTML,
+ * and the header is supplied to say so. Getting this backwards would make every body-reading
+ * clause unreachable in the report and the drift check below would fail on six rows at once.
+ */
+const asObservation = (res: ProbeResponse): ProbeLabObservation => ({
+  requestUrl: res.requestUrl,
+  status: res.status,
+  headers: {
+    ...(res.location ? { location: res.location } : {}),
+    ...(res.wwwAuthenticate ? { "www-authenticate": res.wwwAuthenticate } : {}),
+    ...(res.body ? { "content-type": "text/html; charset=utf-8" } : {}),
+  },
+  ...(res.body ? { body: res.body } : {}),
+});
+const drifted = gateCases.filter((c) => buildReport(asObservation(c.res)).verdict.gate !== c.gate);
+check(
+  `the report's verdict is readGate's verdict, on all ${gateCases.length} rows of the table above`,
+  drifted.length === 0,
+  drifted.map((c) => `${c.name}: report said ${String(buildReport(asObservation(c.res)).verdict.gate)}`).join("; "),
+);
+check(
+  // The other half of the same claim: the wording is the dashboard's wording, not a second
+  // vocabulary invented for a file. `probeOutcome` owns the label and the lab imports it, so a
+  // gate reads as its own name and everything that answered without one reads as the tile does.
+  "...and it is worded in the dashboard's own words",
+  gateCases.every((c) => {
+    const label = buildReport(asObservation(c.res)).verdict.label;
+    return label === (c.gate ? probeGateText(c.gate).label : "No login page");
+  }),
+  gateCases
+    .filter((c) => buildReport(asObservation(c.res)).verdict.label !== (c.gate ? probeGateText(c.gate).label : "No login page"))
+    .map((c) => `${c.name}: ${buildReport(asObservation(c.res)).verdict.label}`)
+    .join("; "),
+);
+check(
+  // I1's direction, restated where a reader of a report will act on it: a gate is the only thing
+  // that withdraws an exposure, and every other answer leaves the finding standing.
+  "a gate withdraws an exposure and nothing else does",
+  gateCases.every((c) => buildReport(asObservation(c.res)).verdict.withdrawsExposure === (c.gate !== undefined)),
+);
+
+/*
+ * The seven per-signal rows — the section the tool exists for, and the one a gate assertion
+ * cannot reach. `readGate` returns the *strongest* signal; these say which clauses fired, which
+ * came close, and on what fact each turned.
+ */
+const loginReport = buildReport(asObservation({ requestUrl: "https://a.example.com/", status: 200, body: PROBE_LOGIN_HTML }));
+const signupReport = buildReport(asObservation({ requestUrl: "https://a.example.com/", status: 200, body: PROBE_SIGNUP_HTML }));
+const jsonReport = buildReport({
+  requestUrl: "https://a.example.com/",
+  status: 200,
+  headers: { "content-type": "application/json" },
+});
+const bare401Report = buildReport({
+  requestUrl: "https://a.example.com/",
+  status: 401,
+  headers: { "content-type": "application/json" },
+});
+const silentReport = buildReport({
+  requestUrl: "https://a.example.com/",
+  headers: {},
+  phase: "resolve",
+  error: "fetch failed (ENOTFOUND)",
+});
+const rowOf = (report: ProbeLabReport, gate: ProbeGate) => report.read.signals.find((s) => s.gate === gate)!;
+check(
+  "every signal gets a row, in the precedence readGate applies",
+  loginReport.read.signals.map((s) => s.gate).join(",") === PROBE_GATES.join(","),
+  loginReport.read.signals.map((s) => s.gate).join(","),
+);
+check(
+  "...each labelled the one way the vocabulary labels it",
+  loginReport.read.signals.every((s) => s.label === probeGateText(s.gate).label),
+);
+check(
+  // Two clauses fire on one login page and only the first decided anything. The rows have to
+  // show both, or the table would read as a list of votes rather than a precedence order.
+  "a login form satisfies two clauses, and the report says which one was the verdict",
+  rowOf(loginReport, "password-form").fired &&
+    rowOf(loginReport, "credential-form").fired &&
+    loginReport.verdict.gate === "password-form",
+  `${rowOf(loginReport, "password-form").fired} / ${rowOf(loginReport, "credential-form").fired} / ${String(loginReport.verdict.gate)}`,
+);
+check(
+  // The newsletter trap, from the diagnostic side. `fixtures/probe/passwordless/news` proves
+  // the rule declines it; this proves the report says *why*, which is what stops somebody
+  // loosening the clause to "fix" it.
+  "the newsletter box is declined, and the reason names the part it lacks",
+  signupReport.verdict.gate === undefined &&
+    rowOf(signupReport, "credential-form").fired === false &&
+    rowOf(signupReport, "credential-form").because.includes("no login intent"),
+  rowOf(signupReport, "credential-form").because,
+);
+check(
+  "...and the missing password field is named on its own clause",
+  rowOf(signupReport, "password-form").fired === false &&
+    rowOf(signupReport, "password-form").because.includes("no input of type=password"),
+  rowOf(signupReport, "password-form").because,
+);
+check(
+  // A body-reading clause cannot fail for lack of a password field on a response no body was
+  // read from. Saying "no password field in the markup" about a JSON answer would send somebody
+  // looking for markup that was never fetched.
+  "a non-HTML answer says the body was never read, on all four body clauses",
+  (["meta-refresh-login", "sso-form", "password-form", "credential-form"] as const).every((g) =>
+    rowOf(jsonReport, g).because.includes("no body was read as HTML"),
+  ),
+  rowOf(jsonReport, "password-form").because,
+);
+check(
+  "a bare 401's challenge row names the missing header rather than the status",
+  rowOf(bare401Report, "challenge").fired === false &&
+    rowOf(bare401Report, "challenge").because.includes("no WWW-Authenticate"),
+  rowOf(bare401Report, "challenge").because,
+);
+check(
+  // The third outcome, which must never read as the second. Nothing answered, so nothing was
+  // measured — the same distinction `probeOutcome` makes and the CLI's summary line repeats.
+  "a service that did not answer is not reported as having no login page",
+  silentReport.verdict.label === "No answer" &&
+    silentReport.verdict.withdrawsExposure === false &&
+    renderMarkdown(silentReport).includes("Nothing was measured") &&
+    !renderMarkdown(silentReport).includes("No `<form>` element"),
+  silentReport.verdict.label,
+);
+
+/*
+ * Section 3 — the evidence no clause reads. This is what a new rule would be designed from, so
+ * the assertion is that it survives the trip: a form the ranking rule reduced to one shape is
+ * still there unranked, with the attributes a different ranking would need.
+ */
+check(
+  "the form no rule ranked is still dumped, attribute by attribute",
+  loginReport.unread.forms.length === 1 &&
+    loginReport.unread.forms[0]!.action === "/login" &&
+    loginReport.unread.forms[0]!.inputs.some((i) => i.type === "password") &&
+    loginReport.unread.forms[0]!.inputs.some((i) => i.name === "username") &&
+    loginReport.unread.forms[0]!.buttons.length > 0,
+  JSON.stringify(loginReport.unread.forms),
+);
+check(
+  // The known blind spot, and the one case where the report has to say the rule *cannot* win.
+  // A shell with one bundle and no form is not a page without a login form on it.
+  "a client-rendered shell is named as the blind spot it is, not as a service with no login",
+  (() => {
+    const spa = buildReport(asObservation({
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: '<!doctype html><html><head><title>App</title></head><body><div id="root"></div><script src="/assets/index-4f2.js"></script></body></html>',
+    }));
+    return (
+      spa.verdict.gate === undefined &&
+      spa.unread.assets.some((a) => a.kind === "script" && a.href === "/assets/index-4f2.js") &&
+      spa.next.some((n) => n.includes("no body-only signal can see it"))
+    );
+  })(),
+);
+check(
+  // A same-origin redirect to a path outside the list is the most actionable finding there is,
+  // and the least safe place to guess: the list only ever *adds* a gate, so a wrong entry costs
+  // a false one. The report has to point at the path rather than suggest widening the rule.
+  "a same-origin redirect elsewhere points at the path, and asks for a fixture rather than a loosening",
+  (() => {
+    const routed = buildReport({
+      requestUrl: "https://a.example.com/",
+      status: 302,
+      headers: { location: "/dashboard" },
+    });
+    return (
+      routed.verdict.gate === undefined &&
+      routed.next.length === 1 &&
+      routed.next[0]!.includes("/dashboard") &&
+      routed.next[0]!.includes("needs a fixture")
+    );
+  })(),
+);
+check(
+  // Nothing to change about a page the rule already reads. An empty section 4 is the report
+  // saying so, rather than a list of speculative improvements to a working verdict.
+  "a page that gated has no next steps at all",
+  loginReport.next.length === 0 && signupReport.next.length > 0,
+  `${loginReport.next.length} / ${signupReport.next.length}`,
+);
+
+/*
+ * I6, applied to a tool whose output is a file somebody pastes into an issue.
+ *
+ * Two separate rules and they are not the same strength. A credential-shaped *header* is
+ * redacted, which `cli.ts` does before an observation record exists. A **cookie value** is never
+ * read at all — only names reach the record — because a session cookie's value is a live
+ * credential and the name is the whole of what is diagnostic.
+ */
+const cookieReport = buildReport({
+  requestUrl: "https://a.example.com/",
+  status: 200,
+  headers: {
+    "content-type": "text/html",
+    "set-cookie": "authentik_session=SECRETVALUE; Path=/; HttpOnly; SameSite=Lax, csrftoken=OTHERSECRET; Path=/",
+    "x-auth-token": "«redacted, 24 chars»",
+  },
+  body: PROBE_APP_HTML,
+});
+const cookieMd = renderMarkdown(cookieReport);
+check(
+  "a cookie is reported by name, and its value never enters the report",
+  cookieReport.unread.cookieNames.join(",") === "authentik_session,csrftoken" &&
+    !cookieMd.includes("SECRETVALUE") &&
+    !cookieMd.includes("OTHERSECRET") &&
+    !renderJson(cookieReport).includes("SECRETVALUE"),
+  cookieReport.unread.cookieNames.join(","),
+);
+check(
+  "...and the cookie header itself is not among the headers listed",
+  cookieReport.unread.headers.every(([name]) => name !== "set-cookie") &&
+    cookieReport.unread.headers.some(([name]) => name === "x-auth-token"),
+  cookieReport.unread.headers.map(([n]) => n).join(","),
+);
+check(
+  // A cookie name is the strongest vendor marker an unauthenticated response carries and no
+  // clause reads one. That is exactly what section 4 is for.
+  "a session cookie on an ungated page is offered as the eighth signal it could be",
+  cookieReport.next.some((n) => n.includes("authentik_session") && n.includes("no signal reads one today")),
+  cookieReport.next.join(" | "),
+);
+check(
+  "a rendered report carries no value the tool decided not to keep",
+  !cookieMd.includes("SECRETVALUE") && cookieMd.includes("«redacted, 24 chars»"),
+);
+
+/* -------------------------------------------------------------------------- */
+/* Which services may be asked at all                                        */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * `hasDetectedAuth` — the fourth rule the probe rests on, and the one that decides whether a
+ * request is sent rather than what an answer means.
+ *
+ * Three terms, each a document or an API answering: a method `deriveAuth` settled on, a tunnel
+ * route carrying an Access policy, or an Authentik provider something actually serves. Two
+ * sources deliberately absent, and each of them for a reason a table can pin: the probe itself,
+ * because a predicate that decides whether to measure cannot read the measurement, and a
+ * `.labview` declaration, because `supplies` is the operator's claim about their own service and
+ * believing it is how a claim becomes a fact nobody checked.
+ *
+ * Asserted here on hand-built services and again through the fixture root below. Both, because
+ * the root can only reach two of the three terms — it has no Authentik snapshot — and because
+ * the terms have to be separable: a rule that happened to be true of every fixture for one
+ * reason would pass a fleet-wide check and still be wrong about the other two.
+ */
+console.log("\nwhat counts as authentication this scan detected, before anything is asked");
+const noPosture: AuthPosture = {
+  method: "none",
+  detail: "",
+  evidence: [],
+  confidence: "observed",
+  exposedWithoutAuth: true,
+};
+/** A service with nothing in front of it, which each row below then adds one term to. */
+const undetected: Pick<Service, "auth" | "cloudflare" | "authentik"> = {
+  auth: { ...noPosture },
+  cloudflare: [],
+  authentik: undefined,
+};
+const akApp = (providers: AuthentikProvider[]): AuthentikMatch => ({
+  applications: [{ name: "App", slug: "app", providers, discoveredVia: "list" }],
+  evidence: ["hostname"],
+  strength: ["hostname"],
+});
+const akProvider = (kind: AuthentikProviderKind, outposts: string[]): AuthentikProvider => ({
+  name: "p",
+  kind,
+  rawKind: kind,
+  outposts,
+  backchannel: false,
+});
+check(
+  "a service with nothing in front of it has no detected authentication",
+  hasDetectedAuth(undetected) === false,
+  JSON.stringify(undetected.auth.method),
+);
+check(
+  // The first term. Every method `deriveAuth` can reach arrives here as `method !== "none"`,
+  // so the row does not need one case per mechanism — but it does need both confidences, and
+  // `inferred` is the one the eligibility rule turns on: a middleware recognised by its name
+  // alone already makes `hasEdgeAuth` true, so asking could not have changed the verdict.
+  "a mechanism the labels named is detected authentication, inferred or confirmed alike",
+  hasDetectedAuth({ ...undetected, auth: { ...noPosture, method: "forward-auth", confidence: "inferred" } }) &&
+    hasDetectedAuth({ ...undetected, auth: { ...noPosture, method: "other-oauth", confidence: "confirmed" } }) &&
+    hasDetectedAuth({ ...undetected, auth: { ...noPosture, method: "basic-auth", confidence: "observed" } }),
+  "one of the three confidences was not taken as detection",
+);
+check(
+  // The second term. A tunnel with a policy, a group or an email list in front of it is a gate
+  // Cloudflare enforces before the request reaches the fleet at all.
+  "a Cloudflare Access policy is detected authentication, by policy, group or email list",
+  hasDetectedAuth({ ...undetected, cloudflare: [{ ...cfRoute("a.example.com", ""), access: { policy: "authenticate" } }] }) &&
+    hasDetectedAuth({ ...undetected, cloudflare: [{ ...cfRoute("a.example.com", ""), access: { group: "staff" } }] }) &&
+    hasDetectedAuth({ ...undetected, cloudflare: [{ ...cfRoute("a.example.com", ""), access: { emails: ["a@b.example"] } }] }),
+  "one of the three Access shapes was not taken as detection",
+);
+check(
+  // And the near miss for it, which is the reason the term reads the block's contents rather
+  // than its presence: an operator who removed the last rule from an `access` block left a
+  // block that gates nothing, and a probe is exactly what such a service needs.
+  "...but an empty Access block gates nothing, so it is not detection and does not withhold a probe",
+  hasDetectedAuth({ ...undetected, cloudflare: [{ ...cfRoute("a.example.com", ""), access: { emails: [] } }] }) === false &&
+    hasDetectedAuth({ ...undetected, cloudflare: [cfRoute("a.example.com", "")] }) === false,
+  "an Access block with no rule in it was taken as a gate",
+);
+check(
+  // The third term, and the one no fixture root here can produce. It is not "an Authentik
+  // application exists" — that is a record in a database. It is a provider something stands at.
+  "an Authentik provider the API reports as enforced is detected authentication",
+  hasDetectedAuth({ ...undetected, authentik: akApp([akProvider("oauth2", [])]) }) &&
+    hasDetectedAuth({ ...undetected, authentik: akApp([akProvider("proxy", ["outpost-1"])]) }),
+  "an enforced provider was not taken as detection",
+);
+check(
+  // The near miss, and it is the whole reason this term goes through `providerEnforces` instead
+  // of counting applications: a proxy provider with no outpost is a gate with nobody standing at
+  // it. Reporting it as protection would be the false comfort the project exists to remove —
+  // and withholding the probe from it would be that same mistake, now costing a measurement.
+  "...but a proxy provider with no outpost is a gate nothing stands at, so the probe still asks",
+  hasDetectedAuth({ ...undetected, authentik: akApp([akProvider("proxy", [])]) }) === false &&
+    hasDetectedAuth({ ...undetected, authentik: akApp([]) }) === false,
+  "an unenforced provider was taken as detection",
+);
+check(
+  // The two exclusions, together, because they are what makes the predicate a question rather
+  // than an answer. A probe result on the service is ignored (it is the thing being decided),
+  // and so is a declaration (it is a claim). `hasDetectedAuth` takes neither field, so this
+  // row is a compile-time fact as much as a runtime one — spelled out because a later widening
+  // of the parameter type is exactly how it would stop being true.
+  "neither a probe result nor a declaration is detection, so neither can withhold a request",
+  hasDetectedAuth({ ...undetected, ...({ probe: { phase: "connected", gate: "password-form" }, declared: { authAgreement: "supplies" } } as object) }) === false,
+  "a measurement or a claim was read as detection",
+);
+// Over a real fleet, and against the partition the exposure count is built from. `unprotected`
+// above spells the same three terms out by hand on purpose — an independent restatement — so
+// asserting the two agree everywhere is what keeps the predicate the probe gates on and the
+// predicate the exposed count rests on from drifting apart in a way neither side would show.
+const detectionDisagrees = eAll.filter(
+  (s) => hasDetectedAuth(s) === (s.auth.method === "none" && !hasEnforcedAuthentikGate(s) && !hasCfAccess(s)),
+);
+check(
+  "over the whole edge fleet it is exactly the negation of the exposure partition's own test",
+  detectionDisagrees.length === 0,
+  detectionDisagrees.map((s) => `${s.name}=${hasDetectedAuth(s)}`).join(" "),
+);
+
+/* -------------------------------------------------------------------------- */
 /* The stage, off                                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -4997,8 +5406,8 @@ const idleProbe = probeStub();
 const unasked = await overviewFor(probeRoot, { fetchImpl: idleProbe.fetchImpl });
 const pbSvcOff = lookup(unasked);
 check(
-  "found 14 stacks, 19 services",
-  unasked.stats.stacks === 14 && unasked.stats.services === 19,
+  "found 15 stacks, 21 services",
+  unasked.stats.stacks === 15 && unasked.stats.services === 21,
   `${unasked.stats.stacks}/${unasked.stats.services}`,
 );
 check(
@@ -5273,22 +5682,90 @@ check(
   JSON.stringify(result("passwordless", "news").form),
 );
 
-console.log("\na read that may not have gone through a gate does not supersede the gate");
-// The `chainComplete` rule in another guise. LabView asked from inside the fleet, where the
-// request may not have travelled the path the middleware sits on, so a 200 here is a note
-// and not a downgrade — the posture is identical to the run where nothing was asked.
+console.log("\na service whose authentication this scan already found is not asked at all");
+/*
+ * The eligibility rule, end to end, and the argument for it in one line: `hasEdgeAuth` is
+ * `configuredEdgeAuth || probeGate`, so where the first term is already true the second cannot
+ * move the verdict in either direction. A request that cannot change a conclusion is a request
+ * with nothing to buy, and it would be an unauthenticated GET at somebody's SSO endpoint.
+ *
+ * Two fixtures, for two of the three terms `hasDetectedAuth` is made of. `gated-open` names an
+ * Authentik forward-auth middleware whose definition is in no scanned stack, so its posture is
+ * `inferred` — the harder half of the rule, and asserted as such below: a gate recognised only
+ * by a middleware's name is still authentication detected through Traefik. `access-gate` is a
+ * tunnel hostname behind a Cloudflare Access policy, which is a gate found without reading a
+ * Traefik label at all. The third term, an enforced Authentik provider, cannot come from this
+ * root (it has no Authentik snapshot) and is pinned directly against the predicate further down.
+ */
 const gatedOpen = pbSvc("gated-open", "app");
+const accessGate = pbSvc("access-gate", "app");
 check(
-  "the configured gate stands after a 200 with no login page",
-  gatedOpen.auth.method === pbSvcOff("gated-open", "app").auth.method &&
-    gatedOpen.auth.exposedWithoutAuth === false &&
-    result("gated-open", "app").gate === undefined,
-  `${gatedOpen.auth.method} exposed=${gatedOpen.auth.exposedWithoutAuth}`,
+  "neither service carries a probe result, because neither was asked",
+  gatedOpen.probe === undefined && accessGate.probe === undefined,
+  `${JSON.stringify(gatedOpen.probe)} / ${JSON.stringify(accessGate.probe)}`,
 );
 check(
-  "...and what it earns is a note naming the vantage the request came from",
-  noteText(gatedOpen).includes("The posture stands: the request came from LabView's vantage point"),
-  noteText(gatedOpen),
+  // The trap, and the reason both addresses keep their entry in `PROBE_ANSWERS`. The stub
+  // *would* have answered, so this row fails on a recorded request rather than on a fixture
+  // that had nothing to say — back the eligibility check out and both URLs appear here.
+  "...and the addresses the stub was holding answers for were never requested",
+  !probeCalls.includes("https://gated.probe.example.com/") &&
+    !probeCalls.includes("https://access.probe.example.com/"),
+  probeCalls.filter((u) => u.includes("gated.probe") || u.includes("access.probe")).join(" ") || "(neither)",
+);
+check(
+  // The safety argument for the whole change, asserted rather than reasoned about: withholding
+  // the request left every part of the verdict where the configuration alone had put it.
+  "...and their verdict is identical to the run where nothing was asked at all",
+  (["gated-open", "access-gate"] as const).every((id) => {
+    const on = pbSvc(id, "app");
+    const off = pbSvcOff(id, "app");
+    return (
+      on.auth.method === off.auth.method &&
+      on.auth.confidence === off.auth.confidence &&
+      on.auth.exposedWithoutAuth === false &&
+      off.auth.exposedWithoutAuth === false
+    );
+  }),
+  `${gatedOpen.auth.method}/${gatedOpen.auth.confidence} exposed=${gatedOpen.auth.exposedWithoutAuth} · ` +
+    `${accessGate.auth.method}/${accessGate.auth.confidence} exposed=${accessGate.auth.exposedWithoutAuth}`,
+);
+check(
+  // Assumption 2 made concrete. `authentik@docker` is a name, matched against no definition
+  // this scan could read, and that is still detection through Traefik — `auth.method` is not
+  // `none`, so `configuredEdgeAuth` is true and a probe could not have changed anything. A
+  // rule that only skipped `confirmed` postures would ask this address.
+  "...and an inferred gate counts as detected, which is the harder half of the rule",
+  gatedOpen.auth.method === "authentik-forward-auth" && gatedOpen.auth.confidence === "inferred",
+  `${gatedOpen.auth.method}/${gatedOpen.auth.confidence}`,
+);
+check(
+  // And the other fixture arrives at the rule from a stack with no Traefik router in it at all:
+  // one tunnel label carrying an Access policy, which `deriveAuth` reads as a mechanism and
+  // `hasDetectedAuth` would withhold on its own second term even if it stopped doing so. Worth
+  // its own row, because "detected through Traefik" is the phrase the request was made in and
+  // this is the case that shows the rule is not about Traefik.
+  "...while the other is withheld on an Access policy at the edge, with no router involved",
+  accessGate.auth.method === "other-oauth" &&
+    accessGate.auth.detail === "Cloudflare Access on access.probe.example.com" &&
+    accessGate.traefik.length === 0 &&
+    hasCfAccess(accessGate),
+  `${accessGate.auth.method}/${accessGate.auth.confidence} "${accessGate.auth.detail}" routers=${accessGate.traefik.length}`,
+);
+check(
+  // Fleet-wide, so a new fixture cannot quietly acquire both. This is also what makes the two
+  // deleted branches of `noteProbe` unreachable rather than merely untested: a service with a
+  // probe result never has detected authentication, so no note has to reconcile the two.
+  "no service in the fleet carries both detected authentication and a probe result",
+  probeFlat(probed).every(([, s]) => !(hasDetectedAuth(s) && s.probe !== undefined)),
+  probeFlat(probed).filter(([, s]) => hasDetectedAuth(s) && s.probe).map(([k]) => k).join(", "),
+);
+check(
+  // Without this the payload cannot tell "not asked" from "no HTTP address to ask": a skipped
+  // service carries no `ServiceProbe`, and its absence looks the same either way.
+  "...and the payload states how many were withheld, since their absence looks like ineligibility",
+  probed.meta.probe.skipped === 2 && unasked.meta.probe.skipped === 0,
+  `${probed.meta.probe.skipped} skipped with the probe on, ${unasked.meta.probe.skipped} with it off`,
 );
 
 console.log("\nnothing was measured about a service that did not answer");
@@ -5304,7 +5781,7 @@ check(
 );
 check(
   "it counts in neither of the two counters",
-  probed.stats.probeGated + probed.stats.probeOpen === 14,
+  probed.stats.probeGated + probed.stats.probeOpen === 13,
   `${probed.stats.probeGated} gated + ${probed.stats.probeOpen} open`,
 );
 check(
@@ -5372,7 +5849,7 @@ console.log("\nthe panel lists exactly the services the tile counted");
  * invent measurements out of network failures — the one mistake this whole stage exists to
  * prevent.
  */
-const probeReport = collectProbeReport(probed.stacks);
+const probeReport = collectProbeReport(probed.stacks, probed.meta.probe.skipped);
 check(
   "every service that answered with a login page is in the gated list, and the counter agrees",
   probeReport.gated.length === probed.stats.probeGated && probeReport.gated.every((e) => e.probe.gate !== undefined),
@@ -5415,28 +5892,52 @@ check(
   // I7. Sorted by stack then service, so the panel is the same panel twice and a reader
   // arriving from the fleet list finds a service where they left it.
   "the same fleet produces the same panel twice, in the fleet list's own order",
-  JSON.stringify(collectProbeReport(probed.stacks)) === JSON.stringify(probeReport) &&
-    JSON.stringify(collectProbeReport([...probed.stacks].reverse())) === JSON.stringify(probeReport),
+  JSON.stringify(collectProbeReport(probed.stacks, probed.meta.probe.skipped)) === JSON.stringify(probeReport) &&
+    JSON.stringify(collectProbeReport([...probed.stacks].reverse(), probed.meta.probe.skipped)) ===
+      JSON.stringify(probeReport),
   probeReport.open.map((e) => e.stackName).slice(0, 4).join(" < "),
+);
+check(
+  // The one number in this report that cannot be recovered from the fleet it was collected
+  // from. A withheld service carries no `ServiceProbe`, so it is indistinguishable from a
+  // service with no HTTP address — which is why the count travels on the payload and is
+  // handed in rather than counted here.
+  "the withheld services reach the panel, since nothing in the fleet records one",
+  probeReport.notAsked === 2 && collectProbeReport(probed.stacks).notAsked === 0,
+  `${probeReport.notAsked} carried, ${collectProbeReport(probed.stacks).notAsked} without the payload's count`,
 );
 check(
   "the summary the tile and the panel share counts the same fleet once",
   probeReportSummaryText(probeReport) ===
-    `${probeReport.probed} services asked · ${probeReport.gated.length} gated · ${probeReport.open.length} answered with no login page · ${probeReport.silent.length} did not answer`,
+    `${probeReport.probed} services asked · ${probeReport.gated.length} gated · ${probeReport.open.length} answered with no login page · ${probeReport.silent.length} did not answer · ${probeReport.notAsked} services not asked (authentication already detected)`,
   probeReportSummaryText(probeReport),
 );
 check(
-  // A zero there is a fact about nothing, and every fleet on a good day would carry it.
-  "...and says nothing about services that did not answer when none of them did",
+  // A zero there is a fact about nothing, and every fleet on a good day would carry it. The
+  // same for the withheld count, which is zero in any fleet whose services are all unprotected
+  // — the fleet the tile matters most in.
+  "...and says nothing about services that did not answer, or were not asked, when none were",
   !probeReportSummaryText(collectProbeReport(unasked.stacks.slice(0, 0))).includes("did not answer") &&
-    probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0 }) === "no service was asked",
-  probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0 }),
+    !probeReportSummaryText(collectProbeReport(unasked.stacks.slice(0, 0))).includes("not asked (") &&
+    probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0, notAsked: 0 }) === "no service was asked",
+  probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0, notAsked: 0 }),
 );
 check(
-  // The tile is drawn from `probed > 0`, so a scan that asked nothing must produce a report that
-  // says nothing — otherwise a fleet with probing off gets a tile counting zero of something.
+  // The case the tile is drawn for even though nothing was measured: every addressable service
+  // already authenticated. "No service was asked" would be true and would read as the stage
+  // having found nothing to do, which is the opposite of what happened.
+  "...and a scan that asked nobody because everybody authenticated says that instead",
+  probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0, notAsked: 3 }) ===
+    "3 services not asked (authentication already detected)",
+  probeReportSummaryText({ open: [], gated: [], silent: [], probed: 0, notAsked: 3 }),
+);
+check(
+  // The tile is drawn from `probed > 0 || notAsked > 0`, so a scan that asked nothing and
+  // withheld nothing must produce a report that says nothing — otherwise a fleet with probing
+  // off gets a tile counting zero of something.
   "a scan that asked nothing produces a report with nothing in it",
-  collectProbeReport(unasked.stacks).probed === 0,
+  collectProbeReport(unasked.stacks, unasked.meta.probe.skipped).probed === 0 &&
+    collectProbeReport(unasked.stacks, unasked.meta.probe.skipped).notAsked === 0,
   `${collectProbeReport(unasked.stacks).probed} asked with the probe off`,
 );
 
@@ -5593,18 +6094,36 @@ check(
   probeCalls.filter((u, i) => probeCalls.indexOf(u) !== i).join(" "),
 );
 /*
- * The total, spelled out as the sum it is. Fifteen eligible services get one request each,
- * and exactly one of them — `lan-fallback/vault`, whose public hostname does not resolve —
- * gets a second from the next vantage. `silent/ghost` does *not* get a second: it also fails,
- * but it publishes no port, so there is no LAN address to fall through to. That asymmetry is
- * the assertion worth having here, because "walk the vantages until one answers" and "walk
+ * The total, spelled out as the sum it is. Sixteen services in this root show an HTTP address;
+ * two of them already had authentication detected and were withheld, so fourteen get one
+ * request each — and exactly one of those, `lan-fallback/vault`, whose public hostname does not
+ * resolve, gets a second from the next vantage. `silent/ghost` does *not* get a second: it also
+ * fails, but it publishes no port, so there is no LAN address to fall through to. That asymmetry
+ * is the assertion worth having here, because "walk the vantages until one answers" and "walk
  * them all" produce the same verdicts on this root and differ only in this number.
  */
 const eligibleCount = probeFlat(probed).filter(([, s]) => s.probe !== undefined).length;
 check(
-  "16 requests: one for each of the 15 eligible services, plus one fallthrough",
-  eligibleCount === 15 && probeCalls.length === 16,
-  `${eligibleCount} eligible, ${probeCalls.length} requests: ${probeCalls.join(" ")}`,
+  "15 requests: one for each of the 14 services asked, plus one fallthrough",
+  eligibleCount === 14 && probeCalls.length === 15,
+  `${eligibleCount} asked, ${probeCalls.length} requests: ${probeCalls.join(" ")}`,
+);
+const addressable = probeFlat(probed).filter(([, s]) => probeTargets(s, PROBE_LAN_HOST).length > 0);
+check(
+  // The arithmetic the `skipped` counter has to satisfy, and the reason `probeTargets` is
+  // consulted before the eligibility check rather than after: a service with a detected gate and
+  // no HTTP address was never a candidate, and counting it as withheld would inflate a number
+  // whose whole job is to say how many questions LabView decided not to ask.
+  //
+  // `access-gate/db` is that service — the same Access policy as its sibling, over a `tcp://`
+  // origin — so this row is what fails when the two lines are swapped. Nothing extra gets
+  // requested by that revert, which is exactly why it needs an assertion of its own: the only
+  // symptom is a counter that has quietly stopped meaning what it says.
+  "...and the withheld services are counted out of the addressable ones, not out of the fleet",
+  addressable.length === eligibleCount + probed.meta.probe.skipped &&
+    hasDetectedAuth(pbSvc("access-gate", "db")) &&
+    probeTargets(pbSvc("access-gate", "db"), PROBE_LAN_HOST).length === 0,
+  `${addressable.length} addressable vs ${eligibleCount} asked + ${probed.meta.probe.skipped} withheld`,
 );
 
 /* -------------------------------------------------------------------------- */
@@ -5672,8 +6191,13 @@ check(
   `${probeConn.ok}/${probeConn.phase}`,
 );
 check(
-  "...and says what it found, in counts",
-  probeConn.read === "15 services probed — 8 gated, 6 open, 1 did not answer",
+  // Three segments, and the third is not decoration. This line is the only place a reader sees
+  // the whole stage at once, and "14 services probed" in a root with 16 HTTP addresses invites
+  // exactly the wrong conclusion — that two of them were somehow unreachable rather than
+  // deliberately left alone. It comes last, after everything that was measured, and it says why.
+  "...and says what it found in counts, including what it chose not to ask and why",
+  probeConn.read ===
+    "14 services probed — 8 gated, 5 open, 1 did not answer — 2 services not asked (authentication already detected)",
   probeConn.read ?? "no read line",
 );
 check(
