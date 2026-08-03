@@ -1,0 +1,27 @@
+# Regression fixture: a probe that got through may not downgrade a detected gate.
+#
+# The router carries an Authentik forward-auth middleware, so the labels do name a gate and
+# `auth.method` is `forward-auth`. The probe then reaches this service and is answered `200`
+# with no login page — because LabView asked from inside the fleet, where the request may
+# simply not have travelled the path the middleware sits on.
+#
+# The posture stands. This is the `chainComplete` rule in another guise: a read that might not
+# have gone through the gate is not evidence about the gate. What the probe earns here is a
+# note, saying where LabView asked from and what it got — which is a genuine thing to know,
+# and not grounds for calling a configured gate absent.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: probe-gated-open
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gatedopen.rule=Host(`gated.probe.example.com`)"
+      - "traefik.http.routers.gatedopen.entrypoints=websecure"
+      - "traefik.http.routers.gatedopen.tls=true"
+      - "traefik.http.routers.gatedopen.middlewares=authentik@docker"
+
+networks:
+  proxy:
+    external: true

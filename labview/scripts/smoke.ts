@@ -1,5 +1,5 @@
 /**
- * Smoke test: run the full pipeline (docker disabled) against four fixture roots
+ * Smoke test: run the full pipeline (docker disabled) against six fixture roots
  * and assert the analyzer produced the expected classifications. Exits non-zero
  * on any failure so it can gate CI / a pre-commit check.
  *
@@ -18,6 +18,11 @@
  *                          Canned responses: ./fixtures/traefik-api.json, which also
  *                          carries the Authentik payload for those runs, since the
  *                          cross-check reads all three sources at once.
+ *   ./fixtures/probe     — the active probe: what a scanned service answers when asked,
+ *                          which addresses may be asked at all, and the one address per
+ *                          fixture the stub is keyed on. Canned answers are in this file
+ *                          rather than a JSON payload, because a probe reads status codes,
+ *                          three headers and a fragment of HTML — not a document.
  *
  *   npx tsx scripts/smoke.ts
  */
@@ -28,14 +33,22 @@ import { dirname, resolve } from "node:path";
 import type {
   AppStack,
   AuthMethod,
+  CloudflareRoute,
   DeclaredAuthMechanism,
   DockerState,
   IngressKind,
   Overview,
+  PortMapping,
+  ProbeGate,
   Service,
+  ServiceProbe,
   SessionInfo,
   TraefikLiveRouter,
+  TraefikRoute,
 } from "../src/model/types.js";
+// The probe's response record, which is deliberately not a `Response`: the recognition rule
+// is asserted as a table of literals below, and this is the shape one row has.
+import type { ProbeResponse } from "../src/model/probe.js";
 import type { TagFilter } from "../src/model/filter.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
@@ -50,6 +63,7 @@ const edgeRoot = resolve(here, "..", "fixtures", "edge");
 const netsRoot = resolve(here, "..", "fixtures", "nets");
 const authentikRoot = resolve(here, "..", "fixtures", "authentik");
 const traefikRoot = resolve(here, "..", "fixtures", "traefik");
+const probeRoot = resolve(here, "..", "fixtures", "probe");
 // Not a fleet: three passwd files for LabView's own login. They are files rather than
 // stack directories because that is what the feature reads — see the section at the end.
 const authRoot = resolve(here, "..", "fixtures", "auth");
@@ -74,6 +88,14 @@ delete process.env.LABVIEW_TRAEFIK_URL;
 delete process.env.LABVIEW_TRAEFIK_USERNAME;
 delete process.env.LABVIEW_TRAEFIK_PASSWORD;
 delete process.env.LABVIEW_TRAEFIK_PASSWORD_FILE;
+// The active probe, and this one is the reason the paragraph above is not paranoid. It
+// sends requests to addresses out of the *fixture* compose files, so an exported
+// `LABVIEW_PROBE_ENABLED` would have this test resolve `login.probe.example.com` for real
+// through the global `fetch`. Off here, enabled per run, and always with a stub.
+delete process.env.LABVIEW_PROBE_ENABLED;
+delete process.env.LABVIEW_PROBE_LAN_HOST;
+delete process.env.LABVIEW_PROBE_TIMEOUT;
+delete process.env.LABVIEW_PROBE_MAX_CONCURRENCY;
 // LabView's own access control, cleared for both reasons at once. An operator with a
 // real `LABVIEW_SESSION_SECRET` or OIDC client secret exported would otherwise have this
 // test assert against their credentials, and a real `LABVIEW_AUTH_PASSWD_FILE` would
@@ -153,6 +175,22 @@ const {
 // dashboard that says "No proxy auth" about every internal database and gets believed.
 const { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } = await import("../src/model/auth.js");
 const { hasEnforcedAuthentikGate } = await import("../src/labels/auth.js");
+// The active probe's two rules — which addresses may be asked, and what counts as a login
+// page — plus the wording of an answer. In `src/` and asserted here for the reason the
+// module's own docstring gives: a rule that lived in the client doing the fetching could
+// only be tested by mocking the fetching, and the cap and the ordering need no fleet at
+// all to pin. The fixture root below then drives the same rules through the whole pipeline.
+const {
+  MAX_PROBE_TARGETS,
+  PROBE_GATES,
+  PROBE_VANTAGES,
+  isHttpOrigin,
+  probeGateText,
+  probeOutcome,
+  probeTargets,
+  probeVantageText,
+  readGate,
+} = await import("../src/model/probe.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
 // can be asserted here: smoke never mounts a DOM, and AND/OR/NOT is a truth table
 // that deserves better than being exercised by hand in a browser.
@@ -466,6 +504,142 @@ function traefikEnv(opts: { enabled?: boolean; url?: string; credential?: boolea
     delete process.env.LABVIEW_TRAEFIK_USERNAME;
     delete process.env.LABVIEW_TRAEFIK_PASSWORD;
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Active probe stub                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The LAN address an operator would tell LabView about, since it cannot see its host's.
+ *
+ * A documentation-range address rather than a plausible one: if this ever escapes the stub
+ * and reaches a real socket, it must not be able to arrive anywhere.
+ */
+const PROBE_LAN_HOST = "192.0.2.10";
+
+/** One canned answer. Every field optional — a header being absent is itself the evidence. */
+interface ProbeAnswer {
+  status: number;
+  location?: string;
+  wwwAuthenticate?: string;
+  contentType?: string;
+  body?: string;
+}
+
+/** A login form: the password input is the signal, and it is in the markup, as always. */
+const PROBE_LOGIN_HTML = `<!doctype html><html><head><title>Sign in</title></head><body>
+<form method="post" action="/login"><input type="text" name="username">
+<input type="password" name="password"><button type="submit">Sign in</button></form>
+</body></html>`;
+/**
+ * An application's own homepage — and the near miss for the body rule.
+ *
+ * It says "Sign in" twice and links to an account page, which is what a great many open
+ * dashboards look like. No password field, so it is not a gate, and a rule that matched on
+ * the words rather than the input would clear this exposure on the strength of a link.
+ */
+const PROBE_APP_HTML = `<!doctype html><html><head><title>Dashboard</title></head><body>
+<h1>Dashboard</h1><nav><a href="/account">Sign in</a></nav><p>Sign in for more.</p>
+</body></html>`;
+
+/**
+ * Every address the fixture fleet answers at, keyed by the exact URL the probe builds.
+ *
+ * Keyed on the whole URL rather than the host, because the scheme and the trailing `/` are
+ * part of what is under test: `probeTargets` picks `https` for a TLS router and `http` for
+ * one without, and it asks at `/` and nowhere else. A typo in either produces a miss here
+ * rather than a pass, which is the point — everything not in this table is a name that does
+ * not resolve.
+ */
+const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
+  // A tunnel hostname serving the application's own login form.
+  "https://login.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_LOGIN_HTML,
+  },
+  // A proxy router with a certresolver, so `https`, answering with a challenge header.
+  "https://challenge.probe.example.com/": { status: 401, wwwAuthenticate: 'Basic realm="api"' },
+  // A proxy router with no TLS, so `http`, handing the request to an identity provider.
+  "http://crm.probe.example.com/": {
+    status: 302,
+    location: "https://sso.probe.example.com/application/o/crm/",
+  },
+  // A relative `Location`, which is what real applications send — resolved against the
+  // request URL, so this stays on the origin and lands on a login path.
+  "https://wiki.probe.example.com/": { status: 302, location: "/login?next=%2F" },
+  // Open: an application homepage, from a public hostname.
+  "https://dash.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
+  // Open: a same-origin redirect to a landing page, which is routing and not a gate.
+  "https://routing.probe.example.com/": { status: 302, location: "/dashboard" },
+  // Open, behind a configured forward-auth middleware the request did not travel through.
+  "https://gated.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
+  // Open, and declared as authenticating itself — the drift case.
+  "https://portal.probe.example.com/": { status: 200, contentType: "text/html", body: PROBE_APP_HTML },
+  // The LAN fallback. Its public hostname is absent from this table on purpose: the tunnel
+  // name does not resolve from inside the fleet, so the walk falls through to the port.
+  [`http://${PROBE_LAN_HOST}:18099/`]: {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_LOGIN_HTML,
+  },
+};
+
+/**
+ * Stand in for the fixture fleet's own services, answering as themselves.
+ *
+ * Unlike the other two stubs this one impersonates *scanned services* rather than an API
+ * LabView was given the address of, so what it records is worth as much as what it serves:
+ * `calls` is the evidence for the containment rules. That no request carried a credential,
+ * that nothing was ever asked at a database port, that a `tcp://` tunnel hostname was never
+ * resolved, and that each address was asked exactly once at `/` are all assertions about
+ * this list and cannot be made any other way.
+ *
+ * Anything outside {@link PROBE_ANSWERS} throws the way `fetch` does — an `ENOTFOUND` on
+ * `cause.code` — because that is the ordinary state of a fleet's public names seen from
+ * inside it, and the fall-through to the next vantage exists for precisely that case.
+ */
+function probeStub(): { fetchImpl: FetchLike; calls: Recorded[] } {
+  const calls: Recorded[] = [];
+
+  const fetchImpl: FetchLike = async (url, init) => {
+    calls.push({ url, sentToken: Boolean(init?.headers?.Authorization) });
+    const answer = PROBE_ANSWERS[url];
+    if (!answer) {
+      const err = new Error("fetch failed");
+      (err as { cause?: unknown }).cause = { code: "ENOTFOUND" };
+      throw err;
+    }
+    return {
+      ok: answer.status >= 200 && answer.status < 300,
+      status: answer.status,
+      json: async () => ({}),
+      headers: {
+        get: (name: string) => {
+          const key = name.toLowerCase();
+          if (key === "location") return answer.location ?? null;
+          if (key === "www-authenticate") return answer.wwwAuthenticate ?? null;
+          if (key === "content-type") return answer.contentType ?? null;
+          return null;
+        },
+      },
+      // No `body` stream, so `readCapped` falls back to `text()` — the documented stub
+      // path. An answer with no body still has one to read, and it is empty, which is
+      // what a status-only response looks like to the rule.
+      text: async () => answer.body ?? "",
+    };
+  };
+
+  return { fetchImpl, calls };
+}
+
+/** Turn the probe on for the next run, with or without a LAN vantage. Off by default. */
+function probeEnv(opts: { enabled?: boolean; lanHost?: string } = {}): void {
+  if (opts.enabled) process.env.LABVIEW_PROBE_ENABLED = "true";
+  else delete process.env.LABVIEW_PROBE_ENABLED;
+  if (opts.lanHost) process.env.LABVIEW_PROBE_LAN_HOST = opts.lanHost;
+  else delete process.env.LABVIEW_PROBE_LAN_HOST;
 }
 
 console.log("LabView smoke test\n");
@@ -3787,6 +3961,815 @@ traefikEnv({ enabled: false });
 authentikEnv({});
 
 /* ========================================================================== */
+/* fixtures/probe — what a service answers when it is asked                   */
+/* ========================================================================== */
+
+/*
+ * Every other source in this file says what a service is *configured* to do. This one says
+ * what it *answers*, which is the only way to see an application's own login page — the
+ * largest class of real protection there is, and one that carries no label, no env key and
+ * no entry in anybody's API.
+ *
+ * So the assertions run in two directions, and the second is the one that needs the care.
+ * A login page answering takes a service out of the exposed count, which means every clause
+ * of the recognition rule is a way to make a finding disappear. The near misses below —
+ * a bare 401, a 403, a redirect to `/dashboard`, a homepage with the words "Sign in" and no
+ * password field — are therefore asserted as *not* gates with the same weight as the four
+ * signals are asserted as gates. And the containment rules get the same treatment: what the
+ * stub was never asked is pinned as tightly as what it answered, because "LabView sent a
+ * GET at a Postgres port" is not a wrong label, it is a wrong action.
+ */
+
+console.log("\n--- active probe (fixtures/probe) ---");
+
+/* -------------------------------------------------------------------------- */
+/* The rules, as pure functions                                               */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Before any fleet: the two rules on literals. A fixture can only reach the cases a fixture
+ * can express, and three of the things most worth pinning — the candidate cap, a bind
+ * address that does not answer at the LAN host, a `Location` that will not parse — need no
+ * compose file at all.
+ */
+const cfRoute = (hostname: string, service: string): CloudflareRoute => ({ hostname, service, raw: {} });
+const tfRoute = (router: string, host: string, tls: boolean): TraefikRoute => ({
+  router,
+  rule: `Host(\`${host}\`)`,
+  hosts: [host],
+  pathPrefixes: [],
+  entrypoints: [],
+  tls,
+  middlewares: [],
+});
+const portMap = (published: string, target = "8080"): PortMapping => ({
+  published,
+  target,
+  protocol: "tcp",
+  raw: `${published}:${target}`,
+});
+const targetsFor = (
+  svc: { cloudflare?: CloudflareRoute[]; traefik?: TraefikRoute[]; ports?: PortMapping[] },
+  lanHost = "",
+): string =>
+  probeTargets({ cloudflare: svc.cloudflare ?? [], traefik: svc.traefik ?? [], ports: svc.ports ?? [] }, lanHost)
+    .map((t) => `${t.vantage}:${t.url}`)
+    .join(" ");
+
+console.log("\nwhich addresses may be asked at all");
+// The rule the whole feature was made conditional on, in its purest form: HTTP has to have
+// been *observed*, and a published port is not an observation of it.
+check(
+  "a service that only publishes ports is not probed, whatever the port is",
+  targetsFor({ ports: [portMap("15432", "5432"), portMap("18081")] }, PROBE_LAN_HOST) === "",
+  targetsFor({ ports: [portMap("15432", "5432"), portMap("18081")] }, PROBE_LAN_HOST) || "(nothing)",
+);
+check(
+  "...and a tunnel route to a non-HTTP origin yields nothing either",
+  targetsFor({ cloudflare: [cfRoute("pg.example.com", "tcp://db:5432")] }) === "" &&
+    targetsFor({ cloudflare: [cfRoute("ssh.example.com", "ssh://bastion:22")] }) === "",
+  targetsFor({ cloudflare: [cfRoute("pg.example.com", "tcp://db:5432")] }) || "(nothing)",
+);
+// Each scheme decided on the operator's own value, and a missing one reading as HTTP on the
+// same convention `parseOrigin` applies to a bare `host:port`.
+for (const [address, http] of [
+  ["", true],
+  ["container:8080", true],
+  ["http://container:8080", true],
+  ["https://container:8443", true],
+  ["HTTPS://container:8443", true],
+  ["tcp://db:5432", false],
+  ["TCP://db:5432", false],
+  ["ssh://bastion:22", false],
+  ["unix:///var/run/app.sock", false],
+] as const) {
+  check(
+    `\`${address || "(no origin declared)"}\` is ${http ? "" : "not "}an HTTP origin`,
+    isHttpOrigin(address) === http,
+    String(isHttpOrigin(address)),
+  );
+}
+check(
+  "a tunnel hostname is asked on https, because the tunnel terminates TLS at the edge",
+  targetsFor({ cloudflare: [cfRoute("app.example.com", "http://app:8080")] }) ===
+    "public:https://app.example.com/",
+  targetsFor({ cloudflare: [cfRoute("app.example.com", "http://app:8080")] }),
+);
+check(
+  "a proxy router is asked on the scheme its own TLS setting implies",
+  targetsFor({ traefik: [tfRoute("a", "secure.example.com", true)] }) === "traefik:https://secure.example.com/" &&
+    targetsFor({ traefik: [tfRoute("b", "plain.example.com", false)] }) === "traefik:http://plain.example.com/",
+  `${targetsFor({ traefik: [tfRoute("a", "secure.example.com", true)] })} / ${targetsFor({ traefik: [tfRoute("b", "plain.example.com", false)] })}`,
+);
+
+console.log("\n...and in which order, since the address decides what an answer is worth");
+// `INGRESS_KINDS` order, which is the most-exposed-first order the rest of the dashboard
+// already uses: what an outsider gets is the answer worth having, and a published port
+// answering says nothing about what the edge in front of it would have done.
+const threeWay = {
+  cloudflare: [cfRoute("app.example.com", "")],
+  traefik: [tfRoute("app", "app.edge.example.com", true)],
+  ports: [portMap("18443")],
+};
+check(
+  "public, then the proxy hostname, then the LAN port",
+  targetsFor(threeWay, PROBE_LAN_HOST) ===
+    `public:https://app.example.com/ traefik:https://app.edge.example.com/ lan:http://${PROBE_LAN_HOST}:18443/`,
+  targetsFor(threeWay, PROBE_LAN_HOST),
+);
+check(
+  "the LAN vantage needs a host to dial, and there is no guessing one",
+  targetsFor(threeWay) === "public:https://app.example.com/ traefik:https://app.edge.example.com/",
+  targetsFor(threeWay),
+);
+// An HTTP router with a path-only rule serves no hostname to ask — but it is still evidence
+// this service speaks HTTP, so the published port becomes askable when the router alone
+// gives nothing. The two halves of `isHttpObservable`, told apart.
+check(
+  "a router with a rule but no host makes the LAN port askable and offers none of its own",
+  targetsFor(
+    {
+      traefik: [
+        {
+          router: "pathonly",
+          rule: "PathPrefix(`/api`)",
+          hosts: [],
+          pathPrefixes: ["/api"],
+          entrypoints: [],
+          tls: false,
+          middlewares: [],
+        },
+      ],
+      ports: [portMap("18444")],
+    },
+    PROBE_LAN_HOST,
+  ) === `lan:http://${PROBE_LAN_HOST}:18444/`,
+  targetsFor(
+    {
+      traefik: [
+        {
+          router: "pathonly",
+          rule: "PathPrefix(`/api`)",
+          hosts: [],
+          pathPrefixes: ["/api"],
+          entrypoints: [],
+          tls: false,
+          middlewares: [],
+        },
+      ],
+      ports: [portMap("18444")],
+    },
+    PROBE_LAN_HOST,
+  ) || "(nothing)",
+);
+// The other half of the same guard, and the reason it is written as two arms rather than one:
+// `isHttpObservable` is deliberately the same test `classifyIngress` uses for the `traefik`
+// ingress kind — hosts *or* a rule — so a service the dashboard tags as proxied is exactly a
+// service the probe considers HTTP. Today `parseTraefik` extracts hosts *from* the rule, so a
+// route can only reach here with both; asserted anyway, because a one-armed test would silently
+// stop matching `classifyIngress` the day hosts arrive from anywhere else.
+const hostNoRule: TraefikRoute = { ...tfRoute("hostonly", "kept.example.com", false), rule: "" };
+check(
+  "...and a router with a host and no rule makes it askable too, matching `classifyIngress`",
+  targetsFor({ traefik: [hostNoRule], ports: [portMap("18446")] }, PROBE_LAN_HOST) ===
+    `traefik:http://kept.example.com/ lan:http://${PROBE_LAN_HOST}:18446/`,
+  targetsFor({ traefik: [hostNoRule], ports: [portMap("18446")] }, PROBE_LAN_HOST) || "(nothing)",
+);
+// A port bound to one interface does not answer on another, and dialling it anyway would
+// record a refused connection as though the service were down. The same evidence
+// `bindReachableFrom` reads in the other direction.
+check(
+  "a loopback-bound port is not dialled at the LAN address; a wildcard-bound one is",
+  targetsFor({ cloudflare: [cfRoute("a.example.com", "")], ports: [portMap("127.0.0.1:18445")] }, PROBE_LAN_HOST) ===
+    "public:https://a.example.com/" &&
+    targetsFor({ cloudflare: [cfRoute("a.example.com", "")], ports: [portMap("0.0.0.0:18446")] }, PROBE_LAN_HOST) ===
+      `public:https://a.example.com/ lan:http://${PROBE_LAN_HOST}:18446/`,
+  targetsFor({ cloudflare: [cfRoute("a.example.com", "")], ports: [portMap("127.0.0.1:18445")] }, PROBE_LAN_HOST),
+);
+check(
+  "...and a port range identifies no single port, so it is skipped rather than guessed at",
+  targetsFor({ cloudflare: [cfRoute("a.example.com", "")], ports: [portMap("18000-18010", "8000-8010")] }, PROBE_LAN_HOST) ===
+    "public:https://a.example.com/",
+  targetsFor({ cloudflare: [cfRoute("a.example.com", "")], ports: [portMap("18000-18010", "8000-8010")] }, PROBE_LAN_HOST),
+);
+check(
+  "one address is asked once, however many routes name it",
+  targetsFor({
+    cloudflare: [cfRoute("app.example.com", ""), cfRoute("app.example.com", "http://app:8080")],
+    traefik: [tfRoute("one", "edge.example.com", true), tfRoute("two", "edge.example.com", true)],
+  }) === "public:https://app.example.com/ traefik:https://edge.example.com/",
+  targetsFor({
+    cloudflare: [cfRoute("app.example.com", ""), cfRoute("app.example.com", "http://app:8080")],
+    traefik: [tfRoute("one", "edge.example.com", true), tfRoute("two", "edge.example.com", true)],
+  }),
+);
+// The cap, which no fixture can reach without committing a compose file with six hostnames
+// on one service. A scanned document must not be able to decide how many requests leave.
+const manyHosts = {
+  cloudflare: Array.from({ length: 6 }, (_, i) => cfRoute(`h${i}.example.com`, "")),
+  ports: [portMap("18447")],
+};
+check(
+  `at most ${MAX_PROBE_TARGETS} addresses per service, whatever the labels ask for`,
+  probeTargets({ ...manyHosts, traefik: [] }, PROBE_LAN_HOST).length === MAX_PROBE_TARGETS,
+  String(probeTargets({ ...manyHosts, traefik: [] }, PROBE_LAN_HOST).length),
+);
+
+console.log("\nwhat counts as a login page — and what does not");
+/*
+ * The recognition rule as a table, which is the only honest way to assert it: each row is
+ * one response and one verdict, and the rows that return `undefined` are half the table.
+ * Every one of those is a real shape a real service answers with, and each would clear an
+ * exposure if the rule were loosened by a single clause.
+ */
+const gateCases: { name: string; res: ProbeResponse; gate: ProbeGate | undefined }[] = [
+  {
+    name: "401 with a challenge header asks for a credential",
+    res: { requestUrl: "https://a.example.com/", status: 401, wwwAuthenticate: 'Basic realm="a"' },
+    gate: "challenge",
+  },
+  {
+    name: "...and so does 407, which is the same thing at a proxy",
+    res: { requestUrl: "https://a.example.com/", status: 407, wwwAuthenticate: "Negotiate" },
+    gate: "challenge",
+  },
+  {
+    name: "a bare 401 is an API saying `not signed in`, not a login page",
+    res: { requestUrl: "https://a.example.com/", status: 401 },
+    gate: undefined,
+  },
+  {
+    name: "...nor is a 401 whose challenge header is blank",
+    res: { requestUrl: "https://a.example.com/", status: 401, wwwAuthenticate: "   " },
+    gate: undefined,
+  },
+  {
+    name: "a 403 refuses the request without asking for anything",
+    res: { requestUrl: "https://a.example.com/", status: 403 },
+    gate: undefined,
+  },
+  {
+    name: "a redirect to another origin is a hand-off",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 302,
+      location: "https://sso.example.com/application/o/a/",
+    },
+    gate: "redirect-origin",
+  },
+  {
+    name: "...including one that differs only in port, which is a different origin",
+    res: { requestUrl: "https://a.example.com/", status: 302, location: "https://a.example.com:8443/" },
+    gate: "redirect-origin",
+  },
+  {
+    name: "a relative redirect to a login path stays on the origin and is still a gate",
+    res: { requestUrl: "https://a.example.com/", status: 302, location: "/login?next=%2F" },
+    gate: "redirect-login",
+  },
+  {
+    name: "...matched as a prefix, so `/oauth2/start` counts",
+    res: { requestUrl: "https://a.example.com/", status: 307, location: "/oauth2/start?rd=%2F" },
+    gate: "redirect-login",
+  },
+  {
+    name: "...and so does the outpost path Authentik publishes",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 302,
+      location: "/outpost.goauthentik.io/start?rd=/",
+    },
+    gate: "redirect-login",
+  },
+  {
+    name: "a same-origin redirect to a landing page is routing, not a gate",
+    res: { requestUrl: "https://a.example.com/", status: 302, location: "/dashboard" },
+    gate: undefined,
+  },
+  {
+    name: "a 3xx with no Location is not evidence of anywhere",
+    res: { requestUrl: "https://a.example.com/", status: 302 },
+    gate: undefined,
+  },
+  {
+    name: "...and neither is a Location that will not parse",
+    res: { requestUrl: "https://a.example.com/", status: 302, location: "http://[" },
+    gate: undefined,
+  },
+  {
+    name: "a 200 carrying a password field is the application's own login form",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_LOGIN_HTML },
+    gate: "password-form",
+  },
+  {
+    name: "...in any spelling HTML permits",
+    res: {
+      requestUrl: "https://a.example.com/",
+      status: 200,
+      body: `<input name='pw' type=password required>`,
+    },
+    gate: "password-form",
+  },
+  {
+    name: "a homepage that says `Sign in` and asks for nothing is not a login page",
+    res: { requestUrl: "https://a.example.com/", status: 200, body: PROBE_APP_HTML },
+    gate: undefined,
+  },
+  {
+    name: "...nor is a 200 whose body could not be read",
+    res: { requestUrl: "https://a.example.com/", status: 200 },
+    gate: undefined,
+  },
+  {
+    // The body is only read on the terms it was fetched on, and a 401 was never one of
+    // them. Without this the challenge clause's header requirement could be bypassed by
+    // any 401 that happens to render a form.
+    name: "...and a body is only ever read as evidence on a 200",
+    res: { requestUrl: "https://a.example.com/", status: 401, body: PROBE_LOGIN_HTML },
+    gate: undefined,
+  },
+];
+for (const c of gateCases) {
+  check(c.name, readGate(c.res) === c.gate, `got ${String(readGate(c.res))}, wanted ${String(c.gate)}`);
+}
+check(
+  "every signal in the vocabulary is reached by one of those rows",
+  PROBE_GATES.every((g) => gateCases.some((c) => c.gate === g)),
+  PROBE_GATES.filter((g) => !gateCases.some((c) => c.gate === g)).join(", ") || "(all)",
+);
+check(
+  "...and half the table is a near miss, which is what makes the rule strict",
+  gateCases.filter((c) => c.gate === undefined).length >= PROBE_GATES.length,
+  `${gateCases.filter((c) => c.gate === undefined).length} near misses, ${PROBE_GATES.length} signals`,
+);
+
+/* -------------------------------------------------------------------------- */
+/* The stage, off                                                             */
+/* -------------------------------------------------------------------------- */
+
+console.log("\noff by default, and off means nothing left the process");
+probeEnv({});
+const idleProbe = probeStub();
+const unasked = await overviewFor(probeRoot, { fetchImpl: idleProbe.fetchImpl });
+const pbSvcOff = lookup(unasked);
+check(
+  "found 11 stacks, 14 services",
+  unasked.stats.stacks === 11 && unasked.stats.services === 14,
+  `${unasked.stats.stacks}/${unasked.stats.services}`,
+);
+check(
+  "...11 of which are reachable without detected authentication before anything is asked",
+  unasked.stats.exposedWithoutAuth === 11,
+  String(unasked.stats.exposedWithoutAuth),
+);
+check("not one request was sent", idleProbe.calls.length === 0, idleProbe.calls.map((c) => c.url).join(" "));
+check(
+  "...and the report says so itself, rather than looking like a read that found nothing",
+  unasked.meta.connections.find((c) => c.target === "probe")?.phase === "disabled",
+  JSON.stringify(unasked.meta.connections.find((c) => c.target === "probe")),
+);
+check(
+  "no service carries a probe result, so the payload has no trace of the feature",
+  !JSON.stringify(unasked.stacks).includes('"probe"'),
+  JSON.stringify(unasked.stacks).slice(0, 0) || "a `probe` key is present",
+);
+check(
+  "both counters are zero",
+  unasked.stats.probeGated === 0 && unasked.stats.probeOpen === 0,
+  `${unasked.stats.probeGated}/${unasked.stats.probeOpen}`,
+);
+// The payload with the stage off does not depend on there being an HTTP layer at all — the
+// closest a running test can get to "byte-identical to before the feature existed".
+const noLayer = await overviewFor(probeRoot);
+check(
+  "...and with it off, supplying an HTTP layer changes nothing in the payload",
+  JSON.stringify(unasked.stacks) === JSON.stringify(noLayer.stacks) &&
+    JSON.stringify(unasked.stats) === JSON.stringify(noLayer.stats),
+  "the two runs differ",
+);
+
+/* -------------------------------------------------------------------------- */
+/* The stage, on                                                              */
+/* -------------------------------------------------------------------------- */
+
+probeEnv({ enabled: true, lanHost: PROBE_LAN_HOST });
+const asked = probeStub();
+const probed = await overviewFor(probeRoot, { fetchImpl: asked.fetchImpl });
+const pbSvc = lookup(probed);
+const probeCalls = asked.calls.map((c) => c.url);
+/** One service's probe result, or a thrown miss — every assertion below wants it present. */
+const result = (stack: string, name: string): ServiceProbe => {
+  const p = pbSvc(stack, name).probe;
+  if (!p) throw new Error(`${stack}/${name} was not probed`);
+  return p;
+};
+const noteText = (s: Service): string => s.notes.join(" | ");
+/*
+ * Every service in a run, keyed by stack *and* service name. Two stacks in this root call
+ * their service `app`, which is ordinary in a real fleet and would have the comparisons below
+ * silently match one stack's verdict against another's — passing or failing for reasons that
+ * have nothing to do with the probe. `${stackId}/${name}` is the key `ProbeSnapshot.byKey`
+ * uses, for the same reason.
+ */
+const probeFlat = (ov: Overview): [string, Service][] =>
+  ov.stacks.flatMap((st) => st.services.map((s) => [`${st.id}/${s.name}`, s] as [string, Service]));
+
+console.log("\na login page answering is protection LabView measured");
+// Each of the four signals, once, through the whole pipeline rather than on a literal: the
+// stub answers as the service, the rule reads it, and the verdict changes.
+check(
+  "a tunnel service served its own login form",
+  result("tunnel-login", "app").gate === "password-form" &&
+    result("tunnel-login", "app").vantage === "public" &&
+    result("tunnel-login", "app").status === 200,
+  JSON.stringify(result("tunnel-login", "app")),
+);
+check(
+  "a proxied service asked for a credential",
+  result("proxy-challenge", "api").gate === "challenge" && result("proxy-challenge", "api").status === 401,
+  JSON.stringify(result("proxy-challenge", "api")),
+);
+check(
+  "...at the https address its certresolver implies",
+  result("proxy-challenge", "api").endpoint === "https://challenge.probe.example.com",
+  result("proxy-challenge", "api").endpoint,
+);
+check(
+  "a proxied service handed the request to an identity provider",
+  result("sso-redirect", "crm").gate === "redirect-origin",
+  JSON.stringify(result("sso-redirect", "crm")),
+);
+check(
+  "...at the http address a router with no TLS implies",
+  result("sso-redirect", "crm").endpoint === "http://crm.probe.example.com",
+  result("sso-redirect", "crm").endpoint,
+);
+check(
+  "a proxied service redirected to a login path of its own",
+  result("own-login", "wiki").gate === "redirect-login",
+  JSON.stringify(result("own-login", "wiki")),
+);
+// The verdict, for all four at once, and the two halves of it that must not merge.
+const gatedFour = [
+  pbSvc("tunnel-login", "app"),
+  pbSvc("proxy-challenge", "api"),
+  pbSvc("sso-redirect", "crm"),
+  pbSvc("own-login", "wiki"),
+];
+check(
+  "all four stop counting as reachable without authentication",
+  gatedFour.every((s) => s.auth.exposedWithoutAuth === false),
+  gatedFour.filter((s) => s.auth.exposedWithoutAuth).map((s) => s.name).join(", "),
+);
+// A response is evidence of a gate and never a name for one, so neither half of the posture
+// moves: not `method`, and not `confidence` either. `observed` is what a service with nothing
+// detected already carries; a probe strengthening that to `confirmed` would be claiming the
+// scan knows which mechanism answered, which is the one thing it cannot know.
+check(
+  "...and none of them acquired a mechanism, because a response cannot name one",
+  gatedFour.every((s) => s.auth.method === "none" && s.auth.confidence === "observed"),
+  gatedFour.map((s) => `${s.name}=${s.auth.method}/${s.auth.confidence}`).join(" "),
+);
+check(
+  "...so the reason a reader is given is the measurement, not a gate that was never found",
+  gatedFour.every((s) => noAuthReason(s) === "probed-gate"),
+  gatedFour.map((s) => `${s.name}=${String(noAuthReason(s))}`).join(" "),
+);
+check(
+  "...and it says which address answered and that the mechanism is unknown",
+  gatedFour.every((s) => /LabView requested https?:\/\/\S+ and was answered with a login page/.test(noteText(s))) &&
+    noteText(gatedFour[0]!).includes("Which mechanism is behind that page is unknown"),
+  noteText(gatedFour[0]!),
+);
+// `own-login/wiki` declares the same login the probe found, so both reasons are true of it.
+// The measured one is what a reader hears: a declaration is taken on trust and a login page
+// was checked, and wording the second as the first would understate what is known.
+const probeWiki = pbSvc("own-login", "wiki");
+check(
+  "where a declaration and a login page both apply, the measurement is the reason given",
+  (probeWiki.declared?.auth.length ?? 0) > 0 && noAuthReason(probeWiki) === "probed-gate",
+  `${probeWiki.declared?.auth.length ?? 0} declared, reason ${String(noAuthReason(probeWiki))}`,
+);
+check(
+  "...and with the probe off the same service falls back to the declaration",
+  noAuthReason(pbSvcOff("own-login", "wiki")) === "declared",
+  String(noAuthReason(pbSvcOff("own-login", "wiki"))),
+);
+// An acceptance the scan has outgrown, and the reason it gives. `tunnel-login` was signed off
+// as open and now answers with a login form, so the acceptance no longer applies — and the
+// arm that says why is its own, because an application's own login page is not an edge and
+// "authenticated at the edge" would send the operator to look at a proxy that is not there.
+check(
+  "a stale acceptance is reported, and blames the measurement rather than an edge",
+  (pbSvc("tunnel-login", "app").declared?.drift ?? []).some(
+    (d) =>
+      d.includes("marks this service as intentionally unauthenticated") &&
+      d.includes("answering with a login page when LabView requested https://login.probe.example.com") &&
+      !d.includes("at the edge"),
+  ),
+  (pbSvc("tunnel-login", "app").declared?.drift ?? []).join(" | ") || "no drift",
+);
+check(
+  "...and with the probe off it is not stale at all, since the exposure is still there",
+  (pbSvcOff("tunnel-login", "app").declared?.drift ?? []).length === 0 &&
+    pbSvcOff("tunnel-login", "app").auth.exposedWithoutAuth === true,
+  (pbSvcOff("tunnel-login", "app").declared?.drift ?? []).join(" | "),
+);
+
+console.log("\nand an answer with no login page is the other half of the value");
+check(
+  "a service that served its homepage is still exposed",
+  pbSvc("open-app", "dash").auth.exposedWithoutAuth === true && result("open-app", "dash").gate === undefined,
+  `exposed=${pbSvc("open-app", "dash").auth.exposedWithoutAuth} gate=${String(result("open-app", "dash").gate)}`,
+);
+check(
+  "...and the finding now says it was measured rather than inferred",
+  noteText(pbSvc("open-app", "dash")).includes(
+    "LabView requested https://dash.probe.example.com from its own vantage point and was answered without a login page (HTTP 200), so this is measured rather than inferred.",
+  ),
+  noteText(pbSvc("open-app", "dash")),
+);
+check(
+  "a same-origin redirect to a landing page did not clear the finding",
+  pbSvc("open-app", "routing").auth.exposedWithoutAuth === true &&
+    result("open-app", "routing").gate === undefined &&
+    noAuthReason(pbSvc("open-app", "routing")) === "gap",
+  `${String(result("open-app", "routing").gate)} / ${String(noAuthReason(pbSvc("open-app", "routing")))}`,
+);
+
+console.log("\na read that may not have gone through a gate does not supersede the gate");
+// The `chainComplete` rule in another guise. LabView asked from inside the fleet, where the
+// request may not have travelled the path the middleware sits on, so a 200 here is a note
+// and not a downgrade — the posture is identical to the run where nothing was asked.
+const gatedOpen = pbSvc("gated-open", "app");
+check(
+  "the configured gate stands after a 200 with no login page",
+  gatedOpen.auth.method === pbSvcOff("gated-open", "app").auth.method &&
+    gatedOpen.auth.exposedWithoutAuth === false &&
+    result("gated-open", "app").gate === undefined,
+  `${gatedOpen.auth.method} exposed=${gatedOpen.auth.exposedWithoutAuth}`,
+);
+check(
+  "...and what it earns is a note naming the vantage the request came from",
+  noteText(gatedOpen).includes("The posture stands: the request came from LabView's vantage point"),
+  noteText(gatedOpen),
+);
+
+console.log("\nnothing was measured about a service that did not answer");
+// The one conclusion this stage must never reach by accident. "Did not answer" and
+// "answered with no login page" are the same absence of a gate and completely different
+// findings, and letting the first read as the second would invent measurements out of
+// network failures.
+const ghost = result("silent", "ghost");
+check(
+  "its phase is the transport failure, not `connected`",
+  ghost.phase === "resolve" && ghost.status === undefined && ghost.gate === undefined,
+  JSON.stringify(ghost),
+);
+check(
+  "it counts in neither of the two counters",
+  probed.stats.probeGated + probed.stats.probeOpen === 9,
+  `${probed.stats.probeGated} gated + ${probed.stats.probeOpen} open`,
+);
+check(
+  "the wording keeps it apart from an open service",
+  probeOutcome(ghost).label === "No answer" && !/login page/i.test(probeOutcome(ghost).label),
+  probeOutcome(ghost).label,
+);
+check(
+  "...and it claims no measurement in any note",
+  pbSvc("silent", "ghost").auth.exposedWithoutAuth === true &&
+    !/was answered/.test(noteText(pbSvc("silent", "ghost"))),
+  noteText(pbSvc("silent", "ghost")),
+);
+
+console.log("\nthe first address that answers wins, and the reader is told which");
+const probeVault = result("lan-fallback", "vault");
+check(
+  "a public hostname that does not resolve falls through to the published port",
+  probeVault.vantage === "lan" && probeVault.endpoint === `http://${PROBE_LAN_HOST}:18099` && probeVault.gate === "password-form",
+  JSON.stringify(probeVault),
+);
+check(
+  "...with the failed attempt kept, in the order it was tried",
+  probeVault.attempts.length === 2 &&
+    probeVault.attempts[0]!.endpoint === "https://vault.probe.example.com" &&
+    probeVault.attempts[0]!.phase === "resolve" &&
+    probeVault.attempts[1]!.phase === "connected",
+  probeVault.attempts.map((a) => `${a.endpoint}=${a.phase}`).join(" "),
+);
+check(
+  "every vantage in the vocabulary is reached by a fixture",
+  PROBE_VANTAGES.every((v) =>
+    probed.stacks.flatMap((s) => s.services).some((s) => s.probe?.vantage === v),
+  ),
+  PROBE_VANTAGES.filter(
+    (v) => !probed.stacks.flatMap((s) => s.services).some((s) => s.probe?.vantage === v),
+  ).join(", ") || "(all)",
+);
+check(
+  "...and each is worded as a different thing to have asked",
+  new Set(PROBE_VANTAGES.map(probeVantageText)).size === PROBE_VANTAGES.length &&
+    PROBE_VANTAGES.every((v) => probeVantageText(v).length > 0),
+  PROBE_VANTAGES.map((v) => `${v}=${probeVantageText(v).slice(0, 20)}`).join(" | "),
+);
+
+console.log("\na measurement against a declaration that was holding a finding back");
+// The strongest argument for the whole stage: the declaration was the only reason this
+// service was not counted, and LabView has now been served the application. It is still not
+// an override — one address, at `/`, once — so the verdict stands and the disagreement is
+// reported as drift, which is what an operator wants from a file they wrote long ago.
+function messageContainsExactUrlHost(message: string, protocol: string, hostname: string): boolean {
+  const urlCandidates = message.match(/https?:\/\/[^\s)]+/g) ?? [];
+  return urlCandidates.some((candidate) => {
+    try {
+      const parsed = new URL(candidate);
+      return parsed.protocol === protocol && parsed.hostname === hostname;
+    } catch {
+      return false;
+    }
+  });
+}
+const portal = pbSvc("declared-open", "portal");
+check(
+  "the declaration still decides the verdict, because a probe asked one address once",
+  portal.declared?.authAgreement === "supplies" && portal.auth.exposedWithoutAuth === false,
+  `${String(portal.declared?.authAgreement)} exposed=${portal.auth.exposedWithoutAuth}`,
+);
+check(
+  "...and the disagreement is reported as drift, naming both sides",
+  (portal.declared?.drift ?? []).some(
+    (d) =>
+      d.includes("declares the service authenticates itself") &&
+      messageContainsExactUrlHost(d, "https:", "portal.probe.example.com") &&
+      d.includes("either the declaration is out of date"),
+  ),
+  (portal.declared?.drift ?? []).join(" | ") || "no drift",
+);
+check(
+  "...which is a disagreement the run with the probe off cannot produce",
+  (pbSvcOff("declared-open", "portal").declared?.drift ?? []).length === 0,
+  (pbSvcOff("declared-open", "portal").declared?.drift ?? []).join(" | "),
+);
+
+/* -------------------------------------------------------------------------- */
+/* Containment — what was never asked                                         */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nwhat the probe never sent, which is the half that cannot be inferred");
+// The rule the feature was made conditional on. Enforced by evidence rather than by a list
+// of ports: neither service in `dbonly` carries a route, so no HTTP was observed, so
+// nothing was asked — and `LABVIEW_PROBE_LAN_HOST` being set does not change it.
+check(
+  "the two services that only publish ports were not probed at all",
+  pbSvc("dbonly", "db").probe === undefined && pbSvc("dbonly", "adminer").probe === undefined,
+  `${JSON.stringify(pbSvc("dbonly", "db").probe)} / ${JSON.stringify(pbSvc("dbonly", "adminer").probe)}`,
+);
+check(
+  "...and no request went anywhere near a published database port",
+  probeCalls.every((u) => !u.includes(":15432") && !u.includes(":18081")),
+  probeCalls.filter((u) => u.includes(":15432") || u.includes(":18081")).join(" "),
+);
+check(
+  "a tcp:// and an ssh:// tunnel route were never resolved, let alone asked",
+  probeCalls.every((u) => {
+    const host = new URL(u).hostname;
+    return host !== "pg.probe.example.com" && host !== "ssh.probe.example.com";
+  }),
+  probeCalls
+    .filter((u) => {
+      const host = new URL(u).hostname;
+      return host === "pg.probe.example.com" || host === "ssh.probe.example.com";
+    })
+    .join(" "),
+);
+check(
+  "...and both stay in the exposed count, unmeasured and honestly so",
+  pbSvc("tcp-tunnel", "postgres-tunnel").probe === undefined &&
+    pbSvc("tcp-tunnel", "bastion").probe === undefined &&
+    pbSvc("tcp-tunnel", "postgres-tunnel").auth.exposedWithoutAuth === true &&
+    pbSvc("tcp-tunnel", "bastion").auth.exposedWithoutAuth === true,
+  probed.stacks.find((s) => s.id === "tcp-tunnel")?.services.map((s) => `${s.name}=${String(s.probe?.phase)}`).join(" ") ?? "",
+);
+// Bounds on the requests that *were* sent: one per address, at `/`, GET, no credential.
+check(
+  "every request was a GET at `/` and nothing else",
+  probeCalls.every((u) => new URL(u).pathname === "/" && !new URL(u).search),
+  probeCalls.filter((u) => new URL(u).pathname !== "/" || new URL(u).search).join(" "),
+);
+check(
+  "...no credential was sent to a scanned service, since none is in scope to send",
+  asked.calls.every((c) => !c.sentToken),
+  asked.calls.filter((c) => c.sentToken).map((c) => c.url).join(" "),
+);
+check(
+  "...and no address was asked twice",
+  new Set(probeCalls).size === probeCalls.length,
+  probeCalls.filter((u, i) => probeCalls.indexOf(u) !== i).join(" "),
+);
+/*
+ * The total, spelled out as the sum it is. Ten eligible services get one request each, and
+ * exactly one of them — `lan-fallback/vault`, whose public hostname does not resolve — gets a
+ * second from the next vantage. `silent/ghost` does *not* get a second: it also fails, but it
+ * publishes no port, so there is no LAN address to fall through to. That asymmetry is the
+ * assertion worth having here, because "walk the vantages until one answers" and "walk them
+ * all" produce the same verdicts on this root and differ only in this number.
+ */
+const eligibleCount = probeFlat(probed).filter(([, s]) => s.probe !== undefined).length;
+check(
+  "11 requests: one for each of the 10 eligible services, plus one fallthrough",
+  eligibleCount === 10 && probeCalls.length === 11,
+  `${eligibleCount} eligible, ${probeCalls.length} requests: ${probeCalls.join(" ")}`,
+);
+
+/* -------------------------------------------------------------------------- */
+/* Reconstruction — the count with the probe term dropped                     */
+/* -------------------------------------------------------------------------- */
+
+console.log("\nthe exposed count can still be reconstructed without the probe (I1)");
+/*
+ * The discipline every evidence source in this program keeps: a reader must be able to take
+ * the new term out and get the old number back. Asserted per service rather than only in
+ * aggregate, because two offsetting errors would pass an aggregate check — a service that
+ * left the count for the wrong reason and one that should have left it and did not.
+ */
+const offExposed = new Map(probeFlat(unasked).map(([k, s]) => [k, s.auth.exposedWithoutAuth]));
+const wrongAfterProbe = probeFlat(probed).filter(
+  ([k, s]) => s.auth.exposedWithoutAuth !== (offExposed.get(k) === true && !s.probe?.gate),
+);
+check(
+  "each service is exposed exactly when it was before, minus the ones a login page answered for",
+  wrongAfterProbe.length === 0,
+  wrongAfterProbe.map(([k]) => k).join(", "),
+);
+// And in aggregate. The term to add back is "was counted, and a login page answered" — not
+// `probeGated`, which is a count of login pages and includes one service that was already
+// out of the count on a declaration. The two numbers differ by exactly that service, which
+// is worth its own line: a counter of measurements and a counter of findings removed are
+// different things, and using either where the other belongs is how a reconstruction stops
+// reconstructing.
+const removedByProbe = probeFlat(probed).filter(
+  ([k, s]) => s.probe?.gate && offExposed.get(k) === true,
+).length;
+check(
+  "...so the aggregate adds back up: 7 exposed + 4 the probe removed = the 11 counted with it off",
+  probed.stats.exposedWithoutAuth === 7 &&
+    removedByProbe === 4 &&
+    probed.stats.exposedWithoutAuth + removedByProbe === unasked.stats.exposedWithoutAuth,
+  `${probed.stats.exposedWithoutAuth} + ${removedByProbe} vs ${unasked.stats.exposedWithoutAuth}`,
+);
+check(
+  "...and `probeGated` counts login pages, which is one more — the service already declared",
+  probed.stats.probeGated === 5 && probed.stats.probeGated === removedByProbe + 1,
+  `${probed.stats.probeGated} gated, ${removedByProbe} removed`,
+);
+const offPosture = new Map(probeFlat(unasked).map(([k, s]) => [k, `${s.auth.method}/${s.auth.confidence}`]));
+const movedMechanism = probeFlat(probed).filter(
+  ([k, s]) => offPosture.get(k) !== `${s.auth.method}/${s.auth.confidence}`,
+);
+check(
+  "no service's mechanism differs between the two runs (I3)",
+  movedMechanism.length === 0,
+  movedMechanism.map(([k, s]) => `${k}: ${offPosture.get(k)} -> ${s.auth.method}/${s.auth.confidence}`).join(", "),
+);
+check(
+  "...and the protected count is a detection count, so the probe left it alone",
+  probed.stats.authProtected === unasked.stats.authProtected &&
+    JSON.stringify(probed.stats.byAuthMethod) === JSON.stringify(unasked.stats.byAuthMethod),
+  `${probed.stats.authProtected} vs ${unasked.stats.authProtected}`,
+);
+
+console.log("\nthe fleet-wide report");
+const probeConn = probed.meta.connections.find((c) => c.target === "probe")!;
+check(
+  "a read where part of the fleet did not answer is partial, and still sound",
+  probeConn.ok === true && probeConn.phase === "partial",
+  `${probeConn.ok}/${probeConn.phase}`,
+);
+check(
+  "...and says what it found, in counts",
+  probeConn.read === "10 services probed — 5 gated, 4 open, 1 did not answer",
+  probeConn.read ?? "no read line",
+);
+check(
+  "...with the unanswered address listed and a hint for the operator",
+  probeConn.attempts.length === 1 &&
+    probeConn.attempts[0]!.endpoint === "https://ghost.probe.example.com" &&
+    Boolean(probeConn.hint),
+  `${probeConn.attempts.map((a) => a.endpoint).join(" ")} hint=${probeConn.hint ?? "none"}`,
+);
+// Enabled, and nothing eligible: a fact about the operator's labels, not about LabView, and
+// distinguishable from both `disabled` and a read that failed. `fixtures/auth` is not a
+// fleet at all, so nothing in it carries a route.
+const nothingEligible = await overviewFor(authRoot, { fetchImpl: probeStub().fetchImpl });
+check(
+  "enabled with nothing eligible reports itself as such, not as a failure",
+  nothingEligible.meta.connections.find((c) => c.target === "probe")?.phase === "not-found",
+  JSON.stringify(nothingEligible.meta.connections.find((c) => c.target === "probe")),
+);
+probeEnv({});
+
+/* ========================================================================== */
 /* connection diagnostics — why a read failed, for every target               */
 /* ========================================================================== */
 
@@ -4104,9 +5087,15 @@ authentikEnv({ token: AK_TOKEN });
 const diag = traefikStub();
 const ovConn = await overviewFor(traefikRoot, { fetchImpl: diag.fetchImpl });
 check(
-  "three reports, docker then authentik then traefik",
-  ovConn.meta.connections.map((c) => c.target).join(",") === "docker,authentik,traefik",
+  "four reports, docker then authentik then traefik then probe",
+  ovConn.meta.connections.map((c) => c.target).join(",") === "docker,authentik,traefik,probe",
   ovConn.meta.connections.map((c) => c.target).join(","),
+);
+const probeOff = ovConn.meta.connections.find((c) => c.target === "probe")!;
+check(
+  "...and the probe reports itself disabled, having sent nothing",
+  !probeOff.ok && probeOff.phase === "disabled" && probeOff.attempts.length === 0,
+  JSON.stringify(probeOff),
 );
 const tfConn = ovConn.meta.connections.find((c) => c.target === "traefik")!;
 check(
@@ -5185,7 +6174,7 @@ console.log("\na missing gate is only reported where a gate was expected");
 // The rule this group exists for: authentication is expected in front of what someone
 // outside the container network can reach, and nowhere else. Say "no proxy auth" about
 // every internal database and the fleet acquires twenty warnings that are all correct
-// topology, after which nobody reads the one that is a finding. So the four reasons a
+// topology, after which nobody reads the one that is a finding. So the five reasons a
 // service has no mechanism are told apart, and exactly one of them is reportable.
 const bare = eSvc("cfdisabled", "live");
 check(
@@ -5236,9 +6225,14 @@ check(
     .map((s) => s.name)
     .join(", "),
 );
-// Every branch has a fixture behind it, so none of the four can be quietly deleted.
+// Every branch has a fixture behind it, so none of the five can be quietly deleted. The
+// probe root is included for the fifth: `probed-gate` is the only reason no configuration
+// can produce, since it exists precisely because nothing in a compose file shows it.
 const reasonsSeen = new Set(
-  [...edge.stacks, ...ak.stacks].flatMap((s) => s.services).map(noAuthReason).filter(Boolean),
+  [...edge.stacks, ...ak.stacks, ...probed.stacks]
+    .flatMap((s) => s.services)
+    .map(noAuthReason)
+    .filter(Boolean),
 );
 check(
   "every reason is reached by a fixture",

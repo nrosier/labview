@@ -1,0 +1,20 @@
+# Regression fixture: a service that did not answer had nothing measured about it.
+#
+# The address is eligible and nothing is listening: no answer, no gate, no conclusion. The
+# posture falls back to exactly what the configuration implies — reachable, no detected
+# authentication, still counted as exposed — and the failure is recorded as a phase and an
+# attempt rather than quietly dropped.
+#
+# This is the direction that matters. "Did not answer" and "answered with no login page" are
+# the same absence of a gate and completely different findings, and a probe that let the first
+# read as the second would be inventing measurements out of network failures. It is also why
+# the fleet-wide report is `partial` rather than `connected` in the probing run: part of what
+# was asked for could not be read, and the banner says so.
+services:
+  ghost:
+    image: example/ghost:1.0.0
+    container_name: probe-silent
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=ghost.probe.example.com"
+      - "dockflare.service=http://probe-silent:8080"

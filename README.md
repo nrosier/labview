@@ -58,6 +58,7 @@ It targets a specific, common TrueNAS Scale pattern:
 | **Auth posture** | `authentik-forward-auth`, `authentik-oauth`, `authentik-ldap`, `forward-auth`, `other-oauth`, `ldap`, `basic-auth`, or `none` — each with the labels or env keys that produced it, and whether the conclusion was `confirmed` — the provider's API reported the gate *and* named the service it belongs to — `observed`, meaning the config states it or the API could only tie the gate to the service by name, or merely `inferred` from a middleware name. |
 | **Authentik API (optional)** | Given a read-only token, LabView reads applications, providers and outposts and ties each application to a service by the provider's internal host, a container name inside a redirect URI, a hostname both sides declare, or a name — slug, application name or provider name — that identifies exactly one service. This is the only way an **OIDC** gate can be found at all: an OAuth2 application appears in no label and no env key, so a service with no hostname of its own is reachable only through the redirect URI or the name. And it finds the reverse, more usefully: an application whose provider **no outpost is serving**, which looks protected in the admin UI and enforces nothing. |
 | **Traefik API (optional, on by default)** | The proxy is located among the scanned stacks and its runtime config read, so the labels are checked against what Traefik actually serves: a router the labels declare that isn't live, an auth middleware named in a label that isn't in the chain the proxy built (the service reads "protected" and answers without a login), a middleware defined in a Traefik *file* provider that a compose scan can't see at all. A live chain replaces inference with `confirmed`, and can also **downgrade** a posture the labels overstate. Also reports backend health per Traefik's own `serverStatus`, and the routers no scanned service could be identified for. |
+| **Active probe (optional, off by default)** | Everything above reads configuration. With `LABVIEW_PROBE_ENABLED=true` the scan also **asks**: one `GET /` per service where HTTP was observed, at its public hostname, else its proxy hostname, else its published port, stopping at the first address that answers. Four things in the answer count as a login page — 401/407 with a `WWW-Authenticate` header, a redirect to another origin, a redirect to a login path, or an HTML page carrying a password field — and any of them takes the service out of the exposed count with the badge **Login page answered**. That is the largest class of protection a compose scan cannot see: the application's own login form. It cuts the other way too, which is half the value — a service that answers with no login page turns an exposure that was *inferred* from configuration into one that was *measured*. What it never does is invent a mechanism: `auth.method` stays `none`, because a password field does not say whose form it is. A service with `ports:` and no route is not eligible, so no database port is ever asked. |
 | **Integration panel** | The `authentik: 13 apps · 9 matched` and `traefik: 10 routers · 8 matched` counts in the topbar are buttons. Click one and you get the whole join: every matched pair with the evidence behind it and how strongly it was established, and every application or router LabView could **not** place — with the reason (`ambiguous` where two services claim it, `no-candidate` where nothing did), plus the rule-by-rule trace of what was tried. Clicking a matched row jumps to that service's drawer. When an integration is unreachable the same panel shows the failure instead: the stage that failed, the address, every candidate that was tried, and the suggested fix. |
 | **Names nothing it can't prove** | A provider is only named when a value says so — a forward-auth address, an issuer URL, an LDAP host. A gate whose provider can't be identified is reported as the mechanism (`forward-auth`) rather than as the most likely vendor. An application that could match two services matches neither. |
 | **Tell it what it can't see** | Drop an optional [`.labview`](labview/.labview.example) YAML file next to a `compose.yml` and it is read with it: a description, owner and criticality, links, what lives in the volumes, a `depends_on` naming another scanned service that compose has no way to name — and the two things a scan structurally cannot find. Authentication **inside** the app (Emby's built-in accounts plus its LDAP bind is `auth: [app-local-accounts, app-ldap]`) is shown as *declared*, from a fixed vocabulary of mechanisms rather than product names. An exposure that is **deliberate** is marked accepted, with a required reason. What you declare is then **compared** with what was found, and only the disagreements are shown: a declaration the scan already proved is not repeated, an `expected.ingress` that matches renders nothing, and a declared login that contradicts a detected one *at the same layer* — `app-oidc` where the scan found an LDAP bind — is reported as **drift**, while the same declaration behind a detected proxy gate is defence in depth and says nothing. A declared login on a service with no gate at all takes it out of the exposed count and gives it its own badge and counter, because *reachable and unauthenticated* is a conclusion and you just answered half of it; accepting an exposure, by contrast, never clears it — it annotates it. What was detected is never altered either way. |
@@ -76,7 +77,8 @@ labview/              the application (see labview/README.md for full docs)
   web/                preact UI
   fixtures/           apps/ (happy path), edge/ (regression cases),
                       authentik/ + authentik-api.json (identity provider integration),
-                      traefik/ + traefik-api.json (reverse proxy integration)
+                      traefik/ + traefik-api.json (reverse proxy integration),
+                      probe/ (the login pages a scan asks for, and the near-misses)
   scripts/smoke.ts    end-to-end pipeline assertions
   compose.yml         deployment example
   Dockerfile          two-stage node:22-alpine build, runs as non-root
@@ -173,6 +175,8 @@ Everything works out of the box. Environment variables override
 | `LABVIEW_TRAEFIK_URL` | *(discovered)* | Traefik API base URL, e.g. `http://traefik:8080`. Only needed when the proxy is outside `appsRoot`, or when discovery picks the wrong endpoint |
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through a hostname Authentik gates: an Authentik user, or the reserved `goauthentik.io/token`. An unauthenticated endpoint is used with no credential |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** (not an API token — see [config.example.yml](labview/config.example.yml)) |
+| `LABVIEW_PROBE_ENABLED` | `false` | **Off by default.** `true` makes a scan issue one `GET /` per HTTP service and read the answer for a login page. The only stage that sends a request to a scanned service; through a public hostname it leaves your fleet. See [Probing a service directly](labview/README.md#probing-a-service-directly) |
+| `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces. Unset means published ports are not asked |
 | `LABVIEW_AUTH_PASSWD_FILE` | `/config/passwd` | `user:hash` lines. One usable entry turns LabView's own login on; no file means it stays off |
 | `LABVIEW_AUTH_PASSWD_ENABLED` | `true` | `false` switches the password form off entirely — the file is then not read |
 | `LABVIEW_OIDC_ISSUER` | *(unset)* | e.g. `https://authentik.example.com/application/o/labview/`. With a client id, this turns OIDC login on |
@@ -222,7 +226,8 @@ login page instead of the API behind it.
 ```text
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
       → build middleware registry → classify ingress → resolve tunnel origins
-      → read the Authentik API ∥ read the Traefik API   (concurrently)
+      → read the Authentik API ∥ read the Traefik API ∥ ask each HTTP service
+                                     (concurrently; the third is opt-in)
       → discover Authentik hostnames
       → match Authentik applications ∥ match live routers to services
       → derive auth posture → build graph → serve /api/overview
@@ -254,7 +259,7 @@ no network with the service it supposedly fronts cannot forward to it. When that
 proves a hop, the graph draws `tunnel → proxy → service`. When nothing proves one,
 the direct edge stays and the service says why the hop is unknown.
 
-Two things compose files genuinely cannot tell you. The first is whether a gate
+Three things compose files genuinely cannot tell you. The first is whether a gate
 defined in Authentik is actually standing in the request path — and for OIDC, whether
 there is a gate at all: an OAuth2 application leaves no trace in the compose file, so
 the identity provider is the only place it can be seen. Give LabView a read-only
@@ -306,6 +311,25 @@ That downgrade requires both reads to have succeeded, because a gate can sit on 
 entrypoint instead of the router; a partial read records the gap and changes no
 posture. This stage is on by default and needs no configuration — if nothing
 answers, the scan continues from the labels alone and reports what it tried.
+
+The third is whether the application has a login page of its own. That is the largest
+class of real protection there is, and it leaves no trace anywhere a scan can look: no
+middleware, no env key, no Authentik application. Until now the only way to keep such a
+service out of the exposed count was to *declare* it, which nothing could check. So
+LabView can simply ask — `LABVIEW_PROBE_ENABLED=true`, one `GET /` per service where
+HTTP was observed, at its public hostname, else its proxy hostname, else
+`LABVIEW_PROBE_LAN_HOST` and the published port, stopping at the first address that
+answers. A challenge header, a redirect off-origin, a redirect to a login path or an
+HTML page with a password field on it is a login page and clears the exposure; a bare
+401, a 403, a `/` → `/dashboard` redirect and the words "Sign in" are not, and the
+exposure stands. What it will not do is name a mechanism — a response is evidence of a
+gate and never a name for one — and it will not contradict a gate the labels declare,
+since a request from LabView's own vantage point may not have travelled the gated path.
+The reason it is **off by default** is that it is the one stage that sends a request to
+something in your own fleet, and through a public hostname that request leaves the fleet
+and comes back in through your edge. A service with `ports:` and no route is not
+eligible, which is what keeps it off your database ports; the cost, stated plainly, is
+that such a service stays inferred rather than measured.
 
 See [labview/README.md](labview/README.md#how-it-works) for the details, and
 [IMPLEMENTATION.md](IMPLEMENTATION.md) for the design rules behind them.
@@ -422,6 +446,15 @@ output is sensitive.
   root. An entry like `../../../secrets.env` is refused and noted on the service
   rather than read — for lexical `..` escapes and for symlinks pointing out of the
   tree alike.
+- **The one read that goes to a scanned service is off by default.** The active probe
+  is the only stage that sends a request to something in your fleet, and it does
+  nothing until `LABVIEW_PROBE_ENABLED=true`. Turned on it is `GET /` with no
+  credential in scope on that code path, redirects read rather than followed, at most
+  four addresses per service, a response body read only when it is HTML and under a
+  size cap, and only ever to a service where HTTP was *observed* — a database port is
+  never asked, whatever `LABVIEW_PROBE_LAN_HOST` is set to. Through a public hostname
+  the request leaves the fleet and returns through your edge, which is the point of
+  that vantage and worth knowing before switching it on.
 - **Published ports count as exposure.** A service with a `ports:` mapping and no
   proxy in front is classified `lan` and flagged exposed-without-auth — it answers
   on the LAN regardless of what the Traefik labels say. When a proxy *is* in front,
@@ -540,7 +573,10 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
 - Auth detection is label/env-driven, and heuristic wherever neither API is
   available to confirm it. It is honest about *edge* auth only: an app with its own
   built-in login (Emby, Home Assistant, Authentik itself) will show up as
-  exposed-without-auth, and the note says exactly that.
+  exposed-without-auth, and the note says exactly that. Switching the active probe on
+  is what finds those logins, and it finds only the ones served at `/` on an address
+  LabView could reach — a login behind a path, a non-standard shape, or an address only
+  a browser on your LAN can get to still reads as exposed.
 - Authentik's applications endpoint filters itself by what the token's user may
   launch, so a least-privilege token is not shown every application. LabView reports
   the total and rebuilds the withheld ones from their providers, but an application

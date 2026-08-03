@@ -1,0 +1,12 @@
+# An acceptance that has stopped applying, and the only way to find that out is to ask.
+#
+# Somebody signed this exposure off, and the service now answers with a login form — so the
+# thing the file excuses is not what the scan finds. The acceptance is reported as drift
+# naming what was measured, rather than left sitting there looking correct: a stale acceptance
+# is the single most dangerous line a sidecar can carry, because it silences a finding.
+services:
+  app:
+    description: Staff tool, signed off as open when it had no login.
+    unauthenticated:
+      intentional: true
+      reason: Internal tool with no login, trusted VLAN only.

@@ -1,0 +1,33 @@
+# Regression fixture: the probe never sends a byte at a database.
+#
+# This is the rule the whole feature was made conditional on — "only http/https services,
+# not databases" — and it is enforced by evidence rather than by a list of ports or images.
+# Neither service here carries a tunnel route or a Traefik router, so the scan has observed
+# no HTTP on either, so `probeTargets` yields nothing and neither is asked. The published
+# ports are deliberate: an eligibility rule that read `ports:` would dial 5432 with an HTTP
+# GET, and `LABVIEW_PROBE_LAN_HOST` being set in the probing run must not change that.
+#
+# The cost of the rule is on the second service and is stated rather than hidden: `adminer`
+# is a web UI, it publishes a port, nothing routes it, and so it is never measured. Its
+# posture stays inferred from configuration — which is correct, and less than could be known.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: probe-db
+    ports:
+      - 15432:5432
+    environment:
+      POSTGRES_PASSWORD: sup3rs3cret
+    networks:
+      - backend
+
+  adminer:
+    image: adminer:4
+    container_name: probe-adminer
+    ports:
+      - 18081:8080
+    networks:
+      - backend
+
+networks:
+  backend:

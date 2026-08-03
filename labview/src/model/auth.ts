@@ -22,7 +22,7 @@ import { isExternallyReachable } from "./ingress.js";
  */
 
 /**
- * Why a service has no authentication mechanism. Exactly one of the four is a finding.
+ * Why a service has no authentication mechanism. Exactly one of the five is a finding.
  */
 export type NoAuthReason =
   /**
@@ -33,6 +33,13 @@ export type NoAuthReason =
   | "gap"
   /** Nothing outside the container network can reach it, so no gate is expected. */
   | "not-reachable"
+  /**
+   * The service was asked, and answered with a login page. No mechanism name, because a
+   * password field cannot say whether it is backed by local accounts, OIDC or SAML — but
+   * LabView made the request and read the answer, which is more than any other reason
+   * here rests on. `ServiceProbe.gate` names which signal fired.
+   */
+  | "probed-gate"
   /**
    * The operator's `.labview` file says the service authenticates itself. Taken at
    * face value: a declared mechanism is assumed to be configured and working, so this
@@ -51,6 +58,7 @@ export type NoAuthReason =
 export const NO_AUTH_REASONS: readonly NoAuthReason[] = [
   "gap",
   "not-reachable",
+  "probed-gate",
   "declared",
   "unnamed-gate",
 ];
@@ -63,17 +71,24 @@ export const NO_AUTH_REASONS: readonly NoAuthReason[] = [
  * kind detected, and nothing declared", which is precisely the finding. Everything
  * after it is therefore *not* a finding, and only needs telling apart to be worded.
  *
+ * `probed-gate` sits above `declared` because the two can both be true of one service,
+ * and then the reader should hear the one LabView checked. A declaration and a login page
+ * that answered are not equal statements: the first is taken on trust, the second was
+ * measured, and wording a measured gate as "declared, not detected" would understate what
+ * is known.
+ *
  * The last branch is a derivation, not a guess. Reaching it means the method is `none`,
- * something outside can reach the service, nothing was declared, and the analyzer still
- * did not count it as exposed — which happens only where `finalizeAuth` found a gate it
- * had no `AuthMethod` to report.
+ * something outside can reach the service, nothing answered a probe with a login page,
+ * nothing was declared, and the analyzer still did not count it as exposed — which
+ * happens only where `finalizeAuth` found a gate it had no `AuthMethod` to report.
  */
 export function noAuthReason(
-  svc: Pick<Service, "auth" | "ingress" | "declared">,
+  svc: Pick<Service, "auth" | "ingress" | "declared" | "probe">,
 ): NoAuthReason | undefined {
   if (svc.auth.method !== "none") return undefined;
   if (svc.auth.exposedWithoutAuth) return "gap";
   if (!isExternallyReachable(svc.ingress)) return "not-reachable";
+  if (svc.probe?.gate) return "probed-gate";
   if (svc.declared?.auth.length) return "declared";
   return "unnamed-gate";
 }
@@ -105,6 +120,11 @@ const NO_AUTH_TEXT: Record<NoAuthReason, NoAuthText> = {
     label: "None expected",
     title:
       "Reachable only from inside the container network, so no proxy or SSO gate is expected in front of it.",
+  },
+  "probed-gate": {
+    label: "Login page answered",
+    title:
+      "LabView requested this service's own address and was answered with a login page, so it is not reachable without authenticating. Which mechanism is behind that page is unknown — one address answering at one moment is the whole of the evidence.",
   },
   declared: {
     label: "Declared, not detected",

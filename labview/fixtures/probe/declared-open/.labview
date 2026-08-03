@@ -1,0 +1,9 @@
+# The declaration the probe disagrees with. Local accounts are the mechanism no scan can
+# observe, which is why a file like this exists at all — and why it needs checking against
+# something other than itself.
+services:
+  portal:
+    description: Staff portal with its own user accounts.
+    auth:
+      - mechanism: app-local-accounts
+        detail: Accounts live in the portal's own database; there is no SSO in front.

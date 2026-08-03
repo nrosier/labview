@@ -101,6 +101,54 @@ export interface LabViewConfig {
     timeoutMs: number;
   };
   /**
+   * Optional active probing: ask each HTTP service what it answers, and read a login
+   * page as evidence that it is not reachable without authenticating.
+   *
+   * The only stage that sends a request to a *scanned service* rather than to an API
+   * LabView was given the address of. Everything else here reads configuration or asks a
+   * system the operator named; this asks the fleet itself, at addresses taken from
+   * scanned documents. That difference is why it is **off by default** and why the
+   * bounds are in `enrich/probe.ts`'s docstring rather than left implicit: enabling it
+   * makes a scan generate traffic, and where a service is fronted by a public hostname
+   * that traffic leaves the fleet.
+   *
+   * No credential field, deliberately. The measurement is what an *unauthenticated*
+   * request gets, so there is nothing to configure and nothing to leak (**I6**) — which
+   * is also why nothing here joins `secrets.keysAlways`.
+   */
+  probe: {
+    /**
+     * Off by default, on the Authentik precedent: a scan must not start dozens of
+     * outbound requests because someone pulled a new image.
+     */
+    enabled: boolean;
+    /**
+     * The host's LAN address, for the `lan` vantage. Empty = no LAN probing.
+     *
+     * Asked for rather than detected because LabView normally runs in a container and
+     * cannot observe the address its host answers on: the interfaces it can see are the
+     * container's own. A published port is reached at `<lanHost>:<published port>`, so
+     * without this the only vantages left are the hostnames in the labels.
+     *
+     * Empty is a supported configuration, not a half-finished one — a fleet whose
+     * services are all behind a tunnel or a proxy needs no LAN vantage at all.
+     */
+    lanHost: string;
+    /**
+     * Per-request timeout. One GET per address, and a service that has not answered in
+     * this long is recorded as `timeout` — which is a finding of its own, since a
+     * reachable address that does not answer is not an exposure.
+     */
+    timeoutMs: number;
+    /**
+     * Services probed at once. Low by default: these requests fan out across the whole
+     * fleet and several of them may land on one reverse proxy, so a burst that a socket
+     * proxy would shrug off can make an edge start refusing connections — which would be
+     * recorded as services that did not answer, i.e. a scan lying about its own fleet.
+     */
+    maxConcurrency: number;
+  };
+  /**
    * LabView's own access control — a login screen in front of its API, distinct from
    * the authentication it *reports* about the services it scans.
    *
@@ -245,6 +293,14 @@ const DEFAULTS: LabViewConfig = {
     password: "",
     timeoutMs: 5000,
   },
+  // The one integration that defaults to off, because it is the one that generates
+  // traffic at the fleet rather than reading something. See the interface above.
+  probe: {
+    enabled: false,
+    lanHost: "",
+    timeoutMs: 5000,
+    maxConcurrency: 4,
+  },
   auth: {
     // Both methods allowed and both dormant: the passwd path does not exist until an
     // operator mounts one, and the issuer is empty. See the interface above.
@@ -385,6 +441,19 @@ function applyEnvOverrides(cfg: LabViewConfig): LabViewConfig {
   if (env.LABVIEW_TRAEFIK_TIMEOUT) {
     const n = Number(env.LABVIEW_TRAEFIK_TIMEOUT);
     if (Number.isFinite(n) && n > 0) cfg.traefik.timeoutMs = Math.floor(n);
+  }
+  // The probe. `!== "false"` like every other boolean here, which for this one block also
+  // means `LABVIEW_PROBE_ENABLED` with any value at all turns it on — deliberate: the
+  // variable is not set by accident, and the default is off.
+  if (env.LABVIEW_PROBE_ENABLED) cfg.probe.enabled = env.LABVIEW_PROBE_ENABLED !== "false";
+  if (env.LABVIEW_PROBE_LAN_HOST) cfg.probe.lanHost = env.LABVIEW_PROBE_LAN_HOST;
+  if (env.LABVIEW_PROBE_TIMEOUT) {
+    const n = Number(env.LABVIEW_PROBE_TIMEOUT);
+    if (Number.isFinite(n) && n > 0) cfg.probe.timeoutMs = Math.floor(n);
+  }
+  if (env.LABVIEW_PROBE_MAX_CONCURRENCY) {
+    const n = Number(env.LABVIEW_PROBE_MAX_CONCURRENCY);
+    if (Number.isFinite(n) && n >= 1) cfg.probe.maxConcurrency = Math.floor(n);
   }
   // Access control. `!== "false"` rather than `=== "true"` matches every other boolean
   // here: the variable being present at all means the operator meant something by it.

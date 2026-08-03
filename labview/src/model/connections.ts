@@ -77,6 +77,23 @@ const HINTS: Record<string, Partial<Record<ConnectionPhase, string>>> = {
       "Something answered that is not Traefik's API — most often an SSO login page. Prefer the proxy's internal address, which is not behind the gate.",
     partial: "Part of the runtime configuration could not be read, so entrypoint-level middlewares are unknown and a gate attached there cannot be ruled out.",
   },
+  // The probe's addresses are not configured, so no hint here can be "check the URL".
+  // Each one instead names the thing the operator can actually change: what makes a
+  // service eligible, whether LabView can reach the address its labels declare, and the
+  // two knobs (`LABVIEW_PROBE_TIMEOUT`, `LABVIEW_PROBE_LAN_HOST`) that exist at all.
+  probe: {
+    "not-found":
+      "Probing is on and no service was eligible. Only a service whose labels show it speaks HTTP is asked — a Cloudflare tunnel route with an http/https origin, or a `traefik.http.routers.*` label. A service that merely publishes a port is never probed, and LABVIEW_PROBE_LAN_HOST does not change that: it adds an address for services already eligible.",
+    resolve:
+      "No probed hostname resolved. These are the hostnames your own labels declare, so LabView has to be able to resolve them from inside its container — with split-horizon DNS the public names may only resolve outside. Set LABVIEW_PROBE_LAN_HOST to probe published ports instead.",
+    connect:
+      "Nothing accepted the connection. If this is the LAN vantage, LABVIEW_PROBE_LAN_HOST has to be an address the container can reach — the host's LAN IP, not 127.0.0.1, which inside a container is the container.",
+    tls: "The certificate was not trusted. Add the issuing CA with NODE_EXTRA_CA_CERTS; LabView does not skip verification, here least of all — a probe that ignored certificates would report a gate it never really reached.",
+    timeout:
+      "The address accepted the connection and never answered. Raise LABVIEW_PROBE_TIMEOUT, or lower LABVIEW_PROBE_MAX_CONCURRENCY if the requests are arriving faster than one reverse proxy will serve them.",
+    partial:
+      "Some services did not answer. Those keep the posture their configuration implies — nothing was measured for them, and nothing was assumed either.",
+  },
 };
 
 export function hintFor(target: string, phase: ConnectionPhase): string | undefined {

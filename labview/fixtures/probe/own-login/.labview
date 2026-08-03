@@ -1,0 +1,10 @@
+# A declaration about the very thing the probe just measured, which is what makes this file
+# worth having here: both statements are true of this service, and the reader should hear the
+# one LabView checked. `probed-gate` outranks `declared` for that reason, and this sidecar is
+# the only fixture where the two branches compete.
+services:
+  wiki:
+    description: Wiki with its own accounts and session middleware.
+    auth:
+      - mechanism: app-local-accounts
+        detail: The wiki authenticates its own users; nothing sits in front of it.

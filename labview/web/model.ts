@@ -19,6 +19,9 @@ export type {
   AuthMethod,
   AuthConfidence,
   AuthPosture,
+  ProbeGate,
+  ProbeVantage,
+  ServiceProbe,
   Declaration,
   DeclaredAuth,
   DeclaredAuthAgreement,
@@ -158,6 +161,16 @@ export type {
  */
 export { NO_AUTH_REASONS, noAuthReason, noAuthText, showsAuthMethod } from "../src/model/auth";
 export type { NoAuthReason, NoAuthText } from "../src/model/auth";
+
+/**
+ * How a probe result is worded, from the module that also decides what counts as a login
+ * page — so the pill in the drawer and the note the analyzer wrote about the same response
+ * cannot describe it in two different ways. `probeOutcome` in particular is a rule and not
+ * a rendering detail: it is the one place that keeps "did not answer" from ever reading as
+ * "answered with no login page".
+ */
+export { PROBE_GATES, PROBE_VANTAGES, probeGateText, probeOutcome, probeVantageText } from "../src/model/probe";
+export type { ProbeGateText, ProbeOutcome } from "../src/model/probe";
 
 /**
  * The tri-state tag filter. In `src/` rather than here because the web bundle is never

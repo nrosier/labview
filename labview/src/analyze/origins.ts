@@ -30,7 +30,8 @@
  * fronts cannot forward to it, so it is not the hop. That is the "proxy network"
  * leg of the path, and it is as observable as the port itself.
  */
-import type { AppStack, OriginTarget, PortMapping, Service } from "../model/types.js";
+import type { AppStack, OriginTarget, Service } from "../model/types.js";
+import { publishedHostPort } from "../model/ports.js";
 import { realNetworks, serviceKey, type NetworkIndex } from "./networks.js";
 
 /** One service, as referenced by the fleet index. */
@@ -105,7 +106,7 @@ export function buildFleetIndex(stacks: AppStack[], nets?: NetworkIndex): FleetI
   for (const stack of stacks) {
     for (const svc of stack.services) {
       for (const p of svc.ports) {
-        const host = hostPort(p);
+        const host = publishedHostPort(p);
         if (!host) continue;
         push(byPort, host.port, { stackId: stack.id, serviceName: svc.name, bindIp: host.bindIp });
       }
@@ -380,23 +381,6 @@ function parseOrigin(address: string): { host: string; port: string } | undefine
   } catch {
     return undefined;
   }
-}
-
-/**
- * The host port a mapping publishes, if it names exactly one.
- *
- * Compose keeps the bind address inside the published field for the three-part
- * form (`127.0.0.1:8096:8096`), so the port is the last segment and anything
- * before it is the interface. A range (`8000-8010`) identifies no single port and
- * is skipped rather than guessed at.
- */
-function hostPort(p: PortMapping): { port: string; bindIp?: string } | undefined {
-  if (!p.published) return undefined;
-  const segs = p.published.split(":");
-  const port = segs[segs.length - 1]!;
-  if (!/^\d+$/.test(port)) return undefined;
-  const bindIp = segs.length > 1 ? segs.slice(0, -1).join(":") : undefined;
-  return bindIp ? { port, bindIp } : { port };
 }
 
 /**
