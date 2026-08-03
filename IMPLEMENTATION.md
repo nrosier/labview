@@ -171,6 +171,7 @@ the whole program. It is a pure function of `(config, filesystem, docker, now)`.
 | 6b. Declared dependencies | `analyze/dependencies.ts` | resolved `.labview` `depends_on` pairs, each with the network they share; `declared.drift` for every reference that named nothing, two things or itself |
 | 7. Identity provider API | `enrich/authentik.ts` | `AuthentikSnapshot` — applications with their providers and outposts, or a reason it is absent. Skipped entirely without a token |
 | 8. Reverse proxy API | `enrich/traefik.ts` | `TraefikSnapshot` — the routers the proxy is serving with their resolved middleware chains and backends, or a reason it is absent. Runs concurrently with step 7 |
+| 8b. Active probe | `enrich/probe.ts` | `ProbeSnapshot` — `svc.probe` for each service where HTTP was *observed*: which address answered, and whether a login page did. Off unless switched on; runs concurrently with steps 7 and 8 (§3.6b) |
 | 9. Provider discovery | `discoverAuthentikHints` | hint strings that identify the SSO provider *in this fleet* |
 | 10. Application matching | `analyze/authentik.ts` | `svc.authentik` — which applications belong to which service, and which matched nothing |
 | 11. Live router matching | `analyze/traefik.ts` | `svc.traefikLive` — which live routers belong to which service, and which matched nothing |
@@ -219,6 +220,11 @@ nothing in the scan, so that request is started before the docker snapshot and
 awaited after, overlapping the two. A *discovered* endpoint cannot be found until
 pass 1 has parsed the routes, so it runs after. Either way the result is one value
 with the same shape.
+
+The probe joins those two under the same `Promise.all` rather than running after them, for the
+same reason: its addresses come from pass 1, and it needs nothing either read produces. When it
+is off — the default — it returns its `disabled` report without sending a request, so the
+concurrency is free (§3.6b).
 
 Origin resolution runs **ahead** of the discovered reads for two reasons. A
 resolved origin structurally identifies the service acting as reverse proxy, which
@@ -627,6 +633,101 @@ discovery, whether a credential was used, whether the API answered unauthenticat
 version, counts, matched services, unmatched routers, and any error. The proxy
 service itself gets `role: "proxy"` in the graph and every matched router is drawn
 from it, so the hop is named rather than left to the reader.
+
+### 3.6b The active probe (step 8b)
+
+Every other source in this document says what a service is *configured* to do. This one says
+what it **answers**, and it exists for one blind spot: an application with its own login page
+carries no label, no env key and no entry in anybody's API, so no amount of reading
+configuration can see it. Until this stage the only way to keep such a service out of the
+exposed count was a `.labview` declaration — a claim LabView cannot check (§3.12). So the scan
+asks: one GET to the service's own address, and a login page answering is evidence in the
+sense I1 means it, because LabView made the request and read the answer.
+
+It is the only integration that **defaults to off**, and it is the only one that sends a
+request to something the fleet's own documents named. Both facts drive the design.
+
+**Two pure rules, in [model/probe.ts](labview/src/model/probe.ts).** Neither lives in the
+client that does the fetching, because a rule inside an I/O module can only be tested by
+mocking the I/O.
+
+`probeTargets(svc, lanHost)` decides eligibility and try-order, from evidence already on the
+service — never from a port number and never from an image name:
+
+| Vantage | Eligible on | Asked at |
+|---|---|---|
+| `public` | a tunnel route with a resolved hostname whose `service:` origin is `http`, `https` or absent | `https://<hostname>/` — the tunnel terminates TLS at the edge, so there is no other scheme it could be |
+| `traefik` | a `traefik.http.routers.*` route's own host. `parseTraefik` reads only HTTP routers, so a non-empty route list *is* the evidence that this is an HTTP service | `https://<host>/` when the router declares TLS, `http://<host>/` otherwise |
+| `lan` | a service one of the two above already found HTTP, **and** `probe.lanHost` set, **and** a published port whose bind address answers there | `http://<lanHost>:<published port>/` |
+
+Order is most- to least-exposed, the same order `INGRESS_KINDS` uses, and the walk stops at
+the first address that *answers*. "Answers" means an HTTP response arrived, whatever its
+status — a 401 is the best outcome available here, so it ends the walk rather than continuing
+to a weaker vantage. Only a transport failure falls through, and a public hostname that does
+not resolve from inside the container is precisely why there is somewhere to fall through to.
+
+**A service with `ports:` and no route of either kind yields no address at all.** That single
+line is what keeps the probe off a database without consulting a port number or an image name,
+and it has a real cost, stated rather than hidden: a LAN-only web UI stays inferred from its
+configuration rather than measured. `lanHost` is the operator's answer to a question LabView
+cannot answer for itself — it runs in a container and cannot see its host's LAN address. Empty
+means no LAN vantage, not a guessed one.
+
+`readGate(res)` is the recognition rule. Four signals, strongest first, each one fact:
+
+| Signal | Fires on |
+|---|---|
+| `challenge` | 401 or 407 **with** a `WWW-Authenticate` header |
+| `redirect-origin` | a 3xx whose `Location` resolves to a different origin |
+| `redirect-login` | a 3xx that stayed on the origin and landed on `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` (prefix match) |
+| `password-form` | a 200 whose HTML body carries an `<input type="password">` |
+
+Nothing else is a gate. A bare 401 with no challenge header is an API saying "not signed in"
+while its UI serves the whole application; a 403 refuses without asking for anything; a
+same-origin redirect to `/dashboard` is routing; a homepage with the words "Sign in" and no
+password field is a homepage. All of them read as *answered, no gate observed*, which leaves
+the exposure finding standing. The asymmetry is deliberate and it is the whole reason the rule
+is strict: this function can only ever take a service **out** of the exposed count, so a
+clause that is merely likely would manufacture the one thing this project exists to remove.
+Half the `readGate` table in `scripts/smoke.ts` is near-misses for that reason.
+
+**Both findings are findings.** A login page answering means the service is not reachable
+without authenticating: it leaves `exposedWithoutAuth`, is counted in `probeGated`, and
+`noAuthReason` reports it as `probed-gate` with `auth.method` untouched at `none`. An answer
+with *no* login page is the other half of the value — the exposure note gains a clause saying
+LabView requested the address and was served the application, which turns a finding inferred
+from configuration into one that was measured. A service that did not answer is neither: it is
+counted in neither statistic, its note claims no measurement, and `probeOutcome` words it as
+`No answer` rather than `No login page`, because letting a silence read as "no gate" would
+reach this stage's one forbidden conclusion by accident.
+
+**A probe never becomes a mechanism** (I3). A password field cannot say whether it is backed
+by local accounts, OIDC or SAML, so `probed-gate` is reported as its own reason and counted in
+its own statistic — exactly as an Authentik gate with no readable method is reported as
+`unnamed-gate`. `svc.probe` sits beside `authentik` and `traefikLive`, never inside `auth`.
+
+**Two things it does not override.** A detected gate answered with no login page keeps its
+posture and gets a note saying the request came from LabView's own vantage point, which may
+not be the path a visitor takes — the same reasoning `chainComplete` rests on (§3.6). And a
+`.labview` declaration that supplies the only protection, contradicted by an open answer, is
+reported as **drift** rather than as an override: a service can serve `/` to anyone and
+authenticate everything past it, and the probe only ever asked for `/`.
+
+**Containment** (I8). The addresses come from scanned documents, so the bounds are part of the
+feature rather than a deployment concern: GET only, at `/`, with no query; no credential, and
+not by omission — no call path into `getResponse` has one in scope; no redirect followed,
+because where a 3xx points is the evidence and following it would let a scanned label send
+LabView somewhere of its choosing; a per-request timeout and a bounded number in flight; at
+most `MAX_PROBE_TARGETS` addresses per service, so a compose file with thirty published ports
+cannot turn one scan into thirty requests; the body read only when the content type is HTML
+and then only to 64 KiB, with the stream cancelled at the cap. And, like every other client,
+it cannot throw and cannot fail a scan (I4): disabled, nothing eligible, or nothing answering
+each return a report that explains itself.
+
+The report is the fourth `meta.connections` entry (§3.10), using existing phases only:
+`disabled` when off, `not-found` when nothing was eligible, `partial` when part of the fleet
+did not answer — which stays `ok`, because what was read is sound — and `connected` otherwise,
+reading like `31 services probed — 12 gated, 17 open, 2 did not answer`.
 
 ### 3.7 The data contract
 
@@ -1549,6 +1650,24 @@ rests on something unverified — so the weaker, truthful statement is still the
 screen. What the invariant forbids is a declaration reaching a measurement, and nothing
 here does.
 
+**Why a probe may join `hasEdgeAuth` while a declaration may not.** The two look similar from
+a distance — both take a service out of the exposed count without naming a mechanism — and the
+difference is the whole of this invariant. A declaration is a *claim*: the file says a login
+exists, and nothing in the scan can confirm or refute it, so it stays a separate term of the
+expression. A probe result is an *observation*: LabView sent the request and read the answer,
+which is the same kind of fact as a middleware definition or a router the proxy reports
+serving. So it belongs inside the evidence term, and it is the only new term this invariant has
+gained that does.
+
+What keeps it inside I1 is the same discipline `unnamed-gate` already keeps. The probe is
+counted in its own statistic (`probeGated`) and reported under its own reason
+(`probed-gate`), it never touches `auth.method` or `confidence`, and the exposed count with
+the probe term dropped is exactly the count a scan with probing off produces — asserted per
+service, not only in aggregate, since two offsetting errors would satisfy a total. `probeGated`
+is deliberately *not* the number to add back: it counts login pages, and one of them may belong
+to a service that was already out of the count on a declaration. A counter of measurements and
+a counter of findings removed are different things.
+
 The identity provider's API is itself an observation, and the one place where a
 *name* is allowed to establish anything: Authentik's records carry no compose
 identifier, so for a service whose gate leaves no trace in any file — an OIDC
@@ -1696,6 +1815,15 @@ endpoint, and needs no privileged access:
   does expose them, and it needs the Docker socket to do it, which is root-equivalent
   on that host anyway. The exposure worth engineering against is a compose file in a
   repository, which a gitignored `.env` beside it closes.
+- **The active probe is `GET /`, and it is the one read that goes to a scanned service**
+  rather than to an API LabView was given the address of (§3.6b). So it is the read with the
+  least privilege of any of them: no credential is sent — not by omission, but because no call
+  path into `getResponse` has one in scope — no redirect is followed, no path or method comes
+  from a label, and only a service where HTTP was *observed* is asked anything at all, which is
+  what keeps it off a database port. It is also the only integration that defaults to **off**:
+  a scan must not start dozens of outbound requests unasked, and to a public hostname those
+  requests leave the fleet. A change that gives the probe a credential, a second method, or a
+  path from a scanned document is a change to this invariant.
 - The image runs as `USER node`.
 - Its own compose example publishes **no `ports:`** — see §7.
 - **Its own login is read-only too.** LabView authenticates people; it authorizes
@@ -2521,8 +2649,8 @@ a per-username throttle, one message for both halves of a wrong guess — §3.13
 the two POST routes (`SameSite=Lax` plus an `Origin` check that runs *before* the session
 check, so a rejection sets no cookie).
 
-**The outbound calls, and their rules.** Two *scanning* stages initiate a connection
-outside the Docker socket, and both carry the same constraints (I5): `GET` only; no
+**The outbound calls, and their rules.** Three *scanning* stages initiate a connection
+outside the Docker socket, and all three carry the same constraints (I5): `GET` only; no
 TLS-verification bypass; the credential readable from a file so it need not sit in
 the environment; and a discovered endpoint probed on an unauthenticated path
 *before* any credential is sent, because a discovered address is a guess and a guess
@@ -2538,8 +2666,15 @@ must never be handed a credential.
   declare `api@internal`. When the read succeeds unauthenticated, that fact is
   reported as a note on the proxy service — LabView's own read is evidence about how
   the API is exposed, and saying so is more useful than staying quiet about it.
+- **The active probe** is off unless switched on, and it is the one read whose address comes
+  out of a scanned document rather than out of the configuration (§3.6b). It is therefore the
+  most tightly bounded: `GET /` and nothing else, never a credential, never a redirect
+  followed, a capped number of addresses per service, an HTML-only body read to a cap, and
+  only for a service where HTTP was observed — so no request is ever sent at a database port.
+  Where the address is a public hostname, that request leaves the fleet, which is the plainest
+  reason this one defaults to off.
 
-A third stage reaches outward only when OIDC is configured, and it is not part of a
+A fourth stage reaches outward only when OIDC is configured, and it is not part of a
 scan: discovery, the token exchange and the JWKS, to the one issuer the operator named
 (§3.13). It shares the timeout and file-backed-credential rules, and adds two of its own —
 the discovery document's `issuer` must equal the configured one, and every endpoint taken
@@ -2561,13 +2696,14 @@ limiting beyond the login route; no CSP, because mermaid and cytoscape both inje
 at runtime and a policy that breaks the graph tab is worse than none; no TLS termination
 (the proxy does it); no persistence, so nothing to leak at rest — which also means
 sessions do not survive a restart (§11); no writes of any kind; and no outbound network
-calls beyond the two scan reads above and, when configured, the one issuer.
+calls beyond the three scan reads above — the third only when the operator switches it on —
+and, when configured, the one issuer.
 
 ---
 
 ## 8. Testing contract
 
-`npm run smoke` runs the entire pipeline against five fixture roots with Docker
+`npm run smoke` runs the entire pipeline against six fixture roots with Docker
 disabled and asserts on the resulting `Overview`. It exits non-zero on any
 failure and gates CI. `npm run typecheck` covers `scripts/` too
 (`tsconfig.scripts.json`): `tsx` strips types without checking them, so an
@@ -2773,6 +2909,42 @@ No posture number moves with them. `matchedServices` on both roots and the
 exposed-without-auth pair asserted with and without the API are unchanged by the reason
 model, which adds reporting and nothing else.
 
+**`fixtures/probe`** — eleven stacks, fourteen services, driven twice: once with probing off
+and once on, against a URL-keyed `probeStub` in `scripts/smoke.ts` rather than a JSON payload,
+because a probe reads status codes, three headers and a fragment of HTML, not a document. The
+LAN host is `192.0.2.10` — documentation range, so a request that escaped the stub could not
+arrive anywhere. Same revert-proof contract; one stack per rule:
+
+| Stack | Pins |
+|---|---|
+| `tunnel-login` | the `password-form` signal end to end, and — with its sidecar — a **stale acceptance**: an exposure signed off as intentional that now answers with a login form is reported as drift naming the *measurement*, not "authenticated at the edge", because an application's own login page is not an edge |
+| `proxy-challenge` | `challenge`, and that a router's own `tls` setting decides the scheme it is asked on |
+| `sso-redirect` | `redirect-origin`, at the `http` address a router with no TLS implies |
+| `own-login` | `redirect-login`, and — with its sidecar — the one service where `probed-gate` and `declared` are both true: the reader gets the measured one, and the same service falls back to `declared` with the probe off |
+| `open-app` | the **guard**, two services: `dash` answers 200 with a homepage and stays exposed with the finding now measured; `routing` redirects same-origin to `/dashboard`, which is application routing and clears nothing |
+| `gated-open` | a detected gate answered 200 with no login page: posture unchanged, note names the vantage the request came from |
+| `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
+| `lan-fallback` | the vantage walk: a public hostname that does not resolve falls through to `http://<lanHost>:18099/`, with the failed attempt kept in the order it was tried |
+| `declared-open` | a declaration that `supplies` the only protection, contradicted by an open answer — the verdict stands (the probe asked one address once) and the disagreement is reported as drift |
+| `dbonly` | a Postgres and an Adminer publishing ports and nothing else: **no request at all**, which is the rule that keeps the probe off a database |
+| `tcp-tunnel` | a `tcp://` and an `ssh://` tunnel origin: never resolved, let alone asked, and both stay honestly in the exposed count |
+
+Three groups of assertions carry what is not about one stack. The **rules**, driven pure: an
+18-row `readGate` table where half the rows are near-misses, plus two meta-assertions — that
+every signal in the union is reached, and that the near-misses outnumber the signals, which is
+what "strict" means here; and `probeTargets` over hand-built routes for scheme, order, the
+per-service cap, dedupe, the bind-address guard, a port range, and each arm of
+`isHttpObservable` separately. **Containment**, asserted on the recorded requests rather than
+on the code: every request a GET at `/` with no query, no credential on any of them, no address
+asked twice, nothing at `:15432` or `:18081`, nothing named `pg.probe` or `ssh.probe`, and the
+total exactly 11 — one for each of the ten eligible services plus the single fallthrough.
+**Reconstruction** (I1): each service exposed exactly when it was with probing off minus the
+ones a login page answered for, asserted per service because two offsetting errors would
+satisfy a total; the aggregate adding back up; `probeGated` being deliberately one *more* than
+that, since it counts login pages and one belongs to a service already out of the count on its
+declaration; and no `auth.method`, `confidence`, `authProtected` or `byAuthMethod` differing
+between the two runs at all.
+
 **The connection taxonomy** (§3.10) is asserted the same way, but without a fixture
 root: the classifiers are pure, so each is driven directly. Every transport code,
 every HTTP status and every socket-file state is mapped to its phase, the reports
@@ -2939,7 +3111,7 @@ a simplification:
   assert against their own credential, and a real `LABVIEW_AUTH_PASSWD_FILE` would put
   their users' hashes in front of assertions that print what they compared.
 
-`fixtures/outside-root.env` sits outside all four roots on purpose: it is the
+`fixtures/outside-root.env` sits outside every scan root on purpose: it is the
 target of the `env_file` escape attempt that must be refused.
 `fixtures/authentik-api.json` and `fixtures/traefik-api.json` sit beside the roots
 rather than inside one so the scanned trees stay purely compose stacks.
@@ -3480,3 +3652,11 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | A retired variable is warned about, not ignored | Ignoring `LABVIEW_OIDC_CLIENT_SECRET_FILE` on the next image pull turns a confidential client into a public one, the provider refuses every sign-in, and nothing in any log connects the two — a lock-out dressed up as a simplification, against I4. So `retiredSettings` keeps all four variable names and all four `config.yml` keys recognised for the single purpose of naming what replaced them. The config-file half is checkable because `merge()` preserves unknown keys, so a `config.yml` written against the previous `config.example.yml` still contains `tokenFile:` and still gets told. Neither the value nor the path is echoed: the variable to move it to is the whole actionable part. |
 | "Set but empty" is carried forward in `blankCredentialVars` rather than recomputed | `applyEnvOverrides` is the only place the difference between unset and empty survives — every reader downstream sees one empty string — and that difference is now the likeliest way a credential fails to arrive: `${OIDC_SECRET}` with no matching `.env` entry expands to nothing and compose passes it on without complaint. Carrying the *names* keeps the readers pure and assertable, keeps `credential` (§3.10) a producible phase after its file-read producer was deleted, and holds to I6 by construction, since a value never lands in the list. The compose examples use `${VAR:-}` and not `${VAR:?}` for the same reason: an unresolved credential should reach LabView and be reported, not stop the container from starting. |
 | Rotation now needs a restart, and the docs say so | `tokenFile` and `passwordFile` were read per build, so a rotated secret took effect on the next rescan; an environment variable is fixed for the life of the process. This is the one capability the row above gives up, and it is written into §3.11 and the README rather than quietly dropped — a documented `docker compose up -d` beats an undocumented rotation that silently stopped working. The passwd file keeps its per-change re-read, which is where the property was actually earning its cost. |
+| The scan **asks** a service, instead of only reading its configuration | An application with its own login page — the largest class of real protection there is — carries no label, no env key and no entry in anybody's API, so no amount of reading configuration can see it. The only previous way to keep such a service out of the exposed count was a `.labview` declaration, which is unverifiable by construction: the count was either wrong or resting on a claim. A GET and the answer to it is observable evidence in the sense I1 means, and the codebase already knew the phenomenon from the other side — `discoverTraefikEndpoints` prefers an internal address precisely because a public hostname is fronted by an edge whose access policy would answer with a login page. |
+| The probe is **opt-in, default off** — the only integration that is | Every other read goes to an address the operator configured; this one goes to services out of their own compose files, and where that address is a public hostname the request leaves the fleet. A scan that started dozens of outbound requests unasked would be doing something the operator did not ask for, however benign each request is. The Authentik read set the precedent for opt-in; this is the stronger case for it. |
+| Eligibility is **observable HTTP only**, never a port number or an image name | The request said "http/https services, not databases", and the only way to honour that without a heuristic is to require evidence: a tunnel route whose own `service:` origin is http/https, or a `traefik.http.routers.*` label. A service with `ports:` and no route yields no address at all — so nothing is ever sent at a database port, and the rule needs no list of ports or images to keep out of I2's way. The cost is real and stated: a LAN-only web UI stays inferred rather than measured. Guessing from `5432` would be a fleet-recognising heuristic that is wrong on the first service that moves its port. |
+| The LAN address is **configured**, not discovered | LabView runs in a container and cannot observe its host's LAN address. `probe.lanHost` is the operator's answer; empty means the LAN vantage is skipped, because a guessed host would produce connection failures that read as services being down. |
+| Only four signals count as a login page, and everything else leaves the finding standing | `readGate` can only ever take a service **out** of the exposed count, so a clause that is merely likely manufactures false comfort — the one thing this project exists to remove. Hence a challenge header is required for a 401 (a bare 401 is an API saying "not signed in" while its UI serves the whole app), a same-origin redirect must land on a login path (`/dashboard` is routing), and a password field must arrive on a 200 whose body was HTML. A finding a reader dismisses costs them a look; the reverse error costs them the exposure. |
+| A probe result joins `hasEdgeAuth`, where a declaration may not | They look alike — both remove a service from the count without naming a mechanism — and the difference is I1 exactly. A declaration is a claim nothing in the scan can check, so it stays a separate term. A probe result is something LabView observed, the same kind of fact as a middleware definition, so it belongs in the evidence term. What keeps it honest is the `unnamed-gate` discipline it borrows: its own counter, its own reason, `auth.method` untouched, and the count reconstructible with the term dropped. |
+| The walk **stops at the first address that answers** | An answer is an answer, whatever the status — a 401 is the best outcome available here — so continuing to a weaker vantage would spend requests to learn something less. Only a transport failure falls through, which is what makes the LAN vantage useful at all: a public hostname routinely does not resolve from inside the container. Vantage order is `INGRESS_KINDS` order, most-exposed first, so the answer a reader is shown is the one an outsider would get. |
+| "Did not answer" is a **third** outcome, never folded into "no login page" | They are the same absence of a gate and completely different findings: one measured an exposure, the other measured nothing. Folding them would let a firewalled service read as "answered, open" — or, worse in the other direction, a timeout read as protection. So it counts in neither statistic, `probeOutcome` words it as `No answer`, and its note claims no measurement. |

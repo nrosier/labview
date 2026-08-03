@@ -1,8 +1,8 @@
 /**
  * The HTTP plumbing shared by every enrichment client that reads another system's
- * API (Authentik's, Traefik's).
+ * API (Authentik's, Traefik's) or asks a scanned service what it answers (the probe).
  *
- * Two rules hold for all of them and are enforced here rather than restated in
+ * Three rules hold for all of them and are enforced here rather than restated in
  * each client:
  *
  *  - **A request never throws.** Timeout, connection refused, a body that is not
@@ -31,6 +31,26 @@ export interface HttpResponse {
    * treats their absence as "no cookie was set".
    */
   headers?: { get(name: string): string | null };
+  /**
+   * The body as text. Only {@link getResponse} reads it, and only for HTML — a
+   * scanned service's login page is the one body in this program that is read as text
+   * rather than parsed as JSON.
+   *
+   * Optional so every existing stub still satisfies the type. Absent means the body
+   * cannot be read, not that it was empty.
+   */
+  text?(): Promise<string>;
+  /**
+   * The body as a stream, when the implementation exposes one — a real `fetch`
+   * response does; a stub does not.
+   *
+   * Preferred over {@link text} wherever it exists, because it is the only way to stop
+   * reading. A response with no `Content-Length` gives no way to know its size in
+   * advance, and `text()` has already bought the whole thing by the time it returns,
+   * so a size cap enforced afterwards is not a cap at all. Reading the stream and
+   * cancelling it at the cap is (invariant I8).
+   */
+  body?: ReadableStream<Uint8Array> | null;
 }
 
 /**
@@ -47,6 +67,13 @@ export type FetchLike = (
     signal?: AbortSignal;
     method?: string;
     body?: string;
+    /**
+     * `"manual"` hands the 3xx back instead of following it, which the probe needs:
+     * where a redirect goes is the evidence, and a followed redirect destroys it by
+     * reporting only what was at the end. Nothing else in the codebase sets this, so
+     * every other request keeps `fetch`'s default.
+     */
+    redirect?: "manual";
   },
 ) => Promise<HttpResponse>;
 
@@ -143,6 +170,157 @@ export async function postForm(
     method: "POST",
     body,
   });
+}
+
+/**
+ * What one GET at a scanned service produced. See {@link getResponse}.
+ *
+ * `ok` means something different here than on {@link JsonResult}, and the difference is
+ * the whole point of the second primitive: there, `ok` means the API returned the
+ * payload that was wanted, so a 401 is a failure. Here it means **a response arrived at
+ * all**, whatever its status — a 401 is the best answer a probe can get. So `phase` is
+ * `connected` for every status code, and only a transport failure produces anything else.
+ */
+export interface ResponseResult {
+  /** Whether an HTTP response arrived. Says nothing about its status. */
+  ok: boolean;
+  status?: number;
+  /** `Location`, verbatim and unresolved — it may be relative. */
+  location?: string;
+  /** `WWW-Authenticate`, verbatim. Present is what matters, not what it says. */
+  wwwAuthenticate?: string;
+  contentType?: string;
+  /** The body, only when it was HTML, and never more than {@link MAX_BODY_BYTES}. */
+  body?: string;
+  /** Why nothing arrived, with no credential in the text. */
+  error?: string;
+  /** `connected` whenever a response arrived; otherwise the transport stage that failed. */
+  phase: ConnectionPhase;
+  /** The transport code behind the phase — a constant, never an address. */
+  code?: string;
+}
+
+/**
+ * How much of an HTML body is read before the connection is cut.
+ *
+ * A login form's `<input type="password">` is in the first few kilobytes of every page
+ * that has one — it is in the markup, not below a megabyte of inlined script — so a
+ * larger cap would buy no additional evidence.
+ */
+export const MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * One GET at a scanned service, to see what it answers.
+ *
+ * The same three rules as {@link getJson} — cannot throw, names the stage that failed,
+ * puts no credential in a message — with four differences, each of them something the
+ * probe needs and no API client does:
+ *
+ *  - **`redirect: "manual"`.** Where a 3xx points is the evidence; following it would
+ *    report what was at the far end instead.
+ *  - **Every status is a success.** A 401 is the answer, not a fault, so `phase` is
+ *    `connected` throughout and the status is carried in `status` for the rule to read.
+ *  - **The three headers a login page is recognised by** are picked out: `Location`,
+ *    `WWW-Authenticate`, `Content-Type`.
+ *  - **The body is read only when it is HTML**, and then only up to
+ *    {@link MAX_BODY_BYTES}, cancelling the stream at the cap. A JSON, image or archive
+ *    response is never read at all.
+ *
+ * **No credential is ever sent.** Not by omission — no call path into this function has
+ * one in scope. The point is to see what an unauthenticated request gets, so a
+ * credential would destroy the measurement as surely as following a redirect would.
+ */
+export async function getResponse(
+  doFetch: FetchLike,
+  url: string,
+  opts: { timeoutMs: number },
+): Promise<ResponseResult> {
+  try {
+    const res = await doFetch(url, {
+      // `*/*` after the HTML preference, because a service that answers only JSON should
+      // answer rather than 406 — a 406 would be recorded as an exposure with no gate,
+      // which is true, and a body LabView refused to accept would be a worse reason for
+      // it than the one that is actually there.
+      headers: { Accept: "text/html,*/*" },
+      signal: AbortSignal.timeout(opts.timeoutMs),
+      redirect: "manual",
+    });
+    const header = (name: string): string | undefined => res.headers?.get(name)?.trim() || undefined;
+    const contentType = header("content-type");
+    return {
+      ok: true,
+      status: res.status,
+      location: header("location"),
+      wwwAuthenticate: header("www-authenticate"),
+      contentType,
+      body: isHtml(contentType) ? await readCapped(res) : undefined,
+      phase: "connected",
+    };
+  } catch (err) {
+    const e = err as Error;
+    if (e.name === "TimeoutError" || e.name === "AbortError") {
+      return { ok: false, error: "timed out", phase: "timeout" };
+    }
+    const cause = (err as { cause?: unknown }).cause;
+    const code = isObject(cause) && typeof cause.code === "string" ? cause.code : undefined;
+    return { ok: false, error: code ? `${e.message} (${code})` : e.message, phase: phaseForCode(code), code };
+  }
+}
+
+/** Whether a content type is HTML. `text/html; charset=utf-8` and bare `text/html` both. */
+function isHtml(contentType: string | undefined): boolean {
+  if (!contentType) return false;
+  const type = contentType.split(";")[0]!.trim().toLowerCase();
+  return type === "text/html" || type === "application/xhtml+xml";
+}
+
+/**
+ * At most {@link MAX_BODY_BYTES} of a response body, as text.
+ *
+ * Streamed and cancelled at the cap where a stream is available, which is what makes the
+ * cap real: a far end that keeps sending is cut off rather than waited out. Where it is
+ * not — a stub in the smoke run, which is not untrusted input — `text()` is truncated
+ * afterwards instead. Never throws: an unreadable body is no body, and the status and
+ * headers already gathered are worth more than the read that failed.
+ */
+async function readCapped(res: HttpResponse): Promise<string | undefined> {
+  try {
+    const stream = res.body;
+    if (stream) return await readStreamCapped(stream);
+    if (!res.text) return undefined;
+    const text = await res.text();
+    return text.length > MAX_BODY_BYTES ? text.slice(0, MAX_BODY_BYTES) : text;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readStreamCapped(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < MAX_BODY_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    // Releases the socket without draining whatever is still coming.
+    await reader.cancel().catch(() => undefined);
+  }
+  const out = new Uint8Array(Math.min(total, MAX_BODY_BYTES));
+  let at = 0;
+  for (const chunk of chunks) {
+    if (at >= out.length) break;
+    const take = Math.min(chunk.byteLength, out.length - at);
+    out.set(chunk.subarray(0, take), at);
+    at += take;
+  }
+  // Non-fatal: a page truncated mid-character must still be searchable.
+  return new TextDecoder("utf-8", { fatal: false }).decode(out);
 }
 
 async function requestJson(

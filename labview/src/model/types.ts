@@ -523,7 +523,23 @@ export interface TraefikSummary {
   unmatchedRouters: UnmatchedRouter[];
 }
 
-/** Derived authentication posture for a service. */
+/**
+ * Derived authentication posture for a service.
+ *
+ * Two kinds of thing are recorded here and they must not be conflated. `method`,
+ * `detail`, `evidence` and `confidence` describe *a mechanism LabView identified* —
+ * something it can name, from a middleware, an env key or an API read.
+ * `exposedWithoutAuth` is the verdict that follows, and it takes in evidence that names
+ * no mechanism at all: a SAML application behind an Authentik gate, a Cloudflare Access
+ * policy, an operator's declaration, a login page the probe was answered with.
+ *
+ * So a new source of protection extends the *verdict* and never the *method*. An
+ * {@link ServiceProbe} answering with a login page is real evidence — LabView made the
+ * request — but a password field cannot tell local accounts from OIDC from SAML, so
+ * turning it into an `AuthMethod` or a fourth `AuthConfidence` would put a name on
+ * something unnamed (invariant I3). It clears `exposedWithoutAuth`, is reported through
+ * its own `NoAuthReason`, and is counted in its own statistic.
+ */
 export interface AuthPosture {
   method: AuthMethod;
   /** Human-readable, e.g. "Authentik forward-auth via `authentik@docker`". */
@@ -537,6 +553,83 @@ export interface AuthPosture {
   confidence: AuthConfidence;
   /** True when the service is publicly reachable but has no detected auth. */
   exposedWithoutAuth: boolean;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The active probe (`src/model/probe.ts`, `src/enrich/probe.ts`)             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which of a service's own addresses answered the probe.
+ *
+ * The three names are {@link IngressKind}'s three external kinds, and the order they
+ * are declared in is the order they are tried: the public hostname first, because that
+ * is the vantage point an outsider actually has, and the LAN address last, because
+ * reaching a published port says nothing about what the edge in front of it would do.
+ *
+ * `probeTargets` in `model/probe.ts` builds the candidates; `PROBE_VANTAGES` there is
+ * this union as an array.
+ */
+export type ProbeVantage = "public" | "traefik" | "lan";
+
+/**
+ * Why a probe response was read as a login page — the strongest signal that fired.
+ *
+ * Four members and no fifth: each is a single observable fact about one response, and a
+ * signal that needed two facts held together would be an inference. `readGate` in
+ * `model/probe.ts` is the whole rule, and everything it does not recognise leaves the
+ * exposure finding standing.
+ */
+export type ProbeGate =
+  /** 401 or 407 *with* a `WWW-Authenticate` header: a credential was asked for. */
+  | "challenge"
+  /** A redirect to a different origin — the shape of every external SSO hand-off. */
+  | "redirect-origin"
+  /** A redirect to a login path on the same origin, i.e. the app's own sign-in page. */
+  | "redirect-login"
+  /** A 200 whose HTML carries a password field. The application's own login form. */
+  | "password-form";
+
+/**
+ * What one service's active probe observed.
+ *
+ * Evidence, in the sense invariant I1 means it — LabView sent the request and read the
+ * answer — and *not* a mechanism: see {@link AuthPosture} for why nothing here may
+ * become an `AuthMethod`. Beside `authentik` and `traefikLive` on {@link Service}
+ * rather than inside `auth`, the same placement `declared` has and for a related
+ * reason: this is a source, and `auth` is the conclusion drawn from every source.
+ *
+ * Present only when the service was eligible and the stage was enabled. A service that
+ * was probed and could not be reached still gets a record — `phase` says which stage
+ * failed and `gate` is absent, so "nothing answered" stays distinguishable from
+ * "answered, and served the page".
+ */
+export interface ServiceProbe {
+  /** The address that produced `phase`, origin only and credential-free. */
+  endpoint: string;
+  /** Which of the service's addresses that was. */
+  vantage: ProbeVantage;
+  /**
+   * How far the request got, on the same scale every other connection uses — but read
+   * differently, because a probe wants a different thing than an API client does.
+   *
+   * `connected` means *an HTTP response arrived*, whatever its status. A 401 is a failure
+   * for the Authentik client and the best possible outcome here, so mapping status codes
+   * to `authenticate` / `authorize` / `path` the way `phaseForStatus` does would leave
+   * "did this service answer at all" with no single test. Every other value is a
+   * transport failure — `resolve`, `connect`, `tls`, `timeout` — and means nothing
+   * answered, at which point `gate` is necessarily absent and the service counts in
+   * neither `OverviewStats.probeGated` nor `.probeOpen`. The status is in `status`.
+   */
+  phase: ConnectionPhase;
+  /** The HTTP status, when one came back. */
+  status?: number;
+  /** Which signal fired. Absent means no gate was observed, not that none exists. */
+  gate?: ProbeGate;
+  /** What happened, in one line, with no credential in the text. */
+  detail: string;
+  /** Every address tried, in vantage order, whether it answered or not. */
+  attempts: ConnectionAttempt[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -787,6 +880,11 @@ export interface Service {
    * Deliberately beside `auth` rather than inside it — see `DeclaredAuthMechanism`.
    */
   declared?: ServiceDeclaration;
+  /**
+   * What answered when LabView asked this service's own address, when the probe stage
+   * was enabled and the service was eligible for it. See {@link ServiceProbe}.
+   */
+  probe?: ServiceProbe;
   /** Notes/warnings surfaced during analysis. */
   notes: string[];
 }
@@ -1023,6 +1121,34 @@ export interface OverviewStats {
    * `declarationDrift`, which is what a statement the scan cannot confirm is.
    */
   declaredDependencies: number;
+  /**
+   * The two probe counters. Both count services LabView *asked* and got an answer from,
+   * which is what separates them from every counter above: those are read from
+   * configuration, these from a response.
+   *
+   * They are disjoint and together they are the services that answered — a service that
+   * was probed and could not be reached is in neither. Like the declaration counters,
+   * neither feeds `authProtected` or `byAuthMethod`, because a login page names no
+   * mechanism; and `probeGated` is what keeps invariant I1's reconstructibility, since
+   * subtracting it from `exposedWithoutAuth` gives the figure a scan with probing off
+   * would report.
+   */
+  /**
+   * Services that would be counted in `exposedWithoutAuth` but for a login page
+   * answering the probe. Evidence rather than a claim, which is why this and
+   * `declaredAuthProtected` are two numbers and not one.
+   */
+  probeGated: number;
+  /**
+   * Services that answered the probe with no gate observed.
+   *
+   * The other half of the value, and the reason the stage is worth running even where it
+   * clears nothing: an exposure that was inferred from labels is now one LabView
+   * measured. Not a subset of `exposedWithoutAuth` — a service behind a detected gate
+   * that answers LabView from inside the fleet is counted here too, and the note on it
+   * says so without touching its posture.
+   */
+  probeOpen: number;
   /**
    * The four network counters, over **real** docker network names — so an
    * `external:` network two stacks share is one network here, not two.

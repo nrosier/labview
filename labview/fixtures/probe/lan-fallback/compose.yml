@@ -1,0 +1,28 @@
+# Regression fixture: the fall-through between vantages, and the vantage a reader is told.
+#
+# Two addresses, tried in order. The tunnel hostname does not resolve — the ordinary state of
+# a fleet whose public names only exist on the outside — and a stage that stopped at the first
+# failure would report "did not answer" about a service that answers perfectly well. So the
+# failure is recorded as an attempt and the next candidate is tried: the published host port,
+# at `LABVIEW_PROBE_LAN_HOST`, which serves a login form.
+#
+# The gate is real and clears the exposure, but which address produced it is part of the
+# finding, not a detail. `vantage: lan` says the login form was seen on the port itself, with
+# nothing at the edge in front of it — a stronger statement about `lan` ingress than a public
+# hostname answering, and a weaker one about everything else. The drawer prints it for that
+# reason, and the failed public attempt stays in `attempts` so the reader can see the probe
+# tried the outside first.
+#
+# The port publishes on the wildcard, deliberately: a mapping bound to `127.0.0.1` does not
+# answer at a LAN address, and `probeTargets` declines to dial one rather than reporting the
+# refusal as though the service were down.
+services:
+  vault:
+    image: example/vault-ui:1.4.0
+    container_name: probe-lan-vault
+    ports:
+      - 18099:8080
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=vault.probe.example.com"
+      - "dockflare.service=http://probe-lan-vault:8080"

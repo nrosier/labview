@@ -58,7 +58,9 @@ live state from the Docker API, and never needs an agent inside each app.
   (rule, hosts, entrypoints, TLS, middlewares), the **live routers Traefik reports
   serving it** when its API was read (status, entrypoints, the resolved middleware
   chain, and each backend with the health Traefik itself reports for it), the
-  **derived auth posture with the evidence that led to it**, the matched
+  **derived auth posture with the evidence that led to it**, what the service answered
+  with when the [probe](#probing-a-service-directly) asked it — which address, and
+  whether a login page came back — the matched
   **Authentik applications and providers** when that API was read (including which
   outpost, if any, is actually serving each one), **each network it is on, what it
   depends on across that network, and who else is merely attached** — the two are
@@ -116,6 +118,13 @@ live state from the Docker API, and never needs an agent inside each app.
   same panel opens on the failure: what failed, the address, every candidate that was
   tried with its own stage, and the suggested fix. `Escape` closes the panel first, the
   service drawer second.
+- **A scan that can ask, not only read** — everything above comes from configuration.
+  Switch the [probe](#probing-a-service-directly) on and the scan also sends one
+  `GET /` per HTTP service and reads the answer for a login page, which is the largest
+  class of protection no compose file mentions. A login page takes the service out of
+  the exposed count with its own badge; an answer *without* one turns an exposure that
+  was inferred into one that was measured. Off by default, since it is the only stage
+  that sends a request to your own services.
 - **Rescan** — re-reads every `compose.yml` and `.env` under the apps root *and*
   re-runs both API exchanges, then reports what moved on each side, inline beside
   `scanned <time>`: `+1 stack, 2 services changed · authentik +2 applications`, with
@@ -294,6 +303,10 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_TRAEFIK_USERNAME` | *(unset)* | Only for an API reachable solely through an Authentik-gated hostname: an Authentik user, or the reserved `goauthentik.io/token` |
 | `LABVIEW_TRAEFIK_PASSWORD` | *(unset)* | That user's **app password** — not an API token, see [`config.example.yml`](config.example.yml). See [Where the credentials go](#where-the-credentials-go) |
 | `LABVIEW_TRAEFIK_TIMEOUT` | `5000` | Per-request timeout, ms. On timeout the scan continues from the labels alone |
+| `LABVIEW_PROBE_ENABLED` | `false` | Whether a scan **asks** each HTTP service for its front page. Off until you turn it on — this is the only stage that sends a request to a scanned service. See [Probing a service directly](#probing-a-service-directly) |
+| `LABVIEW_PROBE_LAN_HOST` | *(unset)* | Your host's LAN address, so a published port can be asked at `<lanHost>:<port>`. LabView sees only its own container's interfaces and cannot work this out. Unset means published ports are not asked |
+| `LABVIEW_PROBE_TIMEOUT` | `5000` | Per-request timeout, ms. A service that does not answer in time is recorded as a timeout, which is its own finding |
+| `LABVIEW_PROBE_MAX_CONCURRENCY` | `4` | Services asked at once. Kept low because these requests fan out across the fleet and many of them land on one reverse proxy |
 
 The default Docker endpoint is the conventional local socket, since it is the one
 endpoint that needs no assumption about your container names; a socket proxy is
@@ -467,6 +480,79 @@ credential is ever interpolated into an error message.
 Every failure here is soft too: nothing answering, a rejected credential, a timeout
 or a shape the parser doesn't recognize leaves the posture exactly as the labels
 described it, with the reason in `meta.traefik.error`.
+
+### Probing a service directly
+
+**Off by default.** With `LABVIEW_PROBE_ENABLED=true`, a scan stops only reading
+configuration and starts *asking*: one `GET /` per eligible service, and it reads what
+comes back for the signs of a login page.
+
+This exists because the largest class of real protection there is — an application's
+own login form — leaves no trace anywhere a compose scan can look. No middleware, no
+env key, no Authentik application. Before the probe the only way to keep such a service
+out of the exposed count was a [declaration](#declaring-what-the-scan-cannot-see), which
+nothing could check. Asking is evidence; a declaration is a claim.
+
+It cuts both ways, and the second half matters just as much: a service that answers
+with **no** login page turns an exposure that was inferred from configuration into one
+that was measured.
+
+**What gets asked, and at which address.** Only services where LabView has already
+*observed* HTTP — an `http`/`https` tunnel origin, or a `traefik.http.routers.*` label.
+Addresses are tried most- to least-exposed, and the walk stops at the first one that
+answers:
+
+| Vantage | Address | Note |
+|---|---|---|
+| `public` | `https://<tunnel hostname>/` | **This request leaves your fleet.** It goes out to the tunnel provider's edge and back in, exactly as a visitor's would |
+| `traefik` | `http(s)://<router host>/` | The proxy hostname from the label; `https` when the router declares TLS |
+| `lan` | `http://<lanHost>:<published port>/` | Only when `LABVIEW_PROBE_LAN_HOST` is set. Unset means this vantage is skipped |
+
+A service with a `ports:` mapping and no route is **not** eligible, and that is the rule
+that keeps the probe off your database ports — a Postgres port is never asked, whatever
+`LABVIEW_PROBE_LAN_HOST` is set to. The cost is stated plainly: a LAN-only service with
+no route stays inferred rather than measured. So does a `tcp://` tunnel, which is not
+HTTP no matter what is behind it.
+
+**What counts as a login page.** Four signals, all of them things in the response
+itself:
+
+| Signal | Fires on |
+|---|---|
+| Credential requested | 401 or 407 **with** a `WWW-Authenticate` header |
+| Redirected off-site | a 3xx whose `Location` is a different origin |
+| Redirected to a login path | a 3xx to `/login`, `/signin`, `/sso`, `/oauth2` or `/outpost.goauthentik.io` |
+| Login form served | a 200 whose HTML carries an `<input type="password">` |
+
+Nothing else. A bare 401 with no challenge header, a 403, a `/` → `/dashboard` redirect,
+a homepage with the words "Sign in" on it — all read as *not* a gate. They still show in
+the drawer as what was measured, but they do not clear an exposure. That asymmetry is
+deliberate: a false finding costs you a look, while false comfort is the thing this tool
+exists to remove.
+
+When a signal does fire, the service leaves the exposed count and its badge reads
+**Login page answered**. What it does *not* get is a mechanism: `auth.method` stays
+`none`, because a password field does not say whose login form it is. A probe is
+evidence of a gate and never a name for one.
+
+Two things it will not do. It will not contradict a gate your labels declare — a
+response from LabView's own vantage point may not have travelled the gated path, so an
+answer with no login page becomes a note, not a downgrade. And it will not make a stale
+[declaration](#declaring-what-the-scan-cannot-see) look right: an acceptance for an
+exposure the probe now finds gated is reported as drift.
+
+**What it sends.** `GET /` and nothing else — no credential is in scope on this code
+path, redirects are read rather than followed, at most four addresses per service, and
+a response body is read only when it is HTML and under a size cap. The URLs come out of
+your compose files, so they are treated as untrusted input.
+
+Failures are soft here too, and reported as their own outcome rather than folded into
+either verdict: a service that does not resolve, refuses the connection or times out is
+**No answer**, and its posture rests on configuration exactly as it did before. The
+aggregate reads like `31 services probed — 12 gated, 17 open, 2 did not answer`, and
+that mixed case is reported as `partial` rather than as a success: some of the fleet
+answered, and what was read is sound, but part of the picture is missing and the line
+says which part.
 
 ---
 
@@ -693,9 +779,10 @@ that. If you trust your edge that much, the open posture is what you want.
 
 ## When a connection fails
 
-Every outbound read — the Docker endpoint, the Authentik API, the Traefik API —
-reports the **stage** it stopped at, because "unreachable" covers a dozen different
-fixes. On startup and on any change you get one line per target:
+Every outbound read — the Docker endpoint, the Authentik API, the Traefik API, and
+the [direct probe](#probing-a-service-directly) when it is switched on — reports the
+**stage** it stopped at, because "unreachable" covers a dozen different fixes. On
+startup and on any change you get one line per target:
 
 ```text
 LabView scanning /data/apps
@@ -753,7 +840,8 @@ API behind it.
 discover stacks → parse compose (+ .env interpolation) → enrich from Docker
       → build middleware registry → classify ingress
       → build the fleet index → resolve tunnel origins
-      → read the Authentik API ∥ read the Traefik API   (one round trip, not two)
+      → read the Authentik API ∥ read the Traefik API ∥ ask each HTTP service
+                                          (one round trip; the third is opt-in)
       → discover Authentik hostnames
       → match Authentik applications ∥ match live routers to services
       → derive auth posture → build graph → serve /api/overview
@@ -977,7 +1065,9 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `lan` — with no detected *proxy/SSO* auth is flagged. Note this is honest about
   *proxy* auth only: apps with their own built-in login (Emby, Home Assistant,
   Authentik itself) will appear here, and the note wording says exactly that. Where
-  that built-in login is the answer, a `.labview` sidecar is how you say so — see
+  that built-in login is the answer, there are two ways to say so: switch on the
+  [direct probe](#probing-a-service-directly) and let the login page answer for itself,
+  which is evidence, or write a `.labview` sidecar, which is a claim — see
   [Declaring what the scan cannot see](#declaring-what-the-scan-cannot-see).
 - **Rescan re-reads everything, and says what moved.** Nothing is remembered
   between scans: every `compose.yml` and `.env` under the apps root is read again,
@@ -1050,6 +1140,15 @@ discover stacks → parse compose (+ .env interpolation) → enrich from Docker
   `LABVIEW_TRAEFIK_PASSWORD` is in the always-masked key list, so LabView scanning
   its own stack cannot print its own credential, and no credential is interpolated
   into any error string.
+- **The one read that goes to a scanned service is off by default.** The
+  [direct probe](#probing-a-service-directly) is the only stage that sends a request to
+  something in your fleet, and it does nothing until `LABVIEW_PROBE_ENABLED=true`. Turned
+  on it is `GET /` with no credential in scope on that code path, redirects read rather
+  than followed, at most four addresses per service, a body read only when it is HTML and
+  under a size cap, and only ever to a service where HTTP was *observed* — a database
+  port is never asked. A public hostname means the request leaves the fleet and comes
+  back through your edge, which is the point of that vantage and worth knowing before you
+  switch it on.
 - **LabView's own login is off until configured, and gates the data when it is.** With a
   `/config/passwd` entry or an OIDC issuer, `/api` needs a session; the SPA shell stays
   public because it carries nothing fleet-specific. Passwords are bcrypt, failed attempts
@@ -1336,6 +1435,29 @@ were `string[]` in earlier versions, so this is a **breaking change** for any ex
 consumer. It was made instead of adding a second, parallel list so that why a match did
 not happen has one home rather than a name in one place and a reason in another.
 
+The [direct probe](#probing-a-service-directly) is **additive** — nothing in the payload
+changed shape for it. `service.probe` is present only for services that were asked, and
+absent for every service when the stage is off:
+
+```jsonc
+{
+  "endpoint": "https://app.example.com",     // origin only, credential-free
+  "vantage": "public",                       // "public" | "traefik" | "lan"
+  "phase": "connected",                      // `connected` = a response arrived, whatever its status
+  "status": 302,
+  "gate": "redirect-origin",                 // absent unless one of the four signals fired
+  "detail": "HTTP 302 — redirected off-site",
+  "attempts": [ /* one per address tried, in vantage order — same shape as every other target's */ ]
+}
+```
+
+`phase` reads differently here than on the API clients: `connected` means *an HTTP
+response arrived*, so a 401 is the best possible outcome rather than a failure, and
+every other value (`resolve`, `connect`, `tls`, `timeout`) means nothing answered — at
+which point `gate` is necessarily absent. `stats.probeGated` and `stats.probeOpen` are
+the two counts that follow from it, and `meta.connections` gains a fourth entry with
+`target: "probe"`, `disabled` when the stage is off.
+
 The **ingress vocabulary** is a third **breaking change**, in three steps. The first was
 a pure rename, every value mapping one-to-one onto the old one:
 
@@ -1464,6 +1586,8 @@ fixtures/
   authentik-api.json   canned API responses for the above
   traefik/    a fleet whose labels and live proxy config disagree
   traefik-api.json     canned proxy + identity responses for the above
+  probe/      a fleet the scan asks: every login-page signal, every near-miss,
+              and the services that must never be asked at all
 ```
 
 ```bash
@@ -1472,7 +1596,7 @@ npm run smoke        # runs the pipeline against fixtures/ and asserts results
 npm run build        # web bundle + server compile
 ```
 
-`npm run smoke` runs the whole pipeline against five fixture roots — `apps` for
+`npm run smoke` runs the whole pipeline against six fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
 redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
 nested interpolation, LAN-port exposure — `ports:` vs `expose:`, the
@@ -1480,11 +1604,13 @@ tunnel-straight-at-the-container pattern and the bypass note on a proxied servic
 — and provider attribution in a fleet whose SSO is *not* Authentik, where every
 mechanism is observable but nothing may be attributed to a vendor), `nets` for what
 is and is not a connection between two services, `authentik` for the
-identity-provider integration, and `traefik` for the reverse-proxy integration.
+identity-provider integration, `traefik` for the reverse-proxy integration, and
+`probe` for the [direct probe](#probing-a-service-directly).
 
 Both API roots drive canned responses (`fixtures/authentik-api.json`,
 `fixtures/traefik-api.json`) through an injected HTTP layer, so the tests need no
-network, no Authentik and no proxy.
+network, no Authentik and no proxy. The probe root's stub is keyed by URL for the
+same reason — which address was asked is half of what there is to assert.
 
 The `authentik` root pins each match rule in isolation, the rejection of an
 ambiguous match, the unserved-provider outcome, pagination, and the rule that a
@@ -1508,9 +1634,26 @@ directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
 both directions, so the contribution is measured rather than assumed.
 
-Every fixture is written so it fails if the corresponding logic is reverted — for
-both API integrations that was checked by actually backing each rule out one at a
-time and confirming the expected assertions broke.
+The `probe` root is a fleet of eleven stacks built so that every login-page signal
+and every near-miss appears exactly once, and it is run **twice** — once with the probe
+off and once on — so what the stage contributes is measured rather than assumed. It
+pins: each of the four signals clearing an exposure, and each near-miss (a bare 401
+with no challenge header, a 403, a same-origin `/dashboard` redirect, a page with
+"Sign in" on it and no password field) leaving the exposure standing; the vantage walk
+stopping at the first address that answers, and falling through only on a transport
+failure; a `tcp://` tunnel and a service with `ports:` and no route never being asked
+at all; a service that does not answer coming back as a third outcome rather than
+either verdict; a configured gate that is *not* downgraded by an open answer, and a
+stale acceptance that *is* reported as drift. Three cross-cutting checks run over both
+passes: that the exposed count with the probe on equals the count with it off minus
+exactly the services a login page answered for (I1), that no service's mechanism or
+confidence moved between the two runs (I3), and that the whole set of requests the stage
+sent was `GET /` and nothing else, with no credential, no address asked twice, and
+nothing sent anywhere near a published database port (I8).
+
+Every fixture is written so it fails if the corresponding logic is reverted — for both
+API integrations and for the probe that was checked by actually backing each rule out
+one at a time and confirming the expected assertions broke.
 
 The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
 ~3 MB) so the dashboard works fully offline with no CDN dependency.

@@ -1,0 +1,27 @@
+# Regression fixture: a same-origin redirect is a gate only when it lands on a login path.
+#
+# This service redirects `/` to `/login` on its own host, which is what an application with
+# its own session middleware does to an unauthenticated visitor. The stack beside it
+# (`open-app`) redirects to `/dashboard`, which is an application routing and is not a gate
+# — the two exist as a pair, because a rule that treats every same-origin 302 as a login
+# page would clear half a fleet on no evidence at all.
+#
+# The sidecar beside this file declares the same login the probe found, so this is also the
+# one service where both `probed-gate` and `declared` are true at once. A reader gets the
+# measured one: the two are not equal statements, and wording a login page LabView was
+# actually served as "declared, not detected" would understate what is known.
+services:
+  wiki:
+    image: example/wiki:1.4.0
+    container_name: probe-own-login
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ownlogin.rule=Host(`wiki.probe.example.com`)"
+      - "traefik.http.routers.ownlogin.entrypoints=websecure"
+      - "traefik.http.routers.ownlogin.tls=true"
+
+networks:
+  proxy:
+    external: true

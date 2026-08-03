@@ -1,0 +1,21 @@
+# Regression fixture: a measurement against the declaration that was holding a finding back.
+#
+# The sidecar beside this file declares that the application logs users in with its own
+# accounts. Nothing in the scan can see such a thing, so the declaration is `supplies` — the
+# single case where a `.labview` file changes a verdict, and the service is kept out of the
+# exposed count on the operator's word alone.
+#
+# Then LabView asked, and was served the application: `200`, no challenge, no redirect, no
+# password field. That is the strongest argument there is for this whole stage. The verdict
+# still stands — the probe asked one address, at `/`, once, and a login page can live one
+# route deeper — so the declaration is not overridden. What it earns is a drift entry saying
+# the two do not agree, which is exactly the service an operator wants from a file they wrote
+# eighteen months ago and have not looked at since.
+services:
+  portal:
+    image: example/portal:2.0.0
+    container_name: probe-declared-portal
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=portal.probe.example.com"
+      - "dockflare.service=http://probe-declared-portal:8080"

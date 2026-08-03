@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main  # Trigger on pushes to the main branch
+  pull_request:
+    branches:
+      - main  # Trigger on pull requests targeting the main branch
 
 # The build needs no write access to the repo; the Docker Hub login uses its own
 # secrets rather than GITHUB_TOKEN.

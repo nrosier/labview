@@ -15,6 +15,7 @@ import {
   networkMembershipText,
   networkScopeMeta,
   noAuthReason,
+  probeVantageText,
   relationLabel,
   serviceConnections,
   showsDeclaredAuth,
@@ -30,6 +31,7 @@ import {
   ExposedBadge,
   IngressBadge,
   NoAuthPill,
+  ProbeResult,
   StatusDot,
 } from "./badges";
 import { Mermaid } from "./Mermaid";
@@ -541,6 +543,35 @@ export function AppDetail({
               </dd>
               <dt>Detail</dt>
               <dd>{svc.auth.detail}</dd>
+              {/* Absent unless this service was actually asked, which needs probing turned
+                  on and an address its own labels showed. A row reading "not probed" on
+                  every service in a fleet nobody enabled it for would be furniture. */}
+              {svc.probe && (
+                <>
+                  <dt title="LabView requested this service at its own address during the scan, with no credential, and did not follow the redirect">
+                    Probe
+                  </dt>
+                  <dd>
+                    <ProbeResult probe={svc.probe} />
+                    <div class="muted-inline">
+                      <span class="mono">{svc.probe.endpoint}</span> ·{" "}
+                      {probeVantageText(svc.probe.vantage)}
+                    </div>
+                    {/* Only where nothing answered. On a success the earlier candidates
+                        are addresses that lost a race, and listing them would read as
+                        problems — the same rule `formatConnection` keeps for the log. */}
+                    {svc.probe.phase !== "connected" && svc.probe.attempts.length > 1 && (
+                      <ul class="evidence" style="margin-top:6px;">
+                        {svc.probe.attempts.map((a) => (
+                          <li class="mono">
+                            {a.endpoint}: {a.phase} — {a.detail}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </dd>
+                </>
+              )}
             </dl>
             {svc.auth.evidence.length > 0 && (
               <ul class="evidence" style="margin-top:8px;">

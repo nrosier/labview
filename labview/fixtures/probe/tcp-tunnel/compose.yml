@@ -1,0 +1,26 @@
+# Regression fixture: a tunnel route is not by itself evidence of HTTP.
+#
+# Cloudflare tunnels carry more than web traffic. These two routes name origins the operator
+# themselves declared as `tcp://` and `ssh://`, so the service on the far end does not speak
+# HTTP and an HTTP GET aimed at it is a byte LabView had no business sending. The scheme in
+# `dockflare.service` is the whole of the evidence, and it is the operator's own value.
+#
+# Both services are `public` ingress with no detected authentication, so both stay in the
+# exposed count — untouched, unmeasured, and honestly so. A probe that guessed HTTP from the
+# presence of a hostname would have reported these two as open web services.
+services:
+  postgres-tunnel:
+    image: postgres:16-alpine
+    container_name: probe-tcp-postgres
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=pg.probe.example.com"
+      - "dockflare.service=tcp://probe-tcp-postgres:5432"
+
+  bastion:
+    image: example/bastion:1.0.0
+    container_name: probe-tcp-bastion
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=ssh.probe.example.com"
+      - "dockflare.service=ssh://probe-tcp-bastion:22"

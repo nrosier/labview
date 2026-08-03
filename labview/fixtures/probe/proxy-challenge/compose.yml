@@ -1,0 +1,24 @@
+# Regression fixture: 401 with a challenge header is a gate; a bare 401 is not.
+#
+# A Traefik router with no auth middleware on it, so the labels say nothing about
+# authentication. The address answers `401` *with* a `WWW-Authenticate` header, which is a
+# server refusing to serve anything until a credential arrives — the `challenge` signal.
+#
+# The router declares `tls`, so the probe asks over https. That is not a detail: the URL
+# scheme is built from the router's own certificate resolver, and a service asked on the
+# wrong scheme answers with a protocol error rather than with its login page.
+services:
+  api:
+    image: example/api:2.0.0
+    container_name: probe-proxy-challenge
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.challenge.rule=Host(`challenge.probe.example.com`)"
+      - "traefik.http.routers.challenge.entrypoints=websecure"
+      - "traefik.http.routers.challenge.tls.certresolver=letsencrypt"
+
+networks:
+  proxy:
+    external: true

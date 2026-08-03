@@ -4,6 +4,7 @@ import { DEFAULT_DOCKER_SOCKET, type LabViewConfig } from "../config.js";
 import type { ConnectionPhase, ConnectionReport, DockerState, PortMapping } from "../model/types.js";
 import { hintFor, plural } from "../model/connections.js";
 import { phaseForCode, phaseForStatus } from "./http.js";
+import { mapWithConcurrency } from "./pool.js";
 
 export interface DockerSnapshot {
   available: boolean;
@@ -311,28 +312,6 @@ export function classifyDockerError(
     };
   }
   return { phase: phaseForCode(code), detail: message, code };
-}
-
-/**
- * Map `items` through `fn` with at most `limit` calls in flight, preserving
- * input order in the result.
- */
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const i = next++;
-      if (i >= items.length) return;
-      out[i] = await fn(items[i]!);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return out;
 }
 
 function toState(i: Docker.ContainerInspectInfo, summary: string): DockerState {

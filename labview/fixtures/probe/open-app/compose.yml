@@ -1,0 +1,30 @@
+# Regression fixture: the other half of the value — an exposure that was measured.
+#
+# Two services, and neither of them is a gate.
+#
+# `dash` is asked at its tunnel hostname and answers `200` with its own homepage: no
+# challenge header, no redirect, no password field. The finding it already had stands, and
+# the exposure note gains the sentence that makes it worth reading — LabView asked, and was
+# served the application. Nothing about this service's posture changes; what changes is that
+# it stopped being an inference.
+#
+# `routing` is the near-miss for the same-origin redirect rule: `/` sends the visitor to
+# `/dashboard`, which is an application routing to its landing page, not a gate. A rule that
+# read every 302 as a login page would take this service out of the exposed count on the
+# strength of nothing.
+services:
+  dash:
+    image: example/dash:1.0.0
+    container_name: probe-open-dash
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=dash.probe.example.com"
+      - "dockflare.service=http://probe-open-dash:3000"
+
+  routing:
+    image: example/routing:1.0.0
+    container_name: probe-open-routing
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=routing.probe.example.com"
+      - "dockflare.service=http://probe-open-routing:8080"

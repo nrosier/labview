@@ -1,0 +1,24 @@
+# Regression fixture: a login page LabView was answered with is protection.
+#
+# A tunnel hostname, nothing else: no middleware, no OIDC env key, no Authentik
+# application, and therefore nothing a compose scan can call authentication. Before the
+# probe this service was `exposed, no auth`, and the only way to say otherwise was a
+# `.labview` declaration nothing could check.
+#
+# The probe asks `https://login.probe.example.com/` and is served an HTML page with a
+# password field. That is the largest class of real protection there is — the application's
+# own login form — so the service leaves the exposed count, `noAuthReason` reports
+# `probed-gate`, and `auth.method` stays `none` because a password field names no mechanism.
+#
+# The sidecar beside this file accepts an exposure that is no longer there. That is the second
+# rule this stack pins: an acceptance the scan has outgrown is reported as drift, and the
+# reason it gives is the measurement rather than "authenticated at the edge" — there is no
+# edge here, and sending the operator to look at a proxy would waste their afternoon.
+services:
+  app:
+    image: example/app:1.0.0
+    container_name: probe-tunnel-login
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=login.probe.example.com"
+      - "dockflare.service=http://probe-tunnel-login:8080"

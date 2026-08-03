@@ -5,8 +5,16 @@ import type {
   DockerState,
   IngressKind,
   NoAuthReason,
+  ServiceProbe,
 } from "../model";
-import { declaredAuthLabel, declaredAuthSummary, noAuthText, showsAuthMethod, showsDeclaredAuth } from "../model";
+import {
+  declaredAuthLabel,
+  declaredAuthSummary,
+  noAuthText,
+  probeOutcome,
+  showsAuthMethod,
+  showsDeclaredAuth,
+} from "../model";
 import { authLabel, authVar, ingressLabel, ingressVar } from "../lib/palette";
 import { statusView } from "../lib/format";
 import { IconCheck, IconGlobe, IconLan, IconLock, IconServer, IconShield, IconWarning } from "./icons";
@@ -75,6 +83,23 @@ export function NoAuthPill({ reason }: { reason: NoAuthReason }) {
   return (
     <span class={`pill${reason === "gap" ? " crit" : ""}`} title={text.title}>
       {text.label}
+    </span>
+  );
+}
+
+/**
+ * What one active probe was answered with.
+ *
+ * `crit` on the open case rather than on the gated one, which is the opposite of how the
+ * word usually reads here: a gate answering is the reassurance, and a service that served
+ * LabView its application without asking anything is the finding. All three labels and
+ * their sentences come from `probeOutcome`, so this component decides nothing.
+ */
+export function ProbeResult({ probe }: { probe: ServiceProbe }) {
+  const out = probeOutcome(probe);
+  return (
+    <span class={`pill${out.critical ? " crit" : ""}`} title={out.title}>
+      {out.label}
     </span>
   );
 }
