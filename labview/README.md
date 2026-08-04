@@ -2093,7 +2093,13 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   current-user address, and the tool asks. For everything else it reports what a visitor
   was shown — every link, every form-less control, the visible text — and says which of
   those facts point at *open*, which point at a login the scan cannot see, and which are
-  only worth another look.
+  only worth another look. For the body that genuinely drew nothing and whose API answers a
+  *bare* `401`, the remedy is a line in the sidecar rather than a bigger probe: an `auth:`
+  declaration (see [`.labview.example`](.labview.example)) takes the service out of the
+  exposed count, is counted as *declared* rather than detected while doing it, and leaves
+  what the probe read untouched. Rendering the page or fetching its bundle would not close
+  that gap honestly — an application ships the same JavaScript whether the deployment gated
+  it or not, so nothing inside it is evidence about *this* deployment.
 - **A service behind a detected gate is no longer measured at all.** It is not asked, so
   there is no answer to report and its drawer carries no probe block — the posture rests
   on the configuration that already established it. What that costs is a corroboration

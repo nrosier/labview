@@ -344,7 +344,14 @@ read carefully here:
   is nothing to change. If it did not, that is deliberate: a bare 401 is what an anonymous-enabled
   Grafana and a world-readable Gitea answer, so counting it would clear services that really are
   open. Changing that is a one-line change to `readStateGate` and a decision about which error you
-  would rather make — not a missing rule.
+  would rather make — not a missing rule. If a ninth signal ever settles this one, this is the shape
+  it would need: not a looser reading of the refusal, but a *second fact beside it* — whether the API
+  serves anything at all to a caller with no credential, as well as refusing its current-user
+  address. An application that refuses everything anonymously is not the anonymous-enabled Grafana
+  the bare 401 has to stay safe for, and unlike a login route literal in a bundle that fact is
+  specific to *this* deployment rather than shipped with the application. It would have to be
+  measured here first — enough real bodies to know what it clears wrongly — before it became a rule,
+  a fixture and a revert trap, which is the road `state-challenge` took.
 - **At one of the other four the lab sweeps** — that is a finding, and section 4 sizes it: one
   entry added to `STATE_PATHS`, a fixture under `fixtures/probe/`, and no new rule. The list is
   the request budget, so an entry is not free; but it is a much smaller change than the one this

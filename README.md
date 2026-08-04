@@ -632,7 +632,9 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   positive reading above, which came out of the tool describing a page by everything it
   happened not to have. For everything else it reports what a visitor was shown — every link,
   every form-less control, the visible text — and marks which of those facts point at *open*
-  and which only warrant a second look.
+  and which only warrant a second look. For what is left, a `.labview` sidecar declaring the
+  service's login is the answer rather than a heavier probe: it clears the exposure, says
+  *declared* rather than detected while doing it, and leaves the detection alone.
 - Authentik's applications endpoint filters itself by what the token's user may
   launch, so a least-privilege token is not shown every application. LabView reports
   the total and rebuilds the withheld ones from their providers, but an application
