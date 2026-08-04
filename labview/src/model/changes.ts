@@ -95,12 +95,14 @@ const VOLATILE_SERVICE_FIELDS: readonly string[] = [
  * same reason as the volatile fields above.
  *
  * A declaration is parsed from a file, so it belongs in the comparison — an edited
- * sidecar is exactly the kind of change this is here to report. But `drift` and
- * `authAgreement` are conclusions about the scan that happen to be stored on the
- * declaration, so a service whose *detected* posture moved would otherwise be reported
- * as an edited file, which is the one thing the deny-list above exists to prevent.
+ * sidecar is exactly the kind of change this is here to report. But `drift`,
+ * `unconfirmed` and `authAgreement` are conclusions about the scan that happen to be
+ * stored on the declaration, so a service whose *detected* posture moved would otherwise
+ * be reported as an edited file, which is the one thing the deny-list above exists to
+ * prevent. `unconfirmed` is the most volatile of the three — it turns on whether a probe
+ * ran at all, so a scan with the toggle flipped would rewrite every declared service.
  */
-const DERIVED_DECLARATION_FIELDS: readonly string[] = ["drift", "authAgreement"];
+const DERIVED_DECLARATION_FIELDS: readonly string[] = ["drift", "unconfirmed", "authAgreement"];
 
 /** Everything about a service that came out of the compose document, as one string. */
 function serviceConfig(svc: Service): string {

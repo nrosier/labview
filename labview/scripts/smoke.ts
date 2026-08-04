@@ -154,6 +154,7 @@ const { MAX_AUTH_ENTRIES, MAX_LIST_ENTRIES, MAX_SIDECAR_BYTES, MAX_TEXT_CHARS, p
 const {
   DECLARED_AUTH_MECHANISMS,
   collectDeclarationDrift,
+  collectUnconfirmedDeclarations,
   compareDeclaredAuth,
   declaredAuthFamily,
   declaredAuthLabel,
@@ -161,6 +162,7 @@ const {
   driftSummaryText,
   formatExposureCount,
   showsDeclaredAuth,
+  unconfirmedSummaryText,
 } = await import("../src/model/declarations.js");
 const { INGRESS_KINDS, ingressMatchesExpectation, isExternallyReachable, normalizeIngress, rollUpIngress } =
   await import("../src/model/ingress.js");
@@ -7526,8 +7528,9 @@ check(
 console.log("\na measurement against a declaration that was holding a finding back");
 // The strongest argument for the whole stage: the declaration was the only reason this
 // service was not counted, and LabView has now been served the application. It is still not
-// an override — one address, at `/`, once — so the verdict stands and the disagreement is
-// reported as drift, which is what an operator wants from a file they wrote long ago.
+// an override — one address, at `/`, once — and it is not a disagreement either, so what it
+// earns is an `unconfirmed` entry rather than drift. Silence from one request is equally
+// consistent with a login a route deeper; only a contradiction belongs in the warning channel.
 function messageContainsExactUrlHost(message: string, protocol: string, hostname: string): boolean {
   const urlCandidates = message.match(/https?:\/\/[^\s)]+/g) ?? [];
   return urlCandidates.some((candidate) => {
@@ -7545,20 +7548,111 @@ check(
   portal.declared?.authAgreement === "supplies" && portal.auth.exposedWithoutAuth === false,
   `${String(portal.declared?.authAgreement)} exposed=${portal.auth.exposedWithoutAuth}`,
 );
+// The revert trap for the whole change: restoring the `drift.push` this replaced fails here,
+// and fails loudly, because the entry it writes is the one thing this fixture exists to forbid.
 check(
-  "...and the disagreement is reported as drift, naming both sides",
-  (portal.declared?.drift ?? []).some(
-    (d) =>
-      d.includes("declares the service authenticates itself") &&
-      messageContainsExactUrlHost(d, "https:", "portal.probe.example.com") &&
-      d.includes("either the declaration is out of date"),
-  ),
-  (portal.declared?.drift ?? []).join(" | ") || "no drift",
+  "...and an answer with no login page is not drift, because it contradicts nothing",
+  (portal.declared?.drift ?? []).length === 0,
+  (portal.declared?.drift ?? []).join(" | "),
 );
 check(
-  "...which is a disagreement the run with the probe off cannot produce",
-  (pbSvcOff("declared-open", "portal").declared?.drift ?? []).length === 0,
-  (pbSvcOff("declared-open", "portal").declared?.drift ?? []).join(" | "),
+  "...it is one unconfirmed entry, naming the address and refusing the inference by name",
+  (portal.declared?.unconfirmed ?? []).length === 1 &&
+    (portal.declared?.unconfirmed ?? []).every(
+      (d) =>
+        d.includes("declares the service authenticates itself") &&
+        messageContainsExactUrlHost(d, "https:", "portal.probe.example.com") &&
+        d.includes("an absence of evidence rather than a disagreement") &&
+        d.includes("The declaration stands, unconfirmed."),
+    ),
+  (portal.declared?.unconfirmed ?? []).join(" | ") || "nothing recorded",
+);
+// The point of the demotion, stated as arithmetic: the service is still withheld from the
+// exposure count on the declaration's strength, and is still counted among the ones that are
+// protected only because somebody said so.
+check(
+  "...with the service still counted as declared-protected, unverified as it ever was",
+  probed.stats.declaredAuthProtected > 0 && probed.stats.declaredAuthUnconfirmed === 1,
+  `protected=${probed.stats.declaredAuthProtected} unconfirmed=${probed.stats.declaredAuthUnconfirmed}`,
+);
+// A subset, not a second population. Asserted rather than argued from `noteDeclarations`
+// only writing the field under `supplies`: that is the reason it holds, not a proof it does.
+check(
+  "...and the new counter is a subset of that one, never a population of its own",
+  probed.stats.declaredAuthUnconfirmed <= probed.stats.declaredAuthProtected,
+  `${probed.stats.declaredAuthUnconfirmed} of ${probed.stats.declaredAuthProtected}`,
+);
+// The same tile-equals-panel claim already pinned for drift, for the panel that opens beside
+// it. `collectUnconfirmedDeclarations` is what the panel lists, so the two counts are one.
+const portalUnconfirmed = collectUnconfirmedDeclarations(probed.stacks);
+check(
+  "the not-confirmed panel lists exactly as many services as its tile counts",
+  portalUnconfirmed.services === probed.stats.declaredAuthUnconfirmed &&
+    portalUnconfirmed.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", ") === "declared-open:1",
+  `report ${portalUnconfirmed.services} vs tile ${probed.stats.declaredAuthUnconfirmed} — ` +
+    portalUnconfirmed.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", "),
+);
+check(
+  "...and says so in its own noun, because a disagreement is not what it is counting",
+  unconfirmedSummaryText(portalUnconfirmed) === "1 service in 1 stack · 1 unconfirmed declaration",
+  unconfirmedSummaryText(portalUnconfirmed),
+);
+// The two fields over one fleet, which is where the distinction is easiest to read: the same
+// probe stage produced both entries, and they are in different channels because the evidence
+// behind them is different in kind. `tunnel-login` was signed off as open and answered with a
+// login form — a gate *found*, so a genuine contradiction, and still drift. `declared-open`
+// answered with nothing, so it is not.
+const probedDrift = collectDeclarationDrift(probed.stacks);
+check(
+  "...while the drift panel over the same fleet holds only the entry backed by a measurement",
+  probedDrift.services === probed.stats.declarationDrift &&
+    probedDrift.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", ") === "tunnel-login:1",
+  `tile ${probed.stats.declarationDrift} — ${probedDrift.stacks.map((s) => `${s.stackId}:${s.entries}`).join(", ")}`,
+);
+// Neither field, with the stage off: the entry is a probe result, so a run that asked nothing
+// has nothing to record — and the sidecar on disk is identical in both runs.
+check(
+  "with the probe off the same sidecar earns neither an unconfirmed entry nor drift",
+  (pbSvcOff("declared-open", "portal").declared?.unconfirmed ?? []).length === 0 &&
+    (pbSvcOff("declared-open", "portal").declared?.drift ?? []).length === 0 &&
+    unasked.stats.declaredAuthUnconfirmed === 0,
+  `${(pbSvcOff("declared-open", "portal").declared?.unconfirmed ?? []).join(" | ")} / ` +
+    `${(pbSvcOff("declared-open", "portal").declared?.drift ?? []).join(" | ")} / ` +
+    `tile ${unasked.stats.declaredAuthUnconfirmed}`,
+);
+// The rule the entry is written under, asserted over the fleet rather than read off the one
+// branch in `noteDeclarations`: an unconfirmed entry only ever belongs to a service whose
+// declaration is the sole reason a finding is withheld, and whose probe came back with no gate.
+// Both halves matter. Without the first the entry would appear beside a mechanism the scan can
+// see, where it says nothing; without the second it would be claiming silence from an answer
+// that was not silent.
+const withUnconfirmed = probed.stacks.flatMap((s) =>
+  s.services.filter((v) => (v.declared?.unconfirmed.length ?? 0) > 0),
+);
+check(
+  "an unconfirmed entry only ever sits on a declaration that is holding a finding back",
+  withUnconfirmed.length === 1 &&
+    withUnconfirmed.every(
+      (v) =>
+        v.declared?.authAgreement === "supplies" &&
+        v.probe?.phase === "connected" &&
+        v.probe.gate === undefined,
+    ),
+  withUnconfirmed
+    .map((v) => `${v.name}=${String(v.declared?.authAgreement)}/${String(v.probe?.gate)}`)
+    .join(" ") || "nothing carries one",
+);
+// The other side of the same rule, and the reason this is a sibling field rather than a member
+// of `DeclaredAuthAgreement`: `own-login/wiki` declares the very login the probe found, so its
+// probe result and its declaration coexist as `supplements` — an agreement no comparison
+// against the probe could have produced, since `compareDeclaredAuth` cannot see one.
+check(
+  "...and a probed service whose answer *was* a gate is left alone, whatever it declared",
+  pbSvc("own-login", "wiki").declared?.authAgreement === "supplements" &&
+    (pbSvc("own-login", "wiki").declared?.unconfirmed ?? []).length === 0 &&
+    result("own-login", "wiki").gate !== undefined,
+  `${String(pbSvc("own-login", "wiki").declared?.authAgreement)} gate=${String(result("own-login", "wiki").gate)} ` +
+    `entries=${(pbSvc("own-login", "wiki").declared?.unconfirmed ?? []).length}`,
 );
 
 /* -------------------------------------------------------------------------- */
@@ -8609,6 +8703,7 @@ declSvc.declared = {
   dependsOn: [],
   auth: [{ mechanism: "app-ldap" }],
   drift: [],
+  unconfirmed: [],
 };
 const declSvcDiff = diffStacks(stacksA, declSvcEdited);
 check(
@@ -8630,6 +8725,19 @@ check(
   "a conclusion the analyzer wrote onto a declaration is not a file edit",
   diffStacks(declSvcEdited, driftOnly).unchanged,
   JSON.stringify(diffStacks(declSvcEdited, driftOnly).changed),
+);
+// `unconfirmed` is the third of them and the most volatile: it turns on whether a probe ran at
+// all, so with the toggle flipped between two scans every declared service in the fleet would
+// be reported as an edited sidecar. Asserted on its own rather than folded into the mutation
+// above so that dropping it from `DERIVED_DECLARATION_FIELDS` fails a check that names it.
+const unconfirmedOnly = clone(declSvcEdited);
+unconfirmedOnly[0]!.services[0]!.declared!.unconfirmed = [
+  "the probe asked this pass, and came back no wiser",
+];
+check(
+  "...including the one that turns on whether a probe ran at all",
+  diffStacks(declSvcEdited, unconfirmedOnly).unchanged,
+  JSON.stringify(diffStacks(declSvcEdited, unconfirmedOnly).changed),
 );
 // …while the parsed part of the very same block still is, so the exclusion above is
 // narrow rather than "declarations are ignored".

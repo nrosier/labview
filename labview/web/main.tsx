@@ -26,6 +26,7 @@ import {
   buildTitle,
   collectDeclarationDrift,
   collectProbeReport,
+  collectUnconfirmedDeclarations,
   declaredAuthLabel,
   driftSummaryText,
   formatExposureCount,
@@ -34,6 +35,7 @@ import {
   probeReportSummaryText,
   probeToggleText,
   shouldBanner,
+  unconfirmedSummaryText,
 } from "./model";
 import {
   EMPTY_TAG_FILTER,
@@ -694,6 +696,11 @@ function App() {
   // are the same object rather than two counts of one fleet.
   const drift = useMemo(() => collectDeclarationDrift(ov?.stacks ?? []), [ov]);
 
+  // The other note field, through the same walker: every declaration the probe asked about
+  // and could not settle. A separate memo rather than a branch at the render site so the two
+  // panels can be open one after the other without recomputing either.
+  const unconfirmed = useMemo(() => collectUnconfirmedDeclarations(ov?.stacks ?? []), [ov]);
+
   // Every probed service, grouped by what its answer was worth. Derived from the same
   // `ov.stacks` the drawers read rather than carried in `ScanMeta`, for the reason the drift
   // collector states: a second copy of a grouping is a second thing to keep in step, and
@@ -1051,6 +1058,21 @@ function App() {
               sub="unverified"
             />
           )}
+          {/* A subset of the tile above: the ones the probe went and asked about and came back
+              from no wiser. Deliberately **not** `alert`, and that is the whole point of the
+              tile existing — the same observation used to be reported as drift, and an alarm
+              that fires on "we could not tell" is the kind that gets trained into noise, which
+              costs the real drift entries their meaning too. It opens for the same reason drift
+              does: the count is unactionable until it says which address was asked. */}
+          {ov.stats.declaredAuthUnconfirmed > 0 && (
+            <StatTile
+              label="Not confirmed"
+              value={ov.stats.declaredAuthUnconfirmed}
+              sub="probe saw no login page"
+              title={`${unconfirmedSummaryText(unconfirmed)}\nclick for the service-by-service detail`}
+              onClick={() => setPanel("unconfirmed")}
+            />
+          )}
           {/* The one tile whose number stands for a set of sentences rather than a
               measurement, so it is the one tile that opens: a count of stale declarations
               is unactionable until it says which file, about which service, and in which
@@ -1313,6 +1335,16 @@ function App() {
           integration panels can with the drawer behind them. */}
       {panel === "drift" && (
         <DriftDetail report={drift} onClose={() => setPanel(null)} onOpenService={openService} />
+      )}
+      {/* The same component, told which field it is showing. One panel with two intros rather
+          than two panels, because the layout is the same question asked of two fields. */}
+      {panel === "unconfirmed" && (
+        <DriftDetail
+          report={unconfirmed}
+          variant="unconfirmed"
+          onClose={() => setPanel(null)}
+          onOpenService={openService}
+        />
       )}
       {panel === "probe" && (
         <ProbeDetail report={probeReport} onClose={() => setPanel(null)} onOpenService={openService} />

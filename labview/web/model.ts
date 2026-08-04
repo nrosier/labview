@@ -94,16 +94,26 @@ export { buildLabel, buildTitle } from "../src/model/build";
  * `collectDeclarationDrift` is here for a third reason: it decides what the drift panel
  * lists and how many services it claims, which has to equal the number the tile beside it
  * shows. A grouping that lived in the component could not be asserted at all.
+ * `collectUnconfirmedDeclarations` is its pair — the same walker over the other note field,
+ * feeding the panel that says *the scan asked and could not tell* rather than *the scan and
+ * the file disagree*.
  */
 export {
   collectDeclarationDrift,
+  collectUnconfirmedDeclarations,
   declaredAuthLabel,
   declaredAuthSummary,
   driftSummaryText,
   formatExposureCount,
   showsDeclaredAuth,
+  unconfirmedSummaryText,
 } from "../src/model/declarations";
-export type { DeclarationDriftReport, ServiceDrift, StackDrift } from "../src/model/declarations";
+export type {
+  DeclarationDriftReport,
+  DeclarationNoteReport,
+  ServiceDrift,
+  StackDrift,
+} from "../src/model/declarations";
 
 /**
  * The ingress vocabulary and the operations on it, from the same module the analyzer

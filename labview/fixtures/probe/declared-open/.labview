@@ -1,6 +1,7 @@
-# The declaration the probe disagrees with. Local accounts are the mechanism no scan can
-# observe, which is why a file like this exists at all — and why it needs checking against
-# something other than itself.
+# The declaration the probe could not confirm — which is not the same as one it contradicts.
+# Local accounts are the mechanism no scan can observe, which is why a file like this exists
+# at all, and why the probe's silence about it says nothing. See the compose file beside this
+# one for what the address actually served and why that settles neither way.
 services:
   portal:
     description: Staff portal with its own user accounts.

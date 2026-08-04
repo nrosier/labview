@@ -187,6 +187,7 @@ export function parseSidecar(text: string, serviceNames: string[], file: string)
           unauthenticatedAccepted: readUnauthenticated(value.unauthenticated, where, warnings),
           expectedIngress: readExpected(value.expected, where, warnings),
           drift: [],
+          unconfirmed: [],
         };
         if (hasServiceContent(decl)) services.set(name, decl);
       }

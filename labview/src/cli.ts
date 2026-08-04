@@ -69,6 +69,15 @@ if (summary) {
       `  declared-protected: ${stats.declaredAuthProtected}  (reachable, no detected auth, declared self-authenticating — unverified)`,
     );
   }
+  // A subset of the line above: the ones the probe went and asked about and came back from
+  // no wiser. Deliberately without the `!` prefix, which the drift line and the warnings
+  // below use — this is an open question, not a finding, and putting it in the alarm channel
+  // is exactly what this field exists to stop.
+  if (stats.declaredAuthUnconfirmed > 0) {
+    console.log(
+      `  unconfirmed:      ${stats.declaredAuthUnconfirmed}  (of those, probed and no login page seen — neither confirmed nor contradicted)`,
+    );
+  }
   // Dependencies a sidecar stated, which is the only way one can cross stacks. Counted,
   // never verified: the scan cannot see the relation, and says so by naming where it came
   // from. A reference that resolved to nothing is not here — it is drift, below.

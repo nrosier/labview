@@ -534,10 +534,15 @@ function flagUnreachableDependencies(
  * is settled by the caller, which is where the one term a declaration contributes to
  * that verdict lives; here it is only read.
  *
- * Three drift checks, all of them for the same reason: a declaration is the one input
- * that can go stale in silence. The compose file changes, the sidecar does not, and
- * a statement written for last year's setup would otherwise keep describing — or
- * excusing — a service that has since moved.
+ * Two drift checks, for the same reason: a declaration is the one input that can go stale
+ * in silence. The compose file changes, the sidecar does not, and a statement written for
+ * last year's setup would otherwise keep describing — or excusing — a service that has
+ * since moved.
+ *
+ * And one check that is deliberately *not* drift. Where the probe asked about a declaration
+ * and came back with nothing, the result is recorded in `declared.unconfirmed`: silence
+ * from a single request to `/` neither confirms the claim nor contradicts it, and only a
+ * contradiction belongs in the warning channel.
  *
  * @param wouldBeExposed the exposure verdict with the declaration left out.
  */
@@ -575,19 +580,30 @@ function noteDeclarations(svc: Service, wouldBeExposed: boolean): void {
   // and repeating it as a declaration would invite a reader to check two sources that
   // say the same thing.
 
-  // A declaration the probe contradicts. Only under `supplies`, where the declaration is
-  // the sole reason a finding is being withheld — and LabView has just been served the
-  // application at the service's own address without authenticating. This is the case the
-  // probe was added for: an unverifiable claim was the only thing standing between a
-  // reader and an exposure, and now something can be said about it.
+  // A declaration the probe asked about and could not settle. Only under `supplies`, where
+  // the declaration is the sole reason a finding is being withheld — and LabView has just
+  // been served the application at the service's own address without authenticating. This
+  // is the case the probe was added for: an unverifiable claim was the only thing standing
+  // between a reader and an exposure, and now *something* can be said about it.
   //
-  // Reported as drift rather than as an override, on the same terms as every other check
-  // here: the two may both be true. A service can serve `/` to anyone and authenticate
-  // everything past it, and the probe only ever asked for `/`.
+  // Recorded as `unconfirmed`, deliberately not as drift. A gate that did not fire is not
+  // a fact about the service — it is a fact about the probe, which asks one address, at
+  // `/`, once, without following redirects. Every one of a login one route deeper, a
+  // sign-in screen the client draws, a token guarding an API rather than a landing page,
+  // and a network restriction this vantage point sits inside answers exactly like a service
+  // with no protection at all. Calling that a disagreement would put an open question in
+  // the channel reserved for contradictions, and an alarm that fires on "could not tell"
+  // costs the genuine drift entries beside it their meaning.
+  //
+  // The verdict is untouched either way: the declaration still holds the finding back, and
+  // the service is still counted in `declaredAuthProtected`.
   const openProbe = svc.probe?.phase === "connected" && !svc.probe.gate ? svc.probe : undefined;
   if (agreement === "supplies" && openProbe) {
-    declared.drift.push(
-      `${declared.file} declares the service authenticates itself (${summary}), but LabView requested ${openProbe.endpoint} and was answered without a login page (HTTP ${openProbe.status}) — either the declaration is out of date, or the mechanism it names does not apply to that address.`,
+    // What was asked and what came back, and then the inference refused by name. No
+    // restatement of the probe's own evidence — `probeReasonText` owns that sentence and
+    // the drawer already shows it, so repeating it here would give one fact two voices.
+    declared.unconfirmed.push(
+      `${declared.file} declares the service authenticates itself (${summary}). LabView requested ${openProbe.endpoint} and no login page answered (HTTP ${openProbe.status}) — an absence of evidence rather than a disagreement, since a login one route deeper, a sign-in screen drawn by the client, or a mechanism that does not sit in front of this address would each answer exactly this way. The declaration stands, unconfirmed.`,
     );
   }
 
@@ -770,6 +786,7 @@ function computeStats(
     byAuthMethod: {},
     declaredAuth: 0,
     declaredAuthProtected: 0,
+    declaredAuthUnconfirmed: 0,
     exposureAccepted: 0,
     declarationDrift: 0,
     // Resolved pairs, so a reference that named nothing is not counted as a dependency
@@ -812,6 +829,12 @@ function computeStats(
       // condition, so this counter and the badge beside it cannot disagree about which
       // services left the exposed count.
       if (declared?.authAgreement === "supplies") stats.declaredAuthProtected++;
+      // Counted off the field the analyzer wrote, for the same reason as the line above and
+      // as `declarationDrift` below: a second derivation of "was this one asked about" could
+      // disagree with the entry the panel and the drawer both render. That it is a subset of
+      // `declaredAuthProtected` follows from `noteDeclarations` only ever writing this field
+      // under `supplies`, not from a condition restated here.
+      if (declared?.unconfirmed.length) stats.declaredAuthUnconfirmed++;
       if (svc.auth.exposedWithoutAuth && declared?.unauthenticatedAccepted) stats.exposureAccepted++;
       if (declared?.drift.length) stats.declarationDrift++;
       // The probe's two counters, and the same discipline as the declaration ones above:

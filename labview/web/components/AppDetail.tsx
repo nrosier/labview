@@ -618,6 +618,13 @@ export function AppDetail({
               {declared?.drift.map((d) => (
                 <div class="note crit">{d}</div>
               ))}
+              {/* Then what the scan asked about and could not settle. `note` rather than
+                  `note crit`, and that difference is the reason this is a second block
+                  instead of more entries in the one above: nothing here is wrong, and a red
+                  border would say it was. */}
+              {declared?.unconfirmed.map((d) => (
+                <div class="note">{d}</div>
+              ))}
               <dl class="kv">
                 {description && (
                   <>

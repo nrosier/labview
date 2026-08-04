@@ -44,7 +44,9 @@ live state from the Docker API, and never needs an agent inside each app.
   out of date the tiles carry a **declaration drift** count too, and that one is a
   button: it opens a panel naming every drifting service under its stack, with the
   file it was declared in and each disagreement spelled out, and each row opens that
-  service's own drawer.
+  service's own drawer. A **Not confirmed** tile beside it opens the same kind of panel
+  for the opposite case — a declared login the probe asked about and could not settle
+  either way — and carries no warning colour, because nothing there is wrong yet.
 - **Stack list** — one card per stack, which is the unit you actually deploy. It
   rolls up its services: live status dots, hostnames, every distinct **ingress** tag and
   **auth mechanism** present, and a count of anything reachable without auth. A missing
@@ -620,6 +622,11 @@ non-downgrade both read the same predicate, so a service can never be skipped fo
 reason its own notes contradict. And it will not make a stale
 [declaration](#declaring-what-the-scan-cannot-see) look right: an acceptance for an
 exposure the probe now finds gated is reported as drift.
+
+It will not go the other way either. A declared login the probe asked about and did not
+find is **not** reported as drift — one request to `/` returning no login page is equally
+consistent with a login a route deeper, so it is recorded as *unconfirmed* instead, with no
+warning attached. Only the first of these two is a contradiction.
 
 **What it sends.** `GET`, and no credential is in scope anywhere on this code path.
 Redirects are read rather than followed, at most four addresses per service, and a response
@@ -1462,7 +1469,9 @@ line, and each is deliberate:
    that count. It does not go quiet: it gets a *Protected — declared* badge, its own
    tile and CLI line (`stats.declaredAuthProtected`), and a note on the service saying
    the verdict rests on a statement this scan cannot verify. The number that left the
-   alarm is always visible as a number.
+   alarm is always visible as a number. Where the login probe went and asked about one of
+   these and came back no wiser, that is visible too, as its own subset count
+   (`stats.declaredAuthUnconfirmed`) — see *Declared, not confirmed* below.
 3. **Declaring an exposure intentional does not clear it.** A service reachable with
    no auth at all stays in `exposedWithoutAuth`, and the tile still shows the number the
    scan found — as `23/28`: 28 findings, 5 accepted, 23 still wanting an answer. The
@@ -1621,6 +1630,38 @@ there and still does the other thing: it holds the same services in the stack li
 place, with everything else the scan says about them.
 
 The classification always stands. Drift is a report, never an override.
+
+### Declared, not confirmed
+
+There is a fifth check, and it is deliberately *not* drift. When a service is kept out of
+the exposed count by a declared login and the login probe reaches its address and finds no
+login page, that is recorded as **unconfirmed** — its own count, its own `Not confirmed`
+tile, and no warning anywhere:
+
+> `.labview` declares the service authenticates itself (Local accounts in the app). LabView
+> requested `https://portal.example.com` and no login page answered (HTTP 200) — an absence
+> of evidence rather than a disagreement, since a login one route deeper, a sign-in screen
+> drawn by the client, or a mechanism that does not sit in front of this address would each
+> answer exactly this way. The declaration stands, unconfirmed.
+
+The probe asks one address, at `/`, once. A login a route deeper, a sign-in screen the
+browser draws after the page loads, a token guarding an API rather than a landing page, and
+a network restriction LabView is on the permitted side of all answer exactly like a service
+with nothing in front of it. So the answer is worth telling you about and is not worth
+warning you about, and the two are different channels: drift means *the file and the scan
+contradict each other*, and an alarm that also fires on *we could not tell* is one you learn
+to ignore. Your declaration still stands, the service is still out of the exposed count, and
+the entries render as plain notes rather than in the drift red.
+
+The `Not confirmed` tile opens the same kind of panel as drift — every unconfirmed service
+under its stack, each row a link into the drawer. Read it as *the sidecars worth checking by
+hand*, not as a list of things that are wrong. The CLI prints it without the `!` that marks
+drift and warnings:
+
+```text
+  declared-protected: 2  (reachable, no detected auth, declared self-authenticating — unverified)
+  unconfirmed:      1  (of those, probed and no login page seen — neither confirmed nor contradicted)
+```
 
 ### Safety
 

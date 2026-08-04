@@ -1083,6 +1083,21 @@ export interface ServiceDeclaration extends Declaration {
    */
   drift: string[];
   /**
+   * Where the scan *asked about* this declaration and could not tell either way.
+   *
+   * Deliberately not `drift`, and the distinction is the whole reason this field exists:
+   * `drift` means the file and the scan contradict each other, this means the scan looked
+   * and came back with nothing. Only the first is a warning. Merging them would put an
+   * open question in the alarm channel, and an alarm that fires on "we could not tell"
+   * is the kind that gets trained into noise — which costs the real drift entries their
+   * meaning too.
+   *
+   * One entry per unresolved question, filled by the analyzer, and never a verdict: a
+   * service whose declaration is unconfirmed is classified exactly as it would be if the
+   * question had never been asked.
+   */
+  unconfirmed: string[];
+  /**
    * How `auth` above stands relative to the detected posture. Filled by the analyzer;
    * absent when nothing was declared, so `auth.length` and this are set together.
    *
@@ -1379,6 +1394,21 @@ export interface OverviewStats {
    * number so what left the exposed count can be found again.
    */
   declaredAuthProtected: number;
+  /**
+   * Of those, the ones LabView went on to ask and learned nothing from: the probe
+   * connected and no login page answered.
+   *
+   * A **subset of `declaredAuthProtected`**, never added to it and never its own alarm.
+   * Two numbers rather than one because they answer different questions: every service in
+   * the counter above rests on a claim this scan cannot verify, and this one says how many
+   * of those claims were actively put to a test that came back silent. A reader chasing
+   * "which of my sidecars should I go and check by hand" wants this list, and a reader
+   * asking "how much of my fleet's protection is unproven" wants the one above.
+   *
+   * Silence is not disagreement, which is why this is not `declarationDrift`: the probe
+   * asks one address, at `/`, once. See `ServiceDeclaration.unconfirmed`.
+   */
+  declaredAuthUnconfirmed: number;
   /** Services that are `exposedWithoutAuth` **and** carry an accepted declaration. */
   exposureAccepted: number;
   /** Services whose declaration disagrees with what the scan found. */
@@ -1389,7 +1419,8 @@ export interface OverviewStats {
    * A fifth declaration counter, and a relation rather than a verdict: it changes none of
    * the four above and none of the evidence-derived counters. A reference that resolved to
    * nothing, or to more than one service, is not counted here — it is counted in
-   * `declarationDrift`, which is what a statement the scan cannot confirm is.
+   * `declarationDrift`, because a reference that names a service the fleet does not have is
+   * contradicted rather than merely unverified.
    */
   declaredDependencies: number;
   /**
@@ -1417,8 +1448,10 @@ export interface OverviewStats {
    * clears nothing: an exposure that was inferred from labels is now one LabView
    * measured. Not a subset of `exposedWithoutAuth` — a service whose `.labview` file
    * declares a mechanism is counted here too, since a declaration is a claim rather than
-   * detection and does not stop the question being asked. Where the two disagree the
-   * declaration still holds the exposure back, and the disagreement is reported as drift.
+   * detection and does not stop the question being asked. Answering with no gate does not
+   * contradict such a declaration and is never reported as drift — the probe asked one
+   * address once. The declaration still holds the exposure back, and the silence is
+   * recorded as `ServiceDeclaration.unconfirmed` and counted in `declaredAuthUnconfirmed`.
    */
   probeOpen: number;
   /**

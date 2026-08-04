@@ -24,10 +24,10 @@ import type { TagFilter, TagMode } from "./filter.js";
 import { EMPTY_TAG_FILTER } from "./filter.js";
 
 export type ViewTab = "overview" | "graph";
-export type ViewPanel = "authentik" | "traefik" | "drift" | "probe";
+export type ViewPanel = "authentik" | "traefik" | "drift" | "unconfirmed" | "probe";
 
 const VIEW_TABS: readonly ViewTab[] = ["overview", "graph"];
-const VIEW_PANELS: readonly ViewPanel[] = ["authentik", "traefik", "drift", "probe"];
+const VIEW_PANELS: readonly ViewPanel[] = ["authentik", "traefik", "drift", "unconfirmed", "probe"];
 
 /**
  * A free-text value's cap. Long enough for the longest thing anybody searches for — a

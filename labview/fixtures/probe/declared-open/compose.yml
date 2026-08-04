@@ -1,4 +1,5 @@
-# Regression fixture: a measurement against the declaration that was holding a finding back.
+# Regression fixture: a measurement that settles nothing, against a declaration that is
+# holding a finding back — and the one inference LabView is not entitled to draw from it.
 #
 # The sidecar beside this file declares that the application logs users in with its own
 # accounts. Nothing in the scan can see such a thing, so the declaration is `supplies` — the
@@ -6,11 +7,17 @@
 # exposed count on the operator's word alone.
 #
 # Then LabView asked, and was served the application: `200`, no challenge, no redirect, no
-# password field. That is the strongest argument there is for this whole stage. The verdict
-# still stands — the probe asked one address, at `/`, once, and a login page can live one
-# route deeper — so the declaration is not overridden. What it earns is a drift entry saying
-# the two do not agree, which is exactly the service an operator wants from a file they wrote
-# eighteen months ago and have not looked at since.
+# password field. What that is worth is the whole point of this fixture. The page is a shell —
+# roughly thirty characters of text and a single link, under both of `servedAnonContent`'s
+# thresholds — so there is no positive evidence of an open service either, and the answer is
+# equally consistent with a login one route deeper, a sign-in screen the browser draws after
+# the page loads, or accounts guarding something that is not this address.
+#
+# So the verdict stands and this earns **no drift entry**. Drift means the file and the scan
+# contradict each other; this is the scan asking and coming back no wiser, and it is recorded
+# as `unconfirmed` — counted, listed, worth an operator's afternoon, and deliberately kept out
+# of the channel that raises warnings. `portal.declared.drift.length === 0` is asserted in
+# smoke for exactly this reason: it fails the moment that inference comes back.
 services:
   portal:
     image: example/portal:2.0.0

@@ -226,12 +226,21 @@ export function detectedAuthSubject(detected: AuthMethod): string {
 /* Every disagreement in the fleet, collected for the reader                   */
 /* -------------------------------------------------------------------------- */
 
-/** One service's disagreements, in the words the analyzer wrote them. */
+/**
+ * Which of the two analyzer-written note fields a report is about.
+ *
+ * The pair exists because they must never be merged: `drift` is *the file and the scan
+ * contradict each other*, `unconfirmed` is *the scan asked and could not tell*. One is a
+ * warning and the other is an open question, and the only thing they share is their shape.
+ */
+export type DeclarationNoteField = "drift" | "unconfirmed";
+
+/** One service's entries, in the words the analyzer wrote them. */
 export interface ServiceDrift {
   service: string;
   /** The file the declaration was read from, e.g. `.labview`. Never a full path. */
   file: string;
-  /** `ServiceDeclaration.drift`, carried through unchanged. */
+  /** The chosen field of `ServiceDeclaration`, carried through unchanged. */
   entries: readonly string[];
 }
 
@@ -254,30 +263,40 @@ export interface StackDrift {
  * already counts that way. Naming both here is what keeps the tile and the panel behind
  * it from looking like they disagree about the same fleet.
  */
-export interface DeclarationDriftReport {
+export interface DeclarationNoteReport {
   stacks: StackDrift[];
   services: number;
   entries: number;
 }
 
 /**
- * Collect the drift the analyzer recorded, for a reader who has a count and wants the case.
+ * The drift report's name, kept because drift is what this shape was built for and what
+ * most of its callers mean. An alias rather than a second interface so the two reports
+ * cannot acquire different fields.
+ */
+export type DeclarationDriftReport = DeclarationNoteReport;
+
+/**
+ * Collect one of the note fields, for a reader who has a count and wants the cases behind it.
  *
  * Derived from `stacks` rather than carried in the payload, for the reason every roll-up in
- * the UI is: the disagreements are already on `svc.declared.drift`, and a second copy in
- * `ScanMeta` would be a second thing to keep in step with the first. Nothing here is
- * re-worded or re-derived either — the analyzer owns what a disagreement says, and a panel
- * that paraphrased it would give one fact two voices.
+ * the UI is: the entries are already on `svc.declared`, and a second copy in `ScanMeta` would
+ * be a second thing to keep in step with the first. Nothing here is re-worded or re-derived
+ * either — the analyzer owns what an entry says, and a panel that paraphrased it would give
+ * one fact two voices.
  *
- * Grouped by stack because drift is a *service* fact with no stack-level counterpart —
- * `ServiceDeclaration` has `drift`, `Declaration` does not — so the stack is a heading the
+ * Grouped by stack because both fields are *service* facts with no stack-level counterpart —
+ * `ServiceDeclaration` has them, `Declaration` does not — so the stack is a heading the
  * services imply, not a source of its own.
  *
  * In `src/model/` rather than in the component that renders it so it can be asserted:
  * smoke never mounts a DOM, and "the panel lists exactly the services the tile counted" is
  * precisely the claim worth pinning.
  */
-export function collectDeclarationDrift(stacks: readonly AppStack[]): DeclarationDriftReport {
+function collectDeclarationNotes(
+  stacks: readonly AppStack[],
+  field: DeclarationNoteField,
+): DeclarationNoteReport {
   const out: StackDrift[] = [];
   let services = 0;
   let entries = 0;
@@ -288,8 +307,8 @@ export function collectDeclarationDrift(stacks: readonly AppStack[]): Declaratio
     const drifting: ServiceDrift[] = [];
     for (const svc of [...stack.services].sort((a, b) => a.name.localeCompare(b.name))) {
       const declared = svc.declared;
-      if (!declared?.drift.length) continue;
-      drifting.push({ service: svc.name, file: declared.file, entries: declared.drift });
+      if (!declared?.[field].length) continue;
+      drifting.push({ service: svc.name, file: declared.file, entries: declared[field] });
     }
     if (!drifting.length) continue;
     const stackEntries = drifting.reduce((n, s) => n + s.entries.length, 0);
@@ -299,6 +318,31 @@ export function collectDeclarationDrift(stacks: readonly AppStack[]): Declaratio
   }
   return { stacks: out, services, entries };
 }
+
+/** Every `.labview` disagreement in the fleet — the warning half of the pair. */
+export function collectDeclarationDrift(stacks: readonly AppStack[]): DeclarationDriftReport {
+  return collectDeclarationNotes(stacks, "drift");
+}
+
+/**
+ * Every declaration this scan asked about and could not settle, grouped the same way.
+ *
+ * The other half of `collectDeclarationDrift`, and a wrapper over the same walker rather
+ * than a second one: two panels that grouped or sorted the same fleet differently would be
+ * two accounts of one scan, and the sort is what makes either of them reproducible (I7).
+ *
+ * The distinction this exists to hold is the whole point of the pair — a service listed here
+ * is **not** a service with a problem. Its declaration is intact, its verdict is unchanged,
+ * and all that has happened is that a single request to `/` came back without a login page,
+ * which is exactly what a client-rendered login, a deeper route or a token-guarded API also
+ * looks like. It is a list of places worth checking by hand, not a list of things that are
+ * wrong.
+ */
+export function collectUnconfirmedDeclarations(stacks: readonly AppStack[]): DeclarationNoteReport {
+  return collectDeclarationNotes(stacks, "unconfirmed");
+}
+
+const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
 /**
  * The report as one line — `3 services in 2 stacks · 4 disagreements`.
@@ -310,9 +354,24 @@ export function collectDeclarationDrift(stacks: readonly AppStack[]): Declaratio
  */
 export function driftSummaryText(report: DeclarationDriftReport): string {
   if (report.services === 0) return "no declaration disagrees with this scan";
-  const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
   return [
     `${plural(report.services, "service")} in ${plural(report.stacks.length, "stack")}`,
     plural(report.entries, "disagreement"),
+  ].join(" · ");
+}
+
+/**
+ * The same line for the other field — `1 service in 1 stack · 1 unconfirmed declaration`.
+ *
+ * A separate function rather than a noun parameter on the one above, because the empty
+ * sentence differs in more than a noun: "no declaration disagrees with this scan" would be
+ * actively wrong here, where nothing being listed means every declaration the probe asked
+ * about was either confirmed or never asked — not that none of them disagree.
+ */
+export function unconfirmedSummaryText(report: DeclarationNoteReport): string {
+  if (report.services === 0) return "every declaration this scan asked about was answered";
+  return [
+    `${plural(report.services, "service")} in ${plural(report.stacks.length, "stack")}`,
+    plural(report.entries, "unconfirmed declaration"),
   ].join(" · ");
 }

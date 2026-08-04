@@ -705,7 +705,9 @@ a service can never be skipped for a reason its own notes contradict.
 
 Neither a probe result nor a `.labview` declaration counts. The first is the measurement being
 decided about, and the second is a claim LabView cannot check (§3.12) — which is exactly the
-case worth measuring, and `fixtures/probe/declared-open` exists to catch it drifting.
+case worth asking about, and `fixtures/probe/declared-open` is that case. What the answer is
+worth is a separate question, settled in §3.12: an address that returns no login page does not
+contradict such a declaration, so the result is recorded as *unconfirmed* rather than as drift.
 
 An `inferred` posture counts as detected. A router naming `authentik@docker` whose definition
 was never found is still authentication detected *through Traefik*, and since
@@ -963,9 +965,11 @@ its own statistic — exactly as an Authentik gate with no readable method is re
 **Two things it does not override.** A detected gate answered with no login page keeps its
 posture and gets a note saying the request came from LabView's own vantage point, which may
 not be the path a visitor takes — the same reasoning `chainComplete` rests on (§3.6). And a
-`.labview` declaration that supplies the only protection, contradicted by an open answer, is
-reported as **drift** rather than as an override: a service can serve `/` to anyone and
-authenticate everything past it, and the probe only ever asked for `/`.
+`.labview` declaration that supplies the only protection is not overridden by an open answer
+either: a service can serve `/` to anyone and authenticate everything past it, and the probe
+only ever asked for `/`. That second case is recorded as **unconfirmed**, not as drift — the
+answer neither confirms the declaration nor contradicts it, and only a contradiction belongs
+in the channel that raises warnings (§3.12).
 
 **Containment** (I8). The addresses come from scanned documents, so the bounds are part of the
 feature rather than a deployment concern: GET only, with no query; no credential, and
@@ -1624,10 +1628,24 @@ Four rules shape it, three of them borrowed from the row above:
 - **The tile becomes a control without becoming a `<button>`.** `StatTile` takes an
   optional `onClick` and, when it has one, carries `role="button"`, `tabIndex={0}` and
   the Enter/Space handler `.stack-head`, `.svc-row` and `.tagrow` already use; its
-  content is block elements, which a real button may not contain. Only the two tiles whose
-  count stands for a set of sentences pass it — drift and the login probe below. A count a
-  reader can take off the payload has nothing further to say, and a tile that looked
-  clickable without being so would be worse than a plain one.
+  content is block elements, which a real button may not contain. Only the tiles whose
+  count stands for a set of sentences pass it — drift, `Not confirmed` below, and the login
+  probe. A count a reader can take off the payload has nothing further to say, and a tile
+  that looked clickable without being so would be worse than a plain one.
+
+**`Not confirmed`, the same panel with the opposite meaning.** `stats.declaredAuthUnconfirmed`
+gets its own tile and opens `DriftDetail` with `variant="unconfirmed"` — one component, one
+layout, two intros, because the layout is the same question asked of two fields and a second
+copy would be a second place for them to fall out of step. A `variant` union rather than a
+handful of optional strings, so the wording of each is decided in one table and drift's
+alarming intro cannot end up over a list of open questions. Three things differ deliberately:
+the tile is **not** `alert` and the entries render as plain `.note` (the visual difference
+between a disagreement and an open question is the whole point of the field existing); the
+intro names the confounders, because a list that looks exactly like the drift list and means
+the opposite has to say so; and the footnote pointing at the `⚠ Declaration drift` chip is
+drift-only, since `ViewState.driftOnly` has no counterpart here and pointing a reader at a
+control that is not there is worse than pointing at nothing. `StackCard` gains **no** badge
+for the same reason — a second warning badge would re-create the noise this removed (§3.12).
 
 **The probe panel.** `Login probe 5` is the third tile of that shape, and it is a **new**
 tile rather than a line added to an existing one for a reason I3 states: `Exposed, no auth`
@@ -1677,8 +1695,8 @@ happens: everything eligible was already authenticated, or nothing was asked at 
 The drawer shell itself (`.drawer-scrim`, the sticky `.dhead`, the scrolling `.dbody`)
 moved out of `ApiDetail.tsx` into `web/components/Panel.tsx`, on the `Section.tsx`
 precedent, so the drift and probe panels inherit the scroll, close and Escape behaviour
-rather than restating it. `main.tsx` holds one `panel` state for all four — `"authentik" |
-"traefik" | "drift" | "probe" | null` — which is what guarantees two are never stacked and
+rather than restating it. `main.tsx` holds one `panel` state for all five — `"authentik" |
+"traefik" | "drift" | "unconfirmed" | "probe" | null` — which is what guarantees two are never stacked and
 fixes the Escape order: the panel closes first, the service drawer second. A row handing over
 to a service drawer clears the panel through the same `openService` the integration
 panels use.
@@ -2042,6 +2060,29 @@ each disagreement is one entry in `svc.declared.drift`, counted in
   one expectation. That same normalization is what drops a declared `internal` written
   beside an external kind, so an expectation can never drift on a kind the scan would
   never report (§5).
+
+**Unconfirmed, because an absence of detection is not a disagreement.** There is a fifth
+check, and it is deliberately *not* drift. Where a declaration `supplies` the only
+protection and the login probe (§3.6) reached the address and found no gate, the result is
+one entry in `svc.declared.unconfirmed`, counted in `stats.declaredAuthUnconfirmed` — a
+subset of `declaredAuthProtected`, never an alarm of its own.
+
+The probe asks one address, at `/`, once, without following redirects. A login one route
+deeper, a sign-in screen the client draws after the page loads, a token guarding an API
+rather than a landing page, and a network restriction this vantage point sits inside all
+answer exactly like a service with no protection at all — which is why the entry names the
+address and the status and then refuses the inference in words. This was reported as drift
+until it was not: drift means *the file and the scan contradict each other*, and an alarm
+that also fires on *the scan could not tell* is the kind that gets trained into noise,
+which costs the genuine entries beside it their meaning. Nothing was lost in the move — the
+same observation is already a row in the Login probe panel and a `probeReasonText` sentence
+in the drawer; what went is the warning framing.
+
+The two fields are collected by one walker with two wrappers
+(`collectDeclarationDrift`, `collectUnconfirmedDeclarations`), rendered by one panel with
+two intros, and shown in the drawer with two classes: `note crit` for a disagreement,
+plain `note` for a question. The stale-acceptance check above stays drift under the same
+rule, because its probe arm fires on a gate that *was* found.
 
 **Agreement is silent, in both directions.** The `Expected ingress` row renders only
 when `ingressMatchesExpectation` is false, and `DeclaredAuthBadge` and the declared
@@ -3079,6 +3120,13 @@ nothing detected, and taken out of the exposure count by a declaration. Read off
 Never folded into `stats.authProtected`, which counts only what the scan could prove
 (§12).
 
+**`declaredAuthUnconfirmed`** — a **subset** of the above: those of them the login probe
+reached and could not settle either way. Two questions, and one number cannot answer both —
+*how much of my fleet's protection is unproven* is the counter above, *which of my sidecars
+should I go and check by hand* is this one. Counted off `declared.unconfirmed.length` rather
+than re-derived, and deliberately not an alarm: it is what the same observation used to be
+reported as drift for, and why it no longer is, is in §3.12 and §12.
+
 **`unauthenticatedAccepted`** — `{ reason }` on a service declaration, present only
 when the sidecar said `intentional: true` **and** gave a reason; without the reason it is
 refused with a warning (§3.12). It does not remove the service from `exposedWithoutAuth`;
@@ -3101,6 +3149,15 @@ the file cannot know about (§12).
 and the scan, counted in `stats.declarationDrift`; the four checkable disagreements are
 enumerated in §3.12. Filled by the analyzer, and a report rather than an override —
 which is why it and `authAgreement` are excluded from the change comparison (§3.11).
+
+**`unconfirmed`** — `svc.declared.unconfirmed[]`, the same shape and the opposite meaning:
+one string per question the scan asked and could not settle, which today is exactly the
+probed-and-no-gate case in §3.12. Kept as a sibling of `drift` rather than merged into it
+because only one of the two is a warning, and as a sibling of `authAgreement` rather than a
+fifth member of it because `compareDeclaredAuth` cannot see the probe by design. Also
+analyzer-written, so also excluded from the change comparison — and the most volatile of the
+three, since it turns on whether a probe ran at all: without the exclusion, a scan with the
+toggle flipped would report every declared service in the fleet as an edited sidecar (§3.11).
 
 **TagFilter / TagMode** — the dashboard's tri-state filter (§3.9):
 `{ include, exclude, mode }` over string tags, with `exclude` always AND-NOT and
@@ -3747,7 +3804,7 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `access-gate` | the same withholding reached without a Traefik label at all: a tunnel hostname behind a Cloudflare Access policy, which is the second of `hasDetectedAuth`'s three terms. Its sibling `db` is a `tcp://` origin under the same policy — detected auth *and* no address, which is what pins the order of the two questions: counted as neither asked nor withheld |
 | `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
 | `lan-fallback` | the vantage walk: a public hostname that does not resolve falls through to `http://<lanHost>:18099/`, with the failed attempt kept in the order it was tried |
-| `declared-open` | a declaration that `supplies` the only protection, contradicted by an open answer — the verdict stands (the probe asked one address once) and the disagreement is reported as drift |
+| `declared-open` | a declaration that `supplies` the only protection, against an answer that settles nothing: the page is a shell — thirty-odd characters and one link, under both of `servedAnonContent`'s thresholds — so there is no evidence of an open service either. The verdict stands (the probe asked one address once) and the result is recorded as **unconfirmed**, not drift. `portal.declared.drift.length === 0` is the revert trap: restoring the inference this replaced fails there |
 | `dbonly` | a Postgres and an Adminer publishing ports and nothing else: **no request at all**, which is the rule that keeps the probe off a database |
 | `tcp-tunnel` | a `tcp://` and an `ssh://` tunnel origin: never resolved, let alone asked, and both stay honestly in the exposed count |
 
@@ -4003,6 +4060,18 @@ producing an empty report rather than empty groups, and the three `driftSummaryT
 wordings including both singulars. Ordering is pinned against *reversed* clones of the
 stacks and two renamed services, because fixture discovery is already alphabetical and
 an assertion over the natural order would pass with no sort at all.
+
+`collectUnconfirmedDeclarations` is asserted the same way over the probe root, and the pair
+is what makes the distinction checkable rather than merely written down: over one fleet, one
+stack lands in each report — `tunnel-login` in drift, because its acceptance was contradicted
+by a login form the probe was actually served, and `declared-open` in unconfirmed, because
+its answer contained nothing at all. `portal.declared.drift.length === 0` is the revert trap
+for the whole change. Beside it: the entry's text against the clause that refuses the
+inference, the verdict unmoved (`supplies`, still out of the exposed count, still counted in
+`declaredAuthProtected`), the new counter a subset of that one, the probe-off run producing
+neither field, and the write rule itself — every service carrying an unconfirmed entry has
+`authAgreement === "supplies"` and a connected probe with no gate, while `own-login/wiki`,
+whose probe *did* find a gate, carries none.
 
 **The build stamp is asserted as a resolver table, because a `.git` directory is not a
 fixture.** `resolveBuildStamp` takes its environment and its file reads as arguments
@@ -4797,6 +4866,7 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Only a **same-layer** disagreement warns | The literal reading of "declared ≠ detected → warn" fires on every layered setup there is: an app that logs users in *and* sits behind a proxy gate is defence in depth, and warning about it teaches the operator that drift means nothing. The two vocabularies describe different tiers of one request path, so they are compared only where both can name the same thing — three families, sorted into the app's own login and the gate in front of it. `declared app-oidc + detected ldap` is two answers to one question and warns; `declared app-oidc + detected forward-auth` is two true statements and does not. `declcompare` pins it with a *pair*: two services declaring the same mechanism, opposite outcomes, decided only by what the scan found. |
 | `declaredAuthProtected` is its own counter, never folded into `authProtected` | `authProtected` means *the scan proved a gate*, and that is the number a reader checks a fleet against. Adding unverifiable protection to it would make it unfalsifiable in exactly the way I1 exists to prevent, and would do it silently — the total would look better with no way to see why. A separate tile, badge and CLI line costs a few lines of UI and keeps both numbers meaning one thing each. |
 | The comparison takes `wouldBeExposed`, not `reachable` | `hasEdgeAuth` includes Cloudflare Access policies and API-confirmed enforced gates, neither of which carries an `AuthMethod`. With plain `reachable`, an already-protected service would be labelled `supplies` and counted in `declaredAuthProtected` — a service credited to a declaration that never left the exposed count, because it was never in it. Passing the caller's own verdict term also makes `supplies` imply `method === "none"`, which is what bounds the feature: a declaration can only change a verdict where the scan found nothing at all. |
+| An absence of detection is not a disagreement, and the alarm channel is the wrong place to say so | A probe that reaches a declared-protected service and finds no login page used to write a `drift` entry. That treats the one inference this stage may never draw as a fact: the probe asks one address, at `/`, once, and a login a route deeper, a client-drawn sign-in screen, a token guarding an API, or a network restriction it sits inside all answer identically. `drift` is the channel for *the file and the scan contradict each other*, and it has a warning tile, a `⚠` CLI line and a filter chip behind it; an alarm that also fires on *we could not tell* is trained into noise, which costs the genuine entries their meaning too. So the observation moved to `declared.unconfirmed` with its own non-alarming tile and counter. **Nothing was lost:** the same fact was already a row in the Login probe panel and a `probeReasonText` sentence in the drawer — only the warning framing went. Not gated on evidence strength either, `servedAnonContent` included: a rule that promoted *strong* silence back to drift would put the reader back to arguing with a measurement about a mechanism it cannot see. A sibling field rather than a fifth `DeclaredAuthAgreement`, because `compareDeclaredAuth` takes `(declared, detected, wouldBeExposed)` and cannot see the probe by design — the alternative was pushing the probe into a pure function or overwriting `authAgreement` after the fact. The stale-acceptance check keeps its drift entry, because its probe arm fires on a gate that *was* found. |
 | A declaration that agrees with the scan is rendered nowhere | The point of the sidecar is to say what the scan cannot see. Repeating what it already found sends the reader to check two sources that agree, and makes the rows that do matter harder to spot — the same reason the expected-ingress row lost its `matches the scan` pill. `redundant` is the outcome that renders nothing, and the fixture that pins it asserts on *silence*: no note, no badge, no drift. |
 | The sidecar is parsed defensively and every mistake is a warning | It is operator input from inside a tree already treated as untrusted (§7), so it is contained like `env_file`, size-capped, length-capped per field, and its unknown keys are *named* — a mistyped `descripton` that silently does nothing is the one failure mode an optional-everything format has. Nothing in it can fail a scan (I4): a malformed sidecar costs the fields it got wrong. And because declared text is prose shown as written, with no key-name heuristic that could apply, the documentation says plainly never to put a secret in one; URL credentials are redacted as a backstop only, which is why a link's label falls back to the redacted URL. |
 | The diff is derived by the caller, not carried in the payload | It needs memory of the previous scan, and `buildOverview` is required to have none (I7). Both consumers already hold two payloads, so `diffStacks(prev, next)` as a pure function of them adds no API surface, no server state, and nothing to keep consistent between the log line and the topbar. |
