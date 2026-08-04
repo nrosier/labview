@@ -29,8 +29,12 @@
  *    back with no gate and no `<form>` at all — the client-rendered shell, where reading the
  *    body cannot work even in principle — the eight fixed addresses in `AUTH_STATE_PATHS` are
  *    asked as well. Fixed list, `GET`, no credential, sequential, and `--no-sweep` turns it off.
- *  - **Nothing discovered on a page is ever fetched.** No asset, no form action, no link. Both
- *    additions above are addresses the *service* named in a `Location` header or that this tool
+ *  - **Guessing the login addresses is off unless asked for.** `--try-login-paths` GETs the ten
+ *    names in the pipeline's own `LOGIN_PATHS` on a form-less shell's origin. Off by default and
+ *    kept that way deliberately: unlike everything above it, no response and no constant of
+ *    LabView's says those addresses exist, so it is the one part of this tool that guesses.
+ *  - **Nothing discovered on a page is ever fetched.** No asset, no form action, no link. Every
+ *    addition above is an address the *service* named in a `Location` header or that this tool
  *    holds in a reviewed constant — never something parsed out of a page's markup.
  *  - Each request has a timeout, and targets are asked sequentially by default
  *    (`--concurrency`).
@@ -38,6 +42,11 @@
  *    issue; `Set-Cookie` is reduced to names and anything that names a credential is elided
  *    before the observation record is built, so a value the tool decided not to keep cannot
  *    reach a report by another route. `--raw-headers` opts out.
+ *  - **The body is described, never dumped**, unless `--save-body` is passed. That flag writes
+ *    the served HTML verbatim to a third file, and it is the one artifact this tool produces
+ *    that is not safe to paste anywhere: an anonymous page carries no session, but it does carry
+ *    whatever a bootstrap script was given (**I6**). The closing lines say so on every run that
+ *    wrote one.
  *  - Writes only under `--out`, and nothing else anywhere.
  *
  * Not shipped: the `Dockerfile` COPYs named paths, so `tools/` never enters the image.
@@ -46,11 +55,12 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
 import { getResponse, type FetchLike, type HttpResponse } from "../../src/enrich/http.js";
 import { hasDetectedAuth } from "../../src/labels/auth.js";
-import { probeTargets } from "../../src/model/probe.js";
+import { LOGIN_PATHS, probeTargets } from "../../src/model/probe.js";
 import type { ConnectionPhase, Overview } from "../../src/model/types.js";
 import {
   AUTH_STATE_PATHS,
   buildReport,
+  firstLoginPage,
   firstRefusal,
   refusalIsPipelineGate,
   renderJson,
@@ -90,11 +100,36 @@ interface Options {
    * target, for a run against services somebody else operates.
    */
   sweep: "auto" | "always" | "never";
+  /**
+   * Whether to GET the pipeline's own {@link LOGIN_PATHS} on a form-less shell's origin.
+   *
+   * **Off by default, and this is the one default that is off for a reason the others are not.**
+   * A hop, a swept address and a `--paths` entry are all addresses somebody named: the service
+   * in a `Location`, LabView in a reviewed constant, the operator on the command line. These are
+   * guesses, ten of them per target, and a guess sent at a service somebody else operates is a
+   * different act from a measurement — so it stays a thing a person asks for by name.
+   *
+   * It also cannot pay off as often as it looks: the case it exists for is the shell whose login
+   * screen is drawn in the browser, and a catch-all router answers all ten with the same page.
+   * That answer *is* a finding — see `loginPathLines` — but it is a finding about routing, not a
+   * login page.
+   */
+  tryLoginPaths: boolean;
   timeoutMs: number;
   concurrency: number;
   out: string;
   /** Keep header values verbatim. Off by default — see {@link redactHeaders}. */
   rawHeaders: boolean;
+  /**
+   * Write the served HTML to a third file, verbatim.
+   *
+   * Off by default, and the only artifact of this tool that is not safe to paste into an issue.
+   * The two reports describe a page — sizes, names, quoted labels, path literals — because a
+   * description can be published and a page cannot: an anonymous response carries no session, but
+   * a bootstrap script carries whatever configuration it was handed (**I6**). So the raw body is
+   * available for replaying a rule against, and saying it is available is part of the flag.
+   */
+  saveBody: boolean;
 }
 
 /** One address to ask, and where it came from — which goes in the report's index. */
@@ -121,10 +156,15 @@ Options
   --max-hops <n>       how far to follow a chain (default: 5)
   --sweep              ask the auth-state addresses on every target that answered
   --no-sweep           never ask them (default: only where a page had no gate and no form)
+  --try-login-paths    also GET the ${LOGIN_PATHS.length} names in LOGIN_PATHS on a form-less
+                       shell's origin (default: off — these are guesses, not addresses anything
+                       named, and a catch-all router answers all of them with the same page)
   --timeout <ms>       per request (default: 8000)
   --concurrency <n>    targets in flight (default: 1)
   --out <dir>          report directory (default: tools/probe-lab/reports)
   --raw-headers        do not redact header values (default: redacted)
+  --save-body          also write the served HTML verbatim (default: off — it is the one file
+                       this tool writes that is not safe to paste into an issue)
   -h, --help           this
 
 Every request is an unauthenticated GET with a timeout, and no credential exists anywhere on
@@ -152,10 +192,12 @@ export function parseArgs(argv: readonly string[]): Options {
     follow: true,
     maxHops: 5,
     sweep: "auto",
+    tryLoginPaths: false,
     timeoutMs: 8_000,
     concurrency: 1,
     out: resolvePath(import.meta.dirname, "reports"),
     rawHeaders: false,
+    saveBody: false,
   };
   const need = (i: number, flag: string): string => {
     const value = argv[i + 1];
@@ -209,6 +251,11 @@ export function parseArgs(argv: readonly string[]): Options {
       case "--no-sweep":
         opts.sweep = "never";
         break;
+      // No `--no-try-login-paths`. Off is the default, and a flag to reassert a default is a flag
+      // somebody has to read the docs to understand the point of.
+      case "--try-login-paths":
+        opts.tryLoginPaths = true;
+        break;
       case "--timeout":
         opts.timeoutMs = positive(need(i, arg), arg);
         i++;
@@ -223,6 +270,9 @@ export function parseArgs(argv: readonly string[]): Options {
         break;
       case "--raw-headers":
         opts.rawHeaders = true;
+        break;
+      case "--save-body":
+        opts.saveBody = true;
         break;
       default:
         if (arg.startsWith("-")) throw new Error(`unknown option ${arg}`);
@@ -450,6 +500,30 @@ async function sweepAuthState(url: string, opts: Options): Promise<ProbeLabObser
   return out;
 }
 
+/**
+ * Ask the pipeline's own login-path names on one origin. `--try-login-paths` only.
+ *
+ * Sequential and never short-circuiting, for the reason the sweep short-circuits and this does
+ * not: a refusal at `/api/me` ends that walk because it has answered the question, while a login
+ * page at `/login` leaves the interesting one open — a service can have a sign-in screen at three
+ * of these names, and which ones is the difference between a router with a catch-all and an
+ * application with a route. Ten requests, the same ten every run, at one service, sequentially.
+ *
+ * **The list is `LOGIN_PATHS` and nothing else**, and it is the pipeline's list rather than one of
+ * this tool's — so a name this asks is a name a `Location` header would be *recognised* by, and the
+ * report can say "a login page at a path the rule already trusts as a name" without that being two
+ * different lists agreeing by luck. `isLoginPath` matches by prefix, which is what makes a bare
+ * `/auth/` or `/if/flow/` worth sending: those are directory prefixes in the list because that is
+ * how the products behind them route, and a GET at the prefix is how a browser arrives too.
+ */
+async function tryLoginPaths(url: string, opts: Options): Promise<ProbeLabObservation[]> {
+  const origin = originOf(url);
+  if (!origin) return [];
+  const out: ProbeLabObservation[] = [];
+  for (const path of LOGIN_PATHS) out.push(await observe(`${origin}${path}`, opts));
+  return out;
+}
+
 /** A `Headers` as a plain record, names lowercased, repeats joined the way `Headers` does. */
 function headerMap(headers: Headers): Record<string, string> {
   const out: Record<string, string> = {};
@@ -500,38 +574,69 @@ function slug(url: string): string {
  *
  * The `Next` column is the count of section-4 lines rather than their text: a row per target
  * is a map, and the reason it points at is in the target's own file.
+ *
+ * The `Login paths` column appears only on a run that passed `--try-login-paths`. A column of
+ * dashes would say the tool looked and found nothing, which is the opposite of what a default run
+ * did — it never asked.
  */
 function renderIndex(rows: Row[], at: string): string {
+  const guessed = rows.some((r) => r.report.loginPaths.length > 0);
+  const head = [
+    "Target",
+    "Verdict",
+    "Signal",
+    "Withdraws exposure",
+    "Chain",
+    "Auth-state",
+    ...(guessed ? ["Login paths"] : []),
+    "Next steps",
+    "Report",
+  ];
   const L = [
     "# probe-lab",
     "",
     `${rows.length} target${rows.length === 1 ? "" : "s"}, ${at}.`,
     "",
-    "| Target | Verdict | Signal | Withdraws exposure | Chain | Auth-state | Next steps | Report |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    `| ${head.join(" | ")} |`,
+    `| ${head.map(() => "---").join(" | ")} |`,
   ];
   for (const { target, report, file } of rows) {
-    // Two columns for the two ways a login page hides from the verdict beside them, so a run over
-    // twenty services shows at a glance which rows are worth opening. Both read `—` when there
-    // was nothing to say, and neither is ever the same cell as a gate: the verdict column is what
-    // LabView concluded and these are what it could not see.
+    // Three columns for the three ways a login page hides from the verdict beside them, so a run
+    // over twenty services shows at a glance which rows are worth opening. Each reads `—` when
+    // there was nothing to say, and none is ever the same cell as a gate: the verdict column is
+    // what LabView concluded and these are what it could not see.
     const ahead = report.chain.find((h) => h.gate !== undefined);
     const refused = firstRefusal(report.sweep);
-    L.push(
-      `| ${target.url} | ${report.verdict.label} | ${report.verdict.gate ?? "—"} | ${
-        report.verdict.withdrawsExposure ? "yes" : "no"
-      } | ${
-        report.chain.length === 0
-          ? "—"
-          : `${report.chain.length} hop${report.chain.length === 1 ? "" : "s"}${ahead ? ` → \`${ahead.gate}\`` : ""}`
-      } | ${
-        report.sweep.length === 0
-          ? "—"
-          : refused
-            ? `**${refused.status} at ${refused.path}**${refusalIsPipelineGate(refused) ? "" : " (evidence only)"}`
-            : `${report.sweep.length} asked, none refused`
-      } | ${report.next.length} | [${file}](${file}) |`,
-    );
+    const found = firstLoginPage(report.loginPaths);
+    const cells = [
+      target.url,
+      report.verdict.label,
+      report.verdict.gate ?? "—",
+      report.verdict.withdrawsExposure ? "yes" : "no",
+      report.chain.length === 0
+        ? "—"
+        : `${report.chain.length} hop${report.chain.length === 1 ? "" : "s"}${ahead ? ` → \`${ahead.gate}\`` : ""}`,
+      report.sweep.length === 0
+        ? "—"
+        : refused
+          ? `**${refused.status} at ${refused.path}**${refusalIsPipelineGate(refused) ? "" : " (evidence only)"}`
+          : `${report.sweep.length} asked, none refused`,
+      // Always "(evidence only)" where there is anything at all, and not conditionally like the
+      // sweep's: there is no reading of a guessed address that a scan could reach, so there is no
+      // case in which this cell is a pipeline gate.
+      ...(guessed
+        ? [
+            report.loginPaths.length === 0
+              ? "—"
+              : found
+                ? `**${found.gate} at ${found.path}** (evidence only)`
+                : `${report.loginPaths.length} asked, none a login page`,
+          ]
+        : []),
+      String(report.next.length),
+      `[${file}](${file})`,
+    ];
+    L.push(`| ${cells.join(" | ")} |`);
   }
   L.push("", "## Where each target came from", "");
   for (const { target } of rows) L.push(`- ${target.url} — ${target.why}`);
@@ -568,35 +673,74 @@ async function main(): Promise<void> {
   let hopRequests = 0;
   let sweptTargets = 0;
   let sweepRequests = 0;
+  let guessedTargets = 0;
+  let guessedRequests = 0;
+  let savedBodies = 0;
 
   /**
-   * The report for one answer, with the auth-state sweep attached if this run calls for it.
+   * The report for one answer, with whatever this run went on to ask attached.
    *
-   * The sweep decision is `wantsSweep`'s, which is in `report.ts` — so what got asked is a
-   * function of the report rather than of a condition written twice, and the smoke pass can pin
-   * it without a network.
+   * Both extra walks are decided by `wantsSweep`, which is in `report.ts` — so what got asked is a
+   * function of the report rather than of a condition written twice, and the smoke pass can pin it
+   * without a network. And both are decided from **`first`**, the report built from the one answer,
+   * not from a later one: eligibility is a property of the page, and re-deriving it after attaching
+   * answers would let one extra request decide whether the next one is sent.
    */
   const reportOn = async (
     obs: ProbeLabObservation,
     hops: ProbeLabObservation[],
   ): Promise<ProbeLabReport> => {
     const first = buildReport(obs, { chain: hops });
-    const wanted =
+    const wantsState =
       opts.sweep === "always" ? obs.status !== undefined : opts.sweep === "auto" && wantsSweep(first);
-    if (!wanted) return first;
-    const sweep = await sweepAuthState(obs.requestUrl, opts);
-    sweptTargets++;
-    sweepRequests += sweep.length;
-    return buildReport(obs, { chain: hops, sweep });
+    // No `--try-login-paths always`. The flag's whole case is the form-less shell, and asking ten
+    // guessed names of a page that already served a form would be requests spent on a question the
+    // markup answered.
+    const wantsGuess = opts.tryLoginPaths && wantsSweep(first);
+    if (!wantsState && !wantsGuess) return first;
+    const sweep = wantsState ? await sweepAuthState(obs.requestUrl, opts) : undefined;
+    if (sweep) {
+      sweptTargets++;
+      sweepRequests += sweep.length;
+    }
+    const guessed = wantsGuess ? await tryLoginPaths(obs.requestUrl, opts) : undefined;
+    if (guessed) {
+      guessedTargets++;
+      guessedRequests += guessed.length;
+    }
+    return buildReport(obs, {
+      chain: hops,
+      ...(sweep ? { sweep } : {}),
+      ...(guessed ? { loginPaths: guessed } : {}),
+    });
   };
 
-  const emit = async (target: Target, report: ProbeLabReport): Promise<void> => {
+  /**
+   * Two files per target, three with `--save-body`.
+   *
+   * The observation is taken as well as the report because the raw body is deliberately not on the
+   * report — `readUnread` describes a page and `renderJson` is meant to be publishable, so the one
+   * structure that carries the served bytes is the observation, and the only thing that ever writes
+   * them is the branch below.
+   */
+  const emit = async (
+    target: Target,
+    report: ProbeLabReport,
+    obs: ProbeLabObservation,
+  ): Promise<void> => {
     const file = `${slug(target.url)}.md`;
     await writeFile(resolvePath(opts.out, file), renderMarkdown(report), "utf8");
     await writeFile(resolvePath(opts.out, `${slug(target.url)}.json`), renderJson(report), "utf8");
+    // Verbatim, with nothing prepended. A warning in the file would make it a different page from
+    // the one that was served, and replaying a rule against it is the only reason it exists.
+    if (opts.saveBody && obs.body !== undefined) {
+      await writeFile(resolvePath(opts.out, `${slug(target.url)}.html`), obs.body, "utf8");
+      savedBodies++;
+    }
     rows.push({ target, report, file });
     const ahead = report.chain.find((h) => h.gate !== undefined);
     const refused = firstRefusal(report.sweep);
+    const guessed = firstLoginPage(report.loginPaths);
     process.stdout.write(
       `${report.verdict.gate ? "gated " : report.read.status === undefined ? "silent" : "open  "} ${
         report.read.status ?? "—"
@@ -604,7 +748,7 @@ async function main(): Promise<void> {
         report.chain.length ? ` [+${report.chain.length} hop${report.chain.length === 1 ? "" : "s"}]` : ""
       }${ahead ? ` [${ahead.gate} down the chain]` : ""}${
         refused ? ` [${refused.status} at ${refused.path}]` : ""
-      }\n`,
+      }${guessed ? ` [${guessed.gate} at ${guessed.path}]` : ""}\n`,
     );
   };
 
@@ -613,7 +757,7 @@ async function main(): Promise<void> {
     const obs = chain[0]!;
     const hops = chain.slice(1);
     hopRequests += hops.length;
-    await emit(target, await reportOn(obs, hops));
+    await emit(target, await reportOn(obs, hops), obs);
     // The end of a chain gets a report of its own, built from the answer already in hand rather
     // than from a second request. It is the page an operator's browser actually shows them, so it
     // is the one they will want the signal rows for — and where the chain ended on a shell, it is
@@ -624,6 +768,7 @@ async function main(): Promise<void> {
       await emit(
         { url: end.requestUrl, why: `the end of ${target.url}'s redirect chain` },
         await reportOn(end, []),
+        end,
       );
     }
   };
@@ -667,6 +812,25 @@ async function main(): Promise<void> {
       }`,
     );
   }
+  if (guessedTargets) {
+    L.push(
+      `--try-login-paths: ${guessedTargets} form-less page${
+        guessedTargets === 1 ? "" : "s"
+      } asked ${guessedRequests} guessed login address${
+        guessedRequests === 1 ? "" : "es"
+      } — a scan asks none of these, so nothing found there is or can become a verdict`,
+    );
+  }
+  // Said on the run rather than only in the README, because the README is read once and this file
+  // is produced every time. It is the only output of this tool that carries a page instead of a
+  // description of one (**I6**).
+  if (savedBodies) {
+    L.push(
+      `--save-body: ${savedBodies} raw HTML file${
+        savedBodies === 1 ? "" : "s"
+      } written — **not safe to paste into an issue**, unlike the .md and .json beside them: a served page carries whatever its bootstrap script was handed`,
+    );
+  }
   // The findings this whole tool exists to surface, and the reason they are last: they are what
   // somebody scrolls back for. Each names a login page LabView cannot see from where it looks —
   // one further down a chain than it reads, one at an address it does not ask, one it asked and
@@ -689,6 +853,17 @@ async function main(): Promise<void> {
       s.wwwAuthenticate?.trim()
         ? `gated at an address the probe does not ask: ${r.target.url} → ${s.status} at ${s.path} — one entry in STATE_PATHS away`
         : `refused with no scheme named, so deliberately not a gate: ${r.target.url} → ${s.status} at ${s.path}`,
+    );
+  }
+  // A different size of change from every line above it, and the wording has to carry that: the
+  // others propose a word or an entry in a list, while acting on this one means the scan sends a
+  // request at an address no label mentioned. Named all the same — a login page nobody knew about
+  // is worth knowing about whatever it would cost to reach.
+  for (const r of rows) {
+    const g = firstLoginPage(r.report.loginPaths);
+    if (!g) continue;
+    L.push(
+      `a login page at a guessed address: ${r.target.url} → ${g.gate} at ${g.path} — the scan asks no login paths at all, so this is a request-budget change and not a rule change`,
     );
   }
   L.push(`reports in ${opts.out}`);

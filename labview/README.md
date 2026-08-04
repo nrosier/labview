@@ -123,7 +123,9 @@ live state from the Docker API, and never needs an agent inside each app.
   `GET /` per HTTP service **it found no authentication for**, and reads the answer for a
   login page, which is the largest class of protection no compose file mentions. A login
   page takes the service out of the exposed count with its own badge; an answer *without*
-  one turns an exposure that was inferred into one that was measured. Off by default,
+  one turns an exposure that was inferred into one that was measured — and where the page
+  served real content beside a sign-in link, the same response is read as *proof* the
+  service is open rather than as an absence of evidence that it is closed. Off by default,
   since it is the only stage that sends a request to your own services — and even when
   it is on, a service already behind a detected gate is left alone, because its answer
   could not change the verdict.
@@ -528,7 +530,9 @@ nothing could check. Asking is evidence; a declaration is a claim.
 
 It cuts both ways, and the second half matters just as much: a service that answers
 with **no** login page turns an exposure that was inferred from configuration into one
-that was measured.
+that was measured. And where that answer was a page a visitor could actually read, the same
+response says something stronger than "nothing refused me" — see [what the page showed a
+visitor](#what-the-page-showed-a-visitor), below.
 
 **What gets asked, and at which address.** Two conditions, and a service has to meet
 both.
@@ -630,7 +634,7 @@ LabView asks next. The walk is sequential and stops at the first refusal, so a s
 one extra request in the ordinary case and four at most. Every scan prints the total it sent:
 
 ```text
-probe    18 services probed — 10 gated, 7 open, 1 did not answer — 2 services not asked
+probe    20 services probed — 10 gated, 9 open, 1 did not answer — 2 services not asked
          (authentication already detected) — 16 extra requests at current-user addresses
 ```
 
@@ -650,6 +654,47 @@ HTTP address` and is a **success**, not a failure: the stage ran, decided about 
 candidate, and the decision was that none of them needed asking. Only a fleet with the
 probe on and no HTTP address anywhere is reported as having found nothing, since that is
 a fact about the labels.
+
+#### What the page showed a visitor
+
+Everything above asks *is there a login page?* and an answer of no is an **absence** — none
+of the eight signals fired. An absence is easy to discount, and rightly, because it is also
+what a login page this rule cannot read looks like.
+
+So the same response is read a second time, the other way round: **what did the page show a
+caller who sent nothing?** No extra request, no new signal, nothing that can change a
+verdict — just the body that was already read, measured for two things at once:
+
+- **content** — how many characters of visible text and how many same-origin links came
+  back, with scripts, styles, comments, `<template>` and `<noscript>` removed first, so a
+  shell full of undrawn markup does not read as a finished page; and
+- **an offer to sign in** — an `<a href>` on one of the login paths, or an anchor or button
+  whose own short label says so in any of a dozen languages. A *sign-out* link is skipped
+  before its path is read, because a page carrying one is a page somebody is already signed
+  in to.
+
+Both together is the finding, and it is the first thing LabView can report *for* an open
+verdict rather than in explanation of one:
+
+```text
+It answered HTTP 200 with a page and no login form. It also served 358 characters of text
+and 3 links to a caller carrying no credential, beside a sign-in link to /login labelled
+"Sign in". That is an application with an optional account rather than a gate in front of
+one: a visitor who never signs in is shown this page.
+```
+
+Content with no offer gets the narrower half of that — *what came back is the application's
+own content and not a shell* — which is still worth having, since it rules out the one page
+no body-reading rule can judge.
+
+An offer with **no** content says nothing at all, and that silence is the point: a sign-in
+link on a page that rendered nothing is a login screen whose form has not been drawn yet,
+which is the opposite conclusion. That case is left to the eighth signal's current-user
+addresses, which are the right question for it.
+
+This can only ever *add a sentence* to a service that stays in the exposed count. It cannot
+gate anything, take anything out of the count, or turn into a mechanism — the rule that
+decides gates cannot see this reading at all.
 
 #### Reading the results
 
@@ -1667,6 +1712,14 @@ absent for every service when the stage is off:
     "status": 401,
     "challenge": true                        // the refusal named a scheme — this is the gate
   },
+  // What the same page showed a caller who sent nothing. Present whenever a body was read
+  // as HTML, gate or no gate, because it describes the response rather than the verdict.
+  "anon": {
+    "textChars": 358,                        // visible text: scripts, templates, noscript removed
+    "links": 3,                              // distinct same-origin links that are not login or logout
+    "loginHref": "/login",                   // absent unless the page linked to one
+    "loginLabel": "Sign in"                  // absent unless a short label said so
+  },
   "detail": "HTTP 302 — redirected off-site",
   "attempts": [ /* one per address tried, in vantage order — same shape as every other target's */ ]
 }
@@ -1688,6 +1741,12 @@ redirect targets are reduced before they are recorded: the query and the fragmen
 dropped, and the origin is kept only when the target actually left the origin. That is
 not tidying — an OAuth `Location` carries `state` and `code`, and a login redirect carries
 `?next=`, and neither has any business in an API response.
+
+`anon` is the one field here that is not a fact a verdict rested on, because it points the
+other way: it is [what the page showed a visitor](#what-the-page-showed-a-visitor), and no
+gate rule reads it. Its two strings are the only page content that reaches the payload at
+all, and both are reduced the same way the redirects are — a path with no query, and a label
+short enough to be a label.
 
 The **ingress vocabulary** is a third **breaking change**, in three steps. The first was
 a pure rename, every value mapping one-to-one onto the old one:
@@ -1934,7 +1993,7 @@ directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
 both directions, so the contribution is measured rather than assumed.
 
-The `probe` root is a fleet of seventeen stacks built so that every login-page signal
+The `probe` root is a fleet of eighteen stacks built so that every login-page signal
 and every near-miss appears exactly once, and it is run **twice** — once with the probe
 off and once on — so what the stage contributes is measured rather than assumed. It
 pins: each of the eight signals clearing an exposure, and each near-miss (a bare 401
@@ -1951,6 +2010,14 @@ failure; a `tcp://` tunnel and a service with `ports:` and no route never being 
 at all; a service that does not answer coming back as a third outcome rather than
 either verdict; a configured gate that is *not* downgraded by an open answer, and a
 stale acceptance that *is* reported as drift.
+
+**One stack points the other way.** `public-portal` is the only pair whose finding is
+*open*: one service serves a landing page with a `Sign in` link and must produce the
+sentence naming it, character count and all, while its sibling serves an article index
+whose headline reads *How to log in to your router* beside a sign-out link and must
+produce the narrower sentence with no offer in it. Between them they pin the label
+vocabulary in both directions — loosen it and the second fails; back the sentence out
+altogether and the first does.
 
 **Two stacks are there to be left alone.** A service with a Traefik auth middleware named
 by an unfound definition and one with a Cloudflare Access policy both have HTTP addresses
@@ -1977,7 +2044,9 @@ A separate group runs the `tools/probe-lab` report over the same canned bodies a
 its verdict equals `readGate`'s on every one of them. That is the only thing standing
 between the diagnostic and a report describing a decision LabView would not make, which
 would be worse than no report at all — it would send somebody to change a rule that was
-never the problem.
+never the problem. The same equality is asserted a second time as a *non*-effect: the
+tool's own page-evidence findings and its opt-in login-path guesses must leave that verdict
+byte-for-byte unchanged, so a diagnostic can never become a rule by accident.
 
 Every fixture is written so it fails if the corresponding logic is reverted — for both
 API integrations and for the probe that was checked by actually backing each rule out
@@ -2003,7 +2072,11 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   deliberate: a gate can only ever take a service *out* of the exposed count, so a rule
   loose enough to catch the rest would clear exposures that are real. Four known misses.
   A login shell built by JavaScript in an empty `<div id="root">` has no form in the HTML
-  and there is no headless browser here. A form below the 64 KiB the probe reads is never
+  and there is no headless browser here — though this one is now narrower than it reads: a
+  page that *rendered* is no longer part of it, because content served to an anonymous
+  caller beside an offer to sign in is [read as proof the service is
+  open](#what-the-page-showed-a-visitor). What is left is a body that drew nothing.
+  A form below the 64 KiB the probe reads is never
   seen — and if the read stops mid-tag, that element is simply not counted rather than
   raising anything; the one thing that *is* said is that it happened, since a truncated
   read now adds "the page continued past what was read" to the reason. A magic-link form
@@ -2017,7 +2090,10 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   and what an eighth signal would have to be. For the JavaScript-rendered case it will
   usually settle it outright — a client-rendered login screen is invisible in the markup,
   but the application behind it still answers `401` to an anonymous request at its
-  current-user address, and the tool asks.
+  current-user address, and the tool asks. For everything else it reports what a visitor
+  was shown — every link, every form-less control, the visible text — and says which of
+  those facts point at *open*, which point at a login the scan cannot see, and which are
+  only worth another look.
 - **A service behind a detected gate is no longer measured at all.** It is not asked, so
   there is no answer to report and its drawer carries no probe block — the posture rests
   on the configuration that already established it. What that costs is a corroboration

@@ -2,6 +2,7 @@ import type {
   AppStack,
   CloudflareRoute,
   LoginFormShape,
+  ProbeAnon,
   ProbeGate,
   ProbeRedirect,
   ProbeState,
@@ -209,6 +210,70 @@ const SAML_FIELD = /<input\b[^>]*\bname\s*=\s*["']?saml(?:request|response)\b/i;
  */
 const PASSWORD_INPUT =
   /<input\b[^>]*(?:\btype\s*=\s*["']?password\b|\bautocomplete\s*=\s*["']?current-password\b)/i;
+
+/**
+ * The words a page puts on the thing you click to sign in.
+ *
+ * This is the vocabulary of a *label*, not of a path or a field name — the fourth way a page
+ * can offer a login, and the only one the other three miss. A prerendered application whose
+ * landing page carries four paragraphs and one `<a href="/login">Sign in</a>` has no password
+ * input, no SAML field and no redirect; what it has is those seven characters.
+ *
+ * Multi-language on purpose, because an operator's fleet is not all English and the label is
+ * the one part of a login that gets translated: a path stays `/login` in every locale, and
+ * `<button>Inloggen</button>` is what the Dutch build of the same application renders.
+ *
+ * **Word boundaries are not decoration.** Without `\b` the `log[\s_-]?in` alternative matches
+ * `Blog index`, `catalog information` and `dialog input`, and that is not a hypothetical — a
+ * label vocabulary with no boundaries is how a documentation site becomes a login page. They
+ * are absent from the non-Latin alternatives because `\b` is defined on ASCII word characters,
+ * so `\bвойти` never matches at all; those literals are long enough to stand alone.
+ *
+ * Each alternative means "sign in" *by itself*. `continue with` is deliberately absent for
+ * failing that test — it is a login label only when a provider name follows, and naming
+ * providers would make this list a vendor list.
+ */
+const LOGIN_LABEL =
+  /\b(?:sign|log)[\s_-]?(?:in|on)\b|\bsso\b|single[\s_-]?sign[\s_-]?on|inloggen|aanmelden|anmelden|einloggen|connexion|se connecter|iniciar sesi|iniciar sess|accedi|войти|登录|登入|ログイン|로그인/i;
+
+/**
+ * The same vocabulary for the opposite door — and the reason it earns a constant of its own.
+ *
+ * A sign-out link is not a near miss for a sign-in link; it is *evidence of the reverse*, and
+ * it very often wears a login path. `isLoginPath` matches on prefix, so `/auth/logout`,
+ * `/oauth2/sign_out` and `/sso/logout` are all "login paths" by name — which means a page
+ * carrying only a logout link would otherwise read as a page offering to sign you in. Real
+ * self-hosted applications put exactly that on every page they serve *after* you have signed
+ * in, so without this the strongest available evidence of a **closed** session would be read as
+ * evidence of an open one.
+ *
+ * So this is checked against the label before the path is trusted, and it is what
+ * {@link saysLogout} answers. `fixtures/probe/public-portal/blog` pins it: remove this and that
+ * service's `/auth/logout` anchor turns into a sign-in affordance and the smoke pass fails.
+ *
+ * Sign-up is not here. It does not need to be — no alternative in {@link LOGIN_LABEL} matches
+ * `Sign up`, `Register` or `Create account` — and adding it would reject `Sign in / Sign up`,
+ * which is one control offering both and is a login affordance.
+ */
+const NOT_LOGIN_LABEL =
+  /\b(?:sign|log)[\s_-]?(?:out|off)\b|afmelden|uitloggen|abmelden|ausloggen|déconnexion|se déconnecter|cerrar sesi|encerrar sess|выйти|выход|登出|注销|ログアウト|로그아웃/i;
+
+/**
+ * How long a string can be and still be read as a *label* rather than as prose.
+ *
+ * {@link saysLogin} answers a vocabulary question and deliberately does not ask this one, because
+ * its two callers are looking at different things: `readAnonAccess` reads control labels, where
+ * length is the whole difference between `Sign in` and `How to log in to your router`, and
+ * `tools/probe-lab` also reads page titles and body text, where the same bound would throw away
+ * every real hit.
+ *
+ * So the bound lives here, exported rather than duplicated: the lab grades a long hit as weak
+ * using this number, and cannot grade it using a different one. Twenty-four characters fits
+ * `Sign in with Google` (19) and `Se connecter` (12), and excludes the article headline above
+ * (28) — which `fixtures/probe/public-portal/blog` pins, for the same reason
+ * {@link NOT_LOGIN_LABEL} is pinned.
+ */
+export const LOGIN_LABEL_MAX = 24;
 
 /**
  * Whether a tunnel origin addresses an HTTP service.
@@ -805,6 +870,244 @@ function attrOf(tag: string, name: string): string | undefined {
   return quoted ? raw.slice(1, -1) : raw;
 }
 
+/* -------------------------------------------------------------------------- */
+/* What the page showed a caller who sent nothing                             */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Everything above this line asks the same question — *is a gate in front of this?* — and
+ * answers it from the shapes a gate makes. What follows asks the opposite question, and it is
+ * the question a real fleet turned out to need.
+ *
+ * Eight probe reports against live services produced one sentence eight times: *no `<form>`
+ * element in the served markup*. True, and useless. Three of those services had served fifteen
+ * to twenty-four kilobytes of finished, readable page — an article index, a landing page, a
+ * media library — every one of them carrying a plain `Sign in` link the operator could see in a
+ * browser and LabView threw away unread, because the only things read out of a body were forms,
+ * scripts and the `<title>`.
+ *
+ * A page like that is not a rule failing to find a gate. It is **proof there is no gate**: an
+ * anonymous request was answered with the application's own content, and the sign-in link beside
+ * it is an optional account, not a door. That is the first positive evidence LabView can report
+ * for an open service, and until now `open` was only ever an absence — *none of the signals
+ * fired* — which is precisely the kind of finding an operator discounts.
+ *
+ * Two properties make it safe to say, and both are structural rather than argued:
+ *
+ *  - **{@link readGate} cannot see any of this.** It takes a {@link ProbeResponse} and this
+ *    record is not on one. There is no code path by which a sign-in link becomes a gate, so the
+ *    worst a mistake here can do is put a wrong *sentence* on a service that stays in the
+ *    exposed count — never take a service out of it (**I1**).
+ *  - **No new request.** It reads the same body `readGate` was already handed (**I8**), and it
+ *    keeps no header, no cookie and no attribute value except a resolved path and a label
+ *    shorter than {@link LOGIN_LABEL_MAX} (**I6**).
+ */
+
+/** Whether a visible label offers to sign somebody in. See {@link LOGIN_LABEL}. */
+export function saysLogin(text: string): boolean {
+  const label = plainText(text);
+  if (!label) return false;
+  // The veto first: `Sign out` must never satisfy a sign-in question, whatever else is in the
+  // string, because the two are read off the same words in the same places.
+  if (NOT_LOGIN_LABEL.test(label)) return false;
+  return LOGIN_LABEL.test(label);
+}
+
+/** Whether a visible label offers to sign somebody out. See {@link NOT_LOGIN_LABEL}. */
+export function saysLogout(text: string): boolean {
+  return NOT_LOGIN_LABEL.test(plainText(text));
+}
+
+/** A label short enough to be a control's own words, and saying sign-in. See {@link LOGIN_LABEL_MAX}. */
+function isLoginLabel(text: string): boolean {
+  const label = plainText(text);
+  return label.length > 0 && label.length <= LOGIN_LABEL_MAX && saysLogin(label);
+}
+
+/**
+ * What the served page showed a request that carried no credential.
+ *
+ * Four numbers and two strings, read off one body. The two halves have to arrive together to
+ * mean anything, which is why this is one function and not two: *content was served* alone is
+ * an open service with no accounts at all, *a sign-in link* alone is a login page whose form is
+ * drawn in the browser — the opposite conclusion — and only the pair is proof of an
+ * application that serves everybody and offers an account.
+ *
+ * **A logout link is skipped before its path is read.** That is the one ordering that matters
+ * here: `isLoginPath` matches on prefix, so `/auth/logout` and `/oauth2/sign_out` are login
+ * paths by name, and a page carrying one is a page somebody is *already signed in to*. Reading
+ * it as a sign-in affordance would turn the strongest evidence of a closed session into
+ * evidence of an open one. See {@link NOT_LOGIN_LABEL}.
+ *
+ * First hit wins for both strings and links are counted by distinct path, so one page yields
+ * one answer and the same page yields the same answer twice (**I7**) — a navigation repeated in
+ * a mobile menu is one link, not two.
+ */
+export function readAnonAccess(body: string, requestUrl: string): ProbeAnon {
+  const paths = new Set<string>();
+  let loginHref: string | undefined;
+  let loginLabel: string | undefined;
+
+  // **Drawn markup, not served markup**, and every number below comes off the same reduction.
+  // A `<template>` is where a client keeps the markup it has *not* rendered, and a framework that
+  // routes in the browser routinely ships its whole sign-in screen inside one; a `<noscript>` is
+  // the page for a visitor who is not the visitor being described. Counting either would produce
+  // the exact mistake this function exists to avoid — a shell reading as a finished page because
+  // its undrawn templates are full of links, or a sign-in affordance reported for markup nobody
+  // was shown. It also keeps `links` and `textChars` two views of one reading rather than two
+  // readings that happen to sit in one record.
+  const drawn = drawnMarkup(body);
+
+  for (const tag of drawn.match(ANCHOR_TAG) ?? []) {
+    const href = attrOf(tag, "href")?.trim();
+    // No href, a fragment on this same page, or a scheme that dials nothing: not a link to
+    // anywhere, and counting one as content would let a page of `href="#"` buttons read as an
+    // article index.
+    if (!href || href.startsWith("#") || /^(?:javascript|mailto|tel|data|blob):/i.test(href)) {
+      continue;
+    }
+    const to = readRedirect(href, requestUrl);
+    if (!to) continue;
+    const label = labelOf(tag);
+    if (saysLogout(label)) continue;
+    if (!to.crossOrigin && isLoginPath(to.to)) {
+      loginHref ??= to.to;
+      if (isLoginLabel(label)) loginLabel ??= label;
+      continue;
+    }
+    if (isLoginLabel(label)) {
+      // A sign-in the page routes to in the browser rather than in a `href` — an SPA's own
+      // link. The label is the whole of the evidence, so the path is not recorded.
+      loginLabel ??= label;
+      continue;
+    }
+    if (!to.crossOrigin) paths.add(to.to);
+  }
+
+  // Controls after anchors, so an anchor's label wins a tie: it is the stronger of the two,
+  // having a resolvable target behind it.
+  if (loginLabel === undefined) {
+    for (const tag of drawn.match(CONTROL_TAG) ?? []) {
+      const label = labelOf(tag);
+      if (isLoginLabel(label)) {
+        loginLabel = label;
+        break;
+      }
+    }
+  }
+
+  const anon: ProbeAnon = { textChars: plainText(drawn).length, links: paths.size };
+  if (loginHref !== undefined) anon.loginHref = loginHref;
+  if (loginLabel !== undefined) anon.loginLabel = loginLabel;
+  return anon;
+}
+
+/**
+ * `<a>` elements with their contents, and the tail of a truncated one.
+ *
+ * Lazy on purpose: a nested `<a>` is invalid HTML and a nested `</a>` ends the first anchor in
+ * every browser, so stopping at the first close tag is what a reader would see. The two
+ * alternatives after it are for markup that never closed one — the next `<a>` and then the end
+ * of a body cut off at `MAX_BODY_BYTES`. Without the lookahead a single unclosed anchor would
+ * swallow every link after it, which is the same reasoning `formBlocks` uses for a truncated
+ * form, applied to a list rather than to one element.
+ */
+const ANCHOR_TAG = /<a\b[^>]*>[\s\S]*?(?:<\/a>|(?=<a\b)|$)/gi;
+
+/**
+ * The controls a sign-in can be, when it is not a link.
+ *
+ * `<button>` is the ordinary case. `<input type=submit|button>` carries its label in `value`
+ * and closes nothing. `role="button"` is the one an SPA emits — a `<div>` or `<span>` wired up
+ * in JavaScript — and it is matched by its role rather than by its tag, since the tag is
+ * whatever the framework chose.
+ *
+ * Deliberately *not* restricted to controls outside a `<form>`: a login form inside a `<form>`
+ * has already been read by {@link readLoginForm} and gated, so a page that reaches this
+ * function has no such form to confuse with one.
+ */
+const CONTROL_TAG =
+  /<button\b[^>]*>[\s\S]*?(?:<\/button>|$)|<input\b[^>]*\btype\s*=\s*["']?(?:submit|button)\b[^>]*>|<([a-z][a-z0-9-]*)\b[^>]*\brole\s*=\s*["']?button\b[^>]*>[\s\S]*?(?:<\/\1>|$)/gi;
+
+/**
+ * What one element says out loud: its own text, or the accessible name standing in for it.
+ *
+ * The fallbacks are the icon-button case and nothing more exotic than that — a control whose
+ * visible content is an `<svg>` has an empty text node and an `aria-label`, and skipping it
+ * would miss the sign-in control of most of the applications that have one. `value` is last
+ * because only `<input>` has it.
+ */
+function labelOf(tag: string): string {
+  const inner = plainText(tag.replace(/^<[^>]*>/, "").replace(/<\/[a-z][a-z0-9-]*>$/i, ""));
+  if (inner) return inner;
+  return plainText(attrOf(tag, "aria-label") ?? attrOf(tag, "title") ?? attrOf(tag, "value") ?? "");
+}
+
+/** Markup out, one line of readable text in. Entities become a space rather than a character. */
+function plainText(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * What a reader would actually have read — the page minus everything a browser does not draw.
+ *
+ * The measure `anonProof` rests on, and the reason it is a *character count* rather than a
+ * sample: a form-less shell and a finished page are the same markup shape and are two orders of
+ * magnitude apart in rendered text, so length separates them where structure does not.
+ *
+ * What counts as drawn is {@link drawnMarkup}'s, so this is that reduction read as text — which
+ * is also where the truncated-body case is handled, and it is the one that decides this number.
+ *
+ * Exported for `tools/probe-lab`, which quotes the first couple of kilobytes of it so a reader
+ * can see the sign-in link in its context. That sample and `ProbeAnon.textChars` have to be two
+ * views of one reading: a lab with its own extractor would print a character count beside a
+ * sample drawn from different text, and the number in the report would not be the number the
+ * rule decided on.
+ */
+export function visibleText(body: string): string {
+  return plainText(drawnMarkup(body));
+}
+
+/**
+ * The served markup minus everything a browser does not draw.
+ *
+ * Comments, and the five elements whose contents are not content: a `<script>`, a `<style>`, an
+ * `<svg>`'s geometry, a `<template>`'s undrawn markup and a `<noscript>`'s alternative page.
+ *
+ * Its own function because {@link readAnonAccess} counts links in it and {@link visibleText}
+ * measures text in it, and those two numbers are only comparable if they came off the same
+ * string — a page whose sign-in link lives in a `<template>` must not be able to report a link a
+ * visitor could not click beside a character count that never included it.
+ *
+ * **The unterminated arm matters more than it looks.** A body cut at `MAX_BODY_BYTES`
+ * mid-`<script>` has no closing tag, and without that arm a bootstrap bundle's own source would
+ * be counted as text a visitor read — inflating the one number that decides whether a service is
+ * described as having served content.
+ *
+ * **`<svg/>` is dropped before either arm**, and it is the one element here that needs that. SVG
+ * is foreign content, which is the only place in HTML where a `/>` really does close the element;
+ * every other tag in the list treats the slash as noise and stays open. So an icon written
+ * `<svg />` is a closed element with nothing in it, and letting the unterminated arm reach it
+ * would throw away the whole rest of the page — a header bar's icon link silently costing a
+ * finished page its content. Direction-safe either way (a page can only lose text, never gain
+ * it), but losing it here means losing the sentence on exactly the services this rule is for.
+ *
+ * Exported for `tools/probe-lab`, which marks the anchors it finds *outside* this reduction as
+ * served-but-not-shown. That distinction is only honest if both halves use one definition of
+ * drawn.
+ */
+export function drawnMarkup(body: string): string {
+  return body
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<svg\b[^>]*\/>/gi, " ")
+    .replace(/<(script|style|template|noscript|svg)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(/<(script|style|template|noscript|svg)\b[^>]*>[\s\S]*$/i, " ");
+}
+
 /** A short answer and the sentence behind it, matching `NoAuthText`'s shape. */
 export interface ProbeGateText {
   label: string;
@@ -1003,6 +1306,7 @@ type ProbeReasonInput = Pick<
   | "refresh"
   | "truncated"
   | "state"
+  | "anon"
   | "detail"
 >;
 
@@ -1107,7 +1411,73 @@ function openReason(probe: ProbeReasonInput, at: string): string {
     probe.form ? formShortfall(probe.form) : undefined,
   ].filter((s): s is string => s !== undefined);
   const closest = near.length ? ` The nearest thing to a signal on it: ${joinAnd(near)}.` : "";
-  return `${at} and served an HTML page carrying none of the signals — no password field, no SAML hand-off, no refresh to a login and no form with login intent.${closest}${stateShortfall(probe.state)}`;
+  return `${at} and served an HTML page carrying none of the signals — no password field, no SAML hand-off, no refresh to a login and no form with login intent.${closest}${stateShortfall(probe.state)}${anonProof(probe.anon)}`;
+}
+
+/**
+ * How much text and how many links a page has to have served before it counts as content.
+ *
+ * **Wording thresholds, not verdict thresholds**, and that distinction is the whole licence for
+ * picking two numbers out of the air. Nothing downstream of {@link anonProof} counts anything:
+ * a threshold set slightly wrong costs one sentence on one service, never one service in the
+ * exposed count, so these can be tuned from real reports without a re-audit of what they move.
+ *
+ * Both must hold, because either alone has a cheap counter-example. A login page can carry two
+ * hundred characters of legal boilerplate; a page of nothing but a navigation can carry ten
+ * links. A shell — the case this must stay silent on — has neither: the largest client-rendered
+ * body in the reports that prompted this rule rendered under fifty characters and no anchors at
+ * all, so there is a wide margin between the two populations rather than a fine line.
+ */
+const ANON_TEXT_MIN = 200;
+const ANON_LINK_MIN = 2;
+
+/**
+ * Whether the page served its own content to a caller who sent no credential.
+ *
+ * The question {@link anonProof} turns on, exported so `tools/probe-lab` can put the same answer
+ * in front of a reader without knowing the numbers behind it — the discipline the four clause
+ * predicates follow, applied to a threshold instead of to a regex. A lab that compared its own
+ * two constants against these would eventually disagree with the sentence the dashboard shows
+ * for the same page, which is the one thing that tool exists not to do.
+ */
+export function servedAnonContent(anon: ProbeAnon): boolean {
+  return anon.textChars >= ANON_TEXT_MIN && anon.links >= ANON_LINK_MIN;
+}
+
+/**
+ * The one thing LabView can say *for* an open verdict rather than in explanation of it.
+ *
+ * Every other sentence in {@link openReason} is an absence — no password field, no refusal, no
+ * form. An absence is what a reader discounts, and rightly: it is equally consistent with a
+ * login this rule cannot see. This sentence is a presence. An anonymous request came back with
+ * the application's own readable content, and next to it an offer to sign in — which is the
+ * signature of an optional account, and is the opposite of a gate.
+ *
+ * Silent unless content was actually served ({@link ANON_TEXT_MIN}, {@link ANON_LINK_MIN}). A
+ * sign-in affordance on a page that served nothing is a login screen with its form not yet
+ * drawn, and saying "open" about that would be the one direction this file must never be wrong
+ * in — so that case says nothing here and is left to {@link stateShortfall}, which asks the
+ * addresses a shell's own client would ask.
+ *
+ * Empty for every service that answered anything but HTML, since there was no page to read.
+ */
+function anonProof(anon: ProbeAnon | undefined): string {
+  if (!anon || !servedAnonContent(anon)) return "";
+  const served = `${anon.textChars} characters of text and ${anon.links} link${anon.links === 1 ? "" : "s"}`;
+  const offer = anonOffer(anon);
+  if (!offer) {
+    return ` It also served ${served} to a caller carrying no credential, so what came back is the application's own content and not a shell — evidence that the service is open, rather than an absence of evidence that it is closed.`;
+  }
+  return ` It also served ${served} to a caller carrying no credential, beside ${offer}. That is an application with an optional account rather than a gate in front of one: a visitor who never signs in is shown this page.`;
+}
+
+/** Which of the two ways the page offered a sign-in, in the words it used. */
+function anonOffer(anon: ProbeAnon): string | undefined {
+  const quoted = anon.loginLabel ? `labelled "${anon.loginLabel}"` : undefined;
+  if (anon.loginHref) {
+    return `a sign-in link to ${anon.loginHref}${quoted ? ` ${quoted}` : ""}`;
+  }
+  return quoted ? `a sign-in control ${quoted}` : undefined;
 }
 
 /**

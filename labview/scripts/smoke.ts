@@ -209,13 +209,20 @@ const { hasDetectedAuth, hasEnforcedAuthentikGate } = await import("../src/label
 // rule here whose whole job is the *negative* verdict, and a sentence that passed on "no login
 // page was found" would be the conclusion again rather than the fact behind it. So every row
 // of its table asserts which fact the sentence names.
+//
+// `readAnonAccess` is the fourth rule and is the only one pointing the other way: it reads the
+// page a stranger was shown and says what that *proves*, so its table is the one place a
+// positive finding about an open service is pinned. It cannot reach a verdict — the assertions
+// below say so as a property, not only as a type.
 const {
+  LOGIN_LABEL_MAX,
   LOGIN_PATHS,
   MAX_PROBE_TARGETS,
   PROBE_GATES,
   PROBE_VANTAGES,
   STATE_PATHS,
   collectProbeReport,
+  drawnMarkup,
   isHttpOrigin,
   isLoginPath,
   probeFormText,
@@ -226,6 +233,7 @@ const {
   probeTargets,
   probeToggleText,
   probeVantageText,
+  readAnonAccess,
   readGate,
   readLoginForm,
   readMediaType,
@@ -233,7 +241,11 @@ const {
   readRefresh,
   readState,
   readStateGate,
+  saysLogin,
+  saysLogout,
+  servedAnonContent,
   stateTargets,
+  visibleText,
   wantsStateProbe,
 } = await import("../src/model/probe.js");
 // The tri-state filter lives in `src/` rather than in the web bundle precisely so it
@@ -667,6 +679,40 @@ const PROBE_SHELL_HTML = `<!doctype html><html><head><title>app</title>
 <body><div id="root"></div></body></html>`;
 
 /**
+ * A page that served a stranger its content and offered to sign them in — and its near miss.
+ *
+ * The only pair here where neither service is gated and neither verdict is in question. What
+ * differs is what the report can *say*: `PROBE_PORTAL_HTML` carries content, links into itself
+ * and one `<a href="/login">Sign in</a>`, which together are a presence rather than an absence,
+ * and `PROBE_BLOG_HTML` carries the same content with the two anchors that must not read as an
+ * offer — a sentence long enough to be prose and a sign-out link whose path is a login path.
+ *
+ * The search form in both is load-bearing: `wantsStateProbe` requires *no form anywhere*, so
+ * without it these two pages would each cost a second request and this fixture would be quietly
+ * editing the arithmetic of the state walk. See `fixtures/probe/public-portal/compose.yml`.
+ */
+const PROBE_PORTAL_HTML = `<!doctype html><html lang="en"><head><title>Acme Portal</title></head>
+<body><header><nav><a href="/status">Status</a> <a href="/docs">Documentation</a>
+<a href="/changelog">Changelog</a></nav><a href="/login">Sign in</a></header>
+<main><h1>Acme Portal</h1>
+<p>Everything on this page is served to anybody who asks for it. The status board, the
+documentation and the changelog are public, and an account is only needed to file a ticket
+or to subscribe to an alert.</p>
+<p>The last deployment finished eleven minutes ago and every region is currently green.</p>
+<form method="get" action="/search"><input type="search" name="q" placeholder="Search the docs">
+<button type="submit">Search</button></form></main></body></html>`;
+const PROBE_BLOG_HTML = `<!doctype html><html lang="en"><head><title>Acme Notes</title></head>
+<body><header><nav><a href="/archive">Archive</a> <a href="/tags">Tags</a></nav>
+<a href="/auth/logout">Sign out</a></header>
+<main><h1>Latest posts</h1>
+<p>Everything on this page is served to anybody who asks for it, and none of it is behind
+anything. The posts are public and the archive is public.</p>
+<ul><li><a href="/posts/router">How to log in to your router</a></li>
+<li><a href="/posts/backups">Keeping a backup you can actually restore</a></li></ul>
+<form method="get" action="/search"><input type="search" name="q" placeholder="Search posts">
+<button type="submit">Search</button></form></main></body></html>`;
+
+/**
  * Every address the fixture fleet answers at, keyed by the exact URL the probe builds.
  *
  * Keyed on the whole URL rather than the host, because the scheme and the trailing `/` are
@@ -747,6 +793,21 @@ const PROBE_ANSWERS: Record<string, ProbeAnswer> = {
   // Open, and the trap for the rule above: an application routing to one of its own flows.
   // `/flows/123` is not `/flows/-/`, and the `-` is the whole difference.
   "https://dataflow.probe.example.com/": { status: 302, location: "/flows/123" },
+  /*
+   * Open, and the only pair here that is open on the strength of what it served rather than of
+   * what it lacked. Both answer a form-bearing 200, so neither costs a second request, and
+   * neither verdict is in question — `probeReasonText` is what these two are for.
+   */
+  "https://app.public.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_PORTAL_HTML,
+  },
+  "https://blog.public.probe.example.com/": {
+    status: 200,
+    contentType: "text/html; charset=utf-8",
+    body: PROBE_BLOG_HTML,
+  },
   /*
    * The eighth signal, and the four addresses behind it.
    *
@@ -4979,6 +5040,230 @@ check(
   probeFormText({ password: false, username: false, submit: false, otp: false }),
 );
 
+console.log("\nwhat the page showed a caller who sent nothing");
+/*
+ * The one rule here that points the other way.
+ *
+ * Every clause above answers *is something refusing me?* and every answer is an absence when it
+ * is negative. `readAnonAccess` answers *what was I shown?*, and a page that served its own
+ * content to a stranger and offered to sign him in is the first thing LabView can say **for** an
+ * open verdict rather than in explanation of one.
+ *
+ * Which is why the table below is mostly near misses, and why they are the *expensive* kind. The
+ * pivot is content: a sign-in link on a finished page is an optional account, and the same link
+ * on an empty shell is a login page whose form has not been drawn — the opposite conclusion from
+ * identical markup. So each row pins both halves, and every row asserts that the reading did not
+ * become a gate: this rule may only ever leave a service in the exposed count (**I1**), and that
+ * is asserted here as a property rather than left to the type.
+ *
+ * `content` reads whether enough was served to say anything at all; then the link and the label,
+ * which are the two ways a page can make the offer and are graded differently downstream.
+ */
+function anonKey(body: string, url = "https://a.example.com/"): string {
+  const anon = readAnonAccess(body, url);
+  return [
+    servedAnonContent(anon) ? "content" : "no content",
+    `${anon.links} link${anon.links === 1 ? "" : "s"}`,
+    anon.loginHref ?? "no login path",
+    anon.loginLabel ? `"${anon.loginLabel}"` : "no login label",
+  ].join(" · ");
+}
+/** A page's own text, long enough to clear the content threshold without being the subject. */
+const ANON_PROSE = `<p>${"Everything on this page is served to anybody who asks for it. ".repeat(5)}</p>`;
+const anonCases: { name: string; body: string; want: string }[] = [
+  {
+    // The rule's whole purpose, in the shape three of the five reports that prompted it wore.
+    name: "content and a sign-in link beside it is the offer, read off one response",
+    body: `<nav><a href="/status">Status</a> <a href="/docs">Docs</a></nav>
+<a href="/login">Sign in</a>${ANON_PROSE}`,
+    want: `content · 2 links · /login · "Sign in"`,
+  },
+  {
+    // The case this must stay silent on, and the reason the content half exists at all. Same
+    // anchor as the row above, on a page with nothing else in it: that is a login screen.
+    name: "the same link on a shell says nothing, because a shell is what a login page looks like",
+    body: `<div id="app"></div><a href="/login">Sign in</a>`,
+    want: `no content · 0 links · /login · "Sign in"`,
+  },
+  {
+    // The link with no words on it — an icon in a header bar, which is most of the applications
+    // that have one. The path is the evidence and the label is absent, not guessed.
+    name: "a path that names a login is the offer even when nothing visible says so",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav><a href="/users/sign_in"><svg /></a>${ANON_PROSE}`,
+    want: "content · 2 links · /users/sign_in · no login label",
+  },
+  {
+    // ...and the accessible name is read when there is one, because that is the label a visitor
+    // using a screen reader was actually offered.
+    name: "...and an accessible name is the label, since that is what was offered",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav>
+<a href="/login" aria-label="Sign in"><svg /></a>${ANON_PROSE}`,
+    want: `content · 2 links · /login · "Sign in"`,
+  },
+  {
+    // The load-bearing veto, and `fixtures/probe/public-portal/blog`'s second trap. `/auth/` is
+    // in `LOGIN_PATHS` and `isLoginPath` matches by prefix, so this path *is* a login path by
+    // name — only the label says otherwise. Reading it as an offer would turn the strongest
+    // evidence that somebody is signed in into evidence that nobody has to be.
+    name: "a sign-out link at a login-shaped path is not an offer to sign in",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav><a href="/auth/logout">Sign out</a>${ANON_PROSE}`,
+    want: "content · 2 links · no login path · no login label",
+  },
+  {
+    // The other half of the same fixture, and the word-matching trap: the words are all there,
+    // in an anchor, on a page that served plenty. A label is a label and a sentence is prose.
+    name: "an article about logging in is a link to an article",
+    body: `<nav><a href="/a">A</a></nav>
+<a href="/posts/router">How to log in to your router</a>${ANON_PROSE}`,
+    want: "content · 2 links · no login path · no login label",
+  },
+  {
+    // The SPA's sign-in: wired up in JavaScript, so there is no `href` to read and nothing for
+    // `readLoginForm` to rank. The label is the whole of the evidence.
+    name: "a control with no form and no href still makes the offer",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav>
+<button type="button" id="signin">Sign in</button>${ANON_PROSE}`,
+    want: `content · 2 links · no login path · "Sign in"`,
+  },
+  {
+    // An anchor's label beats a control's, having a resolvable target behind it. One page, one
+    // answer (**I7**), and the stronger of the two facts is the one recorded.
+    name: "...and an anchor outranks a control when both say it",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav><a href="/sso">Continue with SSO</a>
+<button>Log in</button>${ANON_PROSE}`,
+    want: `content · 2 links · /sso · "Continue with SSO"`,
+  },
+  {
+    // A hand-off to somebody else's IdP. The path is not this origin's, so nothing is recorded
+    // as a path here — but the offer was still made, in words, and that is what is kept.
+    name: "a sign-in at another origin is an offer without a path of its own",
+    body: `<nav><a href="/a">A</a> <a href="/b">B</a></nav>
+<a href="https://sso.example.net/authorize?x=1">Sign in with SSO</a>${ANON_PROSE}`,
+    want: `content · 2 links · no login path · "Sign in with SSO"`,
+  },
+  {
+    // Links are counted by distinct path, so a navigation repeated in a mobile menu is one
+    // link. Without this a page of one duplicated menu would read as a site.
+    name: "the same address twice is one link, so a repeated menu is not content",
+    body: `<nav><a href="/docs">Docs</a></nav><footer><a href="/docs?utm=1">Docs</a></footer>${ANON_PROSE}`,
+    want: "no content · 1 link · no login path · no login label",
+  },
+  {
+    // What is not a link to anywhere. A page of `href="#"` handlers is a shell with its buttons
+    // drawn, and counting them would let one read as an article index.
+    name: "a fragment, a script handler and a mail address are not links to anywhere",
+    body: `<a href="#top">Top</a> <a href="javascript:go()">Go</a> <a href="mailto:x@y.z">Mail</a>
+<a href="/one">One</a>${ANON_PROSE}`,
+    want: "no content · 1 link · no login path · no login label",
+  },
+  {
+    // The shell that would otherwise fake a finished page. A client-routed application keeps
+    // the markup it has *not* drawn in a `<template>`, sign-in screen and all — so counting
+    // served markup instead of drawn markup would read this as content plus an offer, which is
+    // both halves of the sentence wrong at once.
+    name: "markup the client never drew is not what a visitor was shown",
+    body: `<div id="app"></div><template><nav><a href="/a">A</a> <a href="/b">B</a></nav>
+<a href="/login">Sign in</a>${ANON_PROSE}</template>`,
+    want: "no content · 0 links · no login path · no login label",
+  },
+  {
+    // ...and the same for the server's fallback page, which describes a visitor who is not the
+    // one being reported on.
+    name: "...nor is the page written for a visitor with no JavaScript",
+    body: `<div id="app"></div><noscript><a href="/a">A</a> <a href="/b">B</a>${ANON_PROSE}</noscript>`,
+    want: "no content · 0 links · no login path · no login label",
+  },
+];
+for (const c of anonCases) {
+  check(c.name, anonKey(c.body) === c.want, `got ${anonKey(c.body)}, wanted ${c.want}`);
+}
+check(
+  // I1, as a property of the table rather than of the type. Every body above is gate-free by
+  // construction — a sign-in *link* is not a signal, and never becomes one however strongly the
+  // rule above reads it. The moment a login link starts deciding gates, this row fails.
+  "nothing this rule reads is a gate, on any page it reads",
+  anonCases.every(
+    (c) => readGate({ requestUrl: "https://a.example.com/", status: 200, body: c.body }) === undefined,
+  ),
+  anonCases
+    .filter((c) => readGate({ requestUrl: "https://a.example.com/", status: 200, body: c.body }) !== undefined)
+    .map((c) => c.name)
+    .join("; ") || "(none)",
+);
+check(
+  // The thresholds themselves, which are wording thresholds and stay unexported for that
+  // reason — so they are pinned through the predicate, at the boundary, in both directions.
+  // Both halves must hold: a login page can carry two hundred characters of boilerplate, and a
+  // page of nothing but a navigation can carry ten links.
+  "content means text *and* links, and neither alone is content",
+  servedAnonContent({ textChars: 200, links: 2 }) &&
+    !servedAnonContent({ textChars: 199, links: 2 }) &&
+    !servedAnonContent({ textChars: 4000, links: 1 }) &&
+    !servedAnonContent({ textChars: 0, links: 0 }),
+);
+const LOGIN_WORDS = ["Sign in", "Log in", "Log on", "Aanmelden", "Anmelden", "Connexion", "Iniciar sesión", "SSO", "登录", "ログイン"];
+const LOGOUT_WORDS = ["Sign out", "Log off", "Uitloggen", "Abmelden", "Déconnexion", "Cerrar sesión", "登出", "ログアウト"];
+check(
+  // The vocabulary is multi-language because an operator's fleet is not all English, and the
+  // label is the part of a login that gets translated — a path stays `/login` in every locale.
+  "the label vocabulary reaches past English",
+  LOGIN_WORDS.every((s) => saysLogin(s)),
+  LOGIN_WORDS.filter((s) => !saysLogin(s)).join(", ") || "(all)",
+);
+check(
+  // The veto is checked first, and has to be: the two doors are read off the same words in the
+  // same places, and every one of these strings satisfies a sign-in alternative on its own.
+  "...and the sign-out door is read first, in every language it is read in",
+  LOGOUT_WORDS.every((s) => saysLogout(s) && !saysLogin(s)),
+  LOGOUT_WORDS.filter((s) => !saysLogout(s) || saysLogin(s)).join(", ") || "(all)",
+);
+check(
+  // Two absences, each deliberate and each a different kind. Sign-up is not a login and is
+  // excluded by the sign-in vocabulary itself rather than by the veto — putting it in the veto
+  // would reject `Sign in / Sign up`, which is one control offering both. `Continue with` is a
+  // login label only once a provider name follows it, and naming providers would turn a
+  // vocabulary into a vendor list.
+  "...while signing up is not signing in, and neither is continuing with nobody in particular",
+  ["Sign up", "Signup", "Register", "Registreren", "Create account"].every((s) => !saysLogin(s) && !saysLogout(s)) &&
+    !saysLogin("Continue with") &&
+    saysLogin("Sign in / Sign up"),
+);
+check(
+  // Word boundaries, which are the difference between a vocabulary and a documentation site: an
+  // unbounded `log[\s_-]?in` matches `Blog index` and `catalog information`, and a rule that
+  // did would report a login link on the archive page of every blog in a fleet.
+  "...and the words are matched as words, not as substrings of other words",
+  ["Blog index", "Catalog information", "Dialog input", "Backlog integration"].every((s) => !saysLogin(s)),
+  ["Blog index", "Catalog information", "Dialog input", "Backlog integration"].filter((s) => saysLogin(s)).join(", "),
+);
+check(
+  // The division of labour that keeps the article title out of the offer, stated as the pair it
+  // is: the words really are a sign-in label, and the *length* is the only thing that separates
+  // a control from prose about one. Whoever removes the cap should have to fail this row.
+  "the words alone are not the rule — a label is short, and prose is not",
+  saysLogin("How to log in to your router") &&
+    "How to log in to your router".length > LOGIN_LABEL_MAX &&
+    readAnonAccess(`<a href="/x">How to log in to your router</a>${ANON_PROSE}`, "https://a.example.com/")
+      .loginLabel === undefined,
+);
+check(
+  // `textChars` and the lab's text sample have to be two views of one reading, or a report would
+  // print a character count beside a sample drawn from different text. One reduction, one number.
+  "the count and the readable text are the same reading",
+  readAnonAccess(ANON_PROSE, "https://a.example.com/").textChars ===
+    visibleText(ANON_PROSE).length &&
+    drawnMarkup(`<template>${ANON_PROSE}</template>`).includes("Everything") === false,
+);
+check(
+  // The one element that can really close itself, since SVG is foreign content. An icon written
+  // `<svg />` closes there and the page continues; read as unterminated it would swallow
+  // everything after it, and a header bar's icon link would cost a finished page its content.
+  "an icon that closes itself does not take the rest of the page with it",
+  visibleText(`<svg />${ANON_PROSE}`).includes("Everything") &&
+    visibleText(`<svg viewBox="0 0 24 24"><path d="M0 0h24" /></svg>${ANON_PROSE}`).includes("Everything") &&
+    !visibleText(`<svg><path d="M0 0h24" />${ANON_PROSE}`).includes("Everything"),
+);
+
 console.log("\nwhere a response was pointing, read once for both the verdict and the record");
 /*
  * The three readers `readGate` now decides on, asserted directly.
@@ -5357,6 +5642,78 @@ const reasonCases: ReasonCase[] = [
     mustNot: ["gate", "signed in"],
   },
   {
+    // `fixtures/probe/public-portal/app`'s reason, and the only sentence in this table that is a
+    // *presence*. Every row above it explains a negative verdict by listing what was missing;
+    // this one says what was there, which is the half an operator can check in a browser.
+    //
+    // **Revert trap.** Back `anonProof` out of `openReason` and only this row fails: the verdict,
+    // the label and the counts are all identical either way, because a sentence is all this rule
+    // was ever allowed to move (**I1**).
+    name: "a page that served content to a stranger and offered him an account says so",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      anon: { textChars: 412, links: 3, loginHref: "/login", loginLabel: "Sign in" },
+      detail: "x",
+    },
+    must: [
+      "412 characters of text and 3 links",
+      "no credential",
+      "a sign-in link to /login",
+      'labelled "Sign in"',
+      "optional account rather than a gate in front of one",
+      "a visitor who never signs in is shown this page",
+    ],
+  },
+  {
+    // The same proof without the offer: a service with no accounts at all. Worth its own branch
+    // because the offer is what makes the sentence *about* authentication — without it the claim
+    // is narrower, and claiming an optional account nobody was offered would be an invention.
+    name: "...and one with no account to offer says only what it served, and why that is evidence",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      anon: { textChars: 900, links: 7, loginLabel: "Aanmelden" },
+      detail: "x",
+    },
+    must: ["900 characters of text and 7 links", "a sign-in control", '"Aanmelden"'],
+    mustNot: ["sign-in link to"],
+  },
+  {
+    // The pivot, in the wording rule. A sign-in link on a page that served nothing is a login
+    // screen whose form has not been drawn — the *opposite* conclusion from the same record — so
+    // this case says nothing at all rather than saying it weakly. `fixtures/probe/spa-shell` is
+    // the fleet-level half of the same claim, and `stateShortfall` is what speaks there instead.
+    name: "a shell that offered a sign-in and served nothing else is not evidence of anything",
+    probe: {
+      phase: "connected",
+      status: 200,
+      mediaType: "text/html",
+      anon: { textChars: 11, links: 0, loginHref: "/login", loginLabel: "Sign in" },
+      detail: "x",
+    },
+    must: ["no password field"],
+    mustNot: ["characters of text", "optional account", "sign-in link"],
+  },
+  {
+    // Position, asserted rather than trusted: the sentence lives in the negative branch, so a
+    // gate never carries it. A gated verdict printing evidence of openness beside it would read
+    // as the report disagreeing with itself.
+    name: "...and a gate carries none of it, whatever the page also served",
+    probe: {
+      phase: "connected",
+      status: 200,
+      gate: "password-form",
+      mediaType: "text/html",
+      anon: { textChars: 412, links: 3, loginHref: "/login", loginLabel: "Sign in" },
+      detail: "x",
+    },
+    must: ["password field"],
+    mustNot: ["characters of text", "optional account", "no credential"],
+  },
+  {
     // §11's known miss, reported the one time it can be: a form below the cap was never
     // searched for, so the absence of a signal is weaker evidence here than elsewhere.
     name: "a read that stopped at the body cap says a form below it was never searched for",
@@ -5468,9 +5825,10 @@ check(
 );
 
 /*
- * The seven per-signal rows — the section the tool exists for, and the one a gate assertion
- * cannot reach. `readGate` returns the *strongest* signal; these say which clauses fired, which
- * came close, and on what fact each turned.
+ * The eight per-signal rows — one per `PROBE_GATES` entry, including the state signal that
+ * `readGate` itself cannot reach. This is the section the tool exists for, and the one a gate
+ * assertion cannot: `readGate` returns the *strongest* signal, while these say which clauses
+ * fired, which came close, and on what fact each turned.
  */
 const loginReport = buildReport(asObservation({ requestUrl: "https://a.example.com/", status: 200, body: PROBE_LOGIN_HTML }));
 const signupReport = buildReport(asObservation({ requestUrl: "https://a.example.com/", status: 200, body: PROBE_SIGNUP_HTML }));
@@ -5799,6 +6157,130 @@ check(
 );
 
 /*
+ * `--try-login-paths`, the one part of this tool that guesses — and the one section of a report
+ * whose contents the scan could not have produced.
+ *
+ * Off by default, offered at the same form-less shell the sweep is offered at, and it asks the
+ * pipeline's **own** `LOGIN_PATHS` so that a hit is a hit at an address the rule already trusts as
+ * a name. Three answers are worth having, and the rows below are one each: a login page at a
+ * guessed address, the root's own bytes coming back from all of them (a catch-all router, which is
+ * itself proof the login is drawn in the browser), and nothing at any of them.
+ *
+ * **None of it can move the verdict, and that is asserted rather than argued.** `readGate` runs on
+ * these answers — the same rule, on a response the scan never saw — so the finding is stated in
+ * the pipeline's own vocabulary, and it lands in section 4 as a *request-budget* change: the only
+ * proposal in this tool that asks for an address rather than a rule.
+ */
+const LP_LOGIN_PAGE = `<!doctype html><html><head><title>Sign in · Vault</title></head><body>
+<h1>Sign in</h1><form method="post" action="/sign-in">
+<input type="text" name="username" autocomplete="username">
+<input type="password" name="password" autocomplete="current-password">
+<button type="submit">Sign in</button></form></body></html>`;
+const lpObs = (path: string, status: number, body?: string): ProbeLabObservation => ({
+  requestUrl: `https://a.example.com${path}`,
+  status,
+  headers: { "content-type": "text/html; charset=utf-8" },
+  ...(body ? { body, bodyBytes: Buffer.byteLength(body) } : {}),
+});
+const lpBase = buildReport(shellObs);
+/** A login page at `/sign-in`, which is in `LOGIN_PATHS`, and nothing at the other nine. */
+const lpFound = buildReport(shellObs, {
+  loginPaths: LOGIN_PATHS.map((p) =>
+    p === "/sign-in" ? lpObs(p, 200, LP_LOGIN_PAGE) : lpObs(p, 404, "<html><body>Not found</body></html>"),
+  ),
+});
+/** A client-side router: every address answers with the shell's own bytes. */
+const lpCatchAll = buildReport(shellObs, { loginPaths: LOGIN_PATHS.map((p) => lpObs(p, 200, SPA_SHELL_HTML)) });
+/** Nothing anywhere, which rules the guesses out and is worth saying. */
+const lpNone = buildReport(shellObs, {
+  loginPaths: LOGIN_PATHS.map((p) => lpObs(p, 404, "<html><body>Not found</body></html>")),
+});
+check(
+  // The hit, read by the real rule rather than by a second one: `readGate` on the guessed answer
+  // returns `password-form`, which is the same words the dashboard would have used had the scan
+  // ever asked. A lab with its own reading here would eventually disagree with the pipeline about
+  // a page they both looked at.
+  "a login page at a guessed address is read by the pipeline's own rule",
+  lpFound.loginPaths.length === LOGIN_PATHS.length &&
+    lpFound.loginPaths.filter((s) => s.gate !== undefined).length === 1 &&
+    lpFound.loginPaths.find((s) => s.gate)!.path === "/sign-in" &&
+    lpFound.loginPaths.find((s) => s.gate)!.gate === "password-form" &&
+    lpFound.loginPaths.find((s) => s.gate)!.title === "Sign in · Vault",
+  JSON.stringify(lpFound.loginPaths.find((s) => s.gate)),
+);
+check(
+  // **The whole safety argument for the flag**, and the reason it can be offered at all: the scan
+  // has no code path that sends a request to `/login`, so a reading of that answer is not a
+  // reading a scan could reproduce. It goes in section 4 with the size of the change stated, and
+  // the verdict is byte-identical to the run where the flag was off.
+  "...and it changes nothing about the verdict, which is what makes guessing permissible",
+  JSON.stringify(lpFound.verdict) === JSON.stringify(lpBase.verdict) &&
+    lpFound.verdict.gate === undefined &&
+    lpFound.verdict.withdrawsExposure === false &&
+    lpFound.next.some(
+      (n) =>
+        n.includes("/sign-in is a login page") &&
+        n.includes("read by `readGate` as login form served") &&
+        n.includes("a request-budget change and not a rule change"),
+    ),
+  `${JSON.stringify(lpFound.verdict)} · ${lpFound.next.join(" | ")}`,
+);
+check(
+  // The catch-all, which is a finding rather than ten. Every guessed address answering with the
+  // root's own bytes is a client-side router, and that is the strongest available evidence that
+  // the sign-in screen is drawn in the browser — so the section says it once instead of reporting
+  // ten login pages that do not exist.
+  "a router that answers everything with the same page is reported as one fact, not ten",
+  lpCatchAll.loginPaths.every((s) => s.sameAsRoot === true && s.gate === undefined && s.form === undefined) &&
+    lpCatchAll.next.some((n) => n.includes("same bytes") && n.includes("drawn in the browser")),
+  `same=${lpCatchAll.loginPaths.filter((s) => s.sameAsRoot).length}/${lpCatchAll.loginPaths.length} · ${lpCatchAll.next.join(" | ")}`,
+);
+check(
+  // And the negative answer, which is worth printing for the sweep's reason: a reader who came
+  // here suspecting a login page at an unguessed address gets an answer instead of a silence.
+  "...and nothing at any of them is a finding too, with the number asked stated",
+  lpNone.loginPaths.every((s) => s.gate === undefined && s.sameAsRoot === undefined) &&
+    lpNone.next.some((n) => n.includes(`None of the ${LOGIN_PATHS.length} guessed login addresses`)),
+  lpNone.next.join(" | "),
+);
+check(
+  // I1 across all three answers, and in both of the places it could break: the verdict, and the
+  // direction of anything section 3a says about a page whose *other* addresses were asked.
+  "no answer from a guessed address moves a verdict or points at a gate",
+  [lpFound, lpCatchAll, lpNone].every(
+    (r) =>
+      JSON.stringify(r.verdict) === JSON.stringify(lpBase.verdict) &&
+      r.evidence.every((f) => (f.direction as string) !== "gated"),
+  ),
+  [lpFound, lpCatchAll, lpNone].map((r) => JSON.stringify(r.verdict.gate)).join(" "),
+);
+check(
+  // The section header, and the two sentences that have to be in the preamble whatever else is:
+  // that a scan asks none of these addresses, and that nothing was sent with a credential on it.
+  // A reader who skipped the flag's documentation reads the report instead.
+  "a report with guessed addresses in it says who asked them, and with what",
+  (() => {
+    const md = renderMarkdown(lpFound);
+    return (
+      md.includes("### Guessed login addresses") &&
+      md.includes("--try-login-paths") &&
+      md.includes("no credential on any of them") &&
+      md.includes("A scan asks none of these addresses") &&
+      md.includes("`password-form`")
+    );
+  })(),
+);
+check(
+  // The default, which is the state every ordinary run is in: no flag, no section, no argument
+  // needed. `buildReport` with nothing extra produces an empty list rather than an absent field,
+  // so a report is one shape whether the flag was passed or not.
+  "...while an ordinary run has no such section at all",
+  lpBase.loginPaths.length === 0 &&
+    !renderMarkdown(lpBase).includes("Guessed login addresses") &&
+    renderJson(lpBase).includes('"loginPaths": []'),
+);
+
+/*
  * I6, applied to a tool whose output is a file somebody pastes into an issue.
  *
  * Two separate rules and they are not the same strength. A credential-shaped *header* is
@@ -5841,6 +6323,196 @@ check(
 check(
   "a rendered report carries no value the tool decided not to keep",
   !cookieMd.includes("SECRETVALUE") && cookieMd.includes("«redacted, 24 chars»"),
+);
+
+console.log("\nwhat the lab can say about a page the rule found nothing on");
+/*
+ * Section 3a, which is the part of a report the operator's question was actually about.
+ *
+ * Sections 1 and 2 can say which of eight clauses failed. This says *what the page showed*, and it
+ * is the only section that can produce a finding on a body every clause declined — which is the
+ * state five of the eight reports that prompted this change were in.
+ *
+ * **Everything below is downstream of a verdict it cannot reach.** `direction` has no `"gated"`
+ * member, `readEvidence` is handed the gate as a parameter, and no caller writes any of it back.
+ * The rows are ordered accordingly: each detector and its near miss, then the drift check that
+ * would fail the moment any of it leaked into a verdict — this change's version of the revert
+ * contract, and the reason it is safe for the detectors to be lenient where a clause cannot be.
+ */
+const evObs = (body: string, headers: Record<string, string> = {}): ProbeLabObservation => ({
+  requestUrl: "https://a.example.com/",
+  status: 200,
+  headers: { "content-type": "text/html; charset=utf-8", ...headers },
+  body,
+});
+/** Every finding on a body, as `kind:direction:strength` — the three fields a reader acts on. */
+const evKeys = (body: string, headers?: Record<string, string>): string =>
+  buildReport(evObs(body, headers))
+    .evidence.map((f) => `${f.kind}:${f.direction}:${f.strength}`)
+    .join(" ");
+/** A page's own content, so the pivot below has something to pivot on. */
+const EV_PROSE = `<h1>Acme</h1><nav><a href="/status">Status</a> <a href="/docs">Docs</a></nav>
+<p>${"Everything on this page is served to anybody who asks for it. ".repeat(5)}</p>`;
+const evidenceCases: { name: string; body: string; headers?: Record<string, string>; want: string }[] = [
+  {
+    // The headline row, and the whole of the proof for three of the five reports this was built
+    // from: a prerendered page whose sign-in is one anchor. Both halves of the answer arrive —
+    // what was served, and what was offered — and the link is `proof` because the path and the
+    // label agree, which is the strongest thing an anchor can be.
+    name: "content and a sign-in link is the page proving it is open, twice over",
+    body: `${EV_PROSE}<a href="/login">Sign in</a>`,
+    want: "content-served:open:proof login-link:open-with-login:proof",
+  },
+  {
+    // The pivot, and the reason no detector decides its own direction. Identical anchor, empty
+    // page: that is a login screen whose form has not been drawn, which is the *opposite*
+    // conclusion. So the finding survives — a reader still wants to know the anchor is there —
+    // and its direction becomes an instruction rather than an answer.
+    name: "...and the same link on a shell points at a second look, not at an open service",
+    body: `<div id="app"></div><script src="/assets/i.js"></script><a href="/login">Sign in</a>`,
+    want: "login-link:look-closer:proof",
+  },
+  {
+    // The Angular target, exactly as described: a sign-in you have to click, with no `<form>`
+    // around it and therefore nothing for `readLoginForm` to rank. `strong` rather than `proof`
+    // because a label is one fact where an anchor was two.
+    name: "a control with no form around it is the offer an SPA makes",
+    body: `${EV_PROSE}<button type="button" id="signin">Sign in</button>`,
+    want: "content-served:open:proof login-control:open-with-login:strong",
+  },
+  {
+    // The word-matching near miss, on the lab's side of the fence. The words are all there, in an
+    // anchor, on a page that served plenty — and the length is the only thing that separates a
+    // control from prose about one. Graded `weak`, and the gradient is the point: a report that
+    // said `proof` here would have taught its reader to discount the section.
+    name: "...while an article about logging in is a weak hit and says so",
+    body: `${EV_PROSE}<a href="/posts/router">How to log in to your router</a>`,
+    want: "content-served:open:proof login-link:look-closer:weak",
+  },
+  {
+    // The other near miss, and the expensive one. `/auth/` is in `LOGIN_PATHS` and `isLoginPath`
+    // matches by prefix, so this anchor's path *is* a login path — only the label says otherwise.
+    // A page carrying one is a page somebody is already signed in to.
+    name: "...and a sign-out link is not a hit at all, however login-shaped its path",
+    body: `${EV_PROSE}<a href="/auth/logout">Sign out</a>`,
+    want: "content-served:open:proof",
+  },
+  {
+    // The candidate ninth signal, which is the only finding here that would move a count if it
+    // were ever promoted — so it is stated as a question and sized in section 4 rather than
+    // applied. All three facts are required: the page names itself a login, has no form, and
+    // ships a bundle that could draw one.
+    name: "a page that calls itself a sign-in page and ships a bundle is a question, not a verdict",
+    body: `<title>Sign in · Vault</title><script type="module" src="/assets/i.js"></script><div id="app"></div>`,
+    want: "login-heading:look-closer:strong",
+  },
+  {
+    // ...and the near miss for it, which is why the clause is not shipped: the same heading on a
+    // page that also served content is an application with a sign-in *screen*, reached from a
+    // landing page a visitor was shown. Promoting the heading would gate this.
+    name: "...and the same heading over a page that served content is not that question",
+    body: `<title>Sign in · Vault</title>${EV_PROSE}`,
+    want: "content-served:open:proof",
+  },
+  {
+    // The shell's route table. Proof the application *has* a sign-in screen, which is not proof a
+    // visitor was made to use one — so `weak` however many hits there are, and the recommendation
+    // is a `--try-login-paths` run rather than a rule change.
+    name: "a login route in the client's own bytes is what a shell can be asked about",
+    body: `<div id="root"></div><script>window.__CFG__={loginUrl:"/sign-in"};</script>`,
+    want: "login-route:look-closer:weak",
+  },
+  {
+    // Weak in both directions on purpose: a session handed to a caller who sent nothing is an
+    // application tracking anonymous visitors, or a login page issuing a CSRF token, and the
+    // served bytes cannot say which. No clause reads a cookie name at all, which is what makes
+    // this worth reporting.
+    name: "a session cookie on an anonymous GET is a vendor clue and is graded as one",
+    body: `<div id="root"></div>`,
+    headers: { "set-cookie": "authentik_session=X; Path=/" },
+    want: "session-cookie:look-closer:weak",
+  },
+  {
+    // Markup the client had and did not draw. The finding stays — the route is real and worth
+    // asking about — but it cannot be `proof` of anything a visitor was *shown*, so it drops to
+    // the same `weak` a bundle literal gets. Without this a shell's undrawn sign-in screen would
+    // read as an offer on the page.
+    name: "a sign-in inside a template was served but not shown, and is graded as a route",
+    body: `<div id="app"></div><template><a href="/login">Sign in</a></template>`,
+    want: "login-link:look-closer:weak",
+  },
+  {
+    // The empty case, which has to be empty. A page with nothing on it is what the eighth signal
+    // is for, and a section inventing a row here would be the tool answering a question it had
+    // no evidence about.
+    name: "a page with nothing on it proves nothing, and no row is invented for it",
+    body: `<div id="root"></div>`,
+    want: "",
+  },
+];
+for (const c of evidenceCases) {
+  check(c.name, evKeys(c.body, c.headers) === c.want, `got [${evKeys(c.body, c.headers)}], wanted [${c.want}]`);
+}
+check(
+  // **The load-bearing row, and this change's version of the revert contract.** Every body above
+  // is put through the same equivalence the eight-row gate table is put through: the report's
+  // verdict is `readGate`'s verdict, on a table written entirely out of pages that produce
+  // findings. A detector that wrote `verdict.gate` — or a `readEvidence` consulted before the
+  // verdict was settled — fails here and nowhere else.
+  `no finding moves a verdict, on all ${evidenceCases.length} rows of the table above`,
+  evidenceCases.every((c) => {
+    const obs = evObs(c.body, c.headers);
+    return buildReport(obs).verdict.gate === readGate({ requestUrl: obs.requestUrl, status: 200, body: c.body });
+  }),
+  evidenceCases
+    .filter((c) => buildReport(evObs(c.body, c.headers)).verdict.gate !== readGate({ requestUrl: "https://a.example.com/", status: 200, body: c.body }))
+    .map((c) => c.name)
+    .join("; ") || "(none)",
+);
+check(
+  // The type's guarantee, restated where a runtime bug would show. `direction` has no `"gated"`
+  // member, so this cannot fail while the types hold — which is exactly why it is worth one line:
+  // it is what a widened union would break, and a widened union is how this would stop being true.
+  "...and no finding anywhere in the table points at a gate, which is not a direction it has",
+  evidenceCases.every((c) =>
+    buildReport(evObs(c.body, c.headers)).evidence.every((f) => (f.direction as string) !== "gated"),
+  ),
+);
+check(
+  // A gate ends the section, for section 4's reason: the rule already read this page and reached a
+  // conclusion, and a list of open-pointing facts printed beside a `gated` verdict would read as
+  // the report disagreeing with itself. The body is a login page that *also* has content and an
+  // anchor, so every detector above would otherwise fire on it.
+  "a page the rule gated carries no findings, because the reading is already settled",
+  (() => {
+    const gated = buildReport(evObs(`${EV_PROSE}<a href="/login">Sign in</a><form action="/login"><input type="password"></form>`));
+    return gated.verdict.gate === "password-form" && gated.evidence.length === 0;
+  })(),
+);
+check(
+  // I6 on the new sections, which are the ones that quote the page. The text sample is the widest
+  // surface this change opened — two kilobytes of somebody's landing page — so the same two rules
+  // are asserted against a report that has one: a redacted header keeps its placeholder, and a
+  // cookie value never appears at all.
+  "...and a report with a text sample and findings in it still carries no value the tool dropped",
+  (() => {
+    const md = renderMarkdown(
+      buildReport(
+        evObs(`${EV_PROSE}<a href="/login">Sign in</a>`, {
+          "set-cookie": "authentik_session=SECRETVALUE; Path=/",
+          "x-auth-token": "«redacted, 24 chars»",
+        }),
+      ),
+    );
+    return (
+      md.includes("## What a visitor was shown") &&
+      md.includes("### Visible text") &&
+      md.includes("open, with an optional account") &&
+      md.includes("authentik_session") &&
+      !md.includes("SECRETVALUE") &&
+      md.includes("«redacted, 24 chars»")
+    );
+  })(),
 );
 
 /* -------------------------------------------------------------------------- */
@@ -5974,13 +6646,13 @@ const idleProbe = probeStub();
 const unasked = await overviewFor(probeRoot, { fetchImpl: idleProbe.fetchImpl });
 const pbSvcOff = lookup(unasked);
 check(
-  "found 17 stacks, 25 services",
-  unasked.stats.stacks === 17 && unasked.stats.services === 25,
+  "found 18 stacks, 27 services",
+  unasked.stats.stacks === 18 && unasked.stats.services === 27,
   `${unasked.stats.stacks}/${unasked.stats.services}`,
 );
 check(
-  "...20 of which are reachable without detected authentication before anything is asked",
-  unasked.stats.exposedWithoutAuth === 20,
+  "...22 of which are reachable without detected authentication before anything is asked",
+  unasked.stats.exposedWithoutAuth === 22,
   String(unasked.stats.exposedWithoutAuth),
 );
 check("not one request was sent", idleProbe.calls.length === 0, idleProbe.calls.map((c) => c.url).join(" "));
@@ -6400,6 +7072,132 @@ check(
     .join(" "),
 );
 
+console.log("\nthe page a stranger was shown, and the one thing it can prove");
+/*
+ * `fixtures/probe/public-portal`, and the only pair in this root where neither verdict is in
+ * question. Both services are open before this rule runs and open after it, and both stay in the
+ * exposed count — which is the point. What is under test is what the report can *say*.
+ *
+ * Every other sentence a negative verdict carries is an absence: no password field, no hand-off,
+ * no refusal behind the page. An absence is what a reader discounts, and rightly — it is equally
+ * consistent with a login this rule cannot see. `app` is a presence: an anonymous request came
+ * back with the application's own content and an offer to sign in, which is the signature of an
+ * optional account and the opposite of a gate.
+ *
+ * `blog` is the near miss, and it carries the two ways the vocabulary can be wrong at once: an
+ * article title long enough to be prose about signing in, and a sign-out link at `/auth/logout`
+ * — a path `isLoginPath` matches, because prefixes are how the products behind it route. It gets
+ * the content half of the sentence and not the offer half, and the difference between the two
+ * services is four words of markup.
+ *
+ * Neither costs a second request: both serve a search `<form>`, so `wantsStateProbe` is false and
+ * a fixture written to test a sentence about a body is not also editing the state walk's
+ * arithmetic.
+ */
+const portalApp = result("public-portal", "app");
+const portalBlog = result("public-portal", "blog");
+check(
+  "a page that served its content to a stranger and offered him an account is read as both",
+  portalApp.gate === undefined &&
+    pbSvc("public-portal", "app").auth.exposedWithoutAuth === true &&
+    portalApp.anon !== undefined &&
+    servedAnonContent(portalApp.anon) &&
+    portalApp.anon.loginHref === "/login" &&
+    portalApp.anon.loginLabel === "Sign in",
+  `gate=${String(portalApp.gate)} anon=${JSON.stringify(portalApp.anon)}`,
+);
+check(
+  // **The revert trap.** Back `anonProof` out of `openReason` and this row is the only one that
+  // fails in the whole suite: the verdict, the label, the counts and the note are identical with
+  // the sentence and without it, because a sentence is all this rule was ever able to move.
+  "...and the reason says so, in the words the page used",
+  probeReasonText(portalApp).includes("358 characters of text and 3 links") &&
+    probeReasonText(portalApp).includes("caller carrying no credential") &&
+    probeReasonText(portalApp).includes('a sign-in link to /login labelled "Sign in"') &&
+    probeReasonText(portalApp).includes("optional account rather than a gate in front of one"),
+  probeReasonText(portalApp),
+);
+check(
+  // The trap, both halves of it. Drop `NOT_LOGIN_LABEL` and `/auth/logout` becomes an offer to
+  // sign in — which every application with a sign-out link in its header would then carry. Drop
+  // `LOGIN_LABEL_MAX` and the article title becomes one. Either way this row fails and the row
+  // above it still passes, which is why the pair is one fixture.
+  "a sign-out link and an article about logging in are neither of them an offer",
+  portalBlog.gate === undefined &&
+    pbSvc("public-portal", "blog").auth.exposedWithoutAuth === true &&
+    portalBlog.anon !== undefined &&
+    servedAnonContent(portalBlog.anon) &&
+    portalBlog.anon.loginHref === undefined &&
+    portalBlog.anon.loginLabel === undefined,
+  `gate=${String(portalBlog.gate)} anon=${JSON.stringify(portalBlog.anon)}`,
+);
+check(
+  // So it gets the narrower sentence, and the narrower sentence is still worth printing: content
+  // served to an anonymous caller is evidence of an open service on its own. What it must not
+  // claim is an account nobody was offered.
+  "...so what it served is reported, and no account it never offered is invented",
+  probeReasonText(portalBlog).includes("268 characters of text and 4 links") &&
+    probeReasonText(portalBlog).includes("the application's own content and not a shell") &&
+    !probeReasonText(portalBlog).includes("optional account") &&
+    !probeReasonText(portalBlog).includes("sign-in"),
+  probeReasonText(portalBlog),
+);
+check(
+  // The pivot, from the fleet's own bodies rather than from a canned one. `dash` says "Sign in"
+  // twice and links to an account page — every word the offer needs — on a page with 45
+  // characters of text and no links. That is a login screen as often as it is an open dashboard,
+  // so the record keeps the label and the sentence says nothing. A threshold dropped to zero
+  // fails here, and nowhere else in this root.
+  "a page whose only content is the words `sign in` proves nothing, and is not credited with it",
+  result("open-app", "dash").anon?.loginLabel === "Sign in" &&
+    servedAnonContent(result("open-app", "dash").anon!) === false &&
+    !probeReasonText(result("open-app", "dash")).includes("characters of text"),
+  `${JSON.stringify(result("open-app", "dash").anon)} · ${probeReasonText(result("open-app", "dash"))}`,
+);
+check(
+  // Two first requests and no second ones, which is the fixture's own bound and the reason both
+  // pages carry a search form. A `<form>` anywhere makes `wantsStateProbe` false.
+  "neither service cost a second request, because a page with a form is not a shell",
+  portalApp.state === undefined &&
+    portalBlog.state === undefined &&
+    probeCalls.filter((u) => u.includes(".public.probe.example.com")).length === 2,
+  probeCalls.filter((u) => u.includes(".public.probe.example.com")).join(" "),
+);
+check(
+  // The record describes a *response*, not a verdict, so it is present wherever there was a page
+  // to read — gated pages included. §3.7's rule that a field about the run is never optional does
+  // not reach it, for the same reason it does not reach `state`.
+  "the record exists on every page that was read, and on nothing that was not a page",
+  probeFlat(probed).every(([, s]) => {
+    const p = s.probe;
+    if (!p) return true;
+    return (p.anon !== undefined) === (p.status === 200 && p.mediaType === "text/html");
+  }),
+  probeFlat(probed)
+    .filter(([, s]) => s.probe && (s.probe.anon !== undefined) !== (s.probe.status === 200 && s.probe.mediaType === "text/html"))
+    .map(([k, s]) => `${k}=${String(s.probe?.status)}/${String(s.probe?.mediaType)}/anon=${s.probe?.anon !== undefined}`)
+    .join(" ") || "(none)",
+);
+check(
+  // And the direction, measured across the fleet rather than argued: five gated services in this
+  // root carry the record and not one of them says a word about it, because the sentence lives in
+  // the branch that explains an *open* verdict. There is no code path by which a sign-in link
+  // becomes a signal — `readGate` takes a `ProbeResponse`, and this record is not on one — so the
+  // worst a mistake in it can do is put a wrong sentence on a service that stays in the exposed
+  // count, never take one out of it (**I1**).
+  "...and every gated page in the fleet carries one silently, which is the whole of the guarantee",
+  probeFlat(probed).filter(([, s]) => s.probe?.gate && s.probe.anon).length >= 5 &&
+    probeFlat(probed).every(([, s]) => {
+      const p = s.probe;
+      if (!p?.gate) return true;
+      return !probeReasonText(p).includes("caller carrying no credential");
+    }),
+  probeFlat(probed)
+    .filter(([, s]) => s.probe?.gate && s.probe.anon)
+    .map(([k, s]) => `${k}=${String(s.probe?.gate)}`)
+    .join(" ") || "(none)",
+);
+
 console.log("\na service whose authentication this scan already found is not asked at all");
 /*
  * The eligibility rule, end to end, and the argument for it in one line: `hasEdgeAuth` is
@@ -6499,7 +7297,7 @@ check(
 );
 check(
   "it counts in neither of the two counters",
-  probed.stats.probeGated + probed.stats.probeOpen === 17,
+  probed.stats.probeGated + probed.stats.probeOpen === 19,
   `${probed.stats.probeGated} gated + ${probed.stats.probeOpen} open`,
 );
 check(
@@ -6839,13 +7637,13 @@ check(
 /*
  * The total, spelled out as the sum it is, in the two parts it now has.
  *
- * Twenty services in this root show an HTTP address; two of them already had authentication
- * detected and were withheld, so eighteen get one request each — and exactly one of those,
+ * Twenty-two services in this root show an HTTP address; two of them already had authentication
+ * detected and were withheld, so twenty get one request each — and exactly one of those,
  * `lan-fallback/vault`, whose public hostname does not resolve, gets a second from the next
  * vantage. `silent/ghost` does *not*: it also fails, but it publishes no port, so there is no LAN
  * address to fall through to. That asymmetry is worth asserting because "walk the vantages until
  * one answers" and "walk them all" produce the same verdicts on this root and differ only in this
- * number. Nineteen requests, then, to settle what the first response can settle.
+ * number. Twenty-one requests, then, to settle what the first response can settle.
  *
  * The other sixteen are the second request, and they are the price of the eighth signal — five
  * services here answer with a form-less HTML 200, which is the one page no reading of a body can
@@ -6853,12 +7651,18 @@ check(
  * single request (`/api/` refuses immediately, and a refusal is the answer). A rule that walked
  * all four regardless would show up here as 19 rather than 16, which is the only symptom it would
  * have — every verdict on this root would be identical.
+ *
+ * **`public-portal` adds two first requests and no second ones**, which is why it is in this
+ * comment at all. Both its services answer a 200 that carries a `<form>` — a search box — so
+ * `wantsStateProbe` is false for both, and a fixture written to test a sentence about a body does
+ * not also move the arithmetic of a walk it has nothing to do with. Give either of them a page
+ * with no form on it and this row is what says so.
  */
 const eligibleCount = probeFlat(probed).filter(([, s]) => s.probe !== undefined).length;
 const secondCount = probeCalls.filter((u) => new URL(u).pathname !== "/").length;
 check(
-  "35 requests: one for each of the 18 services asked, one fallthrough, and 16 second requests",
-  eligibleCount === 18 && probeCalls.length === 35 && secondCount === 16,
+  "37 requests: one for each of the 20 services asked, one fallthrough, and 16 second requests",
+  eligibleCount === 20 && probeCalls.length === 37 && secondCount === 16,
   `${eligibleCount} asked, ${probeCalls.length} requests (${secondCount} second): ${probeCalls.join(" ")}`,
 );
 check(
@@ -6925,8 +7729,8 @@ const removedByProbe = probeFlat(probed).filter(
   ([k, s]) => s.probe?.gate && offExposed.get(k) === true,
 ).length;
 check(
-  "...so the aggregate adds back up: 11 exposed + 9 the probe removed = the 20 counted with it off",
-  probed.stats.exposedWithoutAuth === 11 &&
+  "...so the aggregate adds back up: 13 exposed + 9 the probe removed = the 22 counted with it off",
+  probed.stats.exposedWithoutAuth === 13 &&
     removedByProbe === 9 &&
     probed.stats.exposedWithoutAuth + removedByProbe === unasked.stats.exposedWithoutAuth,
   `${probed.stats.exposedWithoutAuth} + ${removedByProbe} vs ${unasked.stats.exposedWithoutAuth}`,
@@ -6972,15 +7776,15 @@ check(
 );
 check(
   // Four segments, and neither of the last two is decoration. This line is the only place a
-  // reader sees the whole stage at once. "18 services probed" in a root with 20 HTTP addresses
+  // reader sees the whole stage at once. "20 services probed" in a root with 22 HTTP addresses
   // invites exactly the wrong conclusion — that two of them were somehow unreachable rather than
   // deliberately left alone — so the third segment says why, and comes after everything measured.
-  // The fourth is the request budget: a stage that sent 35 requests while reporting 18 services
-  // would be understating its own traffic by half, and an operator deciding whether to switch this
-  // on is entitled to the real number (**I8**).
+  // The fourth is the request budget: a stage that sent 37 requests while reporting 20 services
+  // would be understating its own traffic by nearly half, and an operator deciding whether to
+  // switch this on is entitled to the real number (**I8**).
   "...and says what it found in counts, including what it chose not to ask and what it cost",
   probeConn.read ===
-    "18 services probed — 10 gated, 7 open, 1 did not answer — 2 services not asked (authentication already detected) — 16 extra requests at current-user addresses",
+    "20 services probed — 10 gated, 9 open, 1 did not answer — 2 services not asked (authentication already detected) — 16 extra requests at current-user addresses",
   probeConn.read ?? "no read line",
 );
 check(

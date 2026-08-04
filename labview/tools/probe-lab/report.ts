@@ -40,8 +40,11 @@
  * person reads. It is not imported by `src/`, it is not in the image, and no scan consults it.
  */
 import {
+  LOGIN_LABEL_MAX,
+  LOGIN_PATHS,
   PROBE_GATES,
   STATE_PATHS,
+  drawnMarkup,
   hasPasswordField,
   hasSamlField,
   isHtmlMediaType,
@@ -50,6 +53,7 @@ import {
   probeGateText,
   probeOutcome,
   probeReasonText,
+  readAnonAccess,
   readGate,
   readLoginForm,
   readMediaType,
@@ -57,12 +61,17 @@ import {
   readRefresh,
   readState,
   readStateGate,
+  saysLogin,
+  saysLogout,
+  servedAnonContent,
+  visibleText,
   wantsStateProbe,
   type StateAnswer,
 } from "../../src/model/probe.js";
 import type {
   ConnectionPhase,
   LoginFormShape,
+  ProbeAnon,
   ProbeGate,
   ProbeRedirect,
   ProbeState,
@@ -147,6 +156,153 @@ export interface AssetRef {
 }
 
 /**
+ * One `<a href>`, and what the pipeline's own predicates make of it.
+ *
+ * **The field this whole section was added for.** Eight reports against a live fleet each said
+ * "no `<form>` element in the served markup" about pages carrying fifteen to twenty-four
+ * kilobytes of finished HTML — and the proof the operator could see in a browser was a plain
+ * `<a href="/login">Sign in</a>` that nothing here had ever read. A form is one of four ways a
+ * page offers a login and it is the least common of them on a prerendered page.
+ *
+ * The three booleans are the pipeline's answers, not the lab's: `isLoginPath`, `saysLogin` and
+ * `saysLogout` as `src/model/probe.ts` exports them. Recording them per anchor is the
+ * fine-tuning surface — a reader who disagrees with a verdict can see which anchor the rule
+ * matched and on which of the two halves.
+ */
+export interface AnchorRef {
+  /** The `href` as written, so a relative link is visible as one. */
+  href: string;
+  /** Resolved against the request URL, query dropped — `readRedirect`'s own reading. */
+  path?: string;
+  crossOrigin?: boolean;
+  /** Visible text, tags stripped and whitespace collapsed. Capped, since prose can be an anchor. */
+  text?: string;
+  ariaLabel?: string;
+  rel?: string;
+  /** `isLoginPath(path)` — set only when true, so a dump of fifty anchors stays readable. */
+  loginPath?: boolean;
+  /** `saysLogin(label)`. */
+  loginLabel?: boolean;
+  /** `saysLogout(label)` — the one that stops the two above from meaning what they look like. */
+  logoutLabel?: boolean;
+  /**
+   * Served, but not drawn: this anchor is inside a `<template>`, `<noscript>`, `<script>` or
+   * `<svg>`, so no visitor was shown it.
+   *
+   * Kept rather than dropped, because a framework that routes in the browser ships its sign-in
+   * screen in a `<template>` and finding it there is *worth knowing* — it says the application has
+   * a login, which is what `login-route` says. It is simply not evidence about what this response
+   * showed anybody, so a finding built on one is graded down to `weak` and points at
+   * `look-closer`. `readAnonAccess` does not see these at all: `drawnMarkup` removes them before
+   * it counts anything.
+   */
+  hidden?: boolean;
+}
+
+/**
+ * One control that is not inside a `<form>` — the sign-in of an application that has no form.
+ *
+ * A single-page application renders `<button>Sign in</button>` with nothing around it and wires
+ * it up in JavaScript, so `readLoginForm` has nothing to rank and `hasPasswordField` has nothing
+ * to find. Only controls outside every `<form>` are here: one inside a form was already read by
+ * the pipeline's own form rules, and dumping it twice would make section 3 argue with section 2.
+ */
+export interface ControlRef {
+  /** Which shape it was found in — a `<button>`, an `<input>`, or a `role="button"` element. */
+  kind: "button" | "input" | "role";
+  label?: string;
+  type?: string;
+  id?: string;
+  ariaLabel?: string;
+  loginLabel?: boolean;
+}
+
+/** A `<meta name|property>` and its content — where a vendor names itself when `generator` does not. */
+export interface MetaRef {
+  name: string;
+  content: string;
+}
+
+/**
+ * A mount point: a custom element, or the `<div>` a framework hands its bundle.
+ *
+ * The shell's fingerprint. `<div id="root">` is Vite or Create React App, `<div id="__next">` is
+ * Next.js, `<home-assistant>` is a custom element that names its own product — and a shell whose
+ * mount point is called `login-app` has said what it is about to draw.
+ */
+export interface RootRef {
+  tag: string;
+  id?: string;
+  className?: string;
+}
+
+/**
+ * An inline `<script>`, described rather than dumped.
+ *
+ * **Never its source.** An anonymous page's bootstrap script is where a client keeps its route
+ * table, and one of the reports that prompted this section listed a `/__config.js` — so what is
+ * kept is a size, a type, the login-shaped path literals in it and the names of the globals it
+ * assigns. That is everything a rule could be built on and none of what would make a report
+ * unsafe to paste into an issue (**I6**).
+ */
+export interface InlineScript {
+  type?: string;
+  id?: string;
+  bytes: number;
+  /** Quoted path literals in it that `isLoginPath` matches — the client's own route table. */
+  loginPaths: string[];
+  /** Globals it assigns (`__NEXT_DATA__`, `window.__NUXT__`) — names only, never values. */
+  bootstrapKeys: string[];
+}
+
+/**
+ * What a reader would have read, and a sample of it.
+ *
+ * `chars` is `read.anon.textChars` — the pipeline's own count, from the pipeline's own
+ * `visibleText`, because a second extractor here would print a number the rule did not decide
+ * on. The sample is capped and exists for one reason: to show the words "Sign in" sitting in
+ * their context, which is what tells a reader whether a hit is a control or a sentence.
+ */
+export interface PageText {
+  chars: number;
+  sample: string;
+  /** Characters of visible text past the sample cap. `0` when the whole of it is above. */
+  omitted: number;
+}
+
+/**
+ * One thing the page proves about itself, and which way it points.
+ *
+ * Section 3a, and the part of a report that answers the question an operator actually asked:
+ * *this service has a sign-in page — why does the tool say it found nothing?* The signal table
+ * above can only say which of eight clauses failed. This says what the page showed.
+ *
+ * **`direction` has no `"gated"` member, and that is the type doing the work.** A finding here
+ * can point at *open*, at *open with an optional account*, or at *worth another look*; it can
+ * never conclude that a gate exists, because concluding that is `readGate`'s job and `readGate`
+ * cannot see any of this. So the worst a detector can be wrong about is a paragraph in a
+ * diagnostic file — never a service's place in the exposed count (**I1**). `buildReport` puts
+ * the verdict together before this function is called, and the smoke pass asserts that a report
+ * with findings has the same `verdict.gate` as `readGate` alone.
+ */
+export interface EvidenceFinding {
+  kind:
+    | "login-link"
+    | "login-control"
+    | "login-route"
+    | "login-heading"
+    | "session-cookie"
+    | "content-served";
+  direction: "open-with-login" | "open" | "look-closer";
+  /** How much the fact carries: `proof` is what a page did, `weak` is what a word suggested. */
+  strength: "proof" | "strong" | "weak";
+  /** Quoted from the page, so a reader checks the finding rather than believing it. */
+  fact: string;
+  /** Why that fact points where `direction` says. */
+  because: string;
+}
+
+/**
  * One hop of a redirect chain the tool walked past the first response.
  *
  * **The scan does not walk this.** `getResponse` sends `redirect: "manual"` and `readGate` reads
@@ -206,6 +362,51 @@ export interface SweepStep {
   sameAsRoot?: boolean;
 }
 
+/**
+ * One address from the pipeline's own {@link LOGIN_PATHS}, asked on purpose, and what it answered.
+ *
+ * **Opt-in, `--try-login-paths`, and off by default.** The other two extra-request sections exist
+ * because a service *told* the tool where to look — a `Location` header, or a convention the
+ * pipeline already trusts enough to send a scan's second request at. This one guesses, and a guess
+ * at ten addresses on somebody's service is a different kind of act, so it happens only when
+ * somebody typed the flag.
+ *
+ * Three readings, and each is worth having:
+ *
+ *  - **A login page.** `gate` is the real `readGate` run on that answer, so this says the
+ *    application has a sign-in screen at a path the pipeline already trusts by name — and the
+ *    change that would let a scan find it is *one more address in a list*, which is a sized,
+ *    reviewable commit rather than a loosened clause.
+ *  - **The same bytes as the root.** A catch-all router, which is proof the login is drawn in the
+ *    browser — the blind spot named, rather than guessed at. Same `sameAsRoot` reasoning as
+ *    {@link SweepStep}, and it matters more here: every path below is *expected* to 404 on a
+ *    service that has no login, so a 200 that is really the shell would otherwise read as a hit.
+ *  - **A 404.** The path is ruled out, which is the answer that keeps a reader from going looking.
+ *
+ * **None of it can move the verdict**, and here that is a plain statement rather than a
+ * construction: the scan asks none of these addresses, so a gate found at one is a gate LabView
+ * does not have. {@link nextSteps} is where it lands, in the register the sweep's own
+ * fourth-address finding already uses.
+ */
+export interface LoginPathStep {
+  /** The path, as it appears in `LOGIN_PATHS`. */
+  path: string;
+  url: string;
+  status?: number;
+  contentType?: string;
+  wwwAuthenticate?: string;
+  bodyBytes?: number;
+  error?: string;
+  /** The same catch-all tell {@link SweepStep.sameAsRoot} is, and load-bearing for the same reason. */
+  sameAsRoot?: boolean;
+  /** `readGate` on this answer — the pipeline's rule at an address the pipeline does not ask. */
+  gate?: ProbeGate;
+  /** `readLoginForm`, so a reader sees *what* made it a login page and not only that it did. */
+  form?: LoginFormShape;
+  /** The page's own name for itself, which is how a reader recognises a sign-in screen. */
+  title?: string;
+}
+
 /** The whole report for one address. `renderMarkdown`/`renderJson` are views of this. */
 export interface ProbeLabReport {
   url: string;
@@ -242,6 +443,14 @@ export interface ProbeLabReport {
     truncated: boolean;
     /** What `readLoginForm` reduced the page to — the one form the rule ranked highest. */
     form?: LoginFormShape;
+    /**
+     * What `readAnonAccess` made of the same body, read the other way round.
+     *
+     * In `read` rather than `unread` because the pipeline reads it now: the scan puts this record
+     * on `ServiceProbe.anon` and `probeReasonText` words a sentence from it. Present exactly when
+     * a body was read at all.
+     */
+    anon?: ProbeAnon;
     signals: SignalRow[];
   };
   /**
@@ -258,6 +467,21 @@ export interface ProbeLabReport {
    * Empty unless the sweep ran. See {@link wantsSweep} for when that is.
    */
   sweep: SweepStep[];
+  /**
+   * 3c — what the pipeline's own {@link LOGIN_PATHS} answered, when somebody asked for it.
+   *
+   * Empty unless `--try-login-paths` was given and the target was the shape {@link wantsSweep}
+   * describes. See {@link LoginPathStep} for why this one is opt-in where the other two are not.
+   */
+  loginPaths: LoginPathStep[];
+  /**
+   * 3a — what the page proves about itself, in the order worth reading.
+   *
+   * Above the dumps because it is the actionable part, and separate from `verdict` because it is
+   * structurally incapable of being one. Empty when nothing answered, or when a gate fired and
+   * there is nothing left to argue about.
+   */
+  evidence: EvidenceFinding[];
   /** 3 — the evidence no signal reads yet, which is what an eighth one would be built from. */
   unread: {
     title?: string;
@@ -266,6 +490,31 @@ export interface ProbeLabReport {
     generator?: string;
     forms: FormDump[];
     assets: AssetRef[];
+    /**
+     * Every `<a href>` on the page, with the pipeline's own reading of each.
+     *
+     * Capped at {@link MAX_ANCHORS}, login-shaped ones kept first and drawn ones ahead of undrawn
+     * — a navigation menu is fifty anchors and the one that matters is not reliably among the
+     * first fifty in document order.
+     */
+    anchors: AnchorRef[];
+    anchorsOmitted: number;
+    /** Controls **outside** every `<form>`, capped at {@link MAX_CONTROLS}. */
+    controls: ControlRef[];
+    controlsOmitted: number;
+    /** Every `<meta name|property>`, capped at {@link MAX_METAS}. */
+    metas: MetaRef[];
+    metasOmitted: number;
+    /** Mount points and custom elements, capped at {@link MAX_ROOTS}. */
+    roots: RootRef[];
+    rootsOmitted: number;
+    /** Inline scripts described, never dumped. Capped at {@link MAX_INLINE_SCRIPTS}. */
+    inlineScripts: InlineScript[];
+    inlineScriptsOmitted: number;
+    /** `<noscript>` contents — the server's own fallback, which sometimes names the login. */
+    noscript: string[];
+    /** What a reader would have read, and a capped sample of it. */
+    text: PageText;
     /** Every response header that survived redaction, in the order they were given. */
     headers: [string, string][];
     /** `Set-Cookie` reduced to names. A session cookie name is a strong vendor marker. */
@@ -274,6 +523,38 @@ export interface ProbeLabReport {
   /** 4 — one line per signal that did not fire, saying what would have to be true. */
   next: string[];
 }
+
+/* -------------------------------------------------------------------------- */
+/* How much of a page a report is allowed to carry                            */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * A report is a file a person reads, and the pages this tool is pointed at run to twenty-four
+ * kilobytes. Every dump below is therefore bounded, and every bound is reported as an `…Omitted`
+ * count rather than applied in silence — a truncated list that does not say it was truncated is
+ * how a reader concludes a page had no sign-in link when what happened is that the report stopped
+ * before it.
+ *
+ * The numbers are deliberately generous. Nothing here can move a verdict, so the only cost of a
+ * bound set too high is a long file, and the only cost of one set too low is the exact failure
+ * this whole change exists to fix.
+ */
+const MAX_ANCHORS = 60;
+const MAX_CONTROLS = 30;
+const MAX_METAS = 40;
+const MAX_ROOTS = 20;
+const MAX_INLINE_SCRIPTS = 20;
+/** How much visible text {@link PageText.sample} keeps. Roughly a screenful and a half. */
+const MAX_TEXT_SAMPLE = 2000;
+/** How much of one anchor's text is kept. Prose can be an anchor; a label is short. */
+const MAX_ANCHOR_TEXT = 120;
+/** How many login-shaped path literals one inline script contributes. */
+const MAX_SCRIPT_PATHS = 8;
+/** How many bootstrap global names one inline script contributes. */
+const MAX_SCRIPT_KEYS = 8;
+/** How many `<noscript>` blocks are kept, and how much of each. */
+const MAX_NOSCRIPT = 4;
+const MAX_NOSCRIPT_TEXT = 400;
 
 /* -------------------------------------------------------------------------- */
 /* The addresses the rule never asks                                          */
@@ -375,10 +656,19 @@ export function wantsSweep(report: ProbeLabReport): boolean {
  * only where the pipeline's own eligibility test says the request would have been sent at all — see
  * {@link pipelineState}. This tool asks eight addresses; four of them are evidence for a reader and
  * cannot appear in a verdict.
+ *
+ * **`loginPaths` cannot, and needs no argument at all.** The pipeline has no code path that sends a
+ * request to `/login`, so there is no reading of those answers that a scan could reproduce. They
+ * are read by the pipeline's rules — `readGate`, `readLoginForm` — for the reader's benefit, and
+ * they land in `next` as a sized change, the same way the sweep's fourth address does.
  */
 export function buildReport(
   obs: ProbeLabObservation,
-  extra: { chain?: readonly ProbeLabObservation[]; sweep?: readonly ProbeLabObservation[] } = {},
+  extra: {
+    chain?: readonly ProbeLabObservation[];
+    sweep?: readonly ProbeLabObservation[];
+    loginPaths?: readonly ProbeLabObservation[];
+  } = {},
 ): ProbeLabReport {
   const contentType = obs.headers["content-type"];
   const mediaType = readMediaType(contentType);
@@ -406,6 +696,11 @@ export function buildReport(
   const redirect = location ? readRedirect(location.trim(), obs.requestUrl) : undefined;
   const refresh = obs.body ? readRefresh(obs.body, obs.requestUrl) : undefined;
   const form = obs.body ? readLoginForm(obs.body, obs.requestUrl) : undefined;
+  // Computed here and put on `asProbe` below, not read out of the extraction pass: this is the
+  // record the *scan* would hold, so the sentence in section 1 of this report is the sentence in
+  // the dashboard drawer. Section 3a's detectors read the same one — a report where the reason
+  // said "a sign-in link to /login" and the evidence list disagreed would be worse than either.
+  const anon = obs.body ? readAnonAccess(obs.body, obs.requestUrl) : undefined;
 
   // `probeOutcome` and `probeReasonText` take a `ServiceProbe`-shaped record. Assembling one
   // here rather than wording anything locally is what keeps this report saying what the
@@ -421,6 +716,7 @@ export function buildReport(
     | "redirect"
     | "refresh"
     | "state"
+    | "anon"
     | "truncated"
     | "detail"
   > = {
@@ -432,6 +728,7 @@ export function buildReport(
     ...(redirect ? { redirect } : {}),
     ...(refresh ? { refresh } : {}),
     ...(state ? { state } : {}),
+    ...(anon ? { anon } : {}),
     ...(obs.truncated ? { truncated: true } : {}),
     detail: obs.error ?? `HTTP ${obs.status}`,
   };
@@ -439,6 +736,8 @@ export function buildReport(
   const signals = signalRows(obs, { mediaType, redirect, refresh, form, wwwAuthenticate, state });
   const chain = buildChain(extra.chain ?? []);
   const sweep = buildSweep(extra.sweep ?? [], obs.body);
+  const loginPaths = buildLoginPaths(extra.loginPaths ?? [], obs.body);
+  const unread = readUnread(obs, anon);
   return {
     url: obs.requestUrl,
     verdict: {
@@ -462,12 +761,18 @@ export function buildReport(
       ...(obs.bodyBytes !== undefined ? { bodyBytes: obs.bodyBytes } : {}),
       truncated: obs.truncated === true,
       ...(form ? { form } : {}),
+      ...(anon ? { anon } : {}),
       signals,
     },
     chain,
     sweep,
-    unread: readUnread(obs),
-    next: nextSteps(obs, signals, { mediaType, form, redirect, refresh, chain, sweep }),
+    loginPaths,
+    // After the verdict, and taking it as an argument rather than deciding anything about it. The
+    // gate is already fixed by the time this runs, which is the I1 argument in the one place it
+    // has to hold: a detector cannot reach `gate` because `gate` is a `const` above it.
+    evidence: readEvidence(unread, { answered, gate, anon }),
+    unread,
+    next: nextSteps(obs, signals, { mediaType, form, redirect, refresh, chain, sweep, loginPaths }),
   };
 }
 
@@ -541,6 +846,52 @@ export function buildSweep(
       ...(same ? { sameAsRoot: true } : {}),
     };
   });
+}
+
+/**
+ * Each guessed login address, read by the pipeline's own rule.
+ *
+ * The same three fields `buildChain` adds to a hop, for the same reason: the question is *would
+ * the scan have found something if it looked here*, and only `readGate` can answer that in a way
+ * comparable to the verdict beside it. `sameAsRoot` comes first in a reader's eye though, because
+ * on a catch-all every one of these is a 200 and none of them is a page.
+ */
+export function buildLoginPaths(
+  observations: readonly ProbeLabObservation[],
+  rootBody?: string,
+): LoginPathStep[] {
+  return observations.map((o) => {
+    const same = rootBody !== undefined && o.body !== undefined && o.body === rootBody;
+    // A catch-all's answer is the target's own page, which was already judged in section 1 — so
+    // judging it again under a different address would put the same reading in the report twice,
+    // once as a verdict and once as a discovery.
+    const gate = o.status !== undefined && !same ? readGate(asProbeResponse(o)) : undefined;
+    const form = !same && o.body ? readLoginForm(o.body, o.requestUrl) : undefined;
+    return {
+      path: pathOf(o.requestUrl),
+      url: o.requestUrl,
+      ...(o.status !== undefined ? { status: o.status } : {}),
+      ...(o.headers["content-type"] ? { contentType: o.headers["content-type"] } : {}),
+      ...(o.headers["www-authenticate"] ? { wwwAuthenticate: o.headers["www-authenticate"] } : {}),
+      ...(o.bodyBytes !== undefined ? { bodyBytes: o.bodyBytes } : {}),
+      ...(o.error ? { error: o.error } : {}),
+      ...(same ? { sameAsRoot: true } : {}),
+      ...(gate ? { gate } : {}),
+      ...(form ? { form } : {}),
+      ...(!same && o.body ? { title: tagText(o.body, "title") } : {}),
+    };
+  });
+}
+
+/**
+ * The first guessed address that turned out to be a login page, if any.
+ *
+ * `gate` and not a status: a 200 at `/login` is a page, and whether it is a *login* page is
+ * `readGate`'s to say. Used by the index and the closing lines, so a run over twenty services
+ * names the ones worth opening.
+ */
+export function firstLoginPage(steps: readonly LoginPathStep[]): LoginPathStep | undefined {
+  return steps.find((s) => s.gate !== undefined);
 }
 
 /**
@@ -760,23 +1111,539 @@ function markers(form: LoginFormShape): string {
  *
  * This is the section a new rule gets designed from, so nothing here is filtered by whether it
  * looks relevant — that judgement is exactly what is being worked out. The `<script src>` list
- * matters most and is the known blind spot: a login screen rendered by JavaScript leaves
- * nothing in the served markup except the bundle that will draw it.
+ * was the known blind spot for a shell; the anchor list is the one that turned out to matter more
+ * often, because a page can be finished and still hold its whole login story in one `<a>`.
+ *
+ * `anon` is passed in rather than recomputed. Everything the pipeline decided about this body is
+ * decided once, in {@link buildReport}, and read from there — so `text.chars` is the number the
+ * scan's own sentence quotes and not a second count that could differ from it by a space.
  */
-function readUnread(obs: ProbeLabObservation): ProbeLabReport["unread"] {
+function readUnread(obs: ProbeLabObservation, anon: ProbeAnon | undefined): ProbeLabReport["unread"] {
   const body = obs.body ?? "";
+  // Forms first, because the control dump is defined as *what is not in one* and needs the same
+  // markup with them removed. `formDumps` reads the originals; `outsideForms` is only for controls.
+  const forms = formDumps(body);
+  const anchors = anchorRefs(body, obs.requestUrl);
+  const controls = controlRefs(outsideForms(drawnMarkup(body)));
+  const metas = metaRefs(body);
+  const roots = rootRefs(body);
+  const scripts = inlineScripts(body);
+  const text = pageText(body, anon);
   return {
     title: tagText(body, "title"),
     h1: tagText(body, "h1"),
     lang: attrOf(/<html\b[^>]*>/i.exec(body)?.[0] ?? "", "lang"),
     generator: metaContent(body, "generator"),
-    forms: formDumps(body),
+    forms,
     assets: assetRefs(body),
+    anchors: anchors.slice(0, MAX_ANCHORS),
+    anchorsOmitted: Math.max(0, anchors.length - MAX_ANCHORS),
+    controls: controls.slice(0, MAX_CONTROLS),
+    controlsOmitted: Math.max(0, controls.length - MAX_CONTROLS),
+    metas: metas.slice(0, MAX_METAS),
+    metasOmitted: Math.max(0, metas.length - MAX_METAS),
+    roots: roots.slice(0, MAX_ROOTS),
+    rootsOmitted: Math.max(0, roots.length - MAX_ROOTS),
+    inlineScripts: scripts.slice(0, MAX_INLINE_SCRIPTS),
+    inlineScriptsOmitted: Math.max(0, scripts.length - MAX_INLINE_SCRIPTS),
+    noscript: noscriptText(body),
+    text,
     // `set-cookie` is dropped here rather than filtered downstream: its names are reported
     // separately and its values are credentials, so the value never enters the record at all.
     headers: Object.entries(obs.headers).filter(([name]) => name !== "set-cookie"),
     cookieNames: cookieNames(obs.headers["set-cookie"]),
   };
+}
+
+/**
+ * Every anchor, login-shaped ones first.
+ *
+ * **The ordering is load-bearing, not cosmetic.** A finished page's navigation is thirty to fifty
+ * anchors and the sign-in link is conventionally last in document order, in a header bar rendered
+ * after the content or in a footer. Capping in document order would therefore drop exactly the
+ * anchor the cap exists to make room for. So anything the pipeline's predicates found interesting
+ * — a login path, a login label, or a logout label, since the logout one is what explains a
+ * *rejected* candidate — sorts ahead of the rest, and document order is preserved within each
+ * group.
+ *
+ * The three booleans are `isLoginPath`, `saysLogin` and `saysLogout` as `src/model/probe.ts`
+ * exports them. Not reimplemented, and not approximated: a reader disagreeing with the reason
+ * sentence in section 1 needs to see the same answers it was built from.
+ */
+function anchorRefs(body: string, requestUrl: string): AnchorRef[] {
+  const shown: AnchorRef[] = [];
+  const undrawn: AnchorRef[] = [];
+  const rest: AnchorRef[] = [];
+  // Which anchors a visitor was actually shown, decided by the pipeline's own `drawnMarkup` and
+  // then asked as a set membership. Matching the drawn string separately would give no way to
+  // relate one list to the other; the whole body is walked once and each anchor is asked whether
+  // it survived the reduction.
+  const drawn = new Set(drawnMarkup(body).match(ANCHOR_TAGS) ?? []);
+  for (const tag of body.match(ANCHOR_TAGS) ?? []) {
+    const href = attrOf(tag, "href")?.trim();
+    if (!href) continue;
+    const hidden = !drawn.has(tag);
+    const text = clip(innerText(tag), MAX_ANCHOR_TEXT);
+    const ariaLabel = attrOf(tag, "aria-label");
+    const rel = attrOf(tag, "rel");
+    // The label the predicates are asked about, which is the same fallback chain `readAnonAccess`
+    // uses: visible text if there is any, otherwise what the tag says about itself.
+    const label = text || ariaLabel || attrOf(tag, "title") || "";
+    // Resolved with the pipeline's own resolver, so `path` is the string `isLoginPath` is asked
+    // about and a reader can check the answer against it. Skipped for a fragment or a scheme
+    // that never leaves the page — those are in the dump, just without a resolved path.
+    const to = /^(?:#|javascript:|mailto:|tel:|data:|blob:)/i.test(href)
+      ? undefined
+      : readRedirect(href, requestUrl);
+    const loginPath = to !== undefined && !to.crossOrigin && isLoginPath(to.to);
+    const loginLabel = label.length > 0 && saysLogin(label);
+    const logoutLabel = label.length > 0 && saysLogout(label);
+    const ref: AnchorRef = {
+      href: clip(href, MAX_ANCHOR_TEXT),
+      ...(to ? { path: to.to, ...(to.crossOrigin ? { crossOrigin: true } : {}) } : {}),
+      ...(text ? { text } : {}),
+      ...(ariaLabel ? { ariaLabel } : {}),
+      ...(rel ? { rel } : {}),
+      ...(loginPath ? { loginPath: true } : {}),
+      ...(loginLabel ? { loginLabel: true } : {}),
+      ...(logoutLabel ? { logoutLabel: true } : {}),
+      ...(hidden ? { hidden: true } : {}),
+    };
+    // Three groups, not two, and the split between the first two is what stops a `<noscript>`
+    // copy of the sign-in link from standing in for the real one: `readEvidence` reports one
+    // finding per resolved path, so whichever row comes first is the row that speaks for that
+    // path — and it has to be the one a visitor could click.
+    (loginPath || loginLabel || logoutLabel ? (hidden ? undrawn : shown) : rest).push(ref);
+  }
+  return [...shown, ...undrawn, ...rest];
+}
+
+/**
+ * `<a>` elements with their contents. The pipeline's own pattern, for the reason it has one.
+ *
+ * Kept here rather than imported because `ANCHOR_TAG` is private in `src/model/probe.ts` — the
+ * discipline that section follows is that *the questions are shared and the patterns are not*, and
+ * a lenient dump is exactly the case that discipline exists to allow. The three alternatives at the
+ * end are the same reasoning: stop at a close tag, at the next anchor, or at a truncated body.
+ */
+const ANCHOR_TAGS = /<a\b[^>]*>[\s\S]*?(?:<\/a>|(?=<a\b)|$)/gi;
+
+/**
+ * The markup with every `<form>` block removed.
+ *
+ * So that a control dump means what its doc comment says: *outside any form*. A `<button>Sign
+ * in</button>` inside a form was already read by `readLoginForm` and ranked in section 2, and
+ * repeating it here would make section 3 look like a second, unranked opinion about the same
+ * element. An unclosed `<form>` swallows the rest of the page, which is the conservative
+ * direction — it can only ever produce fewer form-less controls, never a spurious one.
+ */
+function outsideForms(body: string): string {
+  return body.replace(/<form\b[^>]*>[\s\S]*?(?:<\/form\s*>|$)/gi, " ");
+}
+
+/**
+ * Every control that is not in a form: `<button>`, `role="button"`, and submit-ish `<input>`.
+ *
+ * The shape three of the reports that prompted this section had. A single-page application draws
+ * `<button>Sign in</button>` and attaches a click handler in JavaScript; there is no form, so
+ * `readLoginForm` has nothing to rank and `hasPasswordField` nothing to find, and the page reports
+ * as having no login affordance at all while showing one to every visitor.
+ *
+ * Called on the *drawn* markup with forms removed, which makes this list exactly the set
+ * `readAnonAccess` scanned for its `loginLabel` — so a report cannot show a control the reason
+ * sentence did not consider. A `<template>`'s undrawn button is therefore absent here; the anchor
+ * dump keeps its hidden rows precisely because an `<a href>` has a target worth naming and a
+ * button does not.
+ */
+function controlRefs(markup: string): ControlRef[] {
+  const out: ControlRef[] = [];
+  const push = (kind: ControlRef["kind"], tag: string, label: string) => {
+    const type = attrOf(tag, "type");
+    const id = attrOf(tag, "id");
+    const ariaLabel = attrOf(tag, "aria-label");
+    const text = clip(label, MAX_ANCHOR_TEXT);
+    const asked = text || ariaLabel || attrOf(tag, "title") || attrOf(tag, "value") || "";
+    out.push({
+      kind,
+      ...(text ? { label: text } : {}),
+      ...(type ? { type } : {}),
+      ...(id ? { id } : {}),
+      ...(ariaLabel ? { ariaLabel } : {}),
+      ...(asked.length > 0 && saysLogin(asked) ? { loginLabel: true } : {}),
+    });
+  };
+  for (const m of markup.matchAll(/<button\b[^>]*>([\s\S]*?)(?:<\/button\s*>|$)/gi)) {
+    push("button", m[0].replace(/>[\s\S]*$/, ">"), plainish(m[1] ?? ""));
+  }
+  for (const tag of markup.match(/<input\b[^>]*>/gi) ?? []) {
+    const type = (attrOf(tag, "type") ?? "").toLowerCase();
+    if (type !== "submit" && type !== "button" && type !== "image") continue;
+    push("input", tag, attrOf(tag, "value") ?? "");
+  }
+  for (const m of markup.matchAll(
+    /<([a-z][a-z0-9-]*)\b[^>]*\brole\s*=\s*["']?button\b[^>]*>([\s\S]*?)(?:<\/\1\s*>|$)/gi,
+  )) {
+    // `<button role="button">` exists in real markup; counting it twice would make a report
+    // claim two sign-in controls where a visitor sees one.
+    if ((m[1] ?? "").toLowerCase() === "button") continue;
+    push("role", m[0].replace(/>[\s\S]*$/, ">"), plainish(m[2] ?? ""));
+  }
+  return out;
+}
+
+/**
+ * Every `<meta>` that names something, `name` or `property`.
+ *
+ * `metaContent` above reads exactly one of these, for `generator`. This reads all of them,
+ * because `application-name`, `og:site_name` and `apple-mobile-web-app-title` name a vendor on
+ * pages where `generator` is absent — and a vendor name is what turns "some 200 with no form"
+ * into a product whose auth model can be looked up.
+ */
+function metaRefs(body: string): MetaRef[] {
+  const out: MetaRef[] = [];
+  for (const tag of body.match(/<meta\b[^>]*>/gi) ?? []) {
+    const name = (attrOf(tag, "name") ?? attrOf(tag, "property") ?? "").trim();
+    const content = attrOf(tag, "content");
+    if (!name || content === undefined) continue;
+    out.push({ name, content: clip(content, MAX_ANCHOR_TEXT) });
+  }
+  return out;
+}
+
+/**
+ * Mount points: hyphenated custom elements, and the `<div>` a bundle is handed.
+ *
+ * A shell's whole markup is often one of these and one `<script src>`. Which one it is names the
+ * framework — `__next`, `root`, `app`, `q-app` — and a mount point named for a screen rather than
+ * for a framework has said what the bundle is about to draw, which is the only thing in a shell's
+ * markup that ever points at a login.
+ */
+function rootRefs(body: string): RootRef[] {
+  const out: RootRef[] = [];
+  const seen = new Set<string>();
+  const push = (tag: string, name: string) => {
+    const id = attrOf(tag, "id");
+    const className = attrOf(tag, "class");
+    const key = `${name}#${id ?? ""}.${className ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      tag: name,
+      ...(id ? { id } : {}),
+      ...(className ? { className: clip(className, MAX_ANCHOR_TEXT) } : {}),
+    });
+  };
+  for (const m of body.matchAll(/<([a-z][a-z0-9]*-[a-z0-9-]*)\b[^>]*>/gi)) {
+    push(m[0], (m[1] ?? "").toLowerCase());
+  }
+  for (const m of body.matchAll(/<(div|main|section)\b[^>]*>/gi)) {
+    if (!MOUNT_ID.test((attrOf(m[0], "id") ?? "").toLowerCase())) continue;
+    push(m[0], (m[1] ?? "").toLowerCase());
+  }
+  return out;
+}
+
+/** The `id` values a framework hands its bundle. Anchored, so `login-container` is not one. */
+const MOUNT_ID = /^(?:__\w+|mount|main|\w*app|\w*root)$/;
+
+/**
+ * Every inline `<script>`, described. **Never its source.**
+ *
+ * The one dump in this file that is deliberately lossy, and invariant **I6** is why: a report is a
+ * file somebody pastes into an issue, and an anonymous page's bootstrap script is where a client
+ * keeps its configuration. One of the reports that prompted this work listed a `/__config.js`;
+ * another was a Home Assistant page whose entire routing lived in an inline block. Dumping those
+ * would make the report the least safe artifact the tool produces.
+ *
+ * What is kept is what a *rule* could be built on and nothing else: how big it was, the quoted
+ * path literals in it that the pipeline's own `isLoginPath` matches — which is the client's route
+ * table, and the closest thing a shell has to a sign-in link — and the *names* of the globals it
+ * assigns. Names, never values: `__NEXT_DATA__` says Next.js, and its contents say who is
+ * signed in.
+ */
+function inlineScripts(body: string): InlineScript[] {
+  const out: InlineScript[] = [];
+  for (const m of body.matchAll(/<script\b([^>]*)>([\s\S]*?)(?:<\/script\s*>|$)/gi)) {
+    const attrs = m[1] ?? "";
+    const source = m[2] ?? "";
+    // A `src` script has no inline source to describe, and is already in `assets`.
+    if (attrOf(attrs, "src") !== undefined) continue;
+    if (!source.trim()) continue;
+    const type = attrOf(attrs, "type");
+    const id = attrOf(attrs, "id");
+    const paths = new Set<string>();
+    for (const q of source.matchAll(/["'`](\/[A-Za-z0-9._~\-/]{1,60})["'`]/g)) {
+      const path = q[1]!;
+      if (isLoginPath(path)) paths.add(path);
+      if (paths.size >= MAX_SCRIPT_PATHS) break;
+    }
+    const keys = new Set<string>();
+    for (const k of source.matchAll(
+      /(?:window|globalThis|self)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["']([^"']{1,60})["']\s*\])\s*=|\b(?:var|let|const)\s+(__[\w$]+)\s*=/g,
+    )) {
+      const name = k[1] ?? k[2] ?? k[3];
+      if (name) keys.add(name);
+      if (keys.size >= MAX_SCRIPT_KEYS) break;
+    }
+    out.push({
+      ...(type ? { type } : {}),
+      ...(id ? { id } : {}),
+      bytes: Buffer.byteLength(source, "utf8"),
+      loginPaths: [...paths],
+      bootstrapKeys: [...keys],
+    });
+  }
+  return out;
+}
+
+/**
+ * Each `<noscript>` block's text.
+ *
+ * The server's own account of the page, written for a reader who will not run the bundle — so on
+ * exactly the shells whose markup says nothing, it is sometimes the one place the word "sign in"
+ * appears in what was served.
+ */
+function noscriptText(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.matchAll(/<noscript\b[^>]*>([\s\S]*?)(?:<\/noscript\s*>|$)/gi)) {
+    const text = clip(plainish(m[1] ?? ""), MAX_NOSCRIPT_TEXT);
+    if (text) out.push(text);
+    if (out.length >= MAX_NOSCRIPT) break;
+  }
+  return out;
+}
+
+/**
+ * What a reader would have read, and a capped sample of it.
+ *
+ * `chars` comes from `anon.textChars` whenever a body was read, which is the pipeline's own count
+ * from the pipeline's own `visibleText` — because the sentence in section 1 quotes that number,
+ * and a section 3 that printed a different one would be an argument between two halves of the
+ * same report about the same page. The sample is this file's, and it is the same extraction: one
+ * `visibleText` call, sliced.
+ */
+function pageText(body: string, anon: ProbeAnon | undefined): PageText {
+  const text = body ? visibleText(body) : "";
+  const chars = anon?.textChars ?? text.length;
+  return {
+    chars,
+    sample: text.slice(0, MAX_TEXT_SAMPLE),
+    omitted: Math.max(0, text.length - MAX_TEXT_SAMPLE),
+  };
+}
+
+/** A tag's inner markup as text: `<a href=…><span>Sign in</span></a>` -> `Sign in`. */
+function innerText(tag: string): string {
+  return plainish(tag.replace(/^<[^>]*>/, "").replace(/<\/[a-z][a-z0-9-]*\s*>\s*$/i, ""));
+}
+
+/**
+ * Tags out, entities to a space, whitespace collapsed.
+ *
+ * The lab's own reduction, lenient where the pipeline's cannot be — it feeds a dump a person
+ * reads. Where a *predicate* is asked about a label, it is the pipeline's predicate that is
+ * asked, on whatever this produced.
+ */
+function plainish(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** `text` with an ellipsis if it had to be shortened. Bounds a dump, never a decision. */
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Section 3a — what a visitor was shown                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Cookie names that suggest a session, on a request that carried no credential.
+ *
+ * The lab's own vocabulary and not the pipeline's, because nothing decides on it — no clause reads
+ * a cookie, and a finding built from this one cannot move a count. Lenient on purpose: the point is
+ * to put the name in front of a reader who knows what their fleet runs, which `authentik_session`,
+ * `JSESSIONID` and `_forward_auth` all reward.
+ */
+const SESSION_COOKIE = /sess|\bsid\b|_sid|auth|token|jwt|csrf|xsrf|remember|identity/i;
+
+/** How many findings one report carries. A page with forty anchors can produce a lot of them. */
+const MAX_EVIDENCE = 12;
+/** How many anchors and controls each contribute, strongest first. */
+const MAX_LINK_FINDINGS = 3;
+const MAX_CONTROL_FINDINGS = 2;
+
+/**
+ * What this page proves about itself, strongest first.
+ *
+ * **The section the operator's question is actually about.** Section 2 can say which of eight
+ * clauses failed; only this can say *the page served you four kilobytes of content and a link
+ * reading "Sign in", so there is nothing in front of it.* That is the first positive evidence of
+ * openness the tool has ever produced — until now `open` was an absence, and an absence is what a
+ * reader discounts.
+ *
+ * **Everything here is downstream of the verdict and cannot reach it.** `gate` arrives as a
+ * parameter, already decided; `EvidenceFinding["direction"]` has no `"gated"` member; and no caller
+ * writes any of this back. So the worst a detector below can be is wrong in a paragraph — never
+ * wrong about a service's place in the exposed count (**I1**).
+ *
+ * Nothing is emitted when a gate fired, for the same reason section 4 is empty then: the rule
+ * already read this page and reached a conclusion, and a list of open-pointing facts printed
+ * beside a `gated` verdict would read as the report disagreeing with itself.
+ *
+ * **The pivot is `content-served`.** A sign-in link on a page that served content is proof of an
+ * application with an optional account. The same link on an empty shell is a login page whose form
+ * has not been drawn — the opposite conclusion from the same anchor. So every login finding takes
+ * its `direction` from whether content came with it, rather than each detector deciding for itself.
+ */
+function readEvidence(
+  unread: ProbeLabReport["unread"],
+  ctx: { answered: boolean; gate?: ProbeGate; anon?: ProbeAnon },
+): EvidenceFinding[] {
+  if (!ctx.answered || ctx.gate) return [];
+  const out: EvidenceFinding[] = [];
+  const anon = ctx.anon;
+  const served = anon !== undefined && servedAnonContent(anon);
+  // Where a login affordance points when content came with it, and where it points when it did
+  // not. One decision, made once, so five detectors cannot answer it five ways.
+  const withContent: EvidenceFinding["direction"] = served ? "open-with-login" : "look-closer";
+
+  if (served && anon) {
+    out.push({
+      kind: "content-served",
+      direction: "open",
+      strength: "proof",
+      fact: `${anon.textChars} characters of visible text and ${anon.links} same-origin ${anon.links === 1 ? "link" : "links"} were served to a caller carrying no credential`,
+      because:
+        "a gate answers an anonymous request with a challenge, a redirect or a login form — not with the application's own content. This is what a visitor sees, which makes it evidence that the service is open rather than an absence of evidence that it is closed.",
+    });
+  }
+
+  // `login-link` — the headline gap, and the whole proof for three of the reports this was built
+  // from. Graded by which half of the question the anchor answered: a login *path* is the
+  // pipeline's own vocabulary and worth more than a label, and a long label is worth least of all
+  // because prose contains the words ("How to log in to your router" is a real article title).
+  let links = 0;
+  // One finding per resolved target, and the anchors arrive login-shaped-first, so the first row
+  // for a path is the one that says the most about it. A header bar and a mobile menu are the same
+  // sign-in link twice, and reporting it twice would read as two independent facts.
+  const reported = new Set<string>();
+  for (const a of unread.anchors) {
+    if (links >= MAX_LINK_FINDINGS) break;
+    if (a.logoutLabel || !(a.loginPath || a.loginLabel)) continue;
+    const target = a.path ?? a.href;
+    if (reported.has(target)) continue;
+    reported.add(target);
+    const short = (a.text ?? a.ariaLabel ?? "").length <= LOGIN_LABEL_MAX;
+    const both = a.loginPath === true && a.loginLabel === true && short;
+    // A hidden anchor cannot be `proof` of anything a visitor was shown, whatever it says: it is
+    // markup the client had and did not draw. Graded to the same `weak` a route literal gets,
+    // because that is what it is — a route the bundle knows about.
+    const strength: EvidenceFinding["strength"] = a.hidden
+      ? "weak"
+      : both
+        ? "proof"
+        : a.loginPath || short
+          ? "strong"
+          : "weak";
+    const quoted = a.text
+      ? `reading "${a.text}", `
+      : a.ariaLabel
+        ? `labelled "${a.ariaLabel}", `
+        : "";
+    out.push({
+      kind: "login-link",
+      direction: strength === "weak" ? "look-closer" : withContent,
+      strength,
+      fact: `<a href="${a.href}">, ${quoted}resolving to ${a.path ?? "no same-origin path"}${a.hidden ? " — inside a template, noscript or script, so not drawn" : ""}`,
+      because: a.hidden
+        ? "the markup was served but not shown: it sits inside a `<template>`, `<noscript>`, `<script>` or `<svg>`, so no visitor was offered it. What it does say is that the client knows this route — the same thing `login-route` says, and worth the same `--try-login-paths` run."
+        : a.loginPath
+          ? `\`isLoginPath\` matches ${a.path} — the same vocabulary the \`redirect-login\` clause trusts when a 302 points there${a.loginLabel ? ", and the label says so too" : ", though the label does not say so"}. ${served ? "The page it sits on served content, so this is an account a visitor may choose to use." : "Nothing else was served with it, so this may equally be a login page whose form is drawn in the browser."}`
+          : short
+            ? `the label is a sign-in label by itself, which is how an application with no login \`<form>\` still offers one. ${served ? "It sits on a page that served content." : "Nothing else was served with it, so the page may be the login screen."}`
+            : "the words appear, but in a label too long to be a control — this is far more likely prose about signing in than an offer to do it. Read the text sample before acting on it.",
+    });
+    links++;
+  }
+
+  // `login-control` — the same offer with no anchor around it. Exactly the shape of the target the
+  // operator described as "has a 'Sign in' on the page which I have to click".
+  let controls = 0;
+  for (const c of unread.controls) {
+    if (controls >= MAX_CONTROL_FINDINGS) break;
+    if (!c.loginLabel) continue;
+    const label = c.label ?? c.ariaLabel ?? "";
+    const short = label.length <= LOGIN_LABEL_MAX;
+    out.push({
+      kind: "login-control",
+      direction: short ? withContent : "look-closer",
+      strength: short ? "strong" : "weak",
+      fact: `a <${c.kind === "role" ? "* role=button" : c.kind}> outside every form, labelled "${label}"${c.id ? ` (id="${c.id}")` : ""}`,
+      because: short
+        ? `no \`<form>\` contains it, so \`readLoginForm\` has nothing to rank and \`hasPasswordField\` nothing to find — the sign-in is wired up in JavaScript. ${served ? "The page around it served content, so the account is a feature rather than a gate." : "The page around it served little else, so this may be the login screen itself."}`
+        : "the words appear in a label too long to be a control, so this is probably text rather than an offer.",
+    });
+    controls++;
+  }
+
+  // `login-heading` — the candidate ninth signal, and the only finding here that would move a
+  // count if it were ever promoted. So it is stated as a question rather than an answer, and
+  // `nextSteps` is where the sized change belongs.
+  const heading = [unread.title, unread.h1].find((t) => t !== undefined && saysLogin(t));
+  if (heading && unread.forms.length === 0 && unread.assets.length > 0) {
+    out.push({
+      kind: "login-heading",
+      direction: "look-closer",
+      strength: "strong",
+      fact: `the page names itself "${clip(heading, MAX_ANCHOR_TEXT)}", carries no <form>, and ships ${unread.assets.length} ${unread.assets.length === 1 ? "script or stylesheet" : "scripts or stylesheets"}`,
+      because:
+        "a page that calls itself a sign-in page and has no form is a login screen whose form is drawn in the browser. Nothing in the served bytes proves it, which is why this is a proposal for a ninth clause and not a verdict — see section 4.",
+    });
+  }
+
+  // `login-route` — the shell's route table. Proves the application *has* a sign-in screen, which
+  // is not the same as proving a visitor was made to use one, so it is `weak` however many hits
+  // there are.
+  const routes = new Set<string>();
+  for (const s of unread.inlineScripts) for (const p of s.loginPaths) routes.add(p);
+  for (const a of unread.assets) {
+    const path = a.href.startsWith("/") ? a.href.split(/[?#]/)[0]! : undefined;
+    if (path && isLoginPath(path)) routes.add(path);
+  }
+  if (routes.size) {
+    out.push({
+      kind: "login-route",
+      direction: "look-closer",
+      strength: "weak",
+      fact: `the client's own bytes name ${[...routes].slice(0, MAX_SCRIPT_PATHS).map((p) => `\`${p}\``).join(", ")}`,
+      because:
+        "a login-shaped path in a bundle or an inline script says the application has a sign-in screen somewhere, not that this response was one. Worth an `--try-login-paths` run, which asks those addresses directly.",
+    });
+  }
+
+  // `session-cookie` — weak in both directions on purpose. A session handed to a caller who sent
+  // nothing is either an application tracking anonymous visitors, or a login page issuing a CSRF
+  // token, and the served bytes cannot say which.
+  const sessions = unread.cookieNames.filter((n) => SESSION_COOKIE.test(n));
+  if (sessions.length) {
+    out.push({
+      kind: "session-cookie",
+      direction: "look-closer",
+      strength: "weak",
+      fact: `Set-Cookie named ${sessions.map((n) => `\`${n}\``).join(", ")} on a request that sent no credential`,
+      because:
+        "the name says the application keeps server-side state for anonymous callers. That is what an app with optional accounts does and also what a login form issuing a CSRF token does — the name is a vendor clue, not a verdict.",
+    });
+  }
+
+  const rank = { proof: 0, strong: 1, weak: 2 };
+  // Stable, so within one strength the order above survives: content, then links, then controls.
+  return out.sort((a, b) => rank[a.strength] - rank[b.strength]).slice(0, MAX_EVIDENCE);
 }
 
 /** `<title>Sign in</title>` -> `Sign in`. Whitespace collapsed; nothing else touched. */
@@ -931,6 +1798,7 @@ function nextSteps(
     refresh?: ProbeRedirect;
     chain: ChainStep[];
     sweep: SweepStep[];
+    loginPaths: LoginPathStep[];
   },
 ): string[] {
   if (signals.some((s) => s.fired)) return [];
@@ -964,6 +1832,7 @@ function nextSteps(
   // Before anything about the markup, because it is about something stronger than markup: an
   // address that refused an anonymous caller is a gate that exists, whatever the page said.
   out.push(...sweepLines(ctx.sweep));
+  out.push(...loginPathLines(ctx.loginPaths));
   if (obs.status !== 200 && obs.status !== 401 && obs.status !== 407) {
     out.push(
       `HTTP ${obs.status} is none of the three shapes a gate is recognised in — a credential request, a redirect, or a page served. If this status is how the service refuses an anonymous visitor, that is a new clause and it needs a fact beyond the number: a WWW-Authenticate header, a body, or a redirect.`,
@@ -1138,6 +2007,77 @@ function growState(step: SweepStep): string {
   return scheme ? `${step.status} with \`WWW-Authenticate: ${scheme}\`` : String(step.status);
 }
 
+/**
+ * What guessing the login addresses adds — and what it costs, which is the part that matters.
+ *
+ * Every other line in section 4 proposes a change to a *rule*. This one is the only one that
+ * proposes a change to the **request budget**, and the two are not comparable sizes: a word in
+ * `USERNAME_WORDS` is free at scan time, while asking `/login` is one more request per service
+ * per scan sent to an address no label mentioned, which is exactly what invariant **I8** is a
+ * budget for. So each line below states the finding and then states the cost, and none of them
+ * says "add these to the scan" — a reader with a real fleet is the one who can weigh ten paths
+ * against twenty-five services, and this tool cannot.
+ *
+ * Three findings, in descending order of what they settle:
+ *
+ *  - **A login page at a guessed address.** The service has a sign-in screen; the scan looked at
+ *    the wrong address. `readGate` said so, so the finding is the pipeline's own reading and not
+ *    this file's.
+ *  - **The same bytes as the page itself, everywhere.** A catch-all router, and therefore proof
+ *    the sign-in screen is drawn in the browser. That closes the blind-spot question rather than
+ *    leaving it open: no path is worth adding, because no path would return anything different.
+ *  - **Nothing at any of them.** The ten names are ruled out, which is worth one line — it is the
+ *    result that stops a reader guessing an eleventh.
+ */
+function loginPathLines(steps: LoginPathStep[]): string[] {
+  if (!steps.length) return [];
+  const found = steps.filter((s) => s.gate !== undefined);
+  const shells = steps.filter((s) => s.sameAsRoot);
+  const answered = steps.filter((s) => s.status !== undefined && s.status < 400);
+  if (found.length) {
+    const first = found[0]!;
+    const gate = probeGateText(first.gate!);
+    return [
+      `**${first.path} is a login page** — HTTP ${first.status}${
+        first.title ? `, titled “${first.title}”` : ""
+      }, read by \`readGate\` as ${lower(gate.label)}${
+        first.form ? ` (${markers(first.form)})` : ""
+      }${
+        found.length > 1
+          ? `, and so ${found.length === 2 ? "is" : "are"} ${found
+              .slice(1)
+              .map((s) => s.path)
+              .join(", ")}`
+          : ""
+      }. This service is gated and the scan is looking at the wrong address — but note what would have to change for it to see this: **a scan asks none of these paths.** Reading a login page here costs one request per service per scan at an address no label mentioned, which is a request-budget change and not a rule change. The cheaper version of the same finding is a redirect: if this service sends an anonymous *browser* to ${first.path}, then the root response carries the evidence already and section 1 would have it.`,
+    ];
+  }
+  if (shells.length && shells.length === answered.length) {
+    return [
+      `All ${shells.length} of the ${steps.length} guessed login addresses that answered returned the same bytes as the page itself (${shells
+        .map((s) => s.path)
+        .slice(0, 4)
+        .join(", ")}${shells.length > 4 ? ", …" : ""}). That is a catch-all router, and it settles the blind-spot question rather than leaving it open: **there is no path worth adding to any list**, because every path returns this same shell and the sign-in screen — if there is one — is drawn in the browser afterwards. Recognising it needs a rendered page or a marker the shell itself carries, not another address.`,
+    ];
+  }
+  const reached = steps.filter((s) => s.status !== undefined);
+  return [
+    `None of the ${steps.length} guessed login addresses is a login page (${
+      reached.length
+        ? reached
+            .map((s) => `${s.path} → ${s.status}`)
+            .slice(0, 6)
+            .join(", ")
+        : "none of them answered at all"
+    }). So the ten names \`LOGIN_PATHS\` carries do not find this service's sign-in screen by guessing, and an eleventh name is unlikely to either. If this service has one, it is behind a name only the application knows — section 3's inline scripts and mount points are where that name shows up, if it shows up anywhere.`,
+  ];
+}
+
+/** `Credential requested` → `credential requested`, for a label used mid-sentence. */
+function lower(s: string): string {
+  return s.charAt(0).toLowerCase() + s.slice(1);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Views                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -1236,6 +2176,25 @@ export function renderMarkdown(report: ProbeLabReport): string {
     if (report.chain.some((h) => h.title !== undefined || h.contentType !== undefined)) L.push("");
   }
 
+  // Above the dumps, because it is the part somebody can act on. The preamble states the one thing
+  // a reader has to hold on to before the first row: none of this moved the verdict, and none of it
+  // can — a `look-closer` row beside a "No login page" verdict is not the report contradicting
+  // itself, it is the report saying what a rule change would have to be built from.
+  if (report.evidence.length) {
+    L.push("## What a visitor was shown", "");
+    L.push(
+      `${report.evidence.length} finding${report.evidence.length === 1 ? "" : "s"} read off the same response as the verdict above, and **none of them changed it** — a finding here can point at *open*, at *open with an optional account*, or at *worth another look*, and never at a gate. Deciding a gate is \`readGate\`'s, and \`readGate\` cannot see any of this.`,
+      "",
+    );
+    L.push("| Points at | Strength | What the page did | Why that means it |", "| --- | --- | --- | --- |");
+    for (const f of report.evidence) {
+      L.push(
+        `| \`${f.kind}\` → **${EVIDENCE_DIRECTION[f.direction]}** | ${f.strength} | ${cell(f.fact)} | ${cell(f.because)} |`,
+      );
+    }
+    L.push("");
+  }
+
   L.push("## What the rule did not consider", "");
   const u = report.unread;
   const notes: string[] = [];
@@ -1271,10 +2230,92 @@ export function renderMarkdown(report: ProbeLabReport): string {
       "",
     );
   }
+  // Anchors first among the new dumps, and with a preamble, because this is the section that was
+  // missing: eight reports said "no `<form>` in the served markup" about pages whose entire login
+  // story was one of these rows.
+  if (u.anchors.length) {
+    L.push("### Links", "");
+    L.push(
+      `Login-shaped rows first, then document order${u.anchorsOmitted ? `; ${u.anchorsOmitted} more not shown` : ""}. The three flags are the pipeline's own predicates — \`isLoginPath\`, \`saysLogin\`, \`saysLogout\` — so a finding above can be checked against the row it came from.`,
+      "",
+    );
+    L.push("| href | Resolves to | Text | Login path | Login label | Logout label |", "| --- | --- | --- | --- | --- | --- |");
+    for (const a of u.anchors) {
+      L.push(
+        `| ${cell(a.href)} | ${a.path ? `${a.path}${a.crossOrigin ? " (off origin)" : ""}` : "—"} | ${
+          cell(a.text ?? a.ariaLabel ?? "—")
+        } | ${a.loginPath ? "**yes**" : "no"} | ${a.loginLabel ? "**yes**" : "no"} | ${a.logoutLabel ? "**yes**" : "no"} |`,
+      );
+    }
+    L.push("");
+  }
+  if (u.controls.length) {
+    L.push("### Controls outside every form", "");
+    L.push(
+      `A sign-in that is a \`<button>\` with no \`<form>\` around it is invisible to \`readLoginForm\`, which is why these are listed apart from section 2's ranking${u.controlsOmitted ? `. ${u.controlsOmitted} more not shown` : ""}.`,
+      "",
+    );
+    for (const c of u.controls) {
+      L.push(
+        `- \`${c.kind}\`${c.type ? ` type=${c.type}` : ""}${c.id ? ` id=${c.id}` : ""}: “${c.label ?? c.ariaLabel ?? "—"}”${c.loginLabel ? " — **login label**" : ""}`,
+      );
+    }
+    L.push("");
+  }
   if (u.assets.length) {
     L.push("### Scripts and links", "");
     for (const a of u.assets) L.push(`- \`${a.kind}\`${a.rel ? ` rel=${a.rel}` : ""}: ${a.href}`);
     L.push("");
+  }
+  // Described, never dumped — the heading says so, because a reader who wanted the source will
+  // otherwise assume the tool failed to capture it rather than declined to (**I6**).
+  if (u.inlineScripts.length) {
+    L.push("### Inline scripts", "");
+    L.push(
+      `Sizes, login-shaped path literals and the *names* of the globals each assigns. **The source is not kept**: an anonymous page's bootstrap script carries configuration, and this file is meant to be safe to paste into an issue${u.inlineScriptsOmitted ? `. ${u.inlineScriptsOmitted} more not shown` : ""}.`,
+      "",
+    );
+    u.inlineScripts.forEach((s, i) => {
+      L.push(
+        `- **${i + 1}** — ${s.bytes} bytes${s.type ? `, type=\`${s.type}\`` : ""}${s.id ? `, id=\`${s.id}\`` : ""}${
+          s.loginPaths.length ? `, login-shaped paths: ${s.loginPaths.map((p) => `\`${p}\``).join(", ")}` : ""
+        }${s.bootstrapKeys.length ? `, assigns: ${s.bootstrapKeys.map((k) => `\`${k}\``).join(", ")}` : ""}`,
+      );
+    });
+    L.push("");
+  }
+  if (u.roots.length) {
+    L.push("### Mount points", "");
+    for (const m of u.roots) {
+      L.push(`- \`<${m.tag}>\`${m.id ? ` id=\`${m.id}\`` : ""}${m.className ? ` class=\`${m.className}\`` : ""}`);
+    }
+    if (u.rootsOmitted) L.push(`- _${u.rootsOmitted} more not shown._`);
+    L.push("");
+  }
+  if (u.metas.length) {
+    L.push("### Meta", "");
+    for (const m of u.metas) L.push(`- \`${m.name}\`: ${m.content}`);
+    if (u.metasOmitted) L.push(`- _${u.metasOmitted} more not shown._`);
+    L.push("");
+  }
+  if (u.noscript.length) {
+    L.push("### Noscript", "");
+    for (const n of u.noscript) L.push(`- ${n}`);
+    L.push("");
+  }
+  // Last of the markup dumps and deliberately so: it is the longest, and it is the one a reader
+  // goes to in order to settle a `weak` finding — “Sign in” in a nav bar reads differently from
+  // “sign in” in the middle of a sentence, and only the surrounding words say which happened.
+  if (u.text.chars > 0) {
+    L.push("### Visible text", "");
+    L.push(
+      `${u.text.chars} characters after scripts, styles, comments and tags were removed${u.text.omitted ? `; the first ${u.text.sample.length} are below` : ""}.`,
+      "",
+      "```",
+      u.text.sample,
+      "```",
+      "",
+    );
   }
   if (u.headers.length) {
     L.push("### Response headers", "");
@@ -1310,6 +2351,35 @@ export function renderMarkdown(report: ProbeLabReport): string {
     }
     L.push("");
   }
+  // After the sweep, and the last thing in the section, because it is the only part of the report
+  // that exists because somebody passed a flag. The preamble has to say that before the first row:
+  // a reader comparing two reports of the same service needs to know why one has this table.
+  if (report.loginPaths.length) {
+    L.push("### Guessed login addresses", "");
+    L.push(
+      `\`--try-login-paths\` was passed, so each of the ${report.loginPaths.length} name${
+        report.loginPaths.length === 1 ? "" : "s"
+      } in the pipeline's own \`LOGIN_PATHS\` was asked as well — \`GET\`, **no credential on any of them**, sequential. **A scan asks none of these addresses**, so nothing below is or could become the verdict above; the \`Read as\` column is \`readGate\` run on that answer, which is what makes a row comparable to section 1 rather than a second opinion about it.`,
+      "",
+    );
+    L.push("| Path | Status | Read as | Title | Body |", "| --- | --- | --- | --- | --- |");
+    for (const s of report.loginPaths) {
+      L.push(
+        `| \`${s.path}\` | ${s.status === undefined ? `— (${s.error ?? "no answer"})` : String(s.status)} | ${
+          s.gate ? `\`${s.gate}\`` : s.sameAsRoot ? "not read — the page itself" : "—"
+        } | ${s.title ? cell(s.title) : "—"} | ${
+          s.sameAsRoot
+            ? "the same bytes as the page — a catch-all, not a page of its own"
+            : s.bodyBytes !== undefined
+              ? `${s.bodyBytes} bytes${s.form ? `, ${markers(s.form)}` : ""}`
+              : s.status === undefined
+                ? "—"
+                : "not read (not HTML)"
+        } |`,
+      );
+    }
+    L.push("");
+  }
 
   L.push("## What would have to change", "");
   if (!report.next.length) {
@@ -1320,6 +2390,19 @@ export function renderMarkdown(report: ProbeLabReport): string {
   }
   return `${L.join("\n")}\n`;
 }
+
+/**
+ * What each direction is called in a report.
+ *
+ * Prose rather than the identifier, because the identifier is a discriminant and the words are the
+ * conclusion. `look-closer` reads as an instruction on purpose: it is the only one of the three
+ * that is not an answer, and a reader must not be able to mistake it for one.
+ */
+const EVIDENCE_DIRECTION: Record<EvidenceFinding["direction"], string> = {
+  "open-with-login": "open, with an optional account",
+  open: "open",
+  "look-closer": "worth another look",
+};
 
 /** A table cell: pipes escaped, newlines flattened. Nothing else altered. */
 function cell(text: string): string {

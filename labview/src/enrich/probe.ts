@@ -52,6 +52,7 @@ import {
   STATE_PATHS,
   probeGateText,
   probeTargets,
+  readAnonAccess,
   readGate,
   readLoginForm,
   readMediaType,
@@ -317,6 +318,11 @@ async function probeOne(
     const state = wantsStateProbe({ gate, status: res.status, mediaType, body: res.body })
       ? await probeState(doFetch, target.url, timeoutMs)
       : undefined;
+    // The same body read the other way round: not *what stood in front of this page* but *what
+    // this page showed somebody who sent nothing*. No request of its own, and no path to
+    // `verdict` below — `readAnonAccess` is called after the gate is decided and its answer is
+    // not among `readGate`'s inputs, which is what keeps a sign-in link from ever becoming one.
+    const anon = res.body ? readAnonAccess(res.body, target.url) : undefined;
     // `??` and not `||`: the state gate can only fill an absence, never replace a finding. By
     // `wantsStateProbe`'s first condition `gate` is undefined wherever `state` exists, so the
     // fallback is unreachable — and it is written this way so that stops being something a
@@ -338,6 +344,7 @@ async function probeOne(
       ...(res.truncated ? { truncated: true } : {}),
       ...(form ? { form } : {}),
       ...(state ? { state } : {}),
+      ...(anon ? { anon } : {}),
       detail,
       attempts: tried,
     };

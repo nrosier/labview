@@ -1,0 +1,52 @@
+# Regression fixture: a page that serves its content to a stranger and offers to sign them
+# in is not a gate — it is the opposite, and it is the only thing LabView can say *for* an
+# open verdict rather than in explanation of one.
+#
+# Every other probe fixture pairs a gate with the near miss that must not be read as one.
+# This pair inverts that: neither service is gated, both stay in the exposed count, and what
+# is under test is the *sentence* — whether the report says why the service looks open, or
+# only that nothing looked closed.
+#
+# `app` serves a portal: a nav bar, three paragraphs of its own text, links into itself, and
+# `<a href="/login">Sign in</a>` in the corner. A visitor who never signs in is shown this
+# page, which is the signature of an optional account. `readAnonAccess` reads the content and
+# the offer off the one response the scan already holds — no second request — and
+# `probeReasonText` names both. **Revert trap:** back `anonProof` out of `openReason` and the
+# sentence vanishes while the verdict stays identical, so only the wording assertion fails.
+#
+# `blog` is the near miss, and it carries two traps rather than one because the vocabulary has
+# two ways to be wrong:
+#
+#  - An article titled *"How to log in to your router"*. The words are there, in an anchor,
+#    on a page that served plenty of content — everything the offer clause needs except that
+#    a label is a label and a sentence is a sentence. `LOGIN_LABEL_MAX` is what separates
+#    them, and dropping it makes this blog post an offer to sign in.
+#  - `<a href="/auth/logout">Sign out</a>`. Its path *is* a login path: `isLoginPath` matches
+#    by prefix and `/auth/` is in the list, because that is how the products behind it route.
+#    Only the label says otherwise, so this anchor is what `NOT_LOGIN_LABEL` exists for —
+#    drop the logout half of the vocabulary and every application with a sign-out link in its
+#    header starts reporting a sign-in link at the same address.
+#
+# So `blog` gets the content half of the sentence and not the offer half, and the difference
+# between the two fixtures is four words of markup.
+#
+# Both services serve a search `<form>`, and that is deliberate rather than decoration: it is
+# what keeps `wantsStateProbe` false, so this stack adds two first requests and no second ones
+# — a fixture for a body-reading rule should not also move the request count of a walk it has
+# nothing to do with.
+services:
+  app:
+    image: example/portal:4.2.0
+    container_name: probe-public-app
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=app.public.probe.example.com"
+      - "dockflare.service=http://probe-public-app:8080"
+
+  blog:
+    image: example/blog:4.2.0
+    container_name: probe-public-blog
+    labels:
+      - "dockflare.enable=true"
+      - "dockflare.hostname=blog.public.probe.example.com"
+      - "dockflare.service=http://probe-public-blog:8080"

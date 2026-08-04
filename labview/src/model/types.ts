@@ -703,6 +703,64 @@ export interface ProbeState {
 }
 
 /**
+ * What the served page showed a caller who sent no credential — the anti-gate.
+ *
+ * Every other field on a `ServiceProbe` answers *is something standing in front of this?* This
+ * one answers the opposite question, and it is the only evidence LabView collects that argues a
+ * service really is open rather than merely failing to look closed. An anonymous request that
+ * came back with three thousand characters of readable text, eleven links and a `Sign in`
+ * anchor is a public application with optional accounts: a visitor who never signs in is shown
+ * that page, and the account is a feature behind it rather than a door in front of it.
+ *
+ * **Nothing here can gate.** `readGate` takes a `ProbeResponse` and this record is not on one,
+ * so there is no path by which a sign-in link becomes a `ProbeGate` — it is read after the
+ * verdict and can only ever add a sentence to a service that stays in the exposed count (I1).
+ * The pair is what means something: text with no sign-in affordance is a service with no
+ * accounts at all, and a sign-in affordance on a page with no text is a login screen whose form
+ * the browser has not drawn yet, which is the opposite conclusion.
+ *
+ * Read from the body the first request already returned — no second request (I8) — and carries
+ * no header, no cookie and no attribute value beyond a resolved path and a short label (I6).
+ */
+export interface ProbeAnon {
+  /**
+   * How many characters of text a reader would have seen: script, style, template, `<noscript>`,
+   * inline SVG and comments removed, tags dropped, whitespace collapsed.
+   *
+   * A count rather than a sample because the count is the discriminating fact — a client-rendered
+   * shell and a finished page are the same markup shape and two orders of magnitude apart here —
+   * and because a sample of somebody else's page is the kind of thing that ends up in an issue
+   * report.
+   */
+  textChars: number;
+  /**
+   * Distinct same-origin paths the page linked to, excluding its own sign-in and sign-out links.
+   *
+   * Distinct, so a navigation repeated in a mobile menu counts once. Same-origin, so a footer of
+   * social links does not read as an application's own content. Fragments, `mailto:` and
+   * `javascript:` are not links to anywhere and are not counted.
+   */
+  links: number;
+  /**
+   * The path of a sign-in link the page offered, when one of its anchors pointed at a login
+   * path on its own origin. Path only — query dropped, as `ProbeRedirect.to` is.
+   *
+   * Absent when no anchor did, which includes the case that matters most: a page whose only
+   * login-path anchor was a *logout* link, since `/auth/logout` is a login path by prefix and is
+   * evidence of a session rather than of an invitation to start one.
+   */
+  loginHref?: string;
+  /**
+   * The words on the strongest sign-in affordance found, when a label rather than a path was
+   * what said so — an SPA's own `Sign in` control, which has no `href` to read.
+   *
+   * Bounded to a short label by `LOGIN_LABEL_MAX`, which is what keeps prose out of the
+   * payload: a sentence mentioning signing in is not a control offering to.
+   */
+  loginLabel?: string;
+}
+
+/**
  * What one HTML `<form>` on a probed page is made of.
  *
  * The composition is reported separately from the verdict because the two answer
@@ -829,6 +887,16 @@ export interface ServiceProbe {
    * any form on it.
    */
   state?: ProbeState;
+  /**
+   * What the served page showed an anonymous caller — see {@link ProbeAnon}.
+   *
+   * Present exactly when an HTML body was read, absent when there was no page to read, on the
+   * same reasoning `state` is optional: §3.7's rule that a field describing the *run* is never
+   * optional applies to the run, and this describes a *response*. It is read whether or not
+   * anything gated, because a login page that served nothing is as much a fact as a landing page
+   * that served everything, and the two are told apart by the numbers on it.
+   */
+  anon?: ProbeAnon;
   /** What happened, in one line, with no credential in the text. */
   detail: string;
   /** Every address tried, in vantage order, whether it answered or not. */

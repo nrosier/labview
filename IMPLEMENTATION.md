@@ -684,10 +684,12 @@ for a single rescan. All three facts drive the design.
 
 **Every rule is pure, in [model/probe.ts](labview/src/model/probe.ts).** None lives in the
 client that does the fetching, because a rule inside an I/O module can only be tested by
-mocking the I/O. They divide into four jobs: what may be asked (`probeTargets`), what an answer
+mocking the I/O. They divide into five jobs: what may be asked (`probeTargets`), what an answer
 means (`readGate`, `readLoginForm`, `isLoginPath`), whether a *second* question is worth asking
 and what its answers add up to (`wantsStateProbe`, `stateTargets`, `readState`,
-`readStateGate` — see below), and which fact a decision rested on (`probeReasonText`).
+`readStateGate` — see below), what the page showed a caller who sent nothing (`readAnonAccess`,
+`saysLogin`, `servedAnonContent` — §3.6c, and the only one of the five that answers the opposite
+question), and which fact a decision rested on (`probeReasonText`).
 
 **Only services this scan found no authentication for are asked.** Two questions decide whether
 a request goes out, and they are separate on purpose: `probeTargets` says whether there is an
@@ -906,7 +908,8 @@ things the response then goes away with — where a `Location` pointed, whether 
 at all, where a `<meta refresh>` went — so a negative verdict used to be recorded as
 `HTTP 302 — answered with no login page`: the conclusion, with the fact thrown away. A 302 to
 `/dashboard` and a 302 to `/login` are the same sentence there, and the first is the one that
-leaves a service in the exposed count. So four fields carry the observation:
+leaves a service in the exposed count. So the observation travels beside the verdict, one field
+per fact a sentence has to be able to name:
 
 | Field | Answers |
 |---|---|
@@ -915,6 +918,7 @@ leaves a service in the exposed count. So four fields carry the observation:
 | `refresh` | *a `<meta refresh>` that was not a gate* — the `meta-refresh/home` fixture's own reason |
 | `truncated` | *a form below the body cap* — §11's known miss, reported the one time it bites |
 | `state` | *what the second request found* — which of the four addresses was asked, which refused, and whether it named a scheme. The only one of these fields that records a request rather than a reading, which is why `asked` is on it (**I8**: the payload states what went out) |
+| `anon` | *what the page showed a caller who sent nothing* — characters of text, same-origin links, and a sign-in offer if the page made one (§3.6c). The only field here that is evidence **for** an open verdict rather than in explanation of one, and the only one no gate rule can see |
 
 `readRedirect`, `readRefresh` and `readMediaType` are exported for this and consumed by
 `readGate` itself, so there is exactly one rule for "where does this point" and the recorded
@@ -945,7 +949,8 @@ without authenticating: it leaves `exposedWithoutAuth`, is counted in `probeGate
 `noAuthReason` reports it as `probed-gate` with `auth.method` untouched at `none`. An answer
 with *no* login page is the other half of the value — the exposure note gains a clause saying
 LabView requested the address and was served the application, which turns a finding inferred
-from configuration into one that was measured. A service that did not answer is neither: it is
+from configuration into one that was measured, and where the page it served carries readable
+content the note says what a visitor was shown as well (§3.6c). A service that did not answer is neither: it is
 counted in neither statistic, its note claims no measurement, and `probeOutcome` words it as
 `No answer` rather than `No login page`, because letting a silence read as "no gate" would
 reach this stage's one forbidden conclusion by accident.
@@ -1004,9 +1009,11 @@ rule cannot see — and they are the same row on the dashboard.
 
 [tools/probe-lab](labview/tools/probe-lab/README.md) is how they are told apart. Point it at a
 URL and it writes a Markdown report and a JSON record: the verdict, then **every one of the eight
-signals and the fact that made each fire or not**, then all the evidence no signal reads yet
-(every form and input unranked, `<title>`, scripts, headers, `Set-Cookie` *names*), then one line
-per thing standing between that page and a verdict. `--from-scan overview.json` reads a saved
+signals and the fact that made each fire or not**, then **what a visitor was shown**, then all the
+evidence no signal reads yet (every form and input unranked, every `<a href>` with the pipeline's
+own reading of it, every form-less control, `<meta>`, mount points, inline scripts *described*,
+`<noscript>`, the visible text, headers, `Set-Cookie` *names*), then one line per thing standing
+between that page and a verdict. `--from-scan overview.json` reads a saved
 payload and asks exactly the services this stage found neither authentication nor a login page
 for, at the addresses `probeTargets` gives — the same selection the skip rule above makes, so the
 tool's worklist and the scan's are one rule rather than two.
@@ -1038,6 +1045,43 @@ use, and for the same reason — `buildReport` is a function of an observation r
 report is assertable against canned bodies with no network and nobody's service involved. Which
 is also what makes the JSON the real deliverable: it is a fixture a proposed eighth signal can be
 replayed against offline.
+
+**Section 3a answers the question an operator actually asked.** The signal table can only say which
+of eight clauses failed; *this service has a sign-in page, why does the tool say it found nothing?*
+needs a different kind of row. `evidence: EvidenceFinding[]` is that row — six detectors
+(`login-link`, `login-control`, `login-route`, `login-heading`, `session-cookie`,
+`content-served`), each carrying a `fact` quoted from the page and a `because`, all built on the
+pipeline's own exported predicates. Two things keep it from being a second verdict:
+
+- **`direction` has no `"gated"` member.** A finding can point at *open*, at *open with an optional
+  account*, or at *worth another look*, and there is no member for the fourth possibility. So the
+  worst a detector can be wrong about is a paragraph in a diagnostic file — never a service's place
+  in the exposed count (I1). The `look-closer` grade is where a candidate ninth signal is
+  *proposed*: `login-heading` — a `<title>` saying login with no form and a bundle — is the one
+  finding here that would move a count, and it lands in section 4 as a proposal rather than being
+  applied.
+- **The smoke pass asserts the equality directly**, on every row of its own detector table:
+  `buildReport(obs).verdict.gate === readGate(...)`. That is this section's version of the
+  fixture-revert contract, and it fails the moment a detector leaks into a verdict (§8).
+
+The dumps behind it are bounded, and every bound is reported as an `…Omitted` count rather than
+applied in silence — a truncated anchor list that does not say it was truncated is how a reader
+concludes a page had no sign-in link when what happened is that the report stopped before it.
+Anchors inside a `<template>`, `<noscript>`, `<script>` or `<svg>` are kept but flagged `hidden`,
+which is the one place the lab is deliberately wider than the rule: `readAnonAccess` cannot see
+them at all (§3.6c), and a finding built on one is graded `weak` and points at `look-closer`.
+
+**Two flags default to off, and both defaults are the same argument.** `--try-login-paths` GETs the
+ten names in the pipeline's own `LOGIN_PATHS` on a form-less shell's origin — sequential, bounded,
+`GET`, no credential. The chain and the auth-state sweep exist because a service *told* the tool
+where to look; this one **guesses**, and a guess at ten addresses on somebody's service is a
+different kind of act, so it happens only when somebody typed the flag. It is also the one section
+that cannot move a verdict by plain statement rather than by construction — the scan asks none of
+those addresses — so a login page found at one lands in section 4 sized as *one more entry in a
+list*. `--save-body` writes a third file, the served HTML verbatim, and both the tool README and
+the run's own closing lines say that it is the one artifact this tool writes that is **not** safe
+to paste into an issue: an anonymous body carries no session, but it can carry whatever its
+bootstrap script was handed (I6).
 
 #### The switch beside Rescan
 
@@ -1088,6 +1132,108 @@ Three mechanics behind that, each chosen against a plausible alternative:
 The security consequence is real and is in §7: when LabView is not enforcing a login, `POST
 /api/rescan` is unauthenticated, so this switch lets any visitor start fleet-wide outbound
 requests.
+
+### 3.6c The other question: what the page showed (`readAnonAccess`)
+
+Everything in §3.6b asks *is a gate in front of this?* and answers it from the shapes a gate
+makes. This asks the opposite question, and it is the question a real fleet turned out to need.
+
+Eight probe-lab reports against live services produced one sentence eight times: **no `<form>`
+element in the served markup**. True, and useless. Three of those services had answered an
+anonymous request with fifteen to twenty-four kilobytes of finished, readable page — an article
+index, a landing page, a media library — and every one of them carried a plain `Sign in` link the
+operator could see in a browser and LabView threw away unread, because the only things read out
+of a body were forms, scripts and the `<title>`.
+
+A page like that is not a rule failing to find a gate. It is **proof there is no gate**: an
+anonymous request was answered with the application's own content, and the sign-in link beside it
+is an optional account rather than a door. That is the first positive evidence LabView can report
+about an open service. Until now `open` was only ever an absence — *none of the signals fired* —
+and an absence is precisely what a reader discounts, rightly, because it is equally consistent
+with a login this rule cannot see.
+
+**One pure function, one body, no request.** `readAnonAccess(body, requestUrl)` in
+[model/probe.ts](labview/src/model/probe.ts) returns a `ProbeAnon`: `textChars`, `links`, and
+optionally `loginHref` and `loginLabel`. It reads the same body `readGate` was already handed
+(**I8**), and keeps no header, no cookie and no attribute value except a resolved path and a
+label shorter than `LOGIN_LABEL_MAX` (**I6**).
+
+**It is structurally incapable of gating, which is the I1 argument and is not an argued one.**
+`readGate` takes a `ProbeResponse`; this record is not on one, and `readGate` does not import the
+function. There is no code path by which a sign-in link becomes a gate. So the worst a mistake
+here can do is put a wrong *sentence* on a service that stays in the exposed count — it can never
+take one out of it. Nothing else in this stage has that property, which is why this is the one new
+kind of evidence that needed no new fixture-revert argument about counts.
+
+**Both halves have to arrive together to mean anything**, which is why this is one function and
+not two:
+
+| What was read | On its own it means | So the rule |
+|---|---|---|
+| content served, no sign-in offer | an open application with no accounts at all | says the narrower sentence — *the application's own content and not a shell* |
+| a sign-in offer, no content served | a login page whose form is drawn in the browser — the **opposite** conclusion | says nothing, and leaves the page to `stateShortfall` (§3.6b), which asks the addresses a shell's own client would ask |
+| both | an application that serves everybody and offers an account | says so, and names the link or the control in the words the page used |
+
+**A logout link is skipped before its path is read**, and that ordering is the one thing here that
+would be a real bug the other way round. `isLoginPath` matches on prefix, so `/auth/logout`,
+`/oauth2/sign_out` and `/sso/logout` are all login paths *by name*, and a page carrying one is a
+page somebody is already signed in to. Reading it as a sign-in affordance would turn the strongest
+available evidence of a **closed** session into evidence of an open one.
+
+**Drawn markup, not served markup.** Every number comes off `drawnMarkup(body)`, which removes
+comments, `<script>`, `<style>`, `<template>`, `<noscript>` and `<svg>` before anything is
+counted. A `<template>` is where a client keeps the markup it has *not* rendered, and a framework
+that routes in the browser routinely ships its whole sign-in screen inside one; a `<noscript>` is
+the page for a visitor who is not the visitor being described. Counting either would produce
+exactly the mistake this rule exists to avoid — a shell reading as a finished page because its
+undrawn templates are full of links. `<svg/>` is dropped before either arm, because SVG is foreign
+content and the only place in HTML where `/>` really does close an element; every other tag in the
+list treats the slash as noise, so an unterminated-element arm that swallowed a self-closed `<svg/>`
+would delete the rest of the page. Direction-safe either way — a page can only lose text, never
+gain it — but losing it there means losing the sentence on exactly the services this rule is for.
+
+**The vocabulary is shared as a question, never as a pattern.** `LOGIN_LABEL` and
+`NOT_LOGIN_LABEL` are private, multi-language on purpose (a path stays `/login` in every locale;
+the label is the part that gets translated), and `saysLogin` / `saysLogout` are exported for
+`tools/probe-lab` — the discipline `isLoginPath` and `hasPasswordField` already follow. Three
+details in them are load-bearing and pinned by fixtures: word boundaries, without which
+`log[\s_-]?in` matches `Blog index` and a documentation site becomes a login page; `continue with`
+deliberately **absent**, because it is a login label only when a provider name follows and naming
+providers would make the list a vendor list; and sign-up deliberately absent from the veto, so
+`Sign in / Sign up` — one control offering both — still reads as a login affordance.
+`LOGIN_LABEL_MAX` (24) is exported rather than duplicated, because the lab grades a long hit as
+weak and must grade it by the same number: it fits `Sign in with Google` and excludes *How to log
+in to your router*.
+
+**The thresholds are wording thresholds, not verdict thresholds.** `servedAnonContent` — exported,
+so the lab can put the same answer in front of a reader without knowing the numbers — is
+`textChars >= 200 && links >= 2`. Both must hold, because either alone has a cheap
+counter-example: a login page can carry two hundred characters of legal boilerplate, and a page of
+nothing but a navigation can carry ten links. The margin is wide rather than fine — the largest
+client-rendered body in the reports that prompted this rule rendered under fifty characters and no
+anchors at all. And since nothing downstream counts anything, a threshold set slightly wrong costs
+one sentence on one service, so these can be tuned from real reports with no re-audit of what they
+move.
+
+**Where it surfaces.** `ServiceProbe` gains `anon?: ProbeAnon`, optional for the same reason
+`state` is — present exactly when a body was read as HTML, and §3.7's rule that a field describing
+the *run* is never optional does not apply to a field describing a *response*. `openReason`'s
+HTML-200 branch gains `anonProof(anon)` after `stateShortfall`, built the same way and in the same
+"and the finding stands" register. `probeOutcome` is untouched: the label stays `No login page`,
+because it is still true. The UI needs no change for the same reason the eighth signal needed none
+— the tile and the drawer both render `probeReasonText`.
+
+Note what the record does **not** do on a gated page: `anon` is attached whenever an HTML 200 was
+read, gate or no gate, because it describes a *response*. What never appears on a gated verdict is
+the *sentence* — `anonProof` is reached only from `openReason` — and the fleet-wide smoke assertion
+is worded that way rather than as "the record and a gate never coexist" (§8).
+
+`fixtures/probe/public-portal/` is the rule and its trap in one stack: `app` serves content with
+`<a href="/login">Sign in</a>` and must produce the sentence naming that link, while `blog` serves
+content with an article headline reading *How to log in to your router* and a `/auth/logout`
+anchor, and must produce the narrower sentence with no offer in it. Back out `anonProof` and `app`
+fails; loosen `saysLogin` or drop `NOT_LOGIN_LABEL` and `blog` fails. Both have a search `<form>`,
+so `wantsStateProbe` stays false and neither adds a second request.
 
 ### 3.7 The data contract
 
@@ -3578,7 +3724,7 @@ No posture number moves with them. `matchedServices` on both roots and the
 exposed-without-auth pair asserted with and without the API are unchanged by the reason
 model, which adds reporting and nothing else.
 
-**`fixtures/probe`** — seventeen stacks, twenty-five services, driven twice: once with probing off
+**`fixtures/probe`** — eighteen stacks, twenty-seven services, driven twice: once with probing off
 and once on, against a URL-keyed `probeStub` in `scripts/smoke.ts` rather than a JSON payload,
 because a probe reads status codes, three headers and a fragment of HTML, not a document. The
 LAN host is `192.0.2.10` — documentation range, so a request that escaped the stub could not
@@ -3596,6 +3742,7 @@ arrive anywhere. Same revert-proof contract; one stack per rule:
 | `saml-post` | `sso-form` — the shape that defeats every simpler rule at once: no password field, no `Location`, and a cross-origin `action` the form rule refuses on purpose. The hidden `SAMLRequest` alone is the evidence. TLS on the router, so it is asked over `https` |
 | `passwordless` | a **pair**, and the reason `credential-form` cannot degenerate into word-matching: `magic` serves an email field, a submit button and `action="/login"` with no password anywhere; `news` is the **trap** — the same three tags as a newsletter box, posting to a list service on another origin, which marks nothing and clears nothing, and whose reason must say so in those terms: the form shows no login intent and its action is not a login path |
 | `open-app` | the **guard**, two services: `dash` answers 200 with a homepage and stays exposed with the finding now measured; `routing` redirects same-origin to `/dashboard`, which is application routing and clears nothing |
+| `public-portal` | a **pair**, and the only stack here pinning a sentence that points at *open* (§3.6c). `app` serves a landing page and `<a href="/login">Sign in</a>`: `readGate` must stay `undefined`, the service must **stay** in the exposed count, and the reason must name the link, the label and the number of characters and links behind the claim — back out `anonProof` and it fails. `blog` is the **trap**, twice over: an article headline reading *How to log in to your router* (28 characters, so `LOGIN_LABEL_MAX` excludes it) and a `/auth/logout` anchor (a login path by prefix, which `NOT_LOGIN_LABEL` is checked before). It must produce the *narrower* sentence — content served, no offer — so a loosened label vocabulary or a dropped logout veto fails here rather than on a real fleet. Both carry a search `<form>`, so `wantsStateProbe` is false and neither adds a second request |
 | `gated-open` | **a service whose gate was already detected is never asked.** An `authentik@docker` middleware whose definition is in no scanned stack, so the posture is `inferred` — the harder half of the eligibility rule, since a rule that only withheld `confirmed` postures would still send this request. Its entry in `PROBE_ANSWERS` stays, so the assertion fails on a *recorded request* rather than on a fixture with nothing to say |
 | `access-gate` | the same withholding reached without a Traefik label at all: a tunnel hostname behind a Cloudflare Access policy, which is the second of `hasDetectedAuth`'s three terms. Its sibling `db` is a `tcp://` origin under the same policy — detected auth *and* no address, which is what pins the order of the two questions: counted as neither asked nor withheld |
 | `silent` | eligible, nothing listening. "Did not answer" and "answered with no login page" are the same absence of a gate and completely different findings; it counts in neither statistic and drives the aggregate `partial` |
@@ -3632,8 +3779,22 @@ the 200 that was not a page, the missing header for a bare 401 at `/`, and the a
 one further out that refused without naming a scheme, whose row must still end "the finding
 stands" — with `mustNot` clauses where a
 wording could over-claim (a probe that never connected must not say "login page"), plus two
-meta-assertions that every gate has a row and that no two gates are worded alike; and
-`probeTargets` over hand-built routes for
+meta-assertions that every gate has a row and that no two gates are worded alike; a 13-row
+`readAnonAccess` table reading the same bodies the other way round — the offer, the shell that must
+stay silent, an icon-only anchor, an `aria-label`, the `/auth/logout` veto, the article headline, a
+form-less control, an anchor beating a control for the same label, a cross-origin hand-off, a
+duplicate path counted once, `href="#"`/`javascript:`/`mailto:`, a `<template>` and a `<noscript>`
+— whose most important row is a property rather than a case: `readGate` returns `undefined` on
+every body in the table, which is §3.6c's structural argument asserted rather than reasoned about.
+Beside it, the two thresholds pinned at their boundary (200 characters and 2 links true; 199 and 2,
+4000 and 1, and nothing at all false), four rows over the label vocabulary covering the positives,
+the logout veto, the two *deliberate* absences (`continue with`, and sign-up — so `Sign in / Sign
+up` still reads as an offer) and the word-boundary near misses that keep `Blog index` from being a
+login, the `LOGIN_LABEL_MAX` pairing that separates a control's label from an article's headline,
+and one row asserting `textChars` is `visibleText`'s own count on the same reduction rather than a
+second reading of the page; four more `probeReasonText` rows for the sentence itself — the offer
+branch, the no-offer branch, a shell that must produce neither, and a gated page that must produce
+neither; and `probeTargets` over hand-built routes for
 scheme, order, the per-service cap, dedupe, the bind-address guard, a port range, and each arm
 of `isHttpObservable` separately. **Eligibility**, which decides whether a request is sent at
 all: a table over `hasDetectedAuth` on hand-built services for all three of its terms —
@@ -3642,7 +3803,11 @@ snapshot, and the two negatives that matter most, an *empty* Access block (a gat
 at) and a proxy provider with no outpost — plus the assertion that over the whole edge fleet the
 predicate is exactly the negation of the exposure partition's own test, so eligibility and
 posture cannot drift apart. Then, fleet-wide and revert-proof: **no service carries both
-detected authentication and a probe result**; the two withheld services' `auth.method`,
+detected authentication and a probe result**; `anon` is present on exactly the services that
+answered a 200 of HTML and on no others — gate or no gate, since the record describes a *response*
+— while **no gated verdict in the fleet carries the sentence**, which is the I1 guarantee stated
+the way it is actually true rather than as "the record and a gate never coexist"; the two withheld
+services' `auth.method`,
 `confidence` and `exposedWithoutAuth` are identical to the run where nothing was asked at all,
 which is the safety argument for the whole rule asserted rather than reasoned about; and
 `meta.probe.skipped` is exactly 2 with probing on and 0 with it off. The arithmetic is pinned
@@ -3653,7 +3818,7 @@ than on the code: every request a GET with no query, at `/` or at one of the fou
 `STATE_PATHS` addresses and nothing else; every one of those second requests at an origin the
 first request already reached; no credential on any of them; no address asked twice; nothing at
 `:15432` or `:18081`; nothing named `pg.probe` or `ssh.probe`; neither withheld address anywhere
-in the list; and the total exactly 35 — nineteen first requests, one for each of the eighteen
+in the list; and the total exactly 37 — twenty-one first requests, one for each of the twenty
 services asked plus the single fallthrough, and sixteen second ones. That last number is pinned
 twice over, against the summed `state.asked` on the payload and against a per-service bound of
 `STATE_PATHS.length`, which is what makes the short-circuit falsifiable: removing the `break`
@@ -3701,6 +3866,20 @@ same-origin redirect elsewhere names the path and asks for a fixture rather than
 clause; that a client-rendered shell is named as the known blind spot; and that a rendered
 report carries no cookie value and no redacted header value (I6). All of it runs against the
 canned bodies already in the file — no network, no temporary directory, nobody's service.
+
+Section 3a is asserted the same way, and its load-bearing check is the same equality read as a
+*non*-effect: an 11-row detector table, each row put through `buildReport`, and for every one of
+them `verdict.gate` must equal `readGate`'s answer on the same body — so a detector that leaked
+into a verdict fails here rather than on somebody's dashboard. Beside it, `direction !== "gated"`
+restated as a runtime check rather than only as a type; that a page the rule *did* gate carries no
+findings at all, since there is nothing left to argue about; and that a rendered report keeps the
+whole of the I6 reduction across the new sections — the visible-text sample and the findings table
+present, a session cookie's *name* present, its value absent, and a redacted header still reported
+as a length. The three answer shapes of `--try-login-paths` get one row each — a login page found
+at a guessed path, every path answering with the root's own bytes (a catch-all, and therefore proof
+the login is drawn in the browser), and every path a 404 — with the same no-drift assertion over
+all three, plus the ordinary run where the section is absent and the list is empty rather than
+missing.
 
 Two of those rows are what shipping the eighth signal changed, and they are worth naming because
 they are the record of this tool having worked. The lab sweeps a **wider** list of current-user
@@ -4242,9 +4421,9 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   authentication. That is a false finding in the noisy direction, and it is the tolerable
   one: a gate can only ever take a service *out* of the exposed count, so a rule loose
   enough to catch the remaining cases would clear real exposures instead. Four known
-  misses, each left open deliberately — the first narrowed since, by exactly as much as one
-  extra request can carry and no further:
-  - **A login shell rendered by script — narrowed by one request, not closed.** A single-page
+  misses, each left open deliberately — the first narrowed twice since, once by an extra
+  request and once by reading the same response the other way round, and neither closed it:
+  - **A login shell rendered by script — narrowed twice, not closed.** A single-page
     app that ships an empty `<div id="root">` and builds its form in the browser has no form
     in the HTML, and nothing in *that* response distinguishes it from an open dashboard. There
     is no headless browser and there will not be one — that is a different program. What there
@@ -4255,6 +4434,18 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
     anonymous-enabled Grafana and a world-readable Gitea both answer, and reading that as a
     gate would clear genuinely open services. Those are reported (`ProbeState.refusedAt`, in
     the drawer's own words) and not counted.
+
+    The second narrowing is not another gate rule; it is the **population** this miss draws
+    from getting smaller. "No `<form>` in the markup" used to cover two quite different pages —
+    an empty shell, and a fully prerendered application whose sign-in is one anchor — and both
+    came back as *no signals fired*. `readAnonAccess` (§3.6c) reads the second one positively:
+    content served to an anonymous caller, beside an offer to sign in, is an application with an
+    optional account rather than a gate in front of one, and the reason says so in the page's own
+    words. So a prerendered page is no longer a blind spot at all; what remains one is a body
+    that rendered *nothing*, which is a much narrower and much more recognisable thing. Note
+    which way that runs: it adds a sentence to an `open` verdict and can only ever leave a
+    service **in** the exposed count, so it narrows the doubt rather than the count — the one
+    new reading in this stage with no I1 exposure of any kind.
   - **A form past the body cap.** `MAX_BODY_BYTES` is 64 KiB and the read stops there, so
     a login form below an inlined stylesheet or a base64 hero image is never seen. The cut
     may also land inside a tag, in which case that element is simply not counted: a
@@ -4285,6 +4476,18 @@ Not bugs — bounded scope, stated so nobody assumes otherwise:
   fifth a redirect chain whose first `Location` was a path `LOGIN_PATHS` simply did not have. It
   changes nothing about a scan — it is a diagnostic, not in the image, and imports the rules
   rather than restating them.
+
+  `readAnonAccess` came out of the same loop, and out of the tool's own gap rather than the
+  rule's: eight reports later, three of them described twenty-four kilobytes of prerendered page
+  as "no `<form>` element in the served markup", because the only things `readUnread` captured
+  were forms, scripts and the `<title>` — no `<a href>`, no anchor text, no form-less control, no
+  visible text at all. The proof the operator could see in a browser was a plain
+  `<a href="/login">Sign in</a>` that nothing in the tool had ever read. So the extraction grew
+  to cover the whole of what a page shows, section 3a says what those facts *prove* about a
+  visitor's view, and one of the six detectors was worth promoting into the pipeline — the only
+  one pointing at *open*, and therefore the only one that could be promoted without a rule getting
+  looser. The candidate ninth signal the tool now proposes (`login-heading`: a title saying login,
+  no form, one bundle) is deliberately still a proposal.
 - **A service behind a detected gate is no longer measured at all.** Since the probe skips
   every service this scan found authentication for (§3.6b), a configured gate that has
   quietly stopped working — a forward-auth middleware pointing at a dead outpost that now
@@ -4596,6 +4799,8 @@ Why the non-obvious choices are what they are. Read before reversing one.
 | Every signal that counts as a login page is a fact, and everything else leaves the finding standing | `readGate` can only ever take a service **out** of the exposed count, so a clause that is merely likely manufactures false comfort — the one thing this project exists to remove. Hence a challenge header is required for a 401 (a bare 401 is an API saying "not signed in" while its UI serves the whole app), a same-origin redirect must land on a login path (`/dashboard` is routing), a `<meta http-equiv="refresh">` is resolved through the same rule rather than trusted for existing, a `SAMLRequest` input counts because nothing but the SAML POST binding emits one, and a password field must arrive on a 200 whose body was HTML. A finding a reader dismisses costs them a look; the reverse error costs them the exposure. The signals grew from four to eight; the bar did not move — the eighth needed a second request precisely because no reading of the first response could clear it honestly, and it still requires the refusal to carry a challenge header. |
 | The eighth signal is allowed a **second request**, and only for one shape of answer | Seven signals read one response, which is the cheapest thing a rule can cost and was the whole budget until a form-less HTML shell turned out to be the single most common thing a real fleet's `open` list is made of — a login screen drawn in the browser, indistinguishable in its markup from an open dashboard at any body size. That is not a rule that needs loosening; it is a question asked at the wrong address. So `wantsStateProbe` names the one answer a second request can settle — 200, HTML, no `<form>` anywhere, and nothing already gated — and everything else is decided on the response in hand. The cost is bounded before it is spent: four constant paths, the origin already reached, the walk stops at the first refusal, nothing parsed from the page, sequential regardless of `probe.maxConcurrency`. The ordinary case is one extra request and the worst case is four, and the startup line says the total out loud (§3.6b) so a fleet of shells cannot quietly cost several times what "13 services probed" implies. |
 | A **bare** 401 at a current-user address is reported and not counted | It is the strongest evidence in this whole area and it still is not enough. An API answering 401 with no scheme named is exactly what an anonymous-enabled Grafana and a world-readable Gitea answer — pages that serve everybody, whose current-user endpoint truthfully says nobody is signed in. Counting it would take genuinely open services *out* of the exposed count, the one direction I1 forbids. So `readStateGate` requires `WWW-Authenticate` on the refusal, exactly as `challenge` does one address over: a server sending that header is asking a browser to prompt, which nothing does by accident. 403 is excluded for a different reason — nginx answers it for a directory with no index. What the walk found is still on the payload (`ProbeState.refusedAt`) and still in the drawer's words, as a place to look rather than a verdict, and `fixtures/probe/spa-shell` carries the trap beside the real thing so a rule that dropped the header requirement fails instead of quietly clearing an open service. |
+| Proof that a service is **open** is worth as much as proof that it is gated — and it is the only new evidence here with no I1 exposure at all | Every other rule in this stage answers *is there a gate?*, and an `open` verdict was therefore an absence: none of the eight signals fired. An absence is what a reader discounts, correctly, because it is equally consistent with a login the rule cannot see — which is exactly what eight probe-lab reports said in the same words eight times while three of the services behind them were serving twenty-four kilobytes of public page with a `Sign in` link on it. `readAnonAccess` (§3.6c) says the positive thing instead: an anonymous request was answered with the application's own content, and the offer beside it is an optional account rather than a door. Every constraint that makes the other seven signals expensive to get right is absent here, because the direction is reversed — this can only add a sentence to a service that stays in the exposed count, never remove one from it. That is why its thresholds can be two numbers picked from real reports rather than a fine line somebody has to defend, and why it needed no new `ProbeGate`, no `PROBE_GATES` entry, no second request, and no UI change: the tile and the drawer already render `probeReasonText`. |
+| A login **link** is not a gate, and the type system is where that is enforced rather than the review | The two halves of this change are one fact read twice — a page with a sign-in affordance on it — and they point in opposite directions depending on whether content came with it. That makes "a sign-in link must never clear a service" the single thing most likely to be got wrong later, by somebody adding a detector in a hurry. So it is arranged to be impossible rather than forbidden: `readGate` takes a `ProbeResponse` and the `ProbeAnon` record is not on one, so there is no code path from a link to a gate in the product; and in the lab, `EvidenceFinding.direction` has no `"gated"` member, so the six detectors *cannot* express the conclusion they must not reach — the strongest a finding gets is `look-closer`, which lands in section 4 as a proposal (`login-heading` is the one that would move a count, and it stays a proposal). Two runtime assertions back the types where a type alone would be a promise about source rather than behaviour: every detector row must leave `buildReport(obs).verdict.gate` equal to `readGate`'s own answer, and no gated verdict anywhere in `fixtures/probe` may carry the open-access sentence (§8). |
 | `credential-form` reads **several** facts at once, and it is the only gate that does | Passwordless sign-in — magic links, passkey-first pages — has no password field, no redirect and no hidden binding parameter. One-fact rules cannot see it at all, so a growing class of services that serve nothing but a login form was being counted as exposed. No single fact on such a page is sufficient either: a username field and a submit button are also a newsletter box, which is the default footer on a static site. So this one clause requires a username field, a submit button, and a login-intent marker — an action resolving onto a login path, or a `one-time-code` field — and `fixtures/probe/passwordless` carries the near-miss beside the real thing so the composite cannot drift into word-matching. `types.ts` used to say a fifth member would be an inference; that prose was rewritten to say which fact combination is admitted and why, rather than left to contradict the code. |
 | The switch overrides `probe.enabled` in **both** directions, not just off | A control the configuration can veto is a control that displays a state it does not have — the operator turns it on, nothing probes, and nothing on the page explains it. Full authority also makes the useful case work: trying probing once, on a fleet where it is off by default, without editing a file and restarting. The cost is stated rather than hidden (§7): when no login is configured, `POST /api/rescan` is unauthenticated, so any visitor can start a probing scan. The mitigation is the login, because the same visitor can already read the entire inventory — a narrower switch would protect nothing that `GET /api/overview` does not already give away. |
 | The override lasts one build, and the payload says what that build did | Sticky would mean either persisting a runtime setting, in a program that persists nothing, or letting one click decide what every later scan does — including timer scans nobody asked for, which is precisely the "outbound requests unasked" the default-off row exists to prevent. Per-build keeps the blast radius at one rescan and costs one visible oddity: the TTL expires and probe results leave on their own. `meta.probe` is what pays for it — it records whether *this* build probed and which of configuration or request decided it, and the checkbox re-syncs from it on every overview, so the revert moves the switch rather than leaving it lying (§11). |
