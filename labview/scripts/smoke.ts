@@ -60,6 +60,7 @@ import type { ProbeResponse, StateAnswer } from "../src/model/probe.js";
 // judgement in it, which is what makes a report replayable offline.
 import type { ProbeLabObservation, ProbeLabReport } from "../tools/probe-lab/report.js";
 import type { TagFilter } from "../src/model/filter.js";
+import type { ViewState } from "../src/model/viewstate.js";
 import type { BuildDeps } from "../src/analyze/index.js";
 import type { DockerLike } from "../src/enrich/docker.js";
 import type { FetchLike, HttpResponse } from "../src/enrich/authentik.js";
@@ -253,6 +254,12 @@ const {
 // that deserves better than being exercised by hand in a browser.
 const { EMPTY_TAG_FILTER, cycleTag, describeTagFilter, matchesTagFilter, tagFilterActive } = await import(
   "../src/model/filter.js"
+);
+// The view as a query string, in `src/` for the filter's reason and one more: a link is the
+// one input a visitor can be handed by somebody else, so what a URL is allowed to say has to
+// be asserted against a hostile query rather than trusted because the UI wrote it.
+const { DEFAULT_VIEW_STATE, isViewNavigation, readViewState, writeViewState } = await import(
+  "../src/model/viewstate.js"
 );
 // Which build is running, split the way `parsePasswd`/`readPasswd` are: the resolver takes
 // its environment and its file reads as arguments, so the precedence, the shortening and
@@ -9227,6 +9234,141 @@ check(
   describeTagFilter(F(["lan"]), up),
 );
 check("...and says nothing at all when nothing is filtered", describeTagFilter(EMPTY_TAG_FILTER, up) === "");
+
+console.log("\nthe view as a query string: what a link may say");
+// Two directions, and the second is the one that matters. Forwards: what the UI writes must
+// read back as the same view, or a pasted link shows something other than what was shared.
+// Backwards: an *arbitrary* query must land inside the vocabulary the legends can draw —
+// a link is the one input a visitor can be handed by somebody else, and the failure mode
+// being defended against is not injection (Preact escapes) but a view with no way out of it.
+//
+// `ingress` taken from `INGRESS_KINDS` rather than written out, so these assertions cannot
+// quietly become a test of tags the classifier never produces.
+const VOCAB = {
+  ingress: INGRESS_KINDS,
+  auth: ["authentik-forward-auth", "basic-auth", "none"],
+};
+/** Field by field, not `JSON.stringify`: a reordered object literal is not a regression. */
+const sameFilter = (a: TagFilter, b: TagFilter): boolean =>
+  a.mode === b.mode && a.include.join() === b.include.join() && a.exclude.join() === b.exclude.join();
+const sameView = (a: ViewState, b: ViewState): boolean =>
+  a.tab === b.tab &&
+  a.search === b.search &&
+  a.exposedOnly === b.exposedOnly &&
+  a.hideAccepted === b.hideAccepted &&
+  a.driftOnly === b.driftOnly &&
+  a.service === b.service &&
+  a.panel === b.panel &&
+  a.network === b.network &&
+  sameFilter(a.ingress, b.ingress) &&
+  sameFilter(a.auth, b.auth);
+
+check(
+  "the dashboard as it opens has an empty query, so the address bar stays clean until something happens",
+  writeViewState(DEFAULT_VIEW_STATE) === "",
+  JSON.stringify(writeViewState(DEFAULT_VIEW_STATE)),
+);
+check("...and an empty query reads back as the dashboard as it opens", sameView(readViewState("", VOCAB), DEFAULT_VIEW_STATE));
+
+const fullView: ViewState = {
+  tab: "graph",
+  search: "jellyfin",
+  ingress: { include: ["public", "lan"], exclude: ["internal"], mode: "all" },
+  auth: { include: ["none"], exclude: [], mode: "any" },
+  exposedOnly: true,
+  hideAccepted: true,
+  driftOnly: true,
+  service: "media/jellyfin",
+  panel: "probe",
+  network: "proxy_default",
+};
+const fullQuery = writeViewState(fullView);
+check("every field of a view survives the round trip", sameView(readViewState(fullQuery, VOCAB), fullView), fullQuery);
+// The property the caller relies on to decide a write is a no-op. Without it, `ov` being
+// replaced on every rescan and every cache refresh would stack an identical history entry
+// each time, and Back would need pressing five times to leave a page nobody navigated within.
+check(
+  "...and the same view always spells the same query, which is what lets a no-op write be skipped",
+  writeViewState(readViewState(fullQuery, VOCAB)) === fullQuery,
+);
+// `all:` on the way out only, both on the way in: `any:` is what somebody hand-editing a
+// link reaches for, and rejecting it would be a puzzle rather than a safeguard.
+check(
+  "a tri-state filter is one parameter, mode included",
+  fullQuery.includes("ingress=all%3Apublic%2Clan%2C-internal"),
+  fullQuery,
+);
+check(
+  "...and `any:` is read even though it is never written",
+  readViewState("ingress=any:public,lan", VOCAB).ingress.mode === "any" &&
+    readViewState("ingress=all:public,lan", VOCAB).ingress.mode === "all" &&
+    !writeViewState({ ...DEFAULT_VIEW_STATE, ingress: { include: ["lan"], exclude: [], mode: "any" } }).includes("any"),
+);
+
+// Everything from here down arrives from a link, which is to say from somebody else. Each
+// check is that a bad value became the field's default rather than becoming a view the
+// reader cannot get out of.
+check(
+  "an unknown tag is dropped, so no link can filter on something no chip can clear",
+  !tagFilterActive(readViewState("ingress=quantum", VOCAB).ingress),
+);
+check(
+  "...while the known tags beside it survive, so one typo does not discard the whole filter",
+  readViewState("ingress=quantum,lan", VOCAB).ingress.include.join() === "lan",
+);
+check(
+  "an unrecognised tab falls back to the overview rather than rendering neither",
+  readViewState("tab=../../etc/passwd", VOCAB).tab === "overview",
+);
+check(
+  "an unrecognised panel is dropped, so no link opens a drawer that does not exist",
+  readViewState("panel=admin", VOCAB).panel === undefined,
+);
+check(
+  "a flag is `1` and nothing else, so `exposed=false` does not read as true",
+  !readViewState("exposed=false", VOCAB).exposedOnly && readViewState("exposed=1", VOCAB).exposedOnly,
+);
+const longSearch = readViewState(`q=${"a".repeat(5000)}`, VOCAB).search;
+check("a free-text value is capped, so a hostile link cannot arrive with a megabyte in it", longSearch.length === 200, `${longSearch.length} chars`);
+// Built with `fromCharCode` rather than written as escapes, for the reason the module's own
+// `stripControls` gives: an escape sequence in a character class is something no reader can
+// check by eye, and these three are meant to be legible as newline, NUL and DEL.
+const gremlins = String.fromCharCode(10, 0, 127);
+const stripped = readViewState(`q=me${encodeURIComponent(gremlins)}dia`, VOCAB).search;
+check(
+  "...and a control character costs itself rather than the search term it was pasted with",
+  stripped === "media",
+  JSON.stringify(stripped),
+);
+check(
+  "a service key is carried opaquely, `/` and all",
+  readViewState("svc=media%2Fjellyfin", VOCAB).service === "media/jellyfin",
+);
+
+// The rule behind `pushState` versus `replaceState`, which is the difference between Back
+// closing a drawer and Back undoing one letter of a search.
+check(
+  "opening a drawer is navigation",
+  isViewNavigation(DEFAULT_VIEW_STATE, { ...DEFAULT_VIEW_STATE, service: "media/jellyfin" }),
+);
+check(
+  "...and so is opening a panel",
+  isViewNavigation(DEFAULT_VIEW_STATE, { ...DEFAULT_VIEW_STATE, panel: "drift" }),
+);
+check(
+  "...but typing is not, or Back would undo one letter at a time",
+  !isViewNavigation(DEFAULT_VIEW_STATE, { ...DEFAULT_VIEW_STATE, search: "jelly" }),
+);
+check(
+  "...and neither is a filter, a flag or a tab, none of which open anything",
+  !isViewNavigation(DEFAULT_VIEW_STATE, {
+    ...DEFAULT_VIEW_STATE,
+    tab: "graph",
+    exposedOnly: true,
+    driftOnly: true,
+    ingress: { include: ["lan"], exclude: [], mode: "any" },
+  }),
+);
 
 console.log("\nthe ingress palette and the stylesheet name the same variables");
 // Both halves of the colour lookup are strings the compiler never sees together:

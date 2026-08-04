@@ -1,5 +1,5 @@
 import { render } from "preact";
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 // The stylesheet is a dependency of the app, not a file that happens to sit beside
 // it: importing it here is what puts it in the graph, so Vite minifies it, hashes
 // nothing it does not have to, and injects the <link> itself (§3.9).
@@ -16,6 +16,10 @@ import type {
   SessionInfo,
   TagFilter,
   TraefikSummary,
+  ViewPanel,
+  ViewState,
+  ViewTab,
+  ViewVocabulary,
 } from "./model";
 import {
   buildLabel,
@@ -38,6 +42,7 @@ import {
   matchesTagFilter,
   tagFilterActive,
 } from "./model";
+import { isViewNavigation, readViewState, writeViewState } from "./model";
 import {
   diffIntegrations,
   diffStacks,
@@ -63,6 +68,19 @@ import { NetworksSection } from "./components/NetworksSection";
 
 type Theme = "light" | "dark" | "auto";
 const THEME_KEY = "labview-theme";
+
+/**
+ * Which tag values a link may filter on: exactly the ones the legends can draw.
+ *
+ * Derived from the palettes rather than restated, so a new ingress kind or auth method
+ * becomes filterable in a URL at the moment it gets a chip and never before — which is the
+ * property `readViewState` needs to keep its promise that no link can produce a filter with
+ * no way to clear it.
+ */
+const VIEW_VOCABULARY: ViewVocabulary = {
+  ingress: INGRESS_META.map((m) => m.key),
+  auth: AUTH_META.map((m) => m.key),
+};
 
 interface Flat {
   stack: AppStack;
@@ -254,42 +272,52 @@ function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   /** A failure code from a redirect or from a session that ran out mid-visit. */
   const [loginError, setLoginError] = useState<LoginFailureReason | undefined>(readLoginError);
+  /**
+   * The view the address bar describes, read once, and after `loginError` on purpose: that
+   * reader strips `?login_error=…` with `replaceState`, and reading the query before it would
+   * be reading a URL that is about to change.
+   *
+   * `useState` rather than a plain call so it happens on the first render only. The URL is
+   * where the *initial* state comes from; from then on the state is the source and the URL
+   * follows it, which is the only ordering in which a keystroke cannot fight a history entry.
+   */
+  const [initialView] = useState<ViewState>(() => readViewState(location.search, VIEW_VOCABULARY));
   const [busy, setBusy] = useState(false);
   // What the last rescan found, held until the next one. The initial load has nothing to
   // compare against, so both stay null and the notes are absent rather than empty.
   const [diff, setDiff] = useState<ScanDiff | null>(null);
   /** The other half of the same rescan: what the Authentik and Traefik reads came back with. */
   const [apiDiff, setApiDiff] = useState<IntegrationDiff | null>(null);
-  const [tab, setTab] = useState<"overview" | "graph">("overview");
+  const [tab, setTab] = useState<ViewTab>(initialView.tab);
   const [theme, setTheme] = useState<Theme>((localStorage.getItem(THEME_KEY) as Theme) || "auto");
 
   // Filters
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(initialView.search);
   /**
    * Tri-state, because ingress is multi-valued: a chip is included, excluded, or
    * neither, and the included set is combined with `Any` (OR) or `All` (AND). The
    * semantics live in `model/filter.ts` — this holds only the state.
    */
-  const [ingressFilter, setIngressFilter] = useState<TagFilter>(EMPTY_TAG_FILTER);
+  const [ingressFilter, setIngressFilter] = useState<TagFilter>(initialView.ingress);
   /** The same three states for auth, which stays on `any`: `auth.method` is one value. */
-  const [authFilter, setAuthFilter] = useState<TagFilter>(EMPTY_TAG_FILTER);
-  const [exposedOnly, setExposedOnly] = useState(false);
+  const [authFilter, setAuthFilter] = useState<TagFilter>(initialView.auth);
+  const [exposedOnly, setExposedOnly] = useState(initialView.exposedOnly);
   /**
    * Put the exposures someone has signed off on out of the way, so the list can be read
    * down to zero. Off by default and offered only when there is something to hide — an
    * acceptance is a decision to be able to see, not a way to make the count look better.
    */
-  const [hideAccepted, setHideAccepted] = useState(false);
+  const [hideAccepted, setHideAccepted] = useState(initialView.hideAccepted);
   /** The other direction: only the services whose `.labview` disagrees with the scan. */
-  const [driftOnly, setDriftOnly] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [driftOnly, setDriftOnly] = useState(initialView.driftOnly);
+  const [selected, setSelected] = useState<string | null>(initialView.service ?? null);
   /**
    * The network whose row to open at, set by tapping a network node in the graph.
    *
    * A network node cannot show its own members — its spokes are capped — so tapping one
    * has to hand the reader over to the list that can, which lives on the other tab.
    */
-  const [network, setNetwork] = useState<string | null>(null);
+  const [network, setNetwork] = useState<string | null>(initialView.network ?? null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /**
    * Which side panel is open, if any: an integration's detail, or the declaration drift.
@@ -302,7 +330,7 @@ function App() {
    * places and closed in a defined order, and a single union would have to be unpacked at
    * every use to say which of the two it is.
    */
-  const [panel, setPanel] = useState<"authentik" | "traefik" | "drift" | "probe" | null>(null);
+  const [panel, setPanel] = useState<ViewPanel | null>(initialView.panel ?? null);
   /**
    * Whether the next Rescan asks the services themselves what they answer.
    *
@@ -316,6 +344,90 @@ function App() {
    * says actually ran.
    */
   const [probeOn, setProbeOn] = useState(false);
+
+  /** The search box, so `/` and ⌘K have something to focus. */
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  /**
+   * Everything the address bar carries, gathered in one place.
+   *
+   * Rebuilt every render rather than memoised: it is nine primitives and two small objects,
+   * and a `useMemo` over the same eleven dependencies would cost more to read than it saves.
+   * `probeOn` is deliberately *not* in it — it decides whether a scan sends requests off the
+   * fleet, and a link that turned it on for whoever opened the link would be exactly the
+   * "stored `true` generates fleet-wide traffic" problem its own comment above rules out.
+   */
+  const view: ViewState = {
+    tab,
+    search,
+    ingress: ingressFilter,
+    auth: authFilter,
+    exposedOnly,
+    hideAccepted,
+    driftOnly,
+    ...(selected ? { service: selected } : {}),
+    ...(panel ? { panel } : {}),
+    ...(network ? { network } : {}),
+  };
+
+  /**
+   * The last view the address bar was told about, so the next write knows whether the reader
+   * navigated or merely tuned. Seeded with what the URL already said, which makes the first
+   * write after a cold load a no-op rather than a duplicate entry.
+   */
+  const lastWritten = useRef<ViewState>(initialView);
+
+  /**
+   * Keep the address bar describing what is on screen.
+   *
+   * `pushState` for navigation and `replaceState` for tuning, decided by `isViewNavigation`:
+   * one history entry per keystroke would bury the entry the reader actually wants Back to
+   * reach, while a drawer that Back does not close is the first gesture anybody makes on a
+   * phone failing silently.
+   *
+   * The write is skipped when the URL already says this. That is not an optimisation — `ov`
+   * is replaced on every rescan and on the cache TTL, and without the check each of those
+   * re-renders would stack another identical entry, so Back would need pressing five times to
+   * leave a page nobody had navigated within.
+   */
+  useEffect(() => {
+    const query = writeViewState(view);
+    const url = `${location.pathname}${query ? `?${query}` : ""}${location.hash}`;
+    if (url !== `${location.pathname}${location.search}${location.hash}`) {
+      if (isViewNavigation(lastWritten.current, view)) history.pushState(null, "", url);
+      else history.replaceState(null, "", url);
+    }
+    lastWritten.current = view;
+    // The fields of `view`, not `view` itself: the object is new every render.
+  }, [tab, search, ingressFilter, authFilter, exposedOnly, hideAccepted, driftOnly, selected, panel, network]);
+
+  /**
+   * Back and Forward, in the other direction.
+   *
+   * Every field is re-read through `readViewState` rather than restored from a state object
+   * stashed in the history entry, so an entry written by an older build — or edited by hand,
+   * or arrived at by a Back into a bookmark — is validated on the way in exactly like a
+   * pasted link. `lastWritten` is updated first so the write effect these `setState` calls
+   * trigger recognises the view as already on the address bar and stays quiet.
+   */
+  useEffect(() => {
+    const onPop = () => {
+      const next = readViewState(location.search, VIEW_VOCABULARY);
+      lastWritten.current = next;
+      setTab(next.tab);
+      setSearch(next.search);
+      setIngressFilter(next.ingress);
+      setAuthFilter(next.auth);
+      setExposedOnly(next.exposedOnly);
+      setHideAccepted(next.hideAccepted);
+      setDriftOnly(next.driftOnly);
+      setSelected(next.service ?? null);
+      setPanel(next.panel ?? null);
+      setNetwork(next.network ?? null);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
 
   useEffect(() => {
     applyTheme(theme);
@@ -389,6 +501,47 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [panel]);
+
+  /**
+   * `/` and ⌘K (Ctrl-K) put the cursor in the search box.
+   *
+   * Both spellings, because they come from different habits — `/` from every log viewer and
+   * pager, ⌘K from every command palette — and a reader who tries the wrong one first should
+   * not conclude the dashboard has no shortcut.
+   *
+   * Ignored in two situations, and the first is the important one: `/` is a character in a
+   * path and in every image reference, so a handler that took it while the reader was typing
+   * would make the search box unable to type its own most common query. It is also ignored
+   * while a drawer is open, where the modal trap owns the keyboard and the reader's context is
+   * the sheet in front of them, not the list behind it. And `select()` rather than a bare
+   * `focus()`, so a second press replaces the previous query instead of appending to it.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const slash = e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey;
+      const palette = (e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && !e.altKey;
+      if (!slash && !palette) return;
+      if (selected || panel) return;
+      const el = document.activeElement;
+      if (
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        el instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      // Null on the graph tab, where the filter bar is not rendered. Nothing happens rather
+      // than the tab changing underneath the reader: a keystroke that navigates is a
+      // keystroke people press by accident once and then distrust.
+      const box = searchRef.current;
+      if (!box) return;
+      e.preventDefault();
+      box.focus();
+      box.select();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, panel]);
 
   async function doRescan() {
     setBusy(true);
@@ -493,9 +646,32 @@ function App() {
   // A match must never hide behind a click, so an active filter opens the stacks it
   // matched, and clearing the filter collapses them again. Keyed on the filter
   // inputs rather than on the results, so toggling a stack does not re-trigger it.
+  //
+  // All six inputs, not four: `hideAccepted` and `driftOnly` narrow the list exactly as the
+  // other four do, and while they were missing here, turning on the drift filter narrowed the
+  // list without opening what it had matched — the rule this effect exists to keep. `groups`
+  // stays out for the opposite reason: it is a new array on every rescan and on every cache
+  // refresh, so watching it would collapse the stacks the reader had opened by hand. The cold
+  // load a link describes is handled once, below.
   useEffect(() => {
     setExpanded(filtering ? new Set(groups.map((g) => g.stack.id)) : new Set());
-  }, [search, ingressFilter, authFilter, exposedOnly]);
+  }, [search, ingressFilter, authFilter, exposedOnly, hideAccepted, driftOnly]);
+
+  /**
+   * The same rule, once, for a filter that arrived in a link.
+   *
+   * The effect above cannot do this on its own: on a cold load its filters are already set
+   * before the first render, so it runs while `ov` is still null, finds `groups` empty and
+   * opens nothing — and it deliberately does not watch `groups`, so it never runs again. The
+   * first payload therefore gets one shot, ref-guarded, and every payload after it leaves the
+   * reader's own expansions alone.
+   */
+  const restoredExpansion = useRef(false);
+  useEffect(() => {
+    if (restoredExpansion.current || !ov) return;
+    restoredExpansion.current = true;
+    if (filtering) setExpanded(new Set(groups.map((g) => g.stack.id)));
+  }, [ov, filtering, groups]);
 
   // One count per kind, each counted independently — a service tunnelled and proxied
   // adds to both, so these overlap and do not sum to the number of services. `TagBars`
@@ -601,6 +777,24 @@ function App() {
 
   return (
     <div class="shell">
+      {/* First in the document and invisible until focused. Before the fleet begins there is
+          a theme toggle, a probe switch, a Rescan button, a sign-out link and up to four
+          status buttons, and a keyboard reader should not have to Tab past all of it on every
+          visit — least of all past Rescan, which sends requests. */}
+      <a class="skip-link" href="#main">
+        Skip to fleet
+      </a>
+      {/* What a rescan found, for a reader who cannot see the note beside `scanned <time>`.
+          Rescan replaces the entire page and, until this existed, announced nothing at all:
+          the button went quiet, the fleet was rebuilt, and a screen reader was told none of
+          it. `polite` rather than `assertive` because it is the result of something the reader
+          asked for, not an interruption — and one element carrying both halves of the sentence,
+          so the two diffs are announced as one outcome rather than as two updates. */}
+      <div class="sr-only" role="status" aria-live="polite">
+        {busy
+          ? "Rescanning the fleet…"
+          : [diff ? scanDiffText(diff) : "", apiDiffText].filter(Boolean).join(". ")}
+      </div>
       <header class="topbar">
         <div class="brand">
           <span class="dot">●</span>
@@ -774,280 +968,306 @@ function App() {
         </button>
       </header>
 
-      <ConnectionBanner reports={ov.meta.connections} />
-      {ov.meta.warnings.length > 0 && (
-        <div class="banner">
-          {ov.meta.warnings.length} scan warning(s): {ov.meta.warnings.slice(0, 3).join("; ")}
-          {ov.meta.warnings.length > 3 ? " …" : ""}
-        </div>
-      )}
-      {!ov.meta.dockerAvailable && (
-        <div class="banner">
-          Docker socket not available — showing configuration only. Live status, health and IPs are hidden.
-        </div>
-      )}
+      {/* Everything the topbar is not, in one landmark: the banners, the counts, the
+          distributions, the tabs and whichever tab is showing. The drawers stay outside it —
+          a dialog is not part of the page it covers, and `aria-modal` already says the page is
+          unavailable while one is open.
 
-      <div class="kpis">
-        <StatTile label="Stacks" value={ov.stats.stacks} />
-        <StatTile
-          label="Services"
-          value={ov.stats.services}
-          sub={ov.meta.dockerAvailable ? `${ov.stats.running} running` : undefined}
-        />
-        {/* Subtitles name the mechanism the routes describe, so a tile still reads
-            correctly for a fleet whose tunnel or proxy is a different product. */}
-        <StatTile label="Public" value={ov.stats.publicServices} sub="tunnel route" />
-        <StatTile label="Traefik" value={ov.stats.traefikServices} sub="proxy route" />
-        {/* Every service with a published port, whether or not a proxy also fronts it —
-            the port answers on the LAN either way, which is the thing worth counting.
-            The tiles overlap by construction now: a tunnelled, proxied, port-publishing
-            service is in three of them. */}
-        <StatTile
-          label="LAN"
-          value={ov.stats.lanServices}
-          sub="published port"
-          alert={ov.stats.lanServices > 0}
-        />
-        {/* The complement, and the only tile here that is exclusive: nothing reaches
-            these, not even another container. */}
-        <StatTile label="No ingress" value={ov.stats.noIngressServices} sub="nothing reaches it" />
-        <StatTile label="Auth-protected" value={ov.stats.authProtected} />
-        {/* `23/28` — needing attention over found. The denominator is what the scan
-            found and does not move when an exposure is accepted; the numerator is what
-            nobody has looked at yet, and drives the alarm. So a fleet where every
-            exposure has been reviewed stops shouting without ever understating what is
-            reachable, and the five that were reviewed stay countable. */}
-        <StatTile
-          label="Exposed, no auth"
-          value={formatExposureCount(ov.stats.exposedWithoutAuth, ov.stats.exposureAccepted)}
-          alert={ov.stats.exposedWithoutAuth - ov.stats.exposureAccepted > 0}
-          sub={
-            ov.stats.exposedWithoutAuth === 0
-              ? "none"
-              : ov.stats.exposureAccepted > 0
-                ? `${ov.stats.exposureAccepted} accepted in .labview`
-                : "⚠ review"
-          }
-        />
-        {/* Only when there is something to report: a fleet with no sidecar anywhere sees
-            the same tiles it always did. */}
-        {ov.stats.declaredAuth > 0 && (
-          <StatTile
-            label="Declared auth"
-            value={ov.stats.declaredAuth}
-            sub="from .labview"
-          />
-        )}
-        {/* The services that left the tile above on the strength of a declaration. Its
-            own tile precisely so that number is never absorbed into "Auth-protected",
-            which means *proven* protected — these rest on a statement instead. */}
-        {ov.stats.declaredAuthProtected > 0 && (
-          <StatTile
-            label="Protected — declared"
-            value={ov.stats.declaredAuthProtected}
-            sub="unverified"
-          />
-        )}
-        {/* The one tile whose number stands for a set of sentences rather than a
-            measurement, so it is the one tile that opens: a count of stale declarations
-            is unactionable until it says which file, about which service, and in which
-            direction — all of which the analyzer already wrote. */}
-        {ov.stats.declarationDrift > 0 && (
-          <StatTile
-            label="Declaration drift"
-            value={ov.stats.declarationDrift}
-            alert
-            sub="⚠ stale .labview"
-            title={`${driftSummaryText(drift)}\nclick for the service-by-service detail`}
-            onClick={() => setPanel("drift")}
-          />
-        )}
-        {/* The second tile that opens, for the same reason: a count of probe results is
-            unactionable until it says which address was asked, what came back and why that
-            was or was not read as a login page.
-
-            Its own tile rather than a change to `Exposed, no auth`: that tile counts
-            services with no gate *detected*, and putting a probe result into it would make an
-            observation stand where a mechanism belongs, which I3 forbids. And deliberately
-            not `alert` — `probeOpen` is documented as no subset of the exposure count (a
-            service whose `.labview` file declares a mechanism is asked anyway, since a
-            declaration is a claim rather than detection, and lands in it), so a red tile here
-            would claim a fleet finding the tile beside it may correctly deny. */}
-        {(probeReport.probed > 0 || probeReport.notAsked > 0) && (
-          <StatTile
-            label="Login probe"
-            value={probeReport.probed}
-            sub={
-              probeReport.open.length > 0
-                ? `${probeReport.open.length} with no login page`
-                : probeReport.gated.length > 0
-                  ? `${probeReport.gated.length} gated`
-                  : // A well-run fleet where everything with an HTTP address is already
-                    // behind a gate reaches here: nothing needed asking. Without the tile an
-                    // operator who turned the stage on would see no sign it had run at all,
-                    // which is why `notAsked` alone is enough to draw it.
-                    probeReport.probed === 0
-                    ? `${probeReport.notAsked} already authenticated`
-                    : "none answered"
-            }
-            title={`${probeReportSummaryText(probeReport)}\nclick for the address tried, what came back and why`}
-            onClick={() => setPanel("probe")}
-          />
-        )}
-      </div>
-
-      <div class="dists">
-        <TagBars
-          title="Ingress exposure"
-          segments={ingressSegments}
-          total={ov.stats.services}
-          filter={ingressFilter}
-          onCycle={(k) => setIngressFilter((f) => cycleTag(f, k))}
-          onMode={(mode) => setIngressFilter((f) => ({ ...f, mode }))}
-        />
-        <DistributionBar
-          title="Authentication method"
-          segments={authSegments}
-          filter={authFilter}
-          onCycle={(k) => setAuthFilter((f) => cycleTag(f, k))}
-        />
-      </div>
-
-      <nav class="tabs">
-        <button class={`tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>
-          Stacks ({ov.stats.stacks})
-        </button>
-        <button class={`tab${tab === "graph" ? " active" : ""}`} onClick={() => setTab("graph")}>
-          Relationship graph
-        </button>
-      </nav>
-
-      {tab === "overview" && (
-        <>
-          <div class="filters">
-            <input
-              type="search"
-              placeholder="Search apps, images, hostnames…"
-              value={search}
-              onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
-            />
-            <button
-              class="chip"
-              aria-pressed={exposedOnly}
-              onClick={() => setExposedOnly((v) => !v)}
-            >
-              ⚠ Exposed, no auth
-            </button>
-            {ov.stats.exposureAccepted > 0 && (
-              <button
-                class="chip"
-                aria-pressed={hideAccepted}
-                title="Hide the exposures declared intentional in a .labview file"
-                onClick={() => setHideAccepted((v) => !v)}
-              >
-                Hide accepted ({ov.stats.exposureAccepted})
-              </button>
-            )}
-            {ov.stats.declarationDrift > 0 && (
-              <button
-                class="chip"
-                aria-pressed={driftOnly}
-                title="Only services whose .labview declaration disagrees with the scan"
-                onClick={() => setDriftOnly((v) => !v)}
-              >
-                ⚠ Declaration drift ({ov.stats.declarationDrift})
-              </button>
-            )}
-            {filtering && (
-              <button
-                class="chip"
-                onClick={() => {
-                  setSearch("");
-                  // All three parts of each expression, mode included: a cleared filter
-                  // that silently kept `All` would behave differently the next time a
-                  // second chip was clicked.
-                  setIngressFilter(EMPTY_TAG_FILTER);
-                  setAuthFilter(EMPTY_TAG_FILTER);
-                  setExposedOnly(false);
-                  setHideAccepted(false);
-                  setDriftOnly(false);
-                }}
-              >
-                Clear filters
-              </button>
-            )}
-            {/* The expression in words. Three parts — a set, a mode and an exclusion —
-                cannot be read reliably off which chips look bright, and a filter a reader
-                misreads is a conclusion they draw wrongly. */}
-            {(tagFilterActive(ingressFilter) || tagFilterActive(authFilter)) && (
-              <span class="filter-readout">
-                {[
-                  tagFilterActive(ingressFilter)
-                    ? `ingress: ${describeTagFilter(ingressFilter, (k) => ingressLabel(k as IngressKind))}`
-                    : "",
-                  tagFilterActive(authFilter)
-                    ? `auth: ${describeTagFilter(authFilter, (m) => authLabel(m as AuthMethod))}`
-                    : "",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </span>
-            )}
-            <button
-              class="chip"
-              disabled={groups.length === 0}
-              onClick={() => setExpanded(allOpen ? new Set() : new Set(groups.map((g) => g.stack.id)))}
-            >
-              {allOpen ? "Collapse all" : "Expand all"}
-            </button>
-            <span class="result-count">
-              {filtering
-                ? `${groups.length} of ${ov.stats.stacks} stacks · ${filtered.length} of ${flat.length} services`
-                : `${groups.length} stacks · ${flat.length} services`}
-            </span>
+          `aria-busy` is here rather than on the live region above, which has the opposite
+          meaning: on a live region it suppresses the announcement, and the announcement is the
+          point. Here it says the thing the reader is looking at is mid-rebuild. */}
+      <main id="main" aria-busy={busy}>
+        <ConnectionBanner reports={ov.meta.connections} />
+        {ov.meta.warnings.length > 0 && (
+          <div class="banner">
+            {ov.meta.warnings.length} scan warning(s): {ov.meta.warnings.slice(0, 3).join("; ")}
+            {ov.meta.warnings.length > 3 ? " …" : ""}
           </div>
+        )}
+        {!ov.meta.dockerAvailable && (
+          <div class="banner">
+            Docker socket not available — showing configuration only. Live status, health and IPs are hidden.
+          </div>
+        )}
 
-          {/* Outside the filtered list on purpose: a network is a fleet-wide fact about
-              which services can reach each other, and answering "who else is on this"
-              with a set narrowed by the search box would be answering a different
-              question. */}
-          <NetworksSection
-            graph={ov.graph}
-            soloLocalNetworks={ov.stats.soloLocalNetworks}
-            highlight={network}
-            onOpenService={openService}
+        <div class="kpis">
+          <StatTile label="Stacks" value={ov.stats.stacks} />
+          <StatTile
+            label="Services"
+            value={ov.stats.services}
+            sub={ov.meta.dockerAvailable ? `${ov.stats.running} running` : undefined}
           />
-
-          {groups.length === 0 ? (
-            <div class="center-msg">No services match the current filters.</div>
-          ) : (
-            <div class="stack-list">
-              {groups.map((g) => (
-                <StackCard
-                  key={g.stack.id}
-                  stack={g.stack}
-                  services={g.services}
-                  expanded={expanded.has(g.stack.id)}
-                  onToggle={() => toggleStack(g.stack.id)}
-                  onOpenService={(svc) => setSelected(serviceKey(g.stack.id, svc.name))}
-                />
-              ))}
-            </div>
+          {/* Subtitles name the mechanism the routes describe, so a tile still reads
+              correctly for a fleet whose tunnel or proxy is a different product. */}
+          <StatTile label="Public" value={ov.stats.publicServices} sub="tunnel route" />
+          <StatTile label="Traefik" value={ov.stats.traefikServices} sub="proxy route" />
+          {/* Every service with a published port, whether or not a proxy also fronts it —
+              the port answers on the LAN either way, which is the thing worth counting.
+              The tiles overlap by construction now: a tunnelled, proxied, port-publishing
+              service is in three of them. */}
+          <StatTile
+            label="LAN"
+            value={ov.stats.lanServices}
+            sub="published port"
+            alert={ov.stats.lanServices > 0}
+          />
+          {/* The complement, and the only tile here that is exclusive: nothing reaches
+              these, not even another container. */}
+          <StatTile label="No ingress" value={ov.stats.noIngressServices} sub="nothing reaches it" />
+          <StatTile label="Auth-protected" value={ov.stats.authProtected} />
+          {/* `23/28` — needing attention over found. The denominator is what the scan
+              found and does not move when an exposure is accepted; the numerator is what
+              nobody has looked at yet, and drives the alarm. So a fleet where every
+              exposure has been reviewed stops shouting without ever understating what is
+              reachable, and the five that were reviewed stay countable. */}
+          <StatTile
+            label="Exposed, no auth"
+            value={formatExposureCount(ov.stats.exposedWithoutAuth, ov.stats.exposureAccepted)}
+            alert={ov.stats.exposedWithoutAuth - ov.stats.exposureAccepted > 0}
+            sub={
+              ov.stats.exposedWithoutAuth === 0
+                ? "none"
+                : ov.stats.exposureAccepted > 0
+                  ? `${ov.stats.exposureAccepted} accepted in .labview`
+                  : "⚠ review"
+            }
+          />
+          {/* Only when there is something to report: a fleet with no sidecar anywhere sees
+              the same tiles it always did. */}
+          {ov.stats.declaredAuth > 0 && (
+            <StatTile
+              label="Declared auth"
+              value={ov.stats.declaredAuth}
+              sub="from .labview"
+            />
           )}
-        </>
-      )}
+          {/* The services that left the tile above on the strength of a declaration. Its
+              own tile precisely so that number is never absorbed into "Auth-protected",
+              which means *proven* protected — these rest on a statement instead. */}
+          {ov.stats.declaredAuthProtected > 0 && (
+            <StatTile
+              label="Protected — declared"
+              value={ov.stats.declaredAuthProtected}
+              sub="unverified"
+            />
+          )}
+          {/* The one tile whose number stands for a set of sentences rather than a
+              measurement, so it is the one tile that opens: a count of stale declarations
+              is unactionable until it says which file, about which service, and in which
+              direction — all of which the analyzer already wrote. */}
+          {ov.stats.declarationDrift > 0 && (
+            <StatTile
+              label="Declaration drift"
+              value={ov.stats.declarationDrift}
+              alert
+              sub="⚠ stale .labview"
+              title={`${driftSummaryText(drift)}\nclick for the service-by-service detail`}
+              onClick={() => setPanel("drift")}
+            />
+          )}
+          {/* The second tile that opens, for the same reason: a count of probe results is
+              unactionable until it says which address was asked, what came back and why that
+              was or was not read as a login page.
 
-      {tab === "graph" && (
-        <GraphView
-          graph={ov.graph}
-          themeKey={theme}
-          onOpenService={openService}
-          onOpenNetwork={(name) => {
-            setNetwork(name);
-            setTab("overview");
-          }}
-        />
-      )}
+              Its own tile rather than a change to `Exposed, no auth`: that tile counts
+              services with no gate *detected*, and putting a probe result into it would make an
+              observation stand where a mechanism belongs, which I3 forbids. And deliberately
+              not `alert` — `probeOpen` is documented as no subset of the exposure count (a
+              service whose `.labview` file declares a mechanism is asked anyway, since a
+              declaration is a claim rather than detection, and lands in it), so a red tile here
+              would claim a fleet finding the tile beside it may correctly deny. */}
+          {(probeReport.probed > 0 || probeReport.notAsked > 0) && (
+            <StatTile
+              label="Login probe"
+              value={probeReport.probed}
+              sub={
+                probeReport.open.length > 0
+                  ? `${probeReport.open.length} with no login page`
+                  : probeReport.gated.length > 0
+                    ? `${probeReport.gated.length} gated`
+                    : // A well-run fleet where everything with an HTTP address is already
+                      // behind a gate reaches here: nothing needed asking. Without the tile an
+                      // operator who turned the stage on would see no sign it had run at all,
+                      // which is why `notAsked` alone is enough to draw it.
+                      probeReport.probed === 0
+                      ? `${probeReport.notAsked} already authenticated`
+                      : "none answered"
+              }
+              title={`${probeReportSummaryText(probeReport)}\nclick for the address tried, what came back and why`}
+              onClick={() => setPanel("probe")}
+            />
+          )}
+        </div>
+
+        <div class="dists">
+          <TagBars
+            title="Ingress exposure"
+            segments={ingressSegments}
+            total={ov.stats.services}
+            filter={ingressFilter}
+            onCycle={(k) => setIngressFilter((f) => cycleTag(f, k))}
+            onMode={(mode) => setIngressFilter((f) => ({ ...f, mode }))}
+          />
+          <DistributionBar
+            title="Authentication method"
+            segments={authSegments}
+            filter={authFilter}
+            onCycle={(k) => setAuthFilter((f) => cycleTag(f, k))}
+          />
+        </div>
+
+        <nav class="tabs">
+          <button class={`tab${tab === "overview" ? " active" : ""}`} onClick={() => setTab("overview")}>
+            Stacks ({ov.stats.stacks})
+          </button>
+          <button class={`tab${tab === "graph" ? " active" : ""}`} onClick={() => setTab("graph")}>
+            Relationship graph
+          </button>
+        </nav>
+
+        {tab === "overview" && (
+          <>
+            <div class="filters">
+              {/* Wrapped so the shortcut hint can sit inside the field. `filled` hides the
+                  hint once there is a query, the same way focus does — a glyph over the end
+                  of what somebody is reading back is worse than no hint at all. */}
+              <div class={`searchwrap${search ? " filled" : ""}`}>
+                <input
+                  ref={searchRef}
+                  type="search"
+                  placeholder="Search apps, images, hostnames…"
+                  /* The placeholder is not a label: it is gone the moment there is a value,
+                     which is exactly when a reader coming back to the field needs to know
+                     what it searches. */
+                  aria-label="Search apps, images, hostnames"
+                  value={search}
+                  onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
+                />
+                {/* `aria-hidden` because it names a key, not the field: the label above is
+                    what a screen reader should read, and a bare "/" read out mid-form is
+                    noise. */}
+                <span class="kbd" aria-hidden="true">
+                  /
+                </span>
+              </div>
+              <button
+                class="chip"
+                aria-pressed={exposedOnly}
+                onClick={() => setExposedOnly((v) => !v)}
+              >
+                ⚠ Exposed, no auth
+              </button>
+              {ov.stats.exposureAccepted > 0 && (
+                <button
+                  class="chip"
+                  aria-pressed={hideAccepted}
+                  title="Hide the exposures declared intentional in a .labview file"
+                  onClick={() => setHideAccepted((v) => !v)}
+                >
+                  Hide accepted ({ov.stats.exposureAccepted})
+                </button>
+              )}
+              {ov.stats.declarationDrift > 0 && (
+                <button
+                  class="chip"
+                  aria-pressed={driftOnly}
+                  title="Only services whose .labview declaration disagrees with the scan"
+                  onClick={() => setDriftOnly((v) => !v)}
+                >
+                  ⚠ Declaration drift ({ov.stats.declarationDrift})
+                </button>
+              )}
+              {filtering && (
+                <button
+                  class="chip"
+                  onClick={() => {
+                    setSearch("");
+                    // All three parts of each expression, mode included: a cleared filter
+                    // that silently kept `All` would behave differently the next time a
+                    // second chip was clicked.
+                    setIngressFilter(EMPTY_TAG_FILTER);
+                    setAuthFilter(EMPTY_TAG_FILTER);
+                    setExposedOnly(false);
+                    setHideAccepted(false);
+                    setDriftOnly(false);
+                  }}
+                >
+                  Clear filters
+                </button>
+              )}
+              {/* The expression in words. Three parts — a set, a mode and an exclusion —
+                  cannot be read reliably off which chips look bright, and a filter a reader
+                  misreads is a conclusion they draw wrongly. */}
+              {(tagFilterActive(ingressFilter) || tagFilterActive(authFilter)) && (
+                <span class="filter-readout">
+                  {[
+                    tagFilterActive(ingressFilter)
+                      ? `ingress: ${describeTagFilter(ingressFilter, (k) => ingressLabel(k as IngressKind))}`
+                      : "",
+                    tagFilterActive(authFilter)
+                      ? `auth: ${describeTagFilter(authFilter, (m) => authLabel(m as AuthMethod))}`
+                      : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </span>
+              )}
+              <button
+                class="chip"
+                disabled={groups.length === 0}
+                onClick={() => setExpanded(allOpen ? new Set() : new Set(groups.map((g) => g.stack.id)))}
+              >
+                {allOpen ? "Collapse all" : "Expand all"}
+              </button>
+              <span class="result-count">
+                {filtering
+                  ? `${groups.length} of ${ov.stats.stacks} stacks · ${filtered.length} of ${flat.length} services`
+                  : `${groups.length} stacks · ${flat.length} services`}
+              </span>
+            </div>
+
+            {/* Outside the filtered list on purpose: a network is a fleet-wide fact about
+                which services can reach each other, and answering "who else is on this"
+                with a set narrowed by the search box would be answering a different
+                question. */}
+            <NetworksSection
+              graph={ov.graph}
+              soloLocalNetworks={ov.stats.soloLocalNetworks}
+              highlight={network}
+              onOpenService={openService}
+            />
+
+            {groups.length === 0 ? (
+              <div class="center-msg">No services match the current filters.</div>
+            ) : (
+              <div class="stack-list">
+                {groups.map((g) => (
+                  <StackCard
+                    key={g.stack.id}
+                    stack={g.stack}
+                    services={g.services}
+                    expanded={expanded.has(g.stack.id)}
+                    onToggle={() => toggleStack(g.stack.id)}
+                    onOpenService={(svc) => setSelected(serviceKey(g.stack.id, svc.name))}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "graph" && (
+          <GraphView
+            graph={ov.graph}
+            themeKey={theme}
+            onOpenService={openService}
+            onOpenNetwork={(name) => {
+              setNetwork(name);
+              setTab("overview");
+            }}
+          />
+        )}
+      </main>
 
       {selectedFlat && (
         <AppDetail

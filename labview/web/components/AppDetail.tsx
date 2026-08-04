@@ -23,6 +23,7 @@ import {
   showsDeclaredAuth,
 } from "../model";
 import { fmtTime, shortImage, statusView } from "../lib/format";
+import { useModal } from "../lib/modal";
 import { ingressLabel } from "../lib/palette";
 import { buildServiceMermaid } from "../lib/mermaidDef";
 import {
@@ -160,6 +161,9 @@ export function AppDetail({
    */
   onOpenNetwork: (name: string) => void;
 }) {
+  // The same dialog contract the side panels get, from the same hook: focus moved in and
+  // trapped, focus returned to whatever row or tile opened this, the fleet behind it locked.
+  const ref = useModal<HTMLElement>();
   const s = statusView(svc.docker);
   // One read of the graph for both the diagram and the Networks section, so the picture
   // and the list beneath it cannot name different peers.
@@ -185,7 +189,14 @@ export function AppDetail({
   return (
     <>
       <div class="drawer-scrim" onClick={onClose} />
-      <aside class="drawer" role="dialog" aria-label={`${svc.name} details`}>
+      <aside
+        ref={ref}
+        class="drawer"
+        role="dialog"
+        aria-modal="true"
+        tabIndex={-1}
+        aria-label={`${svc.name} details`}
+      >
         <div class="dhead">
           <StatusDot docker={svc.docker} />
           <div class="title">

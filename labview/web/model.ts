@@ -216,6 +216,22 @@ export {
 export type { TagFilter, TagMode } from "../src/model/filter";
 
 /**
+ * The view as a query string — which tab, which filters, which drawer.
+ *
+ * In `src/` for the same reason the filter is, and one more: everything read out of a URL is
+ * attacker-supplied, so the grammar that decides what a link may say has to be a module the
+ * smoke pass can hand a hostile query to. `main.tsx` keeps the state and makes the `history`
+ * calls; it does not decide what is valid.
+ */
+export {
+  DEFAULT_VIEW_STATE,
+  isViewNavigation,
+  readViewState,
+  writeViewState,
+} from "../src/model/viewstate";
+export type { ViewPanel, ViewState, ViewTab, ViewVocabulary } from "../src/model/viewstate";
+
+/**
  * The wording of LabView's own access control, from the same module the server logs and
  * the routes redirect through — so a failure code cannot mean one thing in a log line and
  * another on the login screen, and the closed set of codes is validated in one place.

@@ -172,6 +172,26 @@ code, .mono {
   font-size: 0.86em;
 }
 
+/* Everything this UI prints in mono is a value it read from somewhere — a container name,
+   an image reference, a URL, an absolute path — so none of it has a space in it and none of
+   it can be broken by the normal rules. On a phone one `http://gateway:8080 (service
+   proxy/gateway is where…)` in a connection report was making the *document* wider than the
+   viewport, which shifts every row on the page and clips the topbar's own buttons off the
+   right edge. `anywhere` rather than `break-word` because these strings have no break
+   opportunities at all, which is exactly the case `break-word` declines to handle. Set on
+   the class and not on a container, so a value added to a new panel later inherits it. */
+code, .mono { overflow-wrap: anywhere; }
+
+/* The same for prose that quotes an address inline without marking it up: the scan
+   diagnostics, the warning banner and the drawer's evidence lists all do. Kept to the
+   containers that carry read values rather than applied globally — headings and labels are
+   this project's own words and should break on their spaces. */
+.banner,
+.note,
+.conn-tried,
+.evidence,
+.probereason { overflow-wrap: break-word; }
+
 /* ---- Layout shell ---------------------------------------------------- */
 
 .shell { max-width: 1400px; margin: 0 auto; padding: 20px; }
@@ -336,8 +356,26 @@ code, .mono {
   gap: 2px; /* 2px surface gap between segments */
 }
 .bar .seg { height: 100%; min-width: 2px; }
-.legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 10px; }
-.legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); cursor: pointer; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; }
+/* `min-height` and the horizontal padding are the target, not decoration: this is a
+   tri-state filter control (`role="button"` in `TagLegend`), and at its natural height —
+   a 12px line box — it was about 17px tall, under WCAG 2.2's 24px minimum (2.5.8). The
+   row gap comes down by the same amount the padding adds, so the legend block keeps its
+   height while each chip grows into it. */
+.legend .item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 4px;
+  margin: 0 -4px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.legend .item:hover { background: var(--surface-2); }
+.legend .item:focus-visible { outline: 2px solid var(--c1); outline-offset: 1px; }
 .legend .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .legend .count { color: var(--muted); font-variant-numeric: tabular-nums; }
 .legend .item.off { opacity: 0.4; }
@@ -351,16 +389,23 @@ code, .mono {
    column and never imply a share of a whole. */
 .disthead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .tagrows { display: grid; gap: 6px; }
+/* Same reason as `.legend .item`: each row is a filter control, and a 12px line box beside
+   a 10px bar is a ~17px target. `min-height` rather than padding so the bar stays
+   vertically centred against the label without a second alignment rule. */
 .tagrow {
   display: grid;
   grid-template-columns: 148px 1fr 2.5em;
   align-items: center;
   gap: 8px;
+  min-height: 28px;
+  padding: 0 4px;
+  margin: 0 -4px;
   font-size: 12px;
   color: var(--ink-2);
   cursor: pointer;
   border-radius: 6px;
 }
+.tagrow:hover { background: var(--surface-2); }
 .tagrow:focus-visible { outline: 2px solid var(--c1); outline-offset: 2px; }
 .tagrow.off { opacity: 0.4; }
 .tagrow .tagname { display: inline-flex; align-items: center; gap: 6px; }
@@ -371,30 +416,59 @@ code, .mono {
 
 /* Any / All: the OR/AND half of the ingress expression, beside the title it governs. */
 .modeswitch { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+/* 24px is the floor, not the design (WCAG 2.2 AA, 2.5.8): at its natural 11px/2px this was
+   a ~20px control, and it is the switch that decides whether two selected kinds mean OR or
+   AND — the one filter state a reader is most likely to get wrong. */
 .modebtn {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   background: var(--surface);
   color: var(--ink-2);
   font: inherit;
   font-size: 11px;
-  padding: 2px 9px;
+  min-height: 24px;
+  padding: 0 10px;
   cursor: pointer;
 }
+.modebtn:hover { background: var(--surface-2); }
+.modebtn:focus-visible { outline: 2px solid var(--c1); outline-offset: -2px; }
 .modebtn.on { background: var(--surface-2); color: var(--ink); font-weight: 600; }
 
 /* ---- Filters --------------------------------------------------------- */
 
+/* Sticky, because the list it filters is the length of the fleet. At 59 stacks a reader
+   scrolls well past this row and then has no search box, no chip, no `n of m` count and no
+   Expand all until they scroll back — and the count in particular is what tells them
+   whether what they are looking at is the whole answer.
+ *
+ * The negative inline margin bleeds the background out to `.shell`'s 20px padding, so rows
+ * scrolling underneath are covered edge to edge rather than showing through two gutters.
+ * `z-index` sits well below the drawer's 40/41: a sticky bar that floated over a modal
+ * scrim would be the same bug in the other direction. */
 .filters {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  margin: 16px 0;
+  margin: 16px -20px;
+  padding: 10px 20px;
+  background: var(--page);
+  border-bottom: 1px solid var(--border);
 }
+/* Capped rather than free-growing. `flex: 1 1 220px` filled every pixel the chips left
+   over, which on a wide screen is a ~1000px box for a search term that is never more than a
+   service name — and it pushed the chips and the result count to the far edge, where they
+   read as unrelated to it. The wrapper is what the flex sizing applies to now, because the
+   key hint inside the box has to be positioned against it. */
+.searchwrap { position: relative; display: flex; flex: 1 1 220px; min-width: 180px; max-width: 380px; }
 .filters input[type="search"] {
-  flex: 1 1 220px;
-  min-width: 180px;
+  width: 100%;
   padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -402,6 +476,27 @@ code, .mono {
   color: var(--ink);
   font: inherit;
 }
+.filters input[type="search"]:focus-visible { outline: 2px solid var(--c1); outline-offset: 1px; }
+/* Which key focuses the box, drawn in the box. Not folded into the placeholder, because a
+   placeholder is a description of what to type and this is a description of how to get
+   here; and it hides itself the moment either has happened, so it never sits behind text.
+   `pointer-events: none` so the hint is not a hole in the input's own hit area. */
+.searchwrap .kbd {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  transform: translateY(-50%);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  pointer-events: none;
+}
+.searchwrap:focus-within .kbd, .searchwrap.filled .kbd { display: none; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   appearance: none;
@@ -498,7 +593,20 @@ code, .mono {
 
 @media (max-width: 760px) {
   .stack-head { flex-wrap: wrap; }
-  .stack-head .badges, .svc-row .badges { max-width: none; justify-content: flex-start; }
+  /* Its own full-width row, and shrinkable to get there.
+     `.stack-head .badges` is `flex: none` at wide widths so the title takes the slack rather
+     than the badges spreading out; dropping `max-width: 45%` here without also dropping that
+     left it sized to `max-content` and unable to shrink, so a stack carrying five badges laid
+     out a 585px row inside a 500px page and pushed the whole document sideways — the tiles
+     stretched to match and the topbar's Rescan button went off-screen. `flex: 1 1 100%` gives
+     it the row `flex-wrap` already allows, `min-width: 0` lets it take less than its widest
+     badge, and the inner `flex-wrap: wrap` then does the wrapping it was always meant to. */
+  .stack-head .badges, .svc-row .badges {
+    max-width: none;
+    justify-content: flex-start;
+    flex: 1 1 100%;
+    min-width: 0;
+  }
   .svc-row { flex-wrap: wrap; padding-left: 14px; }
 }
 
@@ -874,3 +982,44 @@ table.data tr:last-child td { border-bottom: none; }
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
+
+/* ---- Skip link -------------------------------------------------------- */
+
+/* First focusable thing in the document, invisible until it has focus. The header it skips
+   is not decorative — it holds the appsRoot, the scan time, both integration statuses, the
+   theme control, the probe switch and Rescan — so a keyboard reader arriving to look at the
+   fleet was tabbing through eight or more controls to reach the first one about a service. */
+.skip-link {
+  position: absolute;
+  left: 20px;
+  top: -60px;
+  z-index: 50;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--c1);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  transition: top 0.12s ease;
+}
+.skip-link:focus-visible { top: 12px; outline: 2px solid var(--c1); outline-offset: 2px; }
+
+/* ---- Reduced motion --------------------------------------------------- */
+
+/* `reduce` means "no motion that is not carrying information", not "no feedback": the
+   spinner is the only thing on screen saying a scan is still running, so it keeps
+   announcing itself and changes channel — opacity instead of rotation — rather than
+   freezing, which would read as a hung request. Everything else here is decoration and
+   simply stops. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* The shorthand restores duration and iteration-count that the blanket rule above
+     stripped; `.spinner` outranks `*`, so no longhand repetition is needed. */
+  .spinner { animation: pulse 1.4s ease-in-out infinite !important; }
+}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
