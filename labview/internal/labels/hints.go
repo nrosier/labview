@@ -161,25 +161,51 @@ func contiguous(haystack, needle []string) bool {
 // It cannot invent a provider. No such service means an empty return, every issuer stays
 // generic, and a fleet with no Authentik says so.
 func Discover(stacks []payload.AppStack, reg Registry) []string {
-	defining := reg.ServicesDefiningAddress(authentikEndpointMark)
-
 	var out []string
+	eachAuthentik(stacks, reg, func(_ payload.AppStack, svc payload.Service, _ string) {
+		out = append(out, svc.ContainerName)
+		for _, r := range svc.Cloudflare {
+			out = append(out, r.Hostname)
+		}
+		for _, r := range svc.Traefik {
+			out = append(out, r.Hosts...)
+		}
+	})
+	return out
+}
+
+// IsAuthentik is the one definition of "this is Authentik" (§11), which §7's provider discovery
+// and §11's endpoint discovery are both required to share. Two definitions of it would mean a
+// fleet where the hint list adopted a service the identity-provider read would not talk to.
+//
+// Both halves are things Authentik publishes about itself — the vendor's name in an image
+// reference, and the outpost's own endpoint domain in a forward-auth address — and neither is an
+// assumption about how the operator named anything (I2). The caller supplies the second half
+// because finding it needs the middleware registry, which is a fleet-wide reading.
+func IsAuthentik(svc payload.Service, definesOutpostAddress bool) bool {
+	return definesOutpostAddress || strings.Contains(strings.ToLower(svc.Image), authentikMark)
+}
+
+// AuthentikServices is every service the definition matches, as `stack/service` keys in scan
+// order (I7). It is what §11 builds its endpoint candidates from.
+func AuthentikServices(stacks []payload.AppStack, reg Registry) []string {
+	var out []string
+	eachAuthentik(stacks, reg, func(_ payload.AppStack, _ payload.Service, key string) {
+		out = append(out, key)
+	})
+	return out
+}
+
+func eachAuthentik(stacks []payload.AppStack, reg Registry, fn func(payload.AppStack, payload.Service, string)) {
+	defining := reg.ServicesDefiningAddress(authentikEndpointMark)
 	for _, stack := range stacks {
 		for _, svc := range stack.Services {
-			byImage := strings.Contains(strings.ToLower(svc.Image), authentikMark)
-			if !byImage && !defining[stack.ID+"/"+svc.Name] {
-				continue
-			}
-			out = append(out, svc.ContainerName)
-			for _, r := range svc.Cloudflare {
-				out = append(out, r.Hostname)
-			}
-			for _, r := range svc.Traefik {
-				out = append(out, r.Hosts...)
+			key := stack.ID + "/" + svc.Name
+			if IsAuthentik(svc, defining[key]) {
+				fn(stack, svc, key)
 			}
 		}
 	}
-	return out
 }
 
 const (
