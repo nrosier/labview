@@ -189,6 +189,31 @@ type Service struct {
 	Notes []string `json:"notes"`
 }
 
+// ConfiguredEdgeAuth is authentication that was *detected*: a method other than `none` from
+// labels, the live proxy chain, a tunnel access policy or an enforced identity provider. An
+// `inferred` posture counts; neither a probe result nor a declaration does (§13.1).
+func (s Service) ConfiguredEdgeAuth() bool { return s.Auth.Method.Detected() }
+
+// ProbeGate is whether the probe read a gate. It is the second term of the exposure verdict and
+// stays written as its own expression even though the two terms are provably disjoint, because
+// that is what keeps the probe-gated figure a subtractable statistic (§13.1).
+func (s Service) ProbeGate() bool { return s.Probe != nil && s.Probe.Gate != "" }
+
+// HasEdgeAuth is `configuredEdgeAuth || probeGate` — the one expression §13.1 requires evaluated
+// once and shared, so that probe eligibility and the exposure verdict cannot come apart.
+//
+// Because withholding a probe can only remove the second term, it can only ever leave a service
+// *in* the exposed count and never take one out.
+func (s Service) HasEdgeAuth() bool { return s.ConfiguredEdgeAuth() || s.ProbeGate() }
+
+// DeclaredAuthMechanisms is what the sidecar claimed about this service's gate, or nothing.
+func (s Service) DeclaredAuthMechanisms() []DeclaredAuth {
+	if s.Declared == nil {
+		return nil
+	}
+	return s.Declared.Auth
+}
+
 // EnvVar is one resolved environment entry. Value is a required field that may be null:
 // null is a variable declared with no value at all, which is a different reading from a
 // variable set to the empty string (§6). Masked says the value was withheld, never that
