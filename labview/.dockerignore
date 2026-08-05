@@ -1,8 +1,28 @@
-node_modules
-dist
-web/dist
+# The build context is this directory, and the image must contain only the binary plus
+# an example config and an example passwd file (§2.3). Everything the Go build does not
+# read is excluded, so nothing can reach the image by accident.
+
 .git
-fixtures
-*.md
-!README.md
 .DS_Store
+*.log
+
+# The test corpus. §2.3 bars it from the image; excluding it from the context as well
+# keeps a fixture hostname out of every build layer (I2).
+fixtures/
+
+# The frontend source and its dependency tree. What the binary serves is the bundle
+# committed under internal/webui/dist, embedded at compile time — the UI source is
+# never needed to build the image, and §2.3 says no source may be in it.
+web/
+
+# Documentation, the deployment example, and the sidecar example. The image ships the
+# config and passwd examples only.
+*.md
+compose.yml
+.labview.example
+.gitignore
+.dockerignore
+
+# An operator's real config, if they mounted one here.
+config/
+config.local.yml
