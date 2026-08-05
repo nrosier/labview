@@ -12,6 +12,9 @@ on:
 # secrets rather than GITHUB_TOKEN.
 permissions:
   contents: read
+  security-events: write
+  actions: read
+  checks: write
 
 jobs:
   # Gate: a broken build or a reverted fix must not reach Docker Hub. The smoke
