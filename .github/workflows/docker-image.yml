@@ -39,7 +39,7 @@ jobs:
       # and the point of building on the floor is to check that the declaration is
       # true — the same reason the Dockerfile pins golang:1.23-alpine.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: labview/go.mod
           cache-dependency-path: labview/go.sum
