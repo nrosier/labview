@@ -292,13 +292,40 @@ main { padding: 0.9rem 1rem 4rem; min-width: 0; }
 
 /* ---------------------------------------------------------------- tables */
 
-.scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+/* .scroll is the table's own scrollport, in both axes, and that has to be said out loud because the
+   alternative does not exist: per CSS Overflow 3, a box with `overflow-x: auto` and `overflow-y: visible`
+   has the `visible` computed to `auto`, so *any* horizontal scrolling here makes this a vertical
+   scrollport too. There is no way to scroll sideways and let the page keep the vertical axis.
 
+   That matters because §22.1 asks for sticky headers, and `position: sticky` offsets are resolved against
+   the nearest ancestor scrollport — this box, not the viewport. So the header can only stick to something
+   that actually scrolls, which is what the height bound below is for. Written as an unbounded box with a
+   viewport-relative `top`, as this was, the header sticks to a scrollport that never scrolls: the page
+   scrolls instead, the header leaves with it, and a wide view becomes columns of prose with no labels.
+   The diagnostics view is where that shows worst — seven columns, one of them holding every rejected
+   endpoint and why.
+
+   `vh` first and `dvh` second so a browser without dynamic viewport units keeps a bound rather than
+   dropping the declaration and silently losing the sticky header again. The lower bound is there so a
+   short window still shows some rows instead of a scrollbar with one row in it. */
+.scroll {
+  overflow: auto;
+  overscroll-behavior: contain;
+  max-height: max(20rem, calc(100vh - 13rem));
+  max-height: max(20rem, calc(100dvh - 13rem));
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+/* `width: 100%` so a narrow view fills the panel, and the per-cell floor below is what lets a wide one
+   exceed it. An auto-layout table at `width: 100%` with no floor shrinks to its container however many
+   columns it has, which is why the scroll container above could never produce a horizontal scrollbar. */
 table { border-collapse: collapse; width: 100%; font-size: var(--step-0); }
 
 thead th {
   position: sticky;
-  top: 2.6rem;
+  top: 0;
   z-index: 10;
   background: var(--panel);
   text-align: left;
@@ -310,7 +337,13 @@ thead th {
 
 thead th .hint { display: block; font-weight: 400; color: var(--ink-soft); font-size: 0.6875rem; white-space: normal; max-width: 22rem; }
 
-tbody td { padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+/* The width floor and ceiling, per cell rather than per table, so the table's intrinsic width follows the
+   column count instead of a number this file would have to guess: seven columns overflow and scroll, three
+   do not. The ceiling stops one column of evidence from taking the whole panel and leaving the rest
+   unreadably narrow, and `anywhere` breaks a long endpoint or image reference instead of letting it set
+   the column width — the same reading `dl.kv dd` already takes in the drawer. */
+tbody td, thead th { min-width: 7rem; }
+tbody td { padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; max-width: 30rem; overflow-wrap: anywhere; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--neutral-bg); }
 tbody tr[data-open]:hover { cursor: pointer; }
@@ -392,6 +425,14 @@ pre.raw {
   max-height: 26rem;
   overflow: auto;
 }
+
+/* --------------------------------------------------------------- collect */
+
+/* The collect control and the slot it fills, above the table. `pre.raw` above already bounds and scrolls
+   the text, so a collected report of any length costs the table nothing; the reason there is a wrapper at
+   all is that the slot has to exist before the table is drawn to end up above it. */
+.collect { margin-bottom: 0.5rem; }
+.collect .muted { max-width: 46rem; }
 
 /* -------------------------------------------------------------- diagrams */
 

@@ -1074,6 +1074,7 @@
   // with no prefix of its own: it is a list of strings and no column resolves against it.
   var PATHS = {
     warnings: 'meta.warnings',
+    scannedAt: 'meta.scannedAt',
     connections: PRE.conn.slice(0, -PATH_SEP.length),
     unApps: PRE.unApp.slice(0, -PATH_SEP.length),
     unRouters: PRE.unRouter.slice(0, -PATH_SEP.length)
@@ -2007,11 +2008,166 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Collecting a report view (§22.2's `report` shape)
+  //
+  // A connection failure is the one thing this page shows that a reader normally needs to take somewhere
+  // else — into an issue, a paste, a message to whoever runs the endpoint that did not answer. Reading it
+  // off the table means retyping the part that matters, and the part that matters is the longest cell on
+  // the widest view.
+  //
+  // Keyed off the view's *kind*, so this is a property of the report shape rather than of one slug: any
+  // later view Go gives that shape gets the control, and this file still names no view.
+  //
+  // What it collects is likewise the view's own declaration — `fields` for the scan context, `columns` for
+  // each row, headers for the labels — so the text stays in step with the tables and no payload member is
+  // spelled here. The received object is appended verbatim per row, because "what was sent" is a question
+  // the rendered cells cannot answer: a cell shows what this build knew how to read.
+  //
+  // Scoped to the report rows and the view's declared context, which is the whole of `meta` for the
+  // diagnostics view and no part of the services. That is what was asked for, and it is also the only
+  // scope that is safe to hand out: I6 keeps environment variable *values* out of the text haystack, but
+  // nothing keeps them out of the payload, and a collected file is made to be pasted somewhere public.
+  // ---------------------------------------------------------------------------
+
+  function collectText(view, rows) {
+    var lines = [];
+    lines.push('LabView ' + view.title + ' — collected from the payload of the scan below.');
+    lines.push('');
+
+    // The scan context, from the view's own `fields`. Absent stays absent: a missing build stamp is a fact
+    // about the scan and a reader chasing a version needs to see that it was not reported (§3.4).
+    (view.fields || []).forEach(function (path) {
+      var vals = stringsAt(OV, path);
+      lines.push('  ' + path + ': ' + (vals.length ? vals.join(', ') : NOT_REPORTED));
+    });
+
+    lines.push('');
+    lines.push(rows.length + ' ' + view.rowNoun + (rows.length === 1 ? '' : 's') +
+      (rows.length ? '' : ' — ' + view.empty));
+
+    rows.forEach(function (row) {
+      lines.push('');
+      lines.push('--- ' + (asString(row.label) || row.id) + ' ---');
+      view.columns.forEach(function (col) {
+        var cell = cellOf(row, col);
+        lines.push('  ' + col.header + ': ' + cellText(cell));
+      });
+      // Verbatim and uncapped, unlike the cell: CELL_VALUES bounds what a table can show, and the whole of
+      // it is exactly what makes a collected report worth collecting.
+      if (row.raw !== undefined && row.raw !== null) {
+        lines.push('  as received:');
+        JSON.stringify(row.raw, null, 2).split('\n').forEach(function (l) { lines.push('    ' + l); });
+      }
+    });
+
+    lines.push('');
+    return lines.join('\n');
+  }
+
+  // cellText is a cell as one line of the collected report: the same branches fillCell takes, in the same
+  // order of authority, ending in the same absence sentence — so the file and the screen never disagree
+  // about what was read. A term contributes its mark as well as its label, because the mark is what §22.1
+  // makes carry the distinction when colour cannot.
+  function cellText(cell) {
+    if (!cell || cell.absent) return NOT_REPORTED;
+    if (cell.number !== undefined && cell.number !== null) return String(cell.number);
+    var parts = [];
+    if (cell.members) {
+      cell.members.forEach(function (m) { once(parts, termText(termOf(cell.set, m))); });
+    } else if (cell.terms) {
+      cell.terms.forEach(function (t) { once(parts, termText(t)); });
+    } else {
+      (cell.text || []).forEach(function (v) { if (v !== '') once(parts, asString(v)); });
+      if (cell.export) once(parts, cell.export);
+    }
+    return parts.length ? parts.join(' | ') : NOT_REPORTED;
+  }
+
+  function termText(term) {
+    var label = asString(term.label || term.member);
+    return term.mark ? term.mark + ' ' + label : label;
+  }
+
+  // COLLECT is what the control is currently offering, set when the bar is drawn and replaced on every
+  // render. Module-level for the same reason OPEN is: the click handler is delegated, and re-deriving the
+  // rows from the URL at click time would be a second copy of what render() just worked out — one that
+  // could disagree with the table the reader is looking at.
+  var COLLECT = null;
+
+  // collectBar is the control itself: one button, and a slot above the table for what it discloses.
+  //
+  // The slot is reserved here rather than appended on click, because by then the table is already in the
+  // host and the text would land underneath it — below a bounded scroll region, which is to say off screen,
+  // which is to say the button would look broken.
+  function collectBar(host, view, rows) {
+    var wrap = add(host, mk('div', 'collect'));
+    var bar = add(wrap, mk('div', 'diagram-bar'));
+    var button = mk('button', '', 'Collect ' + view.rowNoun + 's');
+    button.type = 'button';
+    button.setAttribute('data-collect', view.slug);
+    add(bar, button);
+    add(bar, mk('span', 'muted', 'the scan context, every ' + view.rowNoun +
+      ' shown in full, and each one as it was received'));
+    COLLECT = { view: view, rows: rows, slot: add(wrap, mk('div', '')), open: false };
+  }
+
+  // openCollect fills that slot: the text, a copy, and a download.
+  //
+  // Two ways out of the page because neither is enough alone. `navigator.clipboard` is a secure-context
+  // API and LabView is commonly reached over plain HTTP on a LAN (§2.4 governs *outbound* TLS, not this
+  // listener) — so on exactly the deployment most likely to have a connection worth diagnosing, Copy
+  // cannot work and says so. The download is a `data:` URL rather than a Blob so there is no object URL to
+  // hold or revoke, and the filename carries the scan's own instant rather than a clock reading: the same
+  // payload collects to the same file (I7).
+  //
+  // On demand rather than always drawn: the text is the longest thing on the page, and a reader who came
+  // here to read the table should not have to scroll past it to reach one.
+  function openCollect() {
+    var c = COLLECT;
+    // The slot is cleared below, so a second click would rebuild rather than stack; this guard is only here
+    // to keep it from rebuilding a string that can run to tens of kilobytes.
+    if (!c || c.open) return;
+    c.open = true;
+
+    var text = collectText(c.view, c.rows);
+    var slot = clear(c.slot);
+
+    var actions = add(slot, mk('div', 'diagram-bar'));
+    add(actions, exportNode(text));
+
+    var name = 'labview-' + c.view.slug + '-' + fileStamp() + '.txt';
+    var down = mk('a', '', 'Download ' + name);
+    down.setAttribute('download', name);
+    down.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(text));
+    add(actions, down);
+
+    // Focusable and focused: the block is the answer to the click, and a keyboard reader should not have
+    // to hunt for where the page just changed.
+    var box = add(slot, mk('pre', 'raw'));
+    box.setAttribute('tabindex', '0');
+    box.setAttribute('data-collected', c.view.slug);
+    add(box, document.createTextNode(text));
+    if (box.focus) box.focus();
+  }
+
+  // fileStamp is the scan's own instant, reduced to something a filesystem accepts. Not a clock reading:
+  // two collections of one payload must name one file (I7).
+  function fileStamp() {
+    var at = asString(pathOf(OV, PATHS.scannedAt));
+    var out = '';
+    for (var i = 0; i < at.length; i++) {
+      var c = at.charAt(i);
+      out += (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ? c : '-';
+    }
+    return out || 'unstamped';
+  }
+
+  // ---------------------------------------------------------------------------
   // The chrome (§22.1)
   // ---------------------------------------------------------------------------
 
   function renderChrome() {
-    var scanned = pathOf(OV, 'meta.scannedAt');
+    var scanned = pathOf(OV, PATHS.scannedAt);
     var ms = asInt(pathOf(OV, 'meta.durationMs'));
     var when = scanned ? 'scanned ' + asString(scanned) : 'scan time ' + NOT_REPORTED;
     el('scanned').textContent = ms === null ? when : when + ' in ' + ms + 'ms';
@@ -2807,6 +2963,11 @@
     } else if (view.kind === M.rowDiagram && S.diagram && p.kind !== M.rowEdge) {
       renderDiagram(host, diagramOf(S.diagram));
     } else {
+      // Above the table, and only on the report shape: a reader who came to a report view came because
+      // something did not answer, and the thing they do next is take it elsewhere. The rows handed over are
+      // the rows on screen, filters and all — collecting one target's failure is a normal thing to want,
+      // and the count above the table already says how many were left out.
+      if (view.kind === M.rowReport) collectBar(host, view, rows);
       renderTable(host, view, rows);
     }
 
@@ -2890,6 +3051,15 @@
       } else {
         copy.textContent = 'Could not copy — this browser did not offer a clipboard';
       }
+      return;
+    }
+
+    // Before the row handler: the bar sits above the table, but a report row is itself clickable and a
+    // reader who hits the button should get the text rather than a drawer.
+    var collect = closest(target, function (n) { return attr(n, 'data-collect') !== null; });
+    if (collect) {
+      ev.preventDefault();
+      openCollect();
       return;
     }
 

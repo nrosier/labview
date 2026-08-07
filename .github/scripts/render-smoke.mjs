@@ -817,6 +817,392 @@ for (const view of C.views.filter((v) => v.dims && v.dims.length)) {
   check('Rescan is the only thing that scans again', out.requests.length === 2);
 }
 
+// --- 11. Collecting a report view ----------------------------------------
+//
+// A report view offers one control that turns the view into something a reader can take elsewhere. The
+// interesting failure is not that the button is missing — it is that the button is there and the text it
+// produces is thinner than the table, which nobody notices until they need it. So the checks below measure
+// the text against the view's own declaration: every column header, every declared context path, every row
+// shown, and the received object per row.
+
+const NAME = (n) => {
+  const found = C.names.find((x) => x.name === n);
+  if (!found) throw new Error('the contract has no name ' + n);
+  return found.value;
+};
+
+const REPORT_VIEWS = C.views.filter((v) => v.kind === NAME('rowReport'));
+check('the contract declares at least one report view', REPORT_VIEWS.length > 0);
+
+// One function, run below over the scanned payload and then over a synthetic one, because every expectation
+// here is read out of the payload under test rather than written down: what a report view owes its reader is
+// *its own* rows in full. Two payloads because the scanned one cannot be relied on to contain the deepest
+// case — see 11b.
+async function checkCollect(view, PAY, tag) {
+  const at = ' (' + tag + ')';
+
+  // Where this view's rows come from, taken from its own columns rather than named here. A report view
+  // declares the payload path of every cell it draws, so the row source is one segment above the first of
+  // them, and the nested paths below fall out of the same declaration.
+  const rowPath = ((view.columns[0].fields || [])[0] || '').split('.').slice(0, -1).join('.');
+  const source = rowPath ? rowPath.split('.').reduce((o, k) => (o == null ? o : o[k]), PAY) : null;
+  if (!check('the ' + view.slug + ' rows come from ' + rowPath + ', which is a list' + at,
+    Array.isArray(source))) return;
+
+  const out = await run('?view=' + view.slug, { body: PAY });
+  noThrow('the ' + view.slug + ' view runs' + at, out);
+
+  const button = out.id('content').querySelectorAll('[data-collect]')[0];
+  if (!check('the ' + view.slug + ' view offers a collect control' + at, !!button)) return;
+
+  // A disclosure, not a wall: the block must not already be on the page.
+  check('the collected text is not drawn until it is asked for' + at,
+    out.id('content').querySelectorAll('[data-collected]').length === 0);
+
+  // It must sit above the table, or on a view whose table is a bounded scroll region the reader clicks and
+  // sees nothing happen.
+  const contentKids = out.id('content').children;
+  const barAt = contentKids.findIndex((n) => n.all().includes(button));
+  const tableAt = contentKids.findIndex((n) => n.all().some((x) => x.tagName === 'TABLE'));
+  check('the collect control is above the table' + at, barAt >= 0 && tableAt >= 0 && barAt < tableAt,
+    'bar at ' + barAt + ', table at ' + tableAt);
+
+  // Through the document, because app.js delegates: one listener, and the handler reads the target's
+  // attributes. Dispatching on the node itself would find no listener and silently prove nothing.
+  DOC.dispatch('click', { target: button, preventDefault() {} });
+  await flush();
+
+  const box = out.id('content').querySelectorAll('[data-collected]')[0];
+  if (!check('clicking collect discloses the text' + at, !!box)) return;
+  const text = box.textContent;
+  check('the collected text is not empty' + at, text.length > 0);
+
+  // Clicking again is a thing readers do when a click produced a lot of text and they are not sure it
+  // registered. It must not stack a second copy underneath the first.
+  DOC.dispatch('click', { target: button, preventDefault() {} });
+  await flush();
+  check('collecting twice leaves one block, not two' + at,
+    out.id('content').querySelectorAll('[data-collected]').length === 1);
+
+  // Against the view's declaration, not against a list kept here by hand.
+  view.columns.forEach((col) => {
+    check('the collected text names the ' + view.slug + ' column ' + JSON.stringify(col.header) + at,
+      text.includes(col.header));
+  });
+  (view.fields || []).forEach((path) => {
+    check('the collected text accounts for the declared context ' + path + at, text.includes(path));
+  });
+
+  // Every row on screen, and the object each one came from. The received object is the half the cells
+  // cannot give: a cell shows what this build knew how to read.
+  const rows = bodyRows(out);
+  check('the ' + view.slug + ' view drew rows to collect' + at, rows.length > 0);
+  check('the collected text says how many ' + view.rowNoun + 's it holds' + at,
+    new RegExp('\\b' + rows.length + ' ' + view.rowNoun).test(text), text.slice(0, 200));
+  rows.forEach((tr) => {
+    const label = (cellsOf(tr)[0] || { textContent: '' }).textContent.trim();
+    if (!label) return;
+    check('the collected text includes the row ' + JSON.stringify(label) + at, text.includes(label));
+  });
+  // Not just that the marker is there — that what follows it parses back into the object it came from.
+  // Counting markers passes a build that truncates each block the way a table cell is truncated, and the
+  // whole point of the received half is that it is the one thing here that is never abridged.
+  // `bare` is the same text with the received blocks lifted out, so a claim can be made about the readable
+  // half on its own. Without it, every value in the payload is trivially "present" in the text — the JSON
+  // dump contains all of them — and a check reading the whole text cannot tell a cell that shows its value
+  // from a cell that dropped it.
+  const received = [];
+  const bare = [];
+  {
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() !== 'as received:') { bare.push(lines[i]); continue; }
+      const buf = [];
+      let j = i + 1;
+      for (; j < lines.length && lines[j].startsWith('    '); j++) buf.push(lines[j].slice(4));
+      received.push(buf.join('\n'));
+      i = j - 1;
+    }
+  }
+  const bareText = bare.join('\n');
+  // The marks, read off the table and looked for in the file. §22.1 makes the mark and not the colour carry
+  // the distinction, and a collected file has no colour at all — so the mark is the *only* thing separating
+  // a failed phase from a setting once the text leaves the page. Read from the rendered tags rather than
+  // from the tone table, because what has to agree is the screen and the file.
+  {
+    const want = new Set();
+    rows.forEach((tr) => tr.all()
+      .filter((n) => (n.className || '').split(/\s+/).includes('tag'))
+      .forEach((tag) => {
+        const mark = tag.children.find((c) => (c.className || '') === 'mark');
+        if (!mark || !mark.textContent) return;
+        want.add(mark.textContent + ' ' + tag.textContent.slice(mark.textContent.length));
+      }));
+    const missing = Array.from(want).filter((w) => !bareText.includes(w));
+    check('the marked terms reach the file with their marks, which is all a file has' + at,
+      want.size > 0 && missing.length === 0,
+      want.size ? 'missing: ' + missing.join(' | ') : 'the table drew no marked term to check');
+  }
+
+  check('the collected text carries each row as it was received' + at, received.length === rows.length,
+    'found ' + received.length + ' received blocks for ' + rows.length + ' rows');
+  const parsedRaw = received.map((t) => {
+    try { return JSON.stringify(JSON.parse(t)); } catch (e) { return null; }
+  });
+  check('each received block is still valid JSON' + at, parsedRaw.every(Boolean),
+    'a block did not parse — truncated?');
+  const wantRaw = source.map((c) => JSON.stringify(c));
+  check('each received block is the whole object that arrived, not a summary of it' + at,
+    parsedRaw.filter(Boolean).every((r) => wantRaw.includes(r)),
+    'a received block did not match any ' + view.rowNoun + ' in the payload');
+
+  // The deepest evidence in the payload, which is the whole reason to collect rather than read: a rejected
+  // candidate is nested a level below anything a cell shows in full. The nested paths come from the columns'
+  // own declaration, so a column that grows a field grows this check with it — and the check runs against
+  // every value at those paths, not only the endpoint, because "the candidate and why" is the whole point.
+  //
+  // Read against `bare`, so what is being claimed is that the *readable* half carries them. The received
+  // JSON below each row holds every value by construction, so asserting against the whole text would pass a
+  // build whose cells silently show one candidate of five and leave the rest to a reader willing to parse.
+  const nestedPaths = view.columns.flatMap((col) => col.fields || [])
+    .filter((f) => f.startsWith(rowPath + '.'))
+    .map((f) => f.slice(rowPath.length + 1).split('.'))
+    .filter((parts) => parts.length > 1);
+  const nested = source.flatMap((row) => nestedPaths.flatMap((parts) => {
+    const list = row[parts[0]];
+    return Array.isArray(list) ? list.map((x) => (x || {})[parts[1]]) : [];
+  })).filter((v) => typeof v === 'string' && v !== '');
+  // Guarded, not asserted: the scanned payload records rejected candidates only when something was actually
+  // rejected, which depends on the runner's network. 11b is the payload that makes this run every time.
+  if (nested.length) {
+    check('the collected report shows every rejected candidate, not only the JSON does' + at,
+      nested.every((e) => bareText.includes(e)),
+      'missing: ' + nested.filter((e) => !bareText.includes(e)).join(' | '));
+  }
+
+  // Both ways out of the page, because clipboard is a secure-context API and this listener is often plain
+  // HTTP — the deployment most likely to have a connection worth collecting is the one where Copy fails.
+  const copy = out.id('content').querySelectorAll('[data-export]')
+    .find((n) => n.getAttribute('data-export') === text);
+  check('the collected text is offered to the clipboard verbatim' + at, !!copy);
+  const down = out.id('content').all()
+    .find((n) => n.tagName === 'A' && n.getAttribute('download'));
+  if (check('the collected text is offered as a download' + at, !!down)) {
+    check('the download names a plain-text file' + at,
+      /^labview-.*\.txt$/.test(down.getAttribute('download')), down.getAttribute('download'));
+    check('the download carries the text itself' + at,
+      decodeURIComponent((down.getAttribute('href') || '').replace(/^data:[^,]*,/, '')) === text);
+    // I7: one payload, one filename. A clock reading here would make two collections of one scan
+    // disagree, and the file is named after the scan precisely so it can be filed against it.
+    check('the download is named after the scan rather than the clock' + at,
+      down.getAttribute('download').includes(
+        String(PAY.meta.scannedAt || '').replace(/[^0-9A-Za-z]/g, '-')),
+      down.getAttribute('download'));
+  }
+
+  // Deterministic for a payload (I7), the same property the diagram export has and for the same reason.
+  const again = await run('?view=' + view.slug, { body: PAY });
+  const b2 = again.id('content').querySelectorAll('[data-collect]')[0];
+  DOC.dispatch('click', { target: b2, preventDefault() {} });
+  await flush();
+  check('collecting twice from one payload produces one text' + at,
+    again.id('content').querySelectorAll('[data-collected]')[0].textContent === text);
+
+  // Filters narrow the collection, because the count above the table says what was left out and a reader
+  // collecting one failing target is a normal thing to want. Measured against the rows the filtered view
+  // actually drew — a length comparison would also pass a build that collected a different wrong set, and
+  // an `if the control is there` guard would pass a build where collecting threw.
+  const firstLabel = (cellsOf(rows[0])[0] || { textContent: '' }).textContent.trim();
+  const narrowed = await run('?view=' + view.slug + '&q=' + encodeURIComponent(firstLabel), { body: PAY });
+  const narrowedRows = bodyRows(narrowed);
+  const b3 = narrowed.id('content').querySelectorAll('[data-collect]')[0];
+  check('a filtered report still offers the control' + at, !!b3);
+  if (b3) {
+    DOC.dispatch('click', { target: b3, preventDefault() {} });
+    await flush();
+    const t3 = narrowed.id('content').querySelectorAll('[data-collected]')[0];
+    if (check('a filtered report collects without throwing' + at, !!t3)) {
+      check('a filtered report collects only the rows on screen' + at,
+        new RegExp('\\b' + narrowedRows.length + ' ' + view.rowNoun).test(t3.textContent),
+        'drew ' + narrowedRows.length + ' rows; the text says: ' +
+          (/^.*$/m.exec(t3.textContent.split('\n')[3] || '') || [''])[0]);
+      check('narrowing the view narrowed the collection' + at,
+        narrowedRows.length < rows.length && narrowedRows.length > 0,
+        'filtering on ' + JSON.stringify(firstLabel) + ' left ' + narrowedRows.length + ' of ' + rows.length);
+    }
+  }
+}
+
+for (const view of REPORT_VIEWS) await checkCollect(view, PAYLOAD, 'scanned');
+
+// --- 11b. A report with rejected candidates in it -------------------------
+//
+// The scanned payload above cannot be relied on for the case that matters most. CI runs the scan with every
+// outbound transport switched off (see .github/workflows/docker-image.yml), which is what makes it hermetic —
+// and a transport that was never attempted rejects no candidates, so `attempts` is empty on all four reports
+// and the deepest check in the function above is *skipped* in exactly the run that gates the image. Locally,
+// with the transports on, it runs; the gate is the one place it must.
+//
+// So: a payload built to contain the shape. Synthetic on purpose, and in the same sense as the graph in 4b —
+// these are reports, not a lab, the hosts are `.invalid` per RFC 6761, and nothing here describes any
+// deployment. What it does describe is the failure worth collecting: one target that answered with something
+// that was not the API, one that resolved nothing across several candidates, one partial read, one setting.
+//
+// It is also the case a reader hits the button for. A rejected candidate carries the address, what made it a
+// candidate, how far it got and why it stopped — four facts a level below anything a table cell shows in
+// full, which is why the collected text and not the view is where they have to survive.
+
+{
+  const DEEP = 'the response body was HTML beginning "<!doctype html>", ' +
+    'which is a web page and not the API this asks for — 512 bytes read, no JSON token in any of them';
+
+  const SYNTH = {
+    meta: {
+      scannedAt: '2026-01-01T00:00:00Z',
+      appsRoot: '/synthetic',
+      durationMs: 1,
+      warnings: ['one synthetic warning, so the declared context has something to carry'],
+      build: { version: '0.0.0-synthetic', commit: '0000000', source: 'synthetic' },
+      dockerAvailable: false,
+      dockerError: 'the container list did not parse (not-json)',
+      connections: [
+        {
+          target: 'docker',
+          ok: false,
+          phase: 'decode',
+          endpoint: 'tcp://synthetic-proxy.invalid:2375',
+          source: 'config',
+          detail: 'the container list did not parse (not-json)',
+          code: '200',
+          hint: 'something answered on that path that is not the Engine — check LABVIEW_DOCKER_HOST',
+          attempts: [
+            {
+              endpoint: 'tcp://synthetic-proxy.invalid:2375',
+              why: 'LABVIEW_DOCKER_HOST names it',
+              phase: 'decode',
+              code: '200',
+              detail: DEEP,
+            },
+          ],
+        },
+        {
+          target: 'authentik',
+          ok: false,
+          phase: 'resolve',
+          source: 'discovered',
+          detail: '2 discovered addresses answered, and none of them is the API',
+          hint: 'the name did not resolve — see the detail beside this line',
+          attempts: [
+            {
+              endpoint: 'http://identity-server.invalid:9000',
+              why: 'a scanned service publishes that port',
+              phase: 'resolve',
+              detail: 'the name did not resolve',
+            },
+            {
+              endpoint: 'https://sso.synthetic.invalid',
+              why: 'a scanned route claims that hostname',
+              phase: 'tls',
+              code: '526',
+              detail: 'the certificate did not verify against the system roots',
+            },
+          ],
+        },
+        {
+          target: 'traefik',
+          ok: true,
+          phase: 'partial',
+          endpoint: 'http://router-api.invalid:8080',
+          source: 'discovered',
+          detail: 'the entrypoint list was refused',
+          code: '403',
+          hint: 'the API is answering unauthenticated for some paths and not others',
+          read: 'routers and services; not entrypoints',
+          attempts: [],
+        },
+        {
+          target: 'probe',
+          ok: false,
+          phase: 'disabled',
+          hint: 'set LABVIEW_PROBE_ENABLED=true if you want this read',
+          attempts: [],
+        },
+      ],
+    },
+    stacks: [],
+    services: [],
+    graph: { nodes: [], edges: [] },
+  };
+
+  // Preconditions, asserted here rather than assumed: this payload is only worth running if it actually
+  // contains the shape the checks above go looking for. Every leaf the column declares must be populated on
+  // some attempt, so a column that grows a field fails here until this payload grows with it.
+  const DIAG = REPORT_VIEWS.find((v) => (v.columns[0].fields || [])[0] === 'meta.connections.target');
+  if (check('the contract still has a connection report view to feed', !!DIAG)) {
+    const attempts = SYNTH.meta.connections.flatMap((c) => c.attempts || []);
+    check('the synthetic payload records rejected candidates', attempts.length > 1);
+    const leaves = DIAG.columns.flatMap((col) => col.fields || [])
+      .filter((f) => f.startsWith('meta.connections.attempts.'))
+      .map((f) => f.slice('meta.connections.attempts.'.length));
+    check('the column declares nested fields to exercise', leaves.length > 0);
+    leaves.forEach((leaf) => {
+      check('the synthetic payload populates attempts.' + leaf,
+        attempts.some((a) => typeof a[leaf] === 'string' && a[leaf] !== ''));
+    });
+    // The one fact a truncating build gets wrong and a counting check cannot see.
+    check('one rejected candidate carries more detail than a cell would show', DEEP.length > 120);
+
+    await checkCollect(DIAG, SYNTH, 'synthetic');
+  }
+}
+
+// --- 12. The structure the stylesheet needs ------------------------------
+//
+// There is no layout engine here, so none of these checks can see a column that is too narrow. What they
+// can see is the structure the stylesheet's readings depend on, and the readings themselves — both of the
+// scroll rules below were wrong in a way that is invisible until someone opens the widest view:
+//
+//   * `overflow-x: auto` with `overflow-y: visible` computes to `auto` on both axes (CSS Overflow 3), so
+//     .scroll is a scrollport whether or not that was intended, and `position: sticky` in the header
+//     resolves against it rather than the viewport. Unbounded, it never scrolls and the header never sticks.
+//   * an auto-layout table at `width: 100%` with no per-cell floor shrinks to its container however many
+//     columns it has, so the scroll container can never produce a horizontal scrollbar.
+//
+// Asserted as text because that is where the bug was. A visual check is still the reader's to make.
+
+{
+  // A table view, not the default one: the overview's content is the card grid and has no table in it.
+  const tableView = C.views.find((v) => v.kind !== NAME('rowStat') && v.kind !== NAME('rowDiagram'));
+  const out = await run('?view=' + tableView.slug);
+  const scroll = out.id('content').all().find((n) => (n.className || '').split(/\s+/).includes('scroll'));
+  check('the table is wrapped in the scroll region the stylesheet styles', !!scroll);
+  check('the scroll region holds the table directly',
+    !!scroll && scroll.children.some((n) => n.tagName === 'TABLE'));
+
+  const css = readFileSync(join(ROOT, 'assets', 'labview.css'), 'utf8');
+  const block = (sel) => {
+    const at = css.indexOf(sel + ' {');
+    if (at < 0) return '';
+    return css.slice(at, css.indexOf('}', at));
+  };
+  const scrollCSS = block('.scroll');
+  // Both bounds, in that order: `dvh` alone drops the whole declaration on a browser that does not know the
+  // unit, and a dropped bound means an unbounded scrollport, which means the sticky header silently stops
+  // working again on exactly the browsers least able to say so.
+  check('.scroll bounds its height, so the sticky header has a scrollport that scrolls',
+    /max-height:[^;]*100vh/.test(scrollCSS), scrollCSS);
+  check('.scroll keeps a static-viewport fallback under the dynamic one',
+    /max-height:[^;]*100vh[^]*max-height:[^;]*100dvh/.test(scrollCSS), scrollCSS);
+  check('.scroll scrolls both axes, which is the only thing that combination can mean',
+    /overflow:\s*auto/.test(scrollCSS), scrollCSS);
+  check('the sticky header is offset from its own scrollport, not the viewport',
+    /top:\s*0;/.test(block('thead th')), block('thead th'));
+  check('cells carry a width floor, so a wide table overflows instead of shrinking to fit',
+    /min-width:/.test(block('tbody td, thead th')), block('tbody td, thead th'));
+  check('cells break long values instead of letting one set the column width',
+    /overflow-wrap:\s*anywhere/.test(block('tbody td')), block('tbody td'));
+}
+
 // ---------------------------------------------------------------------------
 
 console.log((checks - failures) + '/' + checks + ' checks passed');
