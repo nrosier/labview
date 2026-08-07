@@ -129,13 +129,59 @@ type notes struct {
 	mu   sync.Mutex
 	got  []changes.Note
 	made []bool
+
+	// held, when set, is what the first callback waits on. It waits *before* recording, not after,
+	// because what a test using this needs to see is whether a second callback can take its place in
+	// the order while the first is still being delivered — and one that recorded and then waited
+	// would already have taken its own.
+	held    chan struct{}
+	first   bool
+	entered chan struct{} // one send per callback that started
 }
 
 func (n *notes) fn(note changes.Note, forced bool) {
 	n.mu.Lock()
+	hold := n.held
+	if hold == nil || n.first {
+		hold = nil
+	}
+	n.first = true
+	n.mu.Unlock()
+
+	select {
+	case n.entered <- struct{}{}:
+	default:
+	}
+
+	if hold != nil {
+		<-hold
+	}
+
+	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.got = append(n.got, note)
 	n.made = append(n.made, forced)
+}
+
+// holdFirst makes the first callback block until the returned function is called.
+func (n *notes) holdFirst() func() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.held = make(chan struct{})
+	held := n.held
+	return func() { close(held) }
+}
+
+// awaitEntered blocks until want callbacks have started, and fails rather than hanging.
+func (n *notes) awaitEntered(t *testing.T, want int) {
+	t.Helper()
+	for i := 0; i < want; i++ {
+		select {
+		case <-n.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("waited for callback %d of %d to start; %d recorded", i+1, want, n.count())
+		}
+	}
 }
 
 func (n *notes) count() int {
@@ -171,7 +217,7 @@ func no() *bool  { v := false; return &v }
 // fixture is a cache with everything injected.
 func fixture(t *testing.T, ttl time.Duration) (*Cache, *builder, *clock, *notes) {
 	t.Helper()
-	b, ck, n := newBuilder(), newClock(), &notes{}
+	b, ck, n := newBuilder(), newClock(), &notes{entered: make(chan struct{}, 64)}
 	return New(Options{Build: b.fn, TTL: ttl, Now: ck.now, Built: n.fn}), b, ck, n
 }
 
@@ -638,6 +684,59 @@ func TestTheCallbackSeesEachBuildAgainstTheOneBefore(t *testing.T) {
 	note, _ := n.at(1)
 	if len(note.Config) == 0 {
 		t.Fatalf("a stack appeared between the two builds; got %#v", note)
+	}
+}
+
+func TestTheListenerIsToldAboutBuildsInTheOrderTheyFinished(t *testing.T) {
+	// The listener's job is *what changed since the last scan* (§17, and cmd/labview's built keeps
+	// state across calls to do it), which makes it a claim about a sequence. Told out of order it does
+	// not print something slightly wrong — it prints a diff against a scan that has not happened yet.
+	//
+	// The gap this closes is between publishing a result and telling the listener. A build's waiters
+	// are released first, deliberately: they are not made to wait on a log write. That gap is long
+	// enough for the next request to start a build of its own and finish it, and then two goroutines
+	// are at the listener's door with no rule about which knocks first. This test holds the listener
+	// inside the first call and requires that the second build cannot get past it.
+	c, b, ck, n := fixture(t, time.Second)
+	b.stacks = func(run int) []payload.AppStack {
+		out := make([]payload.AppStack, 0, run)
+		for i := 0; i < run; i++ {
+			out = append(out, payload.AppStack{ID: "s" + strconv.Itoa(i),
+				Services: []payload.Service{{Name: "jellyfin"}}})
+		}
+		return out
+	}
+
+	release := n.holdFirst()
+	c.Get(context.Background(), false, nil) // build 1; its callback is now held open
+	n.awaitEntered(t, 1)
+
+	ck.advance(2 * time.Second)
+	c.Get(context.Background(), false, nil) // build 2, which finishes while that callback is held
+
+	// Long enough for a build that does no work to have finished and gone looking for the listener.
+	time.Sleep(100 * time.Millisecond)
+	if got := n.count(); got != 0 {
+		t.Fatalf("the listener was told about build 2 while it was still being told about build 1; "+
+			"%d notes recorded", got)
+	}
+
+	release()
+	n.await(t, 2)
+
+	first, _ := n.at(0)
+	if first.Baseline == "" {
+		t.Fatalf("the first build has nothing to compare against, so it is the baseline; got %#v",
+			first)
+	}
+	second, _ := n.at(1)
+	if second.Baseline != "" {
+		t.Fatalf("the second build is a change against the first, not a second baseline; got %#v",
+			second)
+	}
+	if len(second.Config) == 0 {
+		t.Fatalf("a stack appeared between the two builds, and the second note is where that is "+
+			"said; got %#v", second)
 	}
 }
 

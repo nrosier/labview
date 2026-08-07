@@ -68,6 +68,32 @@ type Cache struct {
 	// request that can share a queued build does, so the ordinary case is a queue of one.
 	running *build
 	queued  []*build
+
+	// pending are the completed builds the listener has not been told about yet, oldest first, and
+	// notifyMu is what makes one goroutine at a time do the telling.
+	//
+	// Both exist because the listener is told *after* the result is published — waiters are not made
+	// to wait on a listener — and that gap is long enough for the next request to start a build of
+	// its own and finish it. Two drain goroutines then reach the listener at once, in whichever order
+	// the scheduler picks, and a listener whose whole job is *what changed since the last scan*
+	// (cmd/labview's built) is told about a later build before an earlier one. Queueing under the
+	// same lock that publishes gives the queue the true build order; notifyMu keeps it.
+	//
+	// A goroutine that finds notifyMu held has nothing to do: whoever holds it drains everything
+	// queued, including notices added while it was inside the callback. It cannot delay a queued
+	// *build* either — a request arriving while a build is running queues behind it rather than
+	// starting a second drain, so two drain goroutines only ever contend here when both have run
+	// their chains to the end.
+	notifyMu sync.Mutex
+	pending  []notice
+}
+
+// notice is one completed build the listener is owed, held as the two payloads rather than as the
+// note itself so the diff is computed outside the lock, the way it was before it was queued.
+type notice struct {
+	previous *payload.Overview
+	current  *payload.Overview
+	forced   bool
 }
 
 // build is one run and everything a waiter needs in order to decide whether it may be answered by
@@ -231,7 +257,13 @@ func (c *Cache) drain(ctx context.Context, b *build) {
 		// The TTL is stamped from this build's own start, by the same arithmetic every build uses —
 		// which is how a forced build resets the TTL (§17) without a rule of its own.
 		c.current, c.at, c.probe = &out, b.startedAt, b.probe
-		forced := b.forced
+
+		// Queued here, in the critical section that published it, because that is the only place the
+		// build order is known: two drain goroutines racing to append after the unlock would record
+		// the order the scheduler gave them rather than the order the builds finished in.
+		if c.built != nil {
+			c.pending = append(c.pending, notice{previous: previous, current: &out, forced: b.forced})
+		}
 
 		// Take the oldest queued build, in arrival order: a request that waited longer is not made
 		// to wait again behind one that arrived after it.
@@ -245,11 +277,34 @@ func (c *Cache) drain(ctx context.Context, b *build) {
 
 		close(b.done)
 
-		if c.built != nil {
-			c.built(changes.Describe(previous, out), forced)
-		}
+		c.flush()
 
 		b = next
+	}
+}
+
+// flush tells the listener about every build it is owed, oldest first.
+//
+// Outside both the cache lock and the waiters' path: a listener that writes to a log must not be
+// able to hold up a scan or a reader. Inside notifyMu, so the order the notices were queued in is
+// the order they are delivered in.
+func (c *Cache) flush() {
+	if c.built == nil {
+		return
+	}
+	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
+	for {
+		c.mu.Lock()
+		if len(c.pending) == 0 {
+			c.mu.Unlock()
+			return
+		}
+		n := c.pending[0]
+		c.pending = c.pending[1:]
+		c.mu.Unlock()
+
+		c.built(changes.Describe(n.previous, *n.current), n.forced)
 	}
 }
 
