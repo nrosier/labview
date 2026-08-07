@@ -47,10 +47,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The toolchain the Dockerfile ships, NOT go.mod's floor — keep this in step with
+      # labview/Dockerfile's build stage. govulncheck reports standard-library advisories
+      # at symbol level alongside module ones, so whichever Go is installed here *is* the
+      # dependency under audit for the largest dependency this program has. Reading the
+      # floor out of go.mod pointed that at Go 1.23.0 and the job reported 28 reachable
+      # stdlib advisories — accurately: Go 1.23 is end of life, so there was no patched
+      # 1.23 to move to and no version of this step could pass. Auditing a toolchain the
+      # image does not ship would be the mirror of that mistake, so this tracks the image.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: labview/go.mod
+          go-version: '1.26'
           cache-dependency-path: labview/go.sum
 
       - name: Dependencies are tidy and their hashes match
@@ -59,7 +67,9 @@ jobs:
           go mod verify
 
       # Gating, and deliberately the default *symbol-level* scan: govulncheck reports
-      # only advisories whose vulnerable functions this binary can actually reach.
+      # only advisories whose vulnerable functions this binary can actually reach. Both
+      # the module requirements and the standard library are in scope — see the Go
+      # version above, which is why it is the image's and not go.mod's.
       #
       # That distinction is load-bearing here rather than a convenience. §2.1 pins
       # golang.org/x/crypto to v0.40.0 because it is the last release whose own go
@@ -119,11 +129,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The shipped toolchain again, for the same reason as the audit job above: CodeQL
+      # analyses what the compiler gives it, so a stdlib two years behind the image's
+      # would be analysed instead of the one that ships.
       - name: Set up Go
         if: matrix.language == 'go'
         uses: actions/setup-go@v7
         with:
-          go-version-file: labview/go.mod
+          go-version: '1.26'
           cache-dependency-path: labview/go.sum
 
       - name: Initialize CodeQL

@@ -10,10 +10,27 @@
 # Node installed.
 
 # ---- build stage -------------------------------------------------------------
-# Pinned to the floor §2.1 sets rather than to the newest toolchain: this is the
-# version the module declares it needs, so building with it is the check that the
-# declaration is true.
-FROM golang:1.23-alpine AS build
+# A *supported* toolchain, deliberately not the floor §2.1 sets. These are two
+# independent things and conflating them is what broke the dependency audit:
+#
+#   * `go 1.23.0` in go.mod is a compatibility promise — §2.1 says "1.23 or later",
+#     so the module must stay buildable by a 1.23 toolchain. The directive is what
+#     enforces that: the compiler rejects any 1.24+ language feature or API here
+#     regardless of which toolchain reads it, so the promise is checked by every
+#     build rather than by the choice of base image.
+#   * the toolchain that compiles the shipped binary decides which *standard library*
+#     is linked into it, and the stdlib is the largest dependency this program has.
+#
+# Building on the floor made the second follow the first, and Go 1.23 went end of
+# life at 1.23.12 — govulncheck found 21 reachable stdlib advisories in the result
+# (request smuggling in net/http, cross-domain header leakage in net/http, x509 name
+# constraint bypass) with no patched 1.23 to move to. A floor is a minimum to remain
+# compatible with, not a version to ship.
+#
+# CI still compiles on 1.23.x in a separate job (docker-image.yml, floor-compat) so
+# the §2.1 claim keeps being tested — which is the part building on the floor was
+# actually for. Bump this image when Go 1.26 leaves support; the floor stays put.
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Dependencies first, so a source-only change does not re-download the module cache.

@@ -34,14 +34,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      # go-version-file rather than a literal, so §2.1's floor is declared in exactly
-      # one place. Hardcoding '1.23' here would let go.mod and CI disagree silently,
-      # and the point of building on the floor is to check that the declaration is
-      # true — the same reason the Dockerfile pins golang:1.23-alpine.
+      # The toolchain the Dockerfile's build stage uses, so the corpus runs against the
+      # standard library that actually ships. Not go.mod's floor: that is a minimum to
+      # stay compatible with (§2.1, "1.23 or later") and is enforced by the `go` directive
+      # at compile time, not by the choice of toolchain. The floor-compat job below is
+      # what checks the declaration is still true; testing on the floor as well would only
+      # mean the tests never touch the stdlib the image contains.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: labview/go.mod
+          go-version: '1.26'
           cache-dependency-path: labview/go.sum
 
       # §2.1 caps the runtime dependency surface at a YAML parser, bcrypt and JWT
@@ -73,9 +75,42 @@ jobs:
       - name: Tests under the race detector
         run: go test -race ./...
 
+  # §2.1 says "Go 1.23 or later", and go.mod's `go 1.23.0` is that claim written down.
+  # This job is the check that it is still true, and it is the *only* place the floor is
+  # built on — the image, the corpus and the vulnerability scan all use a supported
+  # toolchain instead (see labview/Dockerfile for why those two things must not be the
+  # same knob). A `go get` that quietly raises the directive, or a 1.24+ API landing in
+  # a source file, fails here and nowhere else.
+  #
+  # Compile and vet only, not the corpus: what is under test is whether the declared
+  # minimum can still build this module, and behaviour is covered by `test` above on the
+  # toolchain that actually ships. go-version-file rather than a literal so the floor
+  # keeps being declared in exactly one place, which is what makes a silent bump visible.
+  floor-compat:
+    name: Builds on the declared floor
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: labview
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go (go.mod's declared minimum)
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: labview/go.mod
+          cache-dependency-path: labview/go.sum
+
+      - name: Build and vet on the floor
+        run: |
+          go version
+          go build ./...
+          go vet ./...
+
   build-and-push:
     name: Image
-    needs: test
+    needs: [test, floor-compat]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
