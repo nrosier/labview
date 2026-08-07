@@ -155,7 +155,7 @@ func (c *Client) Read(ctx context.Context) Snapshot {
 	}
 
 	// 3 of 3: one inspect per listed container, under the configured fan-out.
-	states, refused := c.inspectAll(ctx, list)
+	states, refused, reason := c.inspectAll(ctx, list)
 
 	snap := Snapshot{States: map[string]payload.DockerState{}}
 	// The index is written in list order, so which of two containers sharing a key wins is decided
@@ -172,8 +172,14 @@ func (c *Client) Read(ctx context.Context) Snapshot {
 
 	read := conn.Plural(len(list), "container", "containers")
 	if refused > 0 {
-		snap.Report = c.report(payload.PhasePartial,
-			strconv.Itoa(refused)+" of "+strconv.Itoa(len(list))+" inspects were refused",
+		detail := strconv.Itoa(refused) + " of " + strconv.Itoa(len(list)) + " inspects were refused"
+		if reason != "" {
+			// One reason, not eighty-six of the same sentence. The first in list order is quoted
+			// because a fleet where the inspects are refused wholesale is refused for one reason, and
+			// a count with no reason is the report an operator can do nothing with.
+			detail += "; the first said: " + reason
+		}
+		snap.Report = c.report(payload.PhasePartial, detail,
 			read+", "+strconv.Itoa(refused)+" could not be inspected")
 		return snap
 	}
@@ -204,7 +210,7 @@ func (c *Client) ping(ctx context.Context) (payload.ConnectionPhase, string) {
 	// on that path, which is `protocol` and not a successful ping — a reverse proxy or a socket proxy
 	// pointed at the wrong upstream produces exactly this.
 	if body := strings.TrimSpace(string(res.Body)); !strings.EqualFold(body, "OK") {
-		return payload.PhaseProtocol, "the endpoint answered 200 and did not answer `OK`"
+		return payload.PhaseProtocol, describing("the endpoint answered 200 and did not answer `OK`", res)
 	}
 	return payload.PhaseConnected, ""
 }
@@ -221,19 +227,60 @@ func (c *Client) list(ctx context.Context) ([]listEntry, payload.ConnectionPhase
 		if code != "" {
 			detail += " (" + code + ")"
 		}
-		return nil, phase, detail
+		return nil, phase, describing(detail, res)
 	}
 	return list, payload.PhaseConnected, ""
 }
 
+// describing appends what actually came back to a detail: how much of it there was, whether the
+// body cap cut it, and its opening bytes.
+//
+// This is where *show me what answered* lands. A phase says the Engine was not read and a
+// `protocol` code says which shape arrived instead, and between them they cannot tell an operator
+// whether they are looking at a socket proxy's refusal, an SSO login page, or the Engine answering
+// perfectly well into a 64 KiB ceiling. Only the body says which, so the body is reported (§15's
+// detail is where the reason lives, and I7 makes it data rather than a log line).
+//
+// The truncation clause is the one an operator is least able to work out for themselves, and it is
+// stated first because it changes what the rest of the line means: a document cut mid-array did not
+// fail to parse because it was the wrong document. The transport already records the cut for exactly
+// this reason (I8's cap is a bound, not a silent one) and dropping it here was hiding the difference
+// between *not the Engine* and *more Engine than fits*.
+func describing(detail string, res transport.Result) string {
+	if len(res.Body) == 0 {
+		return detail + "; the body was empty"
+	}
+	if res.Truncated {
+		detail += ", and it was cut at the " + strconv.Itoa(transport.BodyCap>>10) +
+			" KiB body cap, so what did not parse is an incomplete answer rather than a wrong one"
+	}
+	size := conn.Plural(len(res.Body), "byte", "bytes")
+	excerpt := conn.Excerpt(res.Body)
+	if excerpt == "" {
+		// There were bytes and none of them said anything. Named rather than left as a byte count with
+		// no sentence after it, because a detail that trails off reads as a diagnostic that broke
+		// halfway — and *it answered with whitespace* is itself a finding about what is on that path.
+		return detail + "; the body was " + size + " of whitespace"
+	}
+	return detail + "; " + size + ", beginning " + excerpt
+}
+
 // inspectAll issues one inspect per listed container under the configured fan-out, and returns the
-// results in list order alongside the number refused.
+// results in list order alongside the number refused and why the first of them was.
 //
 // A refused inspect is skipped and counted, never guessed at. That container's ports, networks and
 // health are simply absent, and §10 requires them left out of every conclusion rather than filled in
 // from the list entry — a container whose networks are unknown must not be reported as being on none.
-func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.DockerState, int) {
+//
+// The *reason* is carried out even though the state is not. A socket proxy that permits the list and
+// refuses the inspects is an ordinary arrangement, and it produced a report that said how many
+// inspects were refused and nothing whatever about what refused them.
+func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.DockerState, int, string) {
 	states := make([]*payload.DockerState, len(list))
+
+	// why[i] is why inspect i was refused, written to its own slot for the same reason states is:
+	// nothing about this answer may depend on which worker finished first (I7).
+	why := make([]string, len(list))
 
 	workers := c.cfg.MaxConcurrency
 	if workers <= 0 {
@@ -244,21 +291,17 @@ func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.D
 	}
 
 	var (
-		mu      sync.Mutex
-		refused int
-		next    = make(chan int)
-		wg      sync.WaitGroup
+		next = make(chan int)
+		wg   sync.WaitGroup
 	)
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := range next {
-				st, ok := c.inspect(ctx, list[i])
-				if !ok {
-					mu.Lock()
-					refused++
-					mu.Unlock()
+				st, refusal := c.inspect(ctx, list[i])
+				if st == nil {
+					why[i] = refusal
 					continue
 				}
 				// Written to its own slot, so nothing here depends on completion order (I7).
@@ -272,20 +315,38 @@ func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.D
 	close(next)
 	wg.Wait()
 
-	return states, refused
+	// Counted after the fan-out rather than under a lock during it. A slot with no state *is* a
+	// refusal, so a count derived from the slice cannot disagree with the slice it describes — and
+	// the reason quoted is the first in the Engine's list order rather than the first to finish.
+	refused, reason := 0, ""
+	for i, st := range states {
+		if st != nil {
+			continue
+		}
+		refused++
+		if reason == "" {
+			reason = why[i]
+		}
+	}
+	return states, refused, reason
 }
 
-func (c *Client) inspect(ctx context.Context, entry listEntry) (*payload.DockerState, bool) {
+// inspect reads one container. A nil state is a refusal, and the string beside it is why.
+func (c *Client) inspect(ctx context.Context, entry listEntry) (*payload.DockerState, string) {
 	res := c.http.Do(ctx, transport.Request{URL: c.base + pathInspect + entry.ID + "/json"})
-	if _, _, bad := engineFailure(res); bad {
-		return nil, false
+	if _, detail, bad := engineFailure(res); bad {
+		return nil, detail
 	}
 	var got inspectResponse
-	if _, _, err := conn.ReadJSON(bytes.NewReader(res.Body), &got); err != nil {
-		return nil, false
+	if _, code, err := conn.ReadJSON(bytes.NewReader(res.Body), &got); err != nil {
+		detail := "the inspect did not parse"
+		if code != "" {
+			detail += " (" + code + ")"
+		}
+		return nil, describing(detail, res)
 	}
 	st := got.state(entry)
-	return &st, true
+	return &st, ""
 }
 
 // ---------------------------------------------------------------------------
@@ -310,9 +371,12 @@ func engineFailure(res transport.Result) (payload.ConnectionPhase, string, bool)
 	detail := "the Engine answered " + strconv.Itoa(res.Status)
 	var e engineError
 	if _, _, err := conn.ReadJSON(bytes.NewReader(res.Body), &e); err == nil && e.Message != "" {
-		detail += ": " + e.Message
+		return res.Phase, detail + ": " + e.Message, true
 	}
-	return res.Phase, detail, true
+	// Not the Engine's own error shape, so there is no message to quote and the body is the only
+	// account of the refusal there is. This is the socket proxy that was never given CONTAINERS=1:
+	// the status alone reads as *the Engine refused us*, and what actually refused is in front of it.
+	return res.Phase, describing(detail, res), true
 }
 
 // engineError is the shape every Engine error shares.

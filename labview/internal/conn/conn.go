@@ -12,6 +12,7 @@
 package conn
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -25,8 +26,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nrosier/labview/internal/payload"
+	"github.com/nrosier/labview/internal/secrets"
 )
 
 // Target is an outbound target LabView reports on. The set is closed because §15 requires one
@@ -291,6 +294,85 @@ func firstToken(body string) string {
 	}
 }
 
+// ExcerptCap is how much of an unexpected body a detail carries.
+//
+// It is a diagnostic and not a document: what tells an operator which program answered is in the
+// first few hundred bytes — a proxy's status line, a login page's title, the opening bracket of a
+// list that was cut — and a detail long enough to hold a whole page is one nobody finishes reading.
+const ExcerptCap = 512
+
+// Excerpt is the beginning of a body that was not what was asked for, rendered so that it can go in
+// a `detail` — which is the field a reader sees and the one the log prints (§15, §16).
+//
+// It is the counterpart of the `protocol` code and not a replacement for it. The code names the
+// *shape* that answered and must never say more than that (I6; ReadJSON has its own test holding it
+// there). This says what the shape contained, because `not-json` alone leaves an operator with
+// nowhere to go: a socket proxy answering on the Engine's path, a list cut at the body cap and a
+// plain-text refusal all report those same three words.
+//
+// Four things happen to the bytes, and each is what makes printing them defensible:
+//
+//   - Credentials embedded in a URI are redacted (§20). A body is somebody else's output and may
+//     carry a connection string; the rule that covers an environment value covers this too.
+//   - Runs of whitespace become one space, because §15's format is one line per report plus one
+//     indented line per candidate, and a body carrying newlines would forge those lines.
+//   - It is quoted, so a control character is escaped rather than sent to a terminal, and so a
+//     reader can see where the far end's own text begins and ends.
+//   - The *rendered* text is cut at ExcerptCap, and the cut is stated rather than hidden.
+//
+// A body that is not text is described instead of shown. Bytes that are not valid UTF-8 are a gzip
+// stream, a TLS record or a binary protocol, and *that* is the finding — pasting them into a log
+// tells an operator nothing and corrupts the line they were reading.
+func Excerpt(body []byte) string {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	if !utf8.Valid(trimmed) {
+		return strconv.Itoa(len(body)) + " bytes that are not text"
+	}
+
+	// Fields splits on every kind of whitespace and drops the runs, which is both halves of the
+	// one-line rule in one pass.
+	flat := strings.Join(strings.Fields(secrets.RedactURIs(string(trimmed))), " ")
+
+	// Rendered a rune at a time and spent against the cap, rather than cut and then quoted, because
+	// quoting expands what it renders: one control character becomes four characters, so a body that
+	// is largely control characters would produce a line four times the size this cap promises. What
+	// has to be bounded is the text that reaches the log, not the bytes that produced it — and taking
+	// whole runes is what keeps a replacement character out of a diagnostic, where it would only
+	// invite the reader to wonder whether the far end sent it.
+	var b strings.Builder
+	b.WriteByte('"')
+	cut := false
+	for _, r := range flat {
+		piece := quoteRune(r)
+		// The closing quote is part of the cap, so its byte is reserved before the budget is spent.
+		if b.Len()+len(piece) > ExcerptCap-1 {
+			cut = true
+			break
+		}
+		b.WriteString(piece)
+	}
+	b.WriteByte('"')
+	if !cut {
+		return b.String()
+	}
+	// The ellipsis goes outside the quotes: it is this function's word for *there was more*, not a
+	// character the far end sent.
+	return b.String() + "…"
+}
+
+// quoteRune renders one rune as it appears inside a double-quoted string.
+//
+// strconv.QuoteRune would be the obvious call and is the wrong one: it quotes for single quotes, so
+// it escapes `'` and leaves `"` alone — and a `"` written unescaped into a quoted excerpt ends the
+// quoting early, which is the one thing the quoting is there to prevent.
+func quoteRune(r rune) string {
+	q := strconv.Quote(string(r))
+	return q[1 : len(q)-1]
+}
+
 // ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
@@ -386,13 +468,18 @@ func Hint(target Target, phase payload.ConnectionPhase) string {
 			return "the socket path does not exist — check the bind mount; a missing host path " +
 				"is silently created as an empty directory"
 		case payload.PhaseAuthorize:
-			return "the socket is not readable by this user — add the container's uid to the " +
-				"docker group, or mount the socket with different ownership"
+			// Both arrangements, because one action per (target, phase) pair means this string cannot
+			// branch on the endpoint — and naming only the socket sends the larger half of operators to
+			// the wrong fix. A `403` from a *TCP* endpoint is a socket proxy refusing a path it was
+			// never configured to pass, where there is no uid and no socket to chmod; the body quoted
+			// in the detail usually names the proxy outright.
+			return "a socket proxy that was never given CONTAINERS=1, or — on a unix socket — a uid " +
+				"outside the docker group; the quoted body beside this line says which refused"
 		case payload.PhaseConnect:
 			return "nothing is listening — check that the Engine is running and the path or " +
 				"port is right"
 		case payload.PhaseTimeout:
-			return "the Engine did not answer in time — raise LABVIEW_DOCKER_TIMEOUT_MS, or " +
+			return "the Engine did not answer in time — raise LABVIEW_DOCKER_TIMEOUT, or " +
 				"lower LABVIEW_DOCKER_MAX_CONCURRENCY if the host is loaded"
 		case payload.PhasePartial:
 			return "some containers could not be inspected; their ports, networks and health " +
@@ -452,7 +539,7 @@ func Hint(target Target, phase payload.ConnectionPhase) string {
 			return "part of the fleet did not answer; those services claim no measurement " +
 				"either way"
 		case payload.PhaseTimeout:
-			return "raise LABVIEW_PROBE_TIMEOUT_MS, or lower LABVIEW_PROBE_MAX_CONCURRENCY"
+			return "raise LABVIEW_PROBE_TIMEOUT, or lower LABVIEW_PROBE_MAX_CONCURRENCY"
 		case payload.PhaseNotConfigured:
 			return "set LABVIEW_PROBE_LAN_HOST to reach services published on the host only"
 		}

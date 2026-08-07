@@ -1405,6 +1405,18 @@ candidate, phase, code, detail.
 Each phase MUST map to prose, and each (target, phase) pair to **one action to take**. Formatting
 is one line for the report plus one indented line per rejected candidate.
 
+**A response that could not be read MUST account for what arrived instead**, in the detail: its
+size, whether the body cap of I8 cut it, and the beginning of the body itself. The phase and the
+code are not a diagnosis on their own — a socket proxy's refusal, an SSO login page and a container
+list cut at the cap all report `protocol` / `not-json`, and the body is the only thing that
+separates them. The **code** stays a shape and MUST NOT carry content (I6); the **detail** carries
+the excerpt, rendered so that it cannot damage the line it lands in: credentials in it masked
+(§20), runs of whitespace collapsed to one space so a body cannot forge the indented candidate
+lines, quoted so a control character is escaped rather than acted on, bounded in the **rendered**
+text and not in the bytes that produced it, and bytes that are not valid UTF-8 described rather
+than shown. Where the cap did the cutting, the detail MUST say so: that failure is LabView's and
+the hint for the phase points at the far end.
+
 **Comparing two scans' connections MUST compare target, `ok`, phase and endpoint, and MUST NOT
 compare `read`** — otherwise a container count ticking up re-announces a working target on every
 rescan. A banner is shown for `partial`, and for any failure whose phase is neither `disabled` nor

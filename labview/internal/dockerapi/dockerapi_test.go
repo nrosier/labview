@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -85,6 +86,10 @@ type engine struct {
 	inspects map[string]string // full id -> inspect body
 	refuse   map[string]int    // full id -> status answered instead of the body
 
+	// refuseBody is the refusal's own message, for the tests that have to tell two refusals apart.
+	// Absent means the same generic denial for every id.
+	refuseBody map[string]string
+
 	// waitFor makes one inspect answer only after another already has, which forces inspects to
 	// complete in an order that is not list order.
 	waitFor map[string]string
@@ -119,7 +124,8 @@ func (e *engine) RoundTrip(r *http.Request) (*http.Response, error) {
 		defer close(e.signal(id))
 
 		if status, ok := e.refuse[id]; ok {
-			return respond(status, `{"message":"authorization denied by plugin"}`), nil
+			message := orString(e.refuseBody[id], "authorization denied by plugin")
+			return respond(status, `{"message":"`+message+`"}`), nil
 		}
 		if body, ok := e.inspects[id]; ok {
 			return respond(200, body), nil
@@ -743,6 +749,49 @@ func TestOneRefusedInspectOfOneContainerIsStillPartial(t *testing.T) {
 	}
 }
 
+// TestThePartialDetailSaysWhyTheInspectsWereRefused is the count made actionable. *84 of 86 inspects
+// were refused* is a number an operator can do nothing with; they are refused wholesale for one
+// reason, and that reason is already in the response.
+//
+// One reason and not eighty-four copies of the same sentence — and the one quoted is the first in
+// *list* order, not the first to finish. That is the same rule as the index (I7): nothing about this
+// answer may depend on which of the fan-out's workers came back first.
+func TestThePartialDetailSaysWhyTheInspectsWereRefused(t *testing.T) {
+	first, second := id("0f0f"), id("05ec")
+	e := &engine{
+		listBody: listJSON(
+			listSpec{id: first, name: "first-in-list", status: "Up"},
+			listSpec{id: second, name: "second-in-list", status: "Up"},
+		),
+		refuse: map[string]int{first: http.StatusForbidden, second: http.StatusForbidden},
+		// Two distinguishable refusals, so quoting the wrong one is a visible failure rather than a
+		// coincidence that passes.
+		refuseBody: map[string]string{
+			first:  "denied: the first entry in list order",
+			second: "denied: the second entry in list order",
+		},
+		// And the first entry in list order is made to answer last, so a detail built from completion
+		// order quotes the second and a detail built from list order cannot.
+		waitFor: map[string]string{first: second},
+	}
+	snap := read(t, e, nil, nil)
+
+	if snap.Report.Phase != payload.PhasePartial {
+		t.Fatalf("phase = %q, want partial", snap.Report.Phase)
+	}
+	if !strings.Contains(snap.Report.Detail, "2 of 2 inspects were refused") {
+		t.Errorf("detail = %q, want the count", snap.Report.Detail)
+	}
+	if !strings.Contains(snap.Report.Detail, "denied: the first entry in list order") {
+		t.Errorf("detail = %q, want the reason the *first listed* inspect was refused; the answer must "+
+			"not depend on which worker came back first (I7)", snap.Report.Detail)
+	}
+	// One reason, not eighty-four copies of the same sentence.
+	if n := strings.Count(snap.Report.Detail, "denied:"); n != 1 {
+		t.Errorf("detail = %q, want one reason and got %d", snap.Report.Detail, n)
+	}
+}
+
 func TestAnEmptyFleetIsConnectedAndNotPartial(t *testing.T) {
 	snap := read(t, &engine{}, nil, nil)
 	if snap.Report.Phase != payload.PhaseConnected {
@@ -817,20 +866,167 @@ func TestAForbiddenListIsAuthorizeAndNotConnect(t *testing.T) {
 	}
 }
 
-func TestAListThatDoesNotParseIsProtocolAndSaysOnlyTheShape(t *testing.T) {
-	e := &engine{listBody: `<!doctype html><title>super-secret-lab.example</title>`}
+// TestAListThatDoesNotParseSaysWhatAnsweredInstead is the report an operator gets when the path they
+// configured is answered by something that is not the Engine.
+//
+// The shape alone is not a diagnosis. `not-json` is what a socket proxy's refusal, an SSO login page
+// and a list cut at the body cap all report, and an operator handed those three words has to go and
+// curl the endpoint themselves to learn which of the three they have. The body is the only thing that
+// distinguishes them, so the detail carries the beginning of it — bounded, on one line, quoted and
+// with any credential in it masked, which is what makes printing somebody else's output defensible
+// (conn.Excerpt has the tests for each of those).
+//
+// The `protocol` *code* is unchanged and stays a shape: TestReadJSONNeverPutsTheBodyInTheCode holds
+// that where it is decided.
+func TestAListThatDoesNotParseSaysWhatAnsweredInstead(t *testing.T) {
+	e := &engine{listBody: `<!doctype html>` + "\n" + `<title>Sign in — lab.example</title>`}
 	snap := read(t, e, nil, nil)
 
 	if snap.Report.Phase != payload.PhaseProtocol {
 		t.Fatalf("phase = %q, want protocol", snap.Report.Phase)
 	}
-	if !strings.Contains(snap.Report.Detail, "html") {
-		t.Errorf("detail = %q, want the shape of the body", snap.Report.Detail)
+	for _, want := range []string{
+		"html",             // still the shape, from the shared classifier
+		"54 bytes",         // how much of it there was
+		`"<!doctype html>`, // and the body itself, quoted so a reader can see whose text it is
+		"Sign in — lab.example",
+	} {
+		if !strings.Contains(snap.Report.Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", snap.Report.Detail, want)
+		}
 	}
-	// The code is a shape and never a value: whatever answered, its content does not reach the
-	// payload (I6, I2).
-	if strings.Contains(snap.Report.Detail, "super-secret-lab") {
-		t.Errorf("detail = %q, want no part of the body in it", snap.Report.Detail)
+	// §15's format is one line per report plus one indented line per rejected candidate. A body that
+	// arrived with newlines in it must not be able to forge either.
+	if strings.ContainsAny(snap.Report.Detail, "\n\r") {
+		t.Errorf("detail = %q, which carries the body's own line breaks into a one-line format",
+			snap.Report.Detail)
+	}
+}
+
+// TestAListCutAtTheBodyCapSaysSoRatherThanBlamingTheFarEnd is the failure this whole diagnostic was
+// written for, and it is ours rather than the operator's.
+//
+// I8 caps every read at 64 KiB. A fleet whose container list exceeds that gets a body cut mid-array,
+// which then fails to unmarshal and reports `not-json` — a phrase whose hint sends the operator off
+// to find out what is answering on the Docker path, when the answer is that the Engine answered
+// perfectly well and LabView stopped reading. The transport records the cut for exactly this reason;
+// dropping it here was what made the two indistinguishable.
+func TestAListCutAtTheBodyCapSaysSoRatherThanBlamingTheFarEnd(t *testing.T) {
+	specs := make([]listSpec, 512)
+	for i := range specs {
+		name := "svc-" + strconv.Itoa(i)
+		specs[i] = listSpec{id: id(strconv.FormatInt(int64(i), 16)), name: name,
+			status: "Up 3 days", project: "lab", service: name}
+	}
+	body := listJSON(specs...)
+	// The test's own premise, asserted rather than assumed: if the cap or the entry size ever moves,
+	// this fails here instead of silently testing the ordinary path.
+	if len(body) <= transport.BodyCap {
+		t.Fatalf("the list is %d bytes and the cap is %d; this test needs a list that exceeds it",
+			len(body), transport.BodyCap)
+	}
+
+	snap := read(t, &engine{listBody: body}, nil, nil)
+
+	if snap.Report.Phase != payload.PhaseProtocol {
+		t.Fatalf("phase = %q, want protocol (detail %q)", snap.Report.Phase, snap.Report.Detail)
+	}
+	// The cut is stated before anything else, because it changes what the rest of the line means: a
+	// document cut mid-array did not fail to parse because it was the wrong document.
+	for _, want := range []string{"cut at the 64 KiB body cap", "incomplete answer rather than a wrong one"} {
+		if !strings.Contains(snap.Report.Detail, want) {
+			t.Errorf("detail = %q, want it to say %q", snap.Report.Detail, want)
+		}
+	}
+	// The excerpt of a cut list opens on the Engine's own output, which is the corroboration: an
+	// operator who sees the list's first entries knows they were talking to the Engine all along.
+	if !strings.Contains(snap.Report.Detail, `"[{`) {
+		t.Errorf("detail = %q, want the beginning of the list that was cut", snap.Report.Detail)
+	}
+	// 64 KiB of container list must not become 64 KiB of detail.
+	if len(snap.Report.Detail) > 1024 {
+		t.Errorf("detail is %d bytes long, want a diagnostic and not a document", len(snap.Report.Detail))
+	}
+}
+
+// TestAPingThatAnsweredSomethingElseQuotesIt is the same rule one request earlier. A ping is the
+// cheapest possible check and the body it returns is one word, so *the endpoint answered 200 and did
+// not answer `OK`* with nothing after it is a report that withholds the only evidence there was.
+func TestAPingThatAnsweredSomethingElseQuotesIt(t *testing.T) {
+	e := &engine{pingBody: `<html><head><title>docker-socket-proxy</title></head>`}
+	snap := read(t, e, nil, nil)
+
+	if snap.Report.Phase != payload.PhaseProtocol {
+		t.Fatalf("phase = %q, want protocol", snap.Report.Phase)
+	}
+	if !strings.Contains(snap.Report.Detail, "docker-socket-proxy") {
+		t.Errorf("detail = %q, want what answered instead of OK", snap.Report.Detail)
+	}
+}
+
+// TestARefusalThatIsNotTheEnginesOwnShapeIsStillAccountedFor is the socket proxy that was never given
+// CONTAINERS=1. It answers 403 with its own page rather than the Engine's `{"message":...}`, so there
+// is no message to quote and the body is the only account of the refusal in existence.
+//
+// Getting this one wrong is expensive in a specific way: `the Engine answered 403` reads as *the
+// Docker daemon refused you*, and sends an operator to look at daemon permissions and group
+// membership when what refused them is a container sitting in front of it, named in the body.
+func TestARefusalThatIsNotTheEnginesOwnShapeIsStillAccountedFor(t *testing.T) {
+	e := &engine{
+		listStatus: http.StatusForbidden,
+		listBody:   "Access to /containers/json is denied by tecnativa/docker-socket-proxy\n",
+	}
+	snap := read(t, e, nil, nil)
+
+	if snap.Report.Phase != payload.PhaseAuthorize {
+		t.Fatalf("phase = %q, want authorize", snap.Report.Phase)
+	}
+	for _, want := range []string{"403", "docker-socket-proxy"} {
+		if !strings.Contains(snap.Report.Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", snap.Report.Detail, want)
+		}
+	}
+}
+
+// TestABodyWithNothingInItIsNamedAndNotLeftAsAByteCount keeps the two cases with nothing to quote
+// from reading as a sentence that lost its ending — a detail that stops after *2 bytes* looks like a
+// diagnostic that broke halfway, and an operator cannot tell that from one that worked.
+//
+// Both are findings in their own right: something accepted the request, produced a status, and said
+// nothing at all.
+func TestABodyWithNothingInItIsNamedAndNotLeftAsAByteCount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		e    *engine
+		want string
+	}{{
+		// The engine fake reads an empty listBody as *an empty list*, so bytes that say nothing are
+		// asked for as whitespace. It is also the honest wording: there were bytes.
+		name: "whitespace",
+		e:    &engine{listStatus: http.StatusBadGateway, listBody: " \n"},
+		want: "the body was 2 bytes of whitespace",
+	}, {
+		// An inspect answering 200 with no body at all. This also covers the fourth site the excerpt
+		// reaches — a single container's inspect — and its reason arriving in the partial detail.
+		name: "no body at all",
+		e: &engine{
+			listBody: listJSON(listSpec{id: id("0e0e"), name: "silent", status: "Up"}),
+			inspects: map[string]string{id("0e0e"): ""},
+		},
+		want: "the body was empty",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := read(t, tc.e, nil, nil)
+
+			if !strings.Contains(snap.Report.Detail, tc.want) {
+				t.Errorf("detail = %q, want it to say %q", snap.Report.Detail, tc.want)
+			}
+			for _, trailing := range []string{"beginning", ",", ";"} {
+				if strings.HasSuffix(snap.Report.Detail, trailing) {
+					t.Errorf("detail = %q, which trails off", snap.Report.Detail)
+				}
+			}
+		})
 	}
 }
 

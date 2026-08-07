@@ -14,8 +14,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nrosier/labview/internal/payload"
+	"github.com/nrosier/labview/internal/secrets"
 )
 
 // wrapped is how these errors actually arrive: an `http.Client` returns a *url.Error around a
@@ -294,6 +296,127 @@ func TestReadJSONNeverPutsTheBodyInTheCode(t *testing.T) {
 	}
 }
 
+// TestExcerptIsOneQuotedLineWhateverArrived is the other half of the rule above. The code stays a
+// shape; the *detail* is allowed to say what the shape contained, because `not-json` on its own
+// leaves an operator with nowhere to go. What makes that defensible is that the rendering cannot
+// hurt the log it lands in, whatever the far end sent — so each case here is a way a body could
+// otherwise have broken §15's one-line-per-report format or the terminal reading it.
+func TestExcerptIsOneQuotedLineWhateverArrived(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{{
+		// §15's format is one line per report plus one indented line per candidate. A body carrying
+		// newlines would forge those lines, so runs of whitespace collapse to one space.
+		name: "a multi-line body becomes one line",
+		body: "HTTP/1.1 403 Forbidden\r\nServer: nginx\r\n\r\n  API\tforbidden\n",
+		want: `"HTTP/1.1 403 Forbidden Server: nginx API forbidden"`,
+	}, {
+		// Quoting is what keeps an escape sequence from reaching the terminal *as* an escape
+		// sequence: it survives into the line as the four printable characters that describe it,
+		// where a reader can see what was sent, rather than clearing their screen.
+		name: "control characters are escaped and not acted on",
+		body: "\x1b[2J\x07oops",
+		want: `"\x1b[2J\aoops"`,
+	}, {
+		name: "an empty body has nothing to say",
+		body: "",
+		want: "",
+	}, {
+		name: "a body of nothing but whitespace has nothing to say either",
+		body: " \r\n\t ",
+		want: "",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Excerpt([]byte(tc.body)); got != tc.want {
+				t.Errorf("Excerpt(%q) = %s, want %s", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExcerptRedactsACredentialItWasHanded is I6 reaching the one field that now carries somebody
+// else's output. A body is not ours and may hold a connection string — a proxy echoing its upstream,
+// an ORM printing the DSN it failed on — and the rule that covers an environment value covers this.
+func TestExcerptRedactsACredentialItWasHanded(t *testing.T) {
+	got := Excerpt([]byte(`{"error":"dial postgres://labview:hunter2@db.internal:5432/lab failed"}`))
+
+	if strings.Contains(got, "hunter2") {
+		t.Errorf("Excerpt = %s, which carries the password the body handed it", got)
+	}
+	if !strings.Contains(got, secrets.Mask) {
+		t.Errorf("Excerpt = %s, want the password replaced by %q rather than dropped: an operator "+
+			"needs to see that one was there", got, secrets.Mask)
+	}
+	// Redaction is not censorship of the finding. Everything that says *which* program answered has
+	// to survive it, or the excerpt stops earning its place in the detail.
+	for _, keep := range []string{"postgres://", "labview", "db.internal:5432"} {
+		if !strings.Contains(got, keep) {
+			t.Errorf("Excerpt = %s, want it to keep %q", got, keep)
+		}
+	}
+}
+
+// TestExcerptIsBoundedAndSaysWhereItStopped is I8's containment applied to a diagnostic: a detail
+// long enough to hold a whole page is one nobody finishes reading, and a 64 KiB body pasted into a
+// log is worse than no excerpt at all.
+func TestExcerptIsBoundedAndSaysWhereItStopped(t *testing.T) {
+	// The second body is the one that catches a cut made before quoting rather than after: escaped,
+	// every byte of it renders as four, so a cap spent on the body instead of on the rendering
+	// produces a line four times the length promised.
+	for _, body := range []string{strings.Repeat("a", 4<<10), strings.Repeat("\x01", 4<<10)} {
+		got := Excerpt([]byte(body))
+
+		// The ellipsis is this function's own character and sits outside the cap; everything else,
+		// quotes included, is spent from it.
+		if len(got) > ExcerptCap+len("…") {
+			t.Errorf("Excerpt of %d bytes of %q rendered to %d bytes, want no more than ExcerptCap "+
+				"(%d) and the ellipsis", len(body), body[:1], len(got), ExcerptCap)
+		}
+		if !strings.HasSuffix(got, `"…`) {
+			t.Errorf("Excerpt = %s, want the cut stated with an ellipsis outside the quotes: it is "+
+				"this program's word for *there was more*, not a character the far end sent", got)
+		}
+	}
+}
+
+// TestExcerptNeverSplitsARune keeps a replacement character out of a diagnostic. One appearing in a
+// detail invites the reader to wonder whether the far end sent it, which is an hour spent on this
+// program instead of on their fleet.
+func TestExcerptNeverSplitsARune(t *testing.T) {
+	// Three bytes each, so the cap lands mid-rune however it divides.
+	body := strings.Repeat("字", ExcerptCap)
+
+	got := Excerpt([]byte(body))
+
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Errorf("Excerpt = %s, which was cut through the middle of a rune", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("Excerpt = %q, which is not valid UTF-8", got)
+	}
+}
+
+// TestExcerptDescribesBytesThatAreNotText is the case where showing the body helps nobody. A gzip
+// stream, a TLS record or a binary protocol answering on the Engine's path is itself the finding —
+// pasting it corrupts the line the operator was reading and tells them nothing.
+func TestExcerptDescribesBytesThatAreNotText(t *testing.T) {
+	// A TLS server hello: the far end is speaking HTTPS on a plaintext port, which is a real and
+	// common misconfiguration and one an operator can act on the moment it is named.
+	got := Excerpt([]byte{0x16, 0x03, 0x01, 0x00, 0xa5, 0x01, 0x00, 0x00, 0xa1, 0xff})
+
+	if !strings.Contains(got, "not text") {
+		t.Errorf("Excerpt = %q, want the bytes described rather than shown", got)
+	}
+	if !strings.Contains(got, "10") {
+		t.Errorf("Excerpt = %q, want the length said: it is the only thing left to report", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("Excerpt = %q, which put the bytes in the log after all", got)
+	}
+}
+
 // failingReader stops mid-body, which is what a connection dropped during a read looks like.
 type failingReader struct{ after int }
 
@@ -401,11 +524,18 @@ func TestTheActionDependsOnTheTarget(t *testing.T) {
 		t.Errorf("traefik/credential = %q, want it to rule out the Authentik token", traefik)
 	}
 
-	// The same shape for `authorize`: on Docker it is a filesystem permission, on Authentik a
+	// The same shape for `authorize`: on Docker it is the endpoint's own permission, on Authentik a
 	// token's scope. Nothing about them is interchangeable.
+	//
+	// Docker's names both of its arrangements, because the hint cannot branch on the endpoint and the
+	// two have nothing in common: a `403` over TCP is a socket proxy refusing a path it was never
+	// given, where there is no uid and no socket to chmod, and a `403` on a unix socket is a group
+	// membership. A hint naming only one of them is wrong half the time it is read.
 	docker := Hint(TargetDocker, payload.PhaseAuthorize)
-	if !strings.Contains(docker, "docker group") {
-		t.Errorf("docker/authorize = %q, want it to name the group", docker)
+	for _, want := range []string{"docker group", "CONTAINERS=1"} {
+		if !strings.Contains(docker, want) {
+			t.Errorf("docker/authorize = %q, want it to name %q", docker, want)
+		}
 	}
 	if docker == Hint(TargetAuthentik, payload.PhaseAuthorize) {
 		t.Error("docker and authentik give the same action for `authorize`")

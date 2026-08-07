@@ -1105,13 +1105,48 @@ banner — an optional integration being off is not a fault.
 | `authorize` | the identity was accepted and the access refused (HTTP 403) | **the socket proxy's `CONTAINERS=1`**, or the token's permissions; on a unix socket, the container user's group membership |
 | `path` | no API of this kind answered here (HTTP 404/405) | the base URL — no `/api/v3` suffix for Authentik, `api: {}` enabled for Traefik |
 | `status` | some other error status | the endpoint's own logs |
-| `protocol` | something answered, but not this API | almost always an SSO login page in front of it — point at the internal address instead |
+| `protocol` | something answered, but not this API | almost always an SSO login page in front of it — point at the internal address instead; the line quotes the beginning of what answered, which usually names it outright |
 | `partial` | connected, part of the read failed | the reason is on the line; the posture is unchanged, and nothing is concluded from the missing part |
 
 The most common two in practice, both of which read like a network problem and are
 neither: `authorize` from a socket proxy that was never given `CONTAINERS=1`, and
 `protocol` from a URL that reaches an identity provider's login page rather than the
 API behind it.
+
+### What answered instead
+
+A phase says the API was not read and a code says what shape arrived instead, and
+neither tells you *which* program on that address is talking to you. `not-json` is
+what a socket proxy's refusal, an SSO login page and a truncated container list all
+report. So when a response cannot be read, the line also carries how big it was and
+the beginning of it, quoted:
+
+```text
+warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the container list did not parse (not-json); 40 bytes, beginning "Service Unavailable: no healthy upstream" — something answered on that path that is not the Docker Engine
+warn [conn] docker: authorize unix:///var/run/docker.sock (default) — the Engine answered 403; 70 bytes, beginning "Access to /containers/json is denied by tecnativa/docker-socket-proxy" — the socket is not readable by this user — …
+warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the endpoint answered 200 and did not answer `OK`; 53 bytes, beginning "<html><head><title>docker-socket-proxy</title></head>" — …
+```
+
+The body is somebody else's output, so it is treated as such: a password inside a
+URL in it is masked, it is cut to a few hundred characters, its line breaks are
+flattened into the one line, control characters are escaped rather than sent to your
+terminal, and a body that is not text at all is described — *5 bytes that are not
+text*, which is what a TLS handshake answering on a plaintext port looks like —
+rather than pasted into your log.
+
+One case in that line is worth recognising, because the fix is ours rather than
+yours:
+
+```text
+warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the container list did not parse (not-json), and it was cut at the 64 KiB body cap, so what did not parse is an incomplete answer rather than a wrong one; 65536 bytes, beginning "[{\"Id\":\"3f9a…
+```
+
+Every read is capped at 64 KiB. A fleet whose container list exceeds that gets a
+body cut mid-array, which then fails to parse and reports `not-json` — with a hint
+sending you to find out what is answering on the Docker path, when the answer is
+that the Engine answered perfectly well and LabView stopped reading. The clause
+about the cap is how you tell the two apart at a glance, and the quoted opening is
+the corroboration: it is the Engine's own container list.
 
 ---
 
