@@ -340,6 +340,7 @@ Everything works out of the box. To tune, copy
 | `LABVIEW_DOCKER_SOCKET` | `/var/run/docker.sock` | Socket path. Setting it always wins and disables the TCP host |
 | `LABVIEW_DOCKER_MAX_CONCURRENCY` | `8` | Max concurrent container inspects per scan |
 | `LABVIEW_DOCKER_TIMEOUT` | `5000` | Per-request socket-inactivity timeout, ms. Reset whenever bytes arrive, so a large fleet's listing is unaffected; it exists to turn an endpoint that accepts the connection and then says nothing into a reported `timeout` |
+| `LABVIEW_DOCKER_BODY_CAP` | `8388608` | How much of one Engine response to read, **in bytes** — 8 MiB is about eight thousand containers. The only read with a cap of its own; everything else is capped at 64 KiB. Below 64 KiB is rejected with a note (writing `8` for eight megabytes asks for eight bytes), and above 32 MiB is clamped |
 | `LABVIEW_PORT` | `8080` | HTTP port (container-internal) |
 | `LABVIEW_HOST` | `0.0.0.0` | Bind address |
 | `LABVIEW_CACHE_TTL` | `60` | Seconds a scan is cached before refresh; Rescan ignores it |
@@ -1123,7 +1124,7 @@ the beginning of it, quoted:
 
 ```text
 warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the container list did not parse (not-json); 40 bytes, beginning "Service Unavailable: no healthy upstream" — something answered on that path that is not the Docker Engine
-warn [conn] docker: authorize unix:///var/run/docker.sock (default) — the Engine answered 403; 70 bytes, beginning "Access to /containers/json is denied by tecnativa/docker-socket-proxy" — the socket is not readable by this user — …
+warn [conn] docker: authorize tcp://dockerproxy:2375 (config) — the Engine answered 403; 70 bytes, beginning "Access to /containers/json is denied by tecnativa/docker-socket-proxy" — a socket proxy that was never given CONTAINERS=1, or …
 warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the endpoint answered 200 and did not answer `OK`; 53 bytes, beginning "<html><head><title>docker-socket-proxy</title></head>" — …
 ```
 
@@ -1138,15 +1139,24 @@ One case in that line is worth recognising, because the fix is ours rather than
 yours:
 
 ```text
-warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the container list did not parse (not-json), and it was cut at the 64 KiB body cap, so what did not parse is an incomplete answer rather than a wrong one; 65536 bytes, beginning "[{\"Id\":\"3f9a…
+warn [conn] docker: protocol tcp://dockerproxy:2375 (config) — the container list did not parse (not-json), and it was cut at the 8 MiB body cap, so what did not parse is an incomplete answer rather than a wrong one; 8388608 bytes, beginning "[{\"Id\":\"3f9a…
 ```
 
-Every read is capped at 64 KiB. A fleet whose container list exceeds that gets a
-body cut mid-array, which then fails to parse and reports `not-json` — with a hint
-sending you to find out what is answering on the Docker path, when the answer is
-that the Engine answered perfectly well and LabView stopped reading. The clause
-about the cap is how you tell the two apart at a glance, and the quoted opening is
-the corroboration: it is the Engine's own container list.
+Every read is capped, because a reader that will accept whatever arrives has no
+bound worth the name. But the two kinds of read do not deserve the same number: a
+page from a probed service is a document somebody else wrote, and 64 KiB of it is
+plenty, whereas a container list is *your* fleet's own data and grows by about a
+kilobyte per container — so 64 KiB of it is roughly forty containers. Reading the
+Docker endpoint under that shared cap is how a healthy 86-container fleet came to be
+reported as `not-json`: the body was cut mid-array, so it did not parse, and the hint
+sent you looking for whatever was answering on the Docker path when the Engine had
+answered correctly all along.
+
+So the Docker reads have a cap of their own — `LABVIEW_DOCKER_BODY_CAP`, 8 MiB by
+default, about eight thousand containers — and everything else keeps 64 KiB. If you
+do somehow reach it, the clause names the cap that actually applied, so the number in
+the line is the number you would raise. The quoted opening is the corroboration: it
+is the Engine's own container list, which means you were talking to the Engine.
 
 ---
 

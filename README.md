@@ -231,7 +231,9 @@ login page instead of the API behind it.
 A response that could not be read also has **the beginning of it quoted on the
 line** — masked, flattened to one line and cut short — because the stage alone
 cannot tell a socket proxy's refusal from a login page from a reply LabView
-truncated at its own 64 KiB cap, and the body usually names the program outright.
+truncated at its own read cap, and the body usually names the program outright.
+Where a cap did the cutting the line says so and names the cap that applied, so a
+fleet too large to fit is never reported as a fleet that does not speak Docker.
 See [what answered instead](labview/README.md#what-answered-instead).
 
 ---

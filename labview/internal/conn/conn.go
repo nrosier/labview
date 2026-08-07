@@ -258,9 +258,9 @@ func FromStatus(status int) payload.ConnectionPhase {
 // serves its own login page with a 200 — the status says success and the phase says the API was
 // never reached.
 //
-// The read is bounded by whatever reader it is handed. It does not impose its own cap, because the
-// 64 KiB cap of I8 is applied once, at the transport, and a second cap here would be a second
-// number to keep in step.
+// The read is bounded by whatever reader it is handed. It does not impose its own cap, because I8's
+// size bound is applied once, at the transport, where the request that chose the cap is still in
+// scope — and a second cap here would be a second number to keep in step with the first.
 func ReadJSON(r io.Reader, into any) (payload.ConnectionPhase, string, error) {
 	body, err := io.ReadAll(r)
 	if err != nil {

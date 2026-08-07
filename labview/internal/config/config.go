@@ -63,7 +63,23 @@ type DockerConfig struct {
 	// inactivity, not total time (§3.2).
 	MaxConcurrency int `yaml:"maxConcurrency"`
 	TimeoutMs      int `yaml:"timeoutMs"`
+
+	// BodyCapBytes is how much of one Engine response to read (I8). It is the only read in
+	// the program with a cap of its own, because it is the only one whose size is a fact
+	// about this fleet: a container list runs about a kilobyte per container, so the shared
+	// 64 KiB is roughly forty of them, and past that the list arrives cut and fails to parse
+	// while the Engine has done nothing wrong.
+	BodyCapBytes int `yaml:"bodyCapBytes"`
 }
+
+// MinDockerBodyCap is the floor under docker.bodyCapBytes, and it is the shared default cap
+// of every other read (transport.BodyCap; config_test holds the two in step, since this
+// package imports nothing).
+//
+// A Docker cap *below* what every other read gets can only make a read fail, and it is the
+// shape of the likeliest mistake by a wide margin: LABVIEW_DOCKER_BODY_CAP=8, meaning eight
+// megabytes, asking for eight bytes.
+const MinDockerBodyCap = 64 << 10
 
 // SecretsConfig is §20: which environment keys are masked, and how.
 type SecretsConfig struct {
@@ -204,6 +220,7 @@ func Defaults() Config {
 			SocketPath:     "/var/run/docker.sock",
 			MaxConcurrency: 8,
 			TimeoutMs:      5000,
+			BodyCapBytes:   8 << 20,
 		},
 		Secrets: SecretsConfig{
 			MaskValues: true,
@@ -336,6 +353,15 @@ func (c *Config) validate() []string {
 	}
 
 	atLeastOne("docker.maxConcurrency", &c.Docker.MaxConcurrency, d.Docker.MaxConcurrency)
+	// A floor rather than atLeastOne, because one byte is not a usable cap and the mistake
+	// this catches is an operator writing 8 for eight megabytes. Rejecting it in favour of the
+	// default is what every other out-of-range number here does; the note is what makes the
+	// difference visible instead of leaving a scan reporting `not-json` for a healthy Engine.
+	if c.Docker.BodyCapBytes < MinDockerBodyCap {
+		notes = append(notes, rangeNote("docker.bodyCapBytes", c.Docker.BodyCapBytes,
+			d.Docker.BodyCapBytes, "at least "+itoa(MinDockerBodyCap>>10)+" KiB"))
+		c.Docker.BodyCapBytes = d.Docker.BodyCapBytes
+	}
 	atLeastOne("probe.maxConcurrency", &c.Probe.MaxConcurrency, d.Probe.MaxConcurrency)
 	// maxPages bounds a read the same way maxConcurrency does. Zero would make the
 	// integration report itself reachable having read nothing, which is a false statement

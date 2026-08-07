@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/nrosier/labview/internal/transport"
 )
 
 // defaultTable is §3.1 transcribed by hand, keyed by dotted setting path.
@@ -24,6 +26,10 @@ var defaultTable = map[string]any{
 	"docker.socketPath":     "/var/run/docker.sock",
 	"docker.maxConcurrency": 8,
 	"docker.timeoutMs":      5000,
+	// 8 MiB is about eight thousand containers at a kilobyte each: high enough that no real
+	// fleet reaches it, low enough that a far end answering with a stream is not this
+	// process's memory problem.
+	"docker.bodyCapBytes": 8 << 20,
 
 	"secrets.maskValues": true,
 	"secrets.keyPatterns": []string{"PASS", "SECRET", "TOKEN", "KEY", "APIKEY", "CREDENTIAL",
@@ -214,6 +220,12 @@ func TestRangeFallbacksUseTheBuiltInDefault(t *testing.T) {
 			"[config] auth.maxFailedAttempts must be at least 1; using 5 instead of 0"},
 		{"LABVIEW_AUTH_LOCKOUT_SECONDS", "0", "auth.lockoutSeconds", 60,
 			"[config] auth.lockoutSeconds must be at least 1; using 60 instead of 0"},
+		// The setting is in bytes, so the operator who means eight megabytes and writes 8 asks
+		// for eight bytes. Every read would then fail as a protocol error against an Engine
+		// that answered correctly, which is the exact confusion this whole change removes — so
+		// it falls back and says so rather than being honoured.
+		{"LABVIEW_DOCKER_BODY_CAP", "8", "docker.bodyCapBytes", 8 << 20,
+			"[config] docker.bodyCapBytes must be at least 64 KiB; using 8388608 instead of 8"},
 	}
 	for _, c := range cases {
 		t.Run(c.key, func(t *testing.T) {
@@ -223,6 +235,26 @@ func TestRangeFallbacksUseTheBuiltInDefault(t *testing.T) {
 			}
 			requireLog(t, diag, c.note)
 		})
+	}
+}
+
+// TestTheDockerCapFloorIsTheSharedCap holds MinDockerBodyCap to transport.BodyCap.
+//
+// The config package imports nothing, on purpose — so the floor is a literal there and the
+// two numbers can drift apart in silence. They must not: the floor's whole claim is that a
+// Docker cap below what *every other read* already gets can only be a mistake, and if the
+// shared cap moved that sentence would stop being true. The test is the import config.go
+// deliberately does not have.
+func TestTheDockerCapFloorIsTheSharedCap(t *testing.T) {
+	if MinDockerBodyCap != transport.BodyCap {
+		t.Errorf("MinDockerBodyCap = %d, transport.BodyCap = %d — the floor is meant to be the "+
+			"shared default cap, so one of them moved without the other",
+			MinDockerBodyCap, transport.BodyCap)
+	}
+	// And the default has to be above its own floor, or the fallback would fall to a value the
+	// validation rejects.
+	if got := Defaults().Docker.BodyCapBytes; got < MinDockerBodyCap {
+		t.Errorf("default docker.bodyCapBytes = %d, below the floor of %d", got, MinDockerBodyCap)
 	}
 }
 

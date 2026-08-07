@@ -74,9 +74,10 @@ func (f fakeFS) Usable(name string) error {
 // records every URL it was asked for — which is how "exactly three kinds of request" is asserted
 // rather than asserted about.
 type engine struct {
-	mu    sync.Mutex
-	asked []string
-	done  map[string]chan struct{}
+	mu       sync.Mutex
+	asked    []string
+	done     map[string]chan struct{}
+	finished map[string]bool
 
 	pingStatus int    // 0 means 200
 	pingBody   string // empty means "OK"
@@ -121,7 +122,7 @@ func (e *engine) RoundTrip(r *http.Request) (*http.Response, error) {
 		if before, ok := e.waitFor[id]; ok {
 			<-e.signal(before)
 		}
-		defer close(e.signal(id))
+		defer e.finish(id)
 
 		if status, ok := e.refuse[id]; ok {
 			message := orString(e.refuseBody[id], "authorization denied by plugin")
@@ -151,6 +152,11 @@ func (e *engine) recorded() []string {
 func (e *engine) signal(id string) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.gateLocked(id)
+}
+
+// gateLocked returns the id's gate, creating it on first use. The caller holds e.mu.
+func (e *engine) gateLocked(id string) chan struct{} {
 	if e.done == nil {
 		e.done = map[string]chan struct{}{}
 	}
@@ -158,6 +164,26 @@ func (e *engine) signal(id string) chan struct{} {
 		e.done[id] = make(chan struct{})
 	}
 	return e.done[id]
+}
+
+// finish opens an id's gate for whoever is waiting on it, and says so plainly if the same id
+// finishes twice.
+//
+// Twice means two inspects of one container, which means the list carried a duplicate id — a
+// broken fixture rather than a broken program. Left as a bare `close(...)` in a deferred call,
+// that arrives as "close of closed channel" from inside a goroutine, which is a long way from
+// naming the id that was written down twice.
+func (e *engine) finish(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finished == nil {
+		e.finished = map[string]bool{}
+	}
+	if e.finished[id] {
+		panic("engine fake: container " + id + " was inspected twice; the list carries a duplicate id")
+	}
+	e.finished[id] = true
+	close(e.gateLocked(id))
 }
 
 func respond(status int, body string) *http.Response {
@@ -206,6 +232,16 @@ func read(t *testing.T, e *engine, fsys Filesystem, mutate func(*config.DockerCo
 // id pads a readable prefix out to the 64 hex characters the Engine returns, so that the 12-char
 // short id in the index is a real truncation rather than the whole thing.
 func id(prefix string) string { return prefix + strings.Repeat("0", 64-len(prefix)) }
+
+// nthID is a distinct id for the nth container of a generated fleet.
+//
+// The width matters: id pads on the *right*, so id("1") and id("10") are the same 64 characters,
+// and a generated list numbered with a bare counter carries duplicate ids from the seventeenth
+// entry onward. Fixed-width hex keeps them distinct.
+func nthID(n int) string {
+	hex := strconv.FormatInt(int64(n), 16)
+	return id(strings.Repeat("0", 4-len(hex)) + hex)
+}
 
 type listSpec struct {
 	id      string
@@ -903,49 +939,168 @@ func TestAListThatDoesNotParseSaysWhatAnsweredInstead(t *testing.T) {
 	}
 }
 
-// TestAListCutAtTheBodyCapSaysSoRatherThanBlamingTheFarEnd is the failure this whole diagnostic was
-// written for, and it is ours rather than the operator's.
-//
-// I8 caps every read at 64 KiB. A fleet whose container list exceeds that gets a body cut mid-array,
-// which then fails to unmarshal and reports `not-json` — a phrase whose hint sends the operator off
-// to find out what is answering on the Docker path, when the answer is that the Engine answered
-// perfectly well and LabView stopped reading. The transport records the cut for exactly this reason;
-// dropping it here was what made the two indistinguishable.
-func TestAListCutAtTheBodyCapSaysSoRatherThanBlamingTheFarEnd(t *testing.T) {
-	specs := make([]listSpec, 512)
+// fleetList is a generated container list of n containers, and the inspect body for each.
+func fleetList(n int) (string, map[string]string) {
+	specs := make([]listSpec, n)
+	inspects := make(map[string]string, n)
 	for i := range specs {
 		name := "svc-" + strconv.Itoa(i)
-		specs[i] = listSpec{id: id(strconv.FormatInt(int64(i), 16)), name: name,
-			status: "Up 3 days", project: "lab", service: name}
+		cid := nthID(i)
+		specs[i] = listSpec{id: cid, name: name, status: "Up 3 days", project: "lab", service: name}
+		inspects[cid] = minimalInspect(cid, name)
 	}
-	body := listJSON(specs...)
-	// The test's own premise, asserted rather than assumed: if the cap or the entry size ever moves,
-	// this fails here instead of silently testing the ordinary path.
-	if len(body) <= transport.BodyCap {
-		t.Fatalf("the list is %d bytes and the cap is %d; this test needs a list that exceeds it",
-			len(body), transport.BodyCap)
-	}
+	return listJSON(specs...), inspects
+}
 
-	snap := read(t, &engine{listBody: body}, nil, nil)
+// fleetLargerThan is the smallest generated fleet whose list body exceeds want bytes, with its
+// inspect bodies and its container count.
+//
+// Sized by measurement rather than by a literal count. This fixture's list entry carries four
+// fields where a real Engine's carries a dozen, so the container count that overflows a given cap
+// is a property of the fixture — and a hard-coded one would stop overflowing the moment either the
+// entry or the cap moved, leaving a test that passes while exercising the ordinary path.
+func fleetLargerThan(want int) (string, map[string]string, int) {
+	sample, _ := fleetList(16)
+	for n := want*16/len(sample) + 1; ; n++ {
+		body, inspects := fleetList(n)
+		if len(body) > want {
+			return body, inspects, n
+		}
+	}
+}
+
+// TestAFleetLargerThanTheSharedCapIsReadAndNotMisreported is the outage this change exists for.
+//
+// A container list is about a kilobyte per container, so the shared 64 KiB cap runs out at roughly
+// forty of them. Past that the Engine answered correctly, LabView stopped reading mid-array, the
+// body failed to unmarshal, and the report said `protocol` / `not-json` — LabView's own ceiling
+// described as the far end not speaking Docker, with a hint sending the operator to look for
+// whatever was answering on the Docker path. The fleet was legible the whole time.
+//
+// So the assertion is not about the wording of a diagnostic: it is that there is no diagnostic. The
+// list is read, every container is in the index, and the report is plain `connected`.
+func TestAFleetLargerThanTheSharedCapIsReadAndNotMisreported(t *testing.T) {
+	body, inspects, containers := fleetLargerThan(transport.BodyCap)
+
+	snap := read(t, &engine{listBody: body, inspects: inspects}, nil, nil)
+
+	if snap.Report.Phase != payload.PhaseConnected {
+		t.Fatalf("phase = %q, want connected — the Engine answered a %d-byte list in full (detail %q)",
+			snap.Report.Phase, len(body), snap.Report.Detail)
+	}
+	if snap.Report.Detail != "" {
+		t.Errorf("detail = %q, want nothing to report", snap.Report.Detail)
+	}
+	if got := len(snap.Order); got != containers {
+		t.Errorf("indexed %d containers, want all %d", got, containers)
+	}
+}
+
+// TestAnInspectLargerThanTheSharedCapIsReadToo is the same rule one request later, for one
+// container rather than the whole fleet.
+//
+// An inspect is small until it is not: a service carrying a compose config-hash, a set of Traefik
+// router and middleware labels, and a tunnel's own annotations has a label map that is most of its
+// response. Cut, that container alone reports `the inspect did not parse` and is left out of every
+// conclusion (§10) — one service missing from the index for a reason that is LabView's.
+func TestAnInspectLargerThanTheSharedCapIsReadToo(t *testing.T) {
+	cid, name := id("big"), "big"
+	labels := make([]string, 0, 512)
+	for i := 0; len(strings.Join(labels, ",")) <= transport.BodyCap; i++ {
+		labels = append(labels, `"com.example.router.`+strconv.Itoa(i)+`": "Host(\"svc`+
+			strconv.Itoa(i)+`.lab.example\") && PathPrefix(\"/api\")"`)
+	}
+	body := `{
+		"Id": "` + cid + `",
+		"Name": "/` + name + `",
+		"Created": "2026-01-01T00:00:00Z",
+		"RestartCount": 0,
+		"Config": {"Image": "ghcr.io/example/big:1", "Labels": {` + strings.Join(labels, ",") + `}},
+		"State": {"Status": "running", "Running": true, "StartedAt": "2026-01-02T00:00:00Z"},
+		"NetworkSettings": {"Networks": {"proxy": {"IPAddress": "172.20.0.2"}}, "Ports": {}}
+	}`
+
+	e := &engine{
+		listBody: listJSON(listSpec{id: cid, name: name, status: "Up 3 days", project: "lab", service: name}),
+		inspects: map[string]string{cid: body},
+	}
+	snap := read(t, e, nil, nil)
+
+	if snap.Report.Phase != payload.PhaseConnected {
+		t.Fatalf("phase = %q, want connected — the Engine answered a %d-byte inspect in full (detail %q)",
+			snap.Report.Phase, len(body), snap.Report.Detail)
+	}
+	st, ok := snap.Get(shortID(cid))
+	if !ok {
+		t.Fatalf("container %s is not in the index; the whole point of reading it was to have it",
+			shortID(cid))
+	}
+	if !st.Running || st.Image != "ghcr.io/example/big:1" {
+		t.Errorf("state = %+v, want the fields the inspect carried", st)
+	}
+}
+
+// TestAListCutAtTheConfiguredCapSaysSoRatherThanBlamingTheFarEnd is the same failure one cap
+// higher, because a per-request cap moves the ceiling rather than removing it (I8).
+//
+// Two things are under test. That a cut is reported as a cut — a document cut mid-array did not
+// fail to parse because it was the wrong document, and saying only `not-json` sends the operator
+// after the wrong thing. And that the number in the line is the cap that *actually applied*: this
+// read has a cap of its own, so naming the shared constant would point at a setting that had
+// nothing to do with the cut.
+func TestAListCutAtTheConfiguredCapSaysSoRatherThanBlamingTheFarEnd(t *testing.T) {
+	// Deliberately not transport.BodyCap: a detail that names the shared constant would satisfy an
+	// assertion written against 64 KiB while telling the operator to raise the wrong number.
+	const capBytes = 128 << 10
+	body, _, _ := fleetLargerThan(capBytes)
+
+	snap := read(t, &engine{listBody: body}, nil, func(c *config.DockerConfig) {
+		c.BodyCapBytes = capBytes
+	})
 
 	if snap.Report.Phase != payload.PhaseProtocol {
 		t.Fatalf("phase = %q, want protocol (detail %q)", snap.Report.Phase, snap.Report.Detail)
 	}
-	// The cut is stated before anything else, because it changes what the rest of the line means: a
-	// document cut mid-array did not fail to parse because it was the wrong document.
-	for _, want := range []string{"cut at the 64 KiB body cap", "incomplete answer rather than a wrong one"} {
+	// The cut is stated before anything else, because it changes what the rest of the line means.
+	for _, want := range []string{"cut at the 128 KiB body cap", "incomplete answer rather than a wrong one"} {
 		if !strings.Contains(snap.Report.Detail, want) {
 			t.Errorf("detail = %q, want it to say %q", snap.Report.Detail, want)
 		}
+	}
+	if strings.Contains(snap.Report.Detail, strconv.Itoa(transport.BodyCap>>10)+" KiB") {
+		t.Errorf("detail = %q, want the cap that applied and not the shared default", snap.Report.Detail)
 	}
 	// The excerpt of a cut list opens on the Engine's own output, which is the corroboration: an
 	// operator who sees the list's first entries knows they were talking to the Engine all along.
 	if !strings.Contains(snap.Report.Detail, `"[{`) {
 		t.Errorf("detail = %q, want the beginning of the list that was cut", snap.Report.Detail)
 	}
-	// 64 KiB of container list must not become 64 KiB of detail.
+	// 128 KiB of container list must not become 128 KiB of detail.
 	if len(snap.Report.Detail) > 1024 {
 		t.Errorf("detail is %d bytes long, want a diagnostic and not a document", len(snap.Report.Detail))
+	}
+}
+
+// TestTheCapIsNamedInTheUnitItWasWrittenIn covers capSize on its own, because the sizes that matter
+// are the two an operator actually types — the 8 MiB default and a KiB-sized override — and reaching
+// either through a generated fleet costs megabytes of fixture.
+func TestTheCapIsNamedInTheUnitItWasWrittenIn(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want string
+	}{
+		{8 << 20, "8 MiB"},
+		{1 << 20, "1 MiB"},
+		{64 << 10, "64 KiB"},
+		{128 << 10, "128 KiB"},
+		// Not a round unit, so it is left in bytes: "97 KiB" is a number that appears nowhere in
+		// the configuration, and rounding a cap makes the detail disagree with the setting.
+		{100000, "100000 bytes"},
+		{1, "1 byte"},
+	} {
+		if got := capSize(tc.in); got != tc.want {
+			t.Errorf("capSize(%d) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

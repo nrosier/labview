@@ -1,9 +1,10 @@
 // Package transport is the one HTTP chokepoint. Every outbound request in the program — the three
 // Docker reads, Authentik, Traefik, the probe and the OIDC issuer — is issued through it.
 //
-// Being the only way out is what makes I8's bounds checkable: the time budget, the 64 KiB body cap
-// and the number of requests in flight are single numbers rather than a convention repeated at six
-// call sites. It is also what makes the phase taxonomy single-valued — this package owns the elapsed
+// Being the only way out is what makes I8's bounds checkable: the time budget, the body cap and the
+// number of requests in flight are decided here rather than by a convention repeated at six call
+// sites. The cap is the one of the three a caller may choose (Request.Cap) — and even then only
+// within this package's ceiling, because *how much* is a caller's business and *whether* is not. It is also what makes the phase taxonomy single-valued — this package owns the elapsed
 // time and the budget, so it is the only thing that *can* classify a transport error (§15), and a
 // caller receives a phase it did not derive.
 //
@@ -35,10 +36,27 @@ import (
 	"github.com/nrosier/labview/internal/payload"
 )
 
-// BodyCap is the 64 KiB every network read in the program shares (I8, §13.6). It is one constant
-// because two of them drift: a probe that read 64 KiB and an API that read 128 would make the
-// truncation note mean different things in two panels of the same payload.
+// BodyCap is the 64 KiB a network read takes when it asks for no cap of its own (I8, §13.6). It is
+// the default for every read of a document somebody else authored — an HTML page from a probed
+// service, an API's error body — because the size of one of those is not a fact about this fleet, and
+// a reader that will accept a megabyte of it has no bound worth the name.
+//
+// It is deliberately not the only cap. One number for every read sounds like the safer rule and is
+// not: a container list is *this* fleet's own data, its size grows with the number of containers, and
+// 64 KiB of it is roughly forty containers. Held to one constant, the honest options are to cut the
+// list — reporting `protocol` for a body the Engine answered perfectly — or to raise the bound for
+// the probe's arbitrary HTML too. A read that needs a different number says so per request, and
+// Result.Cap records which number applied so a truncation note still means one thing.
 const BodyCap = 64 << 10
+
+// MaxBodyCap is the ceiling on what a request may ask for. I8 is a bound and not a preference: a
+// caller may choose the size of its own read and may not opt out of having one, so a Cap above this
+// is clamped rather than honoured.
+//
+// 32 MiB is far above any real fleet — a container list runs about a kilobyte per container — and low
+// enough that a far end answering with a stream cannot make this process the reason the host runs out
+// of memory.
+const MaxBodyCap = 32 << 20
 
 // AttemptCap is the number of rejected candidates a report keeps (§13.6). Discovery that tried
 // forty addresses is a diagnosis nobody reads; the first eight are the diagnosis.
@@ -187,6 +205,15 @@ type Request struct {
 	// (§12): a session cookie set by a challenge is sent back on the retry, and it is not kept
 	// anywhere afterwards.
 	Cookies []*http.Cookie
+
+	// Cap is how many bytes of the response body to keep. Zero — and anything at or below it — takes
+	// BodyCap, so a caller that says nothing gets the shared default and no caller can ask for an
+	// unbounded read (I8). Above MaxBodyCap it is clamped.
+	//
+	// This exists for one kind of read: a document whose size is a fact about the fleet rather than
+	// about a stranger. The container list is the whole of it — an 86-container list does not fit in
+	// 64 KiB, and cutting it turns a perfectly good answer from the Engine into `protocol`.
+	Cap int
 }
 
 // Result is one attempt's whole outcome. The phase is already classified, because this package owns
@@ -205,6 +232,12 @@ type Result struct {
 	// page carries its login form in the first 64 KiB or the page is not a login page — and the
 	// fact that it was cut is reported rather than assumed away.
 	Truncated bool
+
+	// Cap is the number of bytes this read was allowed, after the default and the ceiling were
+	// applied. It is reported rather than looked up, because with more than one possible cap a
+	// diagnostic that named the constant would name the wrong number: the reader of *cut at the cap*
+	// needs the cap that did the cutting.
+	Cap int
 
 	Elapsed  time.Duration
 	Endpoint string
@@ -258,6 +291,9 @@ func (c *Client) do(ctx context.Context, method string, req Request) Result {
 	res := Result{
 		Endpoint: c.endpointFor(req.URL),
 		Sent:     headerNames(req.Header),
+		// Resolved here, before anything can fail, so every result carries the cap it would have read
+		// under — including the ones that never got as far as a body.
+		Cap: capFor(req.Cap),
 	}
 
 	// The bound on requests in flight, taken before the clock starts: waiting for a slot is not
@@ -315,7 +351,7 @@ func (c *Client) do(ctx context.Context, method string, req Request) Result {
 	// The body is read whatever the status. A 401's body says which realm; a 403's says which
 	// permission; and a reader that only read 2xx bodies would have nothing to put in the detail of
 	// the failures that most need one.
-	res.Body, res.Truncated, err = readCapped(resp.Body)
+	res.Body, res.Truncated, err = readCapped(resp.Body, res.Cap)
 	if err != nil {
 		// The status already arrived, so the phase it produced stands unless the read itself failed
 		// — and a read that failed mid-body is a connection fault, not a status one.
@@ -325,19 +361,37 @@ func (c *Client) do(ctx context.Context, method string, req Request) Result {
 	return res
 }
 
-// readCapped reads at most BodyCap bytes and says whether there were more.
+// readCapped reads at most cap bytes and says whether there were more.
 //
-// It reads one byte past the cap in order to know. Without that byte a body of exactly 64 KiB and a
+// It reads one byte past the cap in order to know. Without that byte a body of exactly the cap and a
 // body of a megabyte are indistinguishable, and the truncation note would either be missing on the
 // second or invented on the first.
-func readCapped(r io.Reader) ([]byte, bool, error) {
-	body, err := io.ReadAll(io.LimitReader(r, BodyCap+1))
-	if len(body) > BodyCap {
+func readCapped(r io.Reader, cap int) ([]byte, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(r, int64(cap)+1))
+	if len(body) > cap {
 		// The stream is abandoned at the cap: whatever is still coming is not read, and the caller's
 		// deferred Close cancels it (I8).
-		return body[:BodyCap], true, nil
+		return body[:cap], true, nil
 	}
 	return body, false, err
+}
+
+// capFor is the one place a request's asked-for cap becomes the cap that applies.
+//
+// Both ends are closed deliberately. Zero and below take the default, so a caller that says nothing
+// gets 64 KiB and a caller cannot say *no limit* — the absence of a bound is not one of the choices
+// on offer (I8). Above the ceiling is clamped rather than refused, because a misconfigured number is
+// not a reason to fail a read that would otherwise have worked; what the read was actually allowed
+// comes back on the Result either way.
+func capFor(asked int) int {
+	switch {
+	case asked <= 0:
+		return BodyCap
+	case asked > MaxBodyCap:
+		return MaxBodyCap
+	default:
+		return asked
+	}
 }
 
 func (c *Client) acquire(ctx context.Context) error {

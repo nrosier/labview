@@ -282,6 +282,10 @@ func applyEnv(c *Config, env Lookup) (blank []string, notes []string) {
 	flag("LABVIEW_DOCKER_ENABLED", "docker.enabled", &c.Docker.Enabled)
 	num("LABVIEW_DOCKER_MAX_CONCURRENCY", "docker.maxConcurrency", &c.Docker.MaxConcurrency)
 	num("LABVIEW_DOCKER_TIMEOUT", "docker.timeoutMs", &c.Docker.TimeoutMs)
+	// Bytes, not megabytes. A unit-suffixed form would be friendlier and would also make this
+	// the only setting in §3.2 that parses anything but an integer; validate's floor is what
+	// catches the operator who writes 8 meaning 8 MiB.
+	num("LABVIEW_DOCKER_BODY_CAP", "docker.bodyCapBytes", &c.Docker.BodyCapBytes)
 
 	flag("LABVIEW_MASK_SECRETS", "secrets.maskValues", &c.Secrets.MaskValues)
 	num("LABVIEW_CACHE_TTL", "cacheTtlSeconds", &c.CacheTTLSeconds)

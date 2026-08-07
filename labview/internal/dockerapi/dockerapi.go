@@ -202,6 +202,9 @@ func (c *Client) report(phase payload.ConnectionPhase, detail, read string) payl
 // ---------------------------------------------------------------------------
 
 func (c *Client) ping(ctx context.Context) (payload.ConnectionPhase, string) {
+	// No Cap of its own: the Engine answers `OK`, two bytes, so the shared default is already
+	// four orders of magnitude more than this read can legitimately need. Anything larger on
+	// this path is something else answering, and the point of the ping is to notice that.
 	res := c.http.Do(ctx, transport.Request{URL: c.base + pathPing})
 	if phase, detail, bad := engineFailure(res); bad {
 		return phase, detail
@@ -216,7 +219,12 @@ func (c *Client) ping(ctx context.Context) (payload.ConnectionPhase, string) {
 }
 
 func (c *Client) list(ctx context.Context) ([]listEntry, payload.ConnectionPhase, string) {
-	res := c.http.Do(ctx, transport.Request{URL: c.base + pathList})
+	// The one read whose size is a fact about this fleet rather than about a document somebody
+	// else wrote: it grows by roughly a kilobyte per container, so the shared 64 KiB runs out at
+	// around forty of them and the list arrives cut mid-array. Cut, it starts with `[` and
+	// fails to parse, and the scan reports `protocol` — LabView's own ceiling described as the
+	// far end not speaking Docker (§3.1's docker.bodyCapBytes).
+	res := c.http.Do(ctx, transport.Request{URL: c.base + pathList, Cap: c.cfg.BodyCapBytes})
 	if phase, detail, bad := engineFailure(res); bad {
 		return nil, phase, detail
 	}
@@ -238,7 +246,7 @@ func (c *Client) list(ctx context.Context) ([]listEntry, payload.ConnectionPhase
 // This is where *show me what answered* lands. A phase says the Engine was not read and a
 // `protocol` code says which shape arrived instead, and between them they cannot tell an operator
 // whether they are looking at a socket proxy's refusal, an SSO login page, or the Engine answering
-// perfectly well into a 64 KiB ceiling. Only the body says which, so the body is reported (§15's
+// perfectly well into a read cap. Only the body says which, so the body is reported (§15's
 // detail is where the reason lives, and I7 makes it data rather than a log line).
 //
 // The truncation clause is the one an operator is least able to work out for themselves, and it is
@@ -251,8 +259,11 @@ func describing(detail string, res transport.Result) string {
 		return detail + "; the body was empty"
 	}
 	if res.Truncated {
-		detail += ", and it was cut at the " + strconv.Itoa(transport.BodyCap>>10) +
-			" KiB body cap, so what did not parse is an incomplete answer rather than a wrong one"
+		// res.Cap and not the shared constant: this read asks for a cap of its own (§3.1's
+		// docker.bodyCapBytes), so naming the constant would tell an operator to raise a number
+		// that had nothing to do with the cut and leave them looking at the wrong setting.
+		detail += ", and it was cut at the " + capSize(res.Cap) +
+			" body cap, so what did not parse is an incomplete answer rather than a wrong one"
 	}
 	size := conn.Plural(len(res.Body), "byte", "bytes")
 	excerpt := conn.Excerpt(res.Body)
@@ -263,6 +274,24 @@ func describing(detail string, res transport.Result) string {
 		return detail + "; the body was " + size + " of whitespace"
 	}
 	return detail + "; " + size + ", beginning " + excerpt
+}
+
+// capSize renders a byte count the way the cap was written, so an operator reading the detail
+// sees the number they would type back.
+//
+// A cap is set in round binary units and a detail that says "8388608 bytes" makes the reader do
+// the division before they can tell whether it is the default. A value that is *not* a round
+// unit is left in bytes rather than rounded, because a cap of 100000 reported as "97 KiB" is a
+// number that does not appear in the configuration.
+func capSize(n int) string {
+	switch {
+	case n >= 1<<20 && n%(1<<20) == 0:
+		return strconv.Itoa(n>>20) + " MiB"
+	case n >= 1<<10 && n%(1<<10) == 0:
+		return strconv.Itoa(n>>10) + " KiB"
+	default:
+		return conn.Plural(n, "byte", "bytes")
+	}
 }
 
 // inspectAll issues one inspect per listed container under the configured fan-out, and returns the
@@ -333,7 +362,14 @@ func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.D
 
 // inspect reads one container. A nil state is a refusal, and the string beside it is why.
 func (c *Client) inspect(ctx context.Context, entry listEntry) (*payload.DockerState, string) {
-	res := c.http.Do(ctx, transport.Request{URL: c.base + pathInspect + entry.ID + "/json"})
+	// The same cap as the list. One container is small next to the whole list, but a container
+	// carrying a long environment, many mounts or a large label set is the same kind of data —
+	// this fleet's own, sized by how it was deployed — and cutting it produces the same
+	// misdirected `protocol` report for one service instead of all of them.
+	res := c.http.Do(ctx, transport.Request{
+		URL: c.base + pathInspect + entry.ID + "/json",
+		Cap: c.cfg.BodyCapBytes,
+	})
 	if _, detail, bad := engineFailure(res); bad {
 		return nil, detail
 	}

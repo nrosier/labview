@@ -132,7 +132,7 @@ appsRoot:          "/data/apps"
 composeFilenames:  ["compose.yml","compose.yaml","docker-compose.yml","docker-compose.yaml"]
 sidecarFilenames:  [".labview",".labview.yml",".labview.yaml"]
 docker:   { enabled: true, host: "", port: 2375, socketPath: "/var/run/docker.sock",
-            maxConcurrency: 8, timeoutMs: 5000 }
+            maxConcurrency: 8, timeoutMs: 5000, bodyCapBytes: 8388608 }   # 8 MiB
 secrets:  { maskValues: true,
             keyPatterns: ["PASS","SECRET","TOKEN","KEY","APIKEY","CREDENTIAL","PRIVATE",
                           "SALT","PEPPER","DSN"],
@@ -172,7 +172,10 @@ default `traefik.url` and no host-naming convention may ever ship (I2).
 Booleans are true unless the value is exactly `false` — the variable being present at all
 means the operator meant something. Numbers are parsed, required finite, floored, and
 **rejected in favour of the default when out of range**: `maxConcurrency` needs `>= 1`,
-timeouts `> 0`, and `ttlMinutes` / `maxFailedAttempts` / `lockoutSeconds` `>= 1`.
+timeouts `> 0`, `ttlMinutes` / `maxFailedAttempts` / `lockoutSeconds` `>= 1`, and
+`docker.bodyCapBytes` at least the shared 64 KiB read cap — a Docker cap below what every other
+read already gets can only make a read fail, and it is the shape of the likeliest mistake,
+which is writing `8` for eight megabytes.
 
 | Env | Setting | Rule |
 |---|---|---|
@@ -185,6 +188,7 @@ timeouts `> 0`, and `ttlMinutes` / `maxFailedAttempts` / `lockoutSeconds` `>= 1`
 | `LABVIEW_DOCKER_ENABLED` | `docker.enabled` | `false` = configuration-only scan |
 | `LABVIEW_DOCKER_MAX_CONCURRENCY` | `docker.maxConcurrency` | bounded inspect fan-out |
 | `LABVIEW_DOCKER_TIMEOUT` | `docker.timeoutMs` | per-request socket **inactivity**, not total time |
+| `LABVIEW_DOCKER_BODY_CAP` | `docker.bodyCapBytes` | **bytes**, not megabytes; how much of one Engine response to read. Floor 64 KiB, ceiling 32 MiB (I8) |
 | `LABVIEW_MASK_SECRETS` | `secrets.maskValues` | |
 | `LABVIEW_CACHE_TTL` | `cacheTtlSeconds` | parsed, unvalidated |
 | `LABVIEW_PORT` / `LABVIEW_HOST` | `server.port` / `host` | |
@@ -774,6 +778,17 @@ bind mount of a missing host path creates an empty *directory*, which is the usu
 present but not accessible to this uid (which is `authorize`, not `connect`); and present and
 answering.
 
+**The container list and the inspects MUST be read under `docker.bodyCapBytes`, not under the
+shared 64 KiB cap** (I8, §3.1). These are the only reads in the program whose size is a fact about
+*this fleet* rather than about a document somebody else authored: a list entry runs roughly a
+kilobyte per container, so 64 KiB is about forty containers, and an inspect grows with the labels
+and mounts a service was deployed with. Past the cap the body arrives cut mid-array, fails to
+unmarshal, and is classified `protocol` / `not-json` — LabView's own ceiling reported as the far end
+not speaking Docker, with a hint sending the operator to find out what is answering on the Docker
+path. Where a cap did the cutting, the detail MUST name **the cap that actually applied** and say
+the answer was incomplete rather than wrong (§15). The `_ping` keeps the shared default: it answers
+two bytes, and anything larger on that path is the finding.
+
 **Inspects** run under a bounded fan-out (`docker.maxConcurrency`). A refused inspect is skipped
 and counted, and turns the read `partial` with `read: "<n> containers, <k> could not be
 inspected"` — those containers' ports, networks and health are missing, so they MUST be left out
@@ -1253,7 +1268,9 @@ supplying the only protection is not overridden by an open answer either — tha
 path into the fetch may have one in scope; **no redirect followed**, because where a 3xx points is
 the evidence; a per-request timeout and a bounded number in flight; at most **4 addresses per
 service**; and the body read only when the content type is HTML, then only to **64 KiB**, with the
-stream cancelled at the cap. That cap is shared with every other network read in the program.
+stream cancelled at the cap. That is the shared default cap, and the probe keeps it deliberately:
+the size of a page somebody else wrote is not a fact about this fleet, so a probe willing to read a
+megabyte of it has no bound worth the name. The Docker reads are the exception and say why (§10).
 Disabled, nothing eligible, or nothing answering each return a report that explains itself (I4).
 The recorded attempt list is truncated to **8** entries.
 
@@ -1414,8 +1431,10 @@ the excerpt, rendered so that it cannot damage the line it lands in: credentials
 (§20), runs of whitespace collapsed to one space so a body cannot forge the indented candidate
 lines, quoted so a control character is escaped rather than acted on, bounded in the **rendered**
 text and not in the bytes that produced it, and bytes that are not valid UTF-8 described rather
-than shown. Where the cap did the cutting, the detail MUST say so: that failure is LabView's and
-the hint for the phase points at the far end.
+than shown. Where the cap did the cutting, the detail MUST say so **and MUST name the cap that
+actually applied**, not the shared default: that failure is LabView's, the hint for the phase points
+at the far end, and a line naming a cap that had nothing to do with the cut sends the operator to
+raise the wrong setting (I8's size bound is per read).
 
 **Comparing two scans' connections MUST compare target, `ok`, phase and endpoint, and MUST NOT
 compare `read`** — otherwise a container count ticking up re-announces a working target on every
@@ -1647,7 +1666,12 @@ Eight rules. A change that breaks one is wrong regardless of what it adds.
   no clock outside an injected one, and **no logging inside the analysis** — diagnostics are data.
 - **I8 — Containment.** Every configuration-supplied path is resolved and checked against the scan
   root before it is read, lexically **and** through symlinks; every network read is bounded in
-  time, size and concurrency; and the gate never consults scanned data.
+  time, size and concurrency; and the gate never consults scanned data. The size bound is
+  **per read, with a shared default of 64 KiB and a hard ceiling**: a read may choose its own
+  cap and MUST NOT be able to express *unbounded*, and a cap above the ceiling is clamped rather
+  than honoured. One number for every read is the weaker rule, not the stronger one — it forces
+  the cap on a document somebody else authored and the cap on this fleet's own container list to
+  be the same number, and whichever way it is set, one of the two is wrong.
 
 ---
 

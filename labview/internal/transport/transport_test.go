@@ -41,10 +41,13 @@ func respond(status int, header http.Header, body string) *http.Response {
 // The bounds of I8
 // ---------------------------------------------------------------------------
 
-// TestTheBodyCapIsSharedAndIsSixtyFourKiB is I8's size bound at the one place it is applied. The cap
-// is a single constant because two of them drift, and a payload whose probe truncated at 64 KiB
-// while its API truncated at 128 would make the truncation note mean two different things.
-func TestTheBodyCapIsSharedAndIsSixtyFourKiB(t *testing.T) {
+// TestTheDefaultBodyCapIsSixtyFourKiB is I8's size bound at the one place it is applied. 64 KiB is
+// what a request that asks for no cap of its own gets, which is every read of a document somebody
+// else authored: an HTML page from a probed service, an API's error body.
+//
+// A request may name a larger one (see below), and the number it was allowed comes back on the
+// Result — so the truncation note still means one thing even though the cap no longer does.
+func TestTheDefaultBodyCapIsSixtyFourKiB(t *testing.T) {
 	if BodyCap != 64*1024 {
 		t.Fatalf("BodyCap = %d, want 65536 — §13.6 and I8 both name 64 KiB", BodyCap)
 	}
@@ -78,7 +81,72 @@ func TestTheBodyCapIsSharedAndIsSixtyFourKiB(t *testing.T) {
 			if res.Phase != payload.PhaseConnected {
 				t.Errorf("phase = %q, want %q", res.Phase, payload.PhaseConnected)
 			}
+			if res.Cap != BodyCap {
+				t.Errorf("cap = %d, want the default %d reported on the result", res.Cap, BodyCap)
+			}
 		})
+	}
+}
+
+// TestARequestMayChooseItsOwnCapAndMayNotRemoveIt is the other half of I8 once there is more than one
+// cap. Choosing the size of your own read is a caller's business; not having one is not on offer.
+//
+// The container list is why this exists: it is the fleet's own data, it runs about a kilobyte per
+// container, and 64 KiB of it is roughly forty. Cutting it produced a `protocol` report about a body
+// the Engine had answered perfectly.
+func TestARequestMayChooseItsOwnCapAndMayNotRemoveIt(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		asked int
+		want  int
+	}{
+		// Zero is *say nothing and take the shared default*, which is what every read outside Docker
+		// does and the reason adding this field changed no existing caller.
+		{"unset", 0, BodyCap},
+		// Not an error, and not a way out either. A negative cap is a bug in a caller, and the safe
+		// reading of a bug is the default rather than *unbounded*.
+		{"negative", -1, BodyCap},
+		{"a megabyte", 1 << 20, 1 << 20},
+		{"smaller than the default", 1 << 10, 1 << 10},
+		// The ceiling holds whatever a caller or a config file says, because I8 is a bound and not a
+		// preference. Clamped rather than refused: a number somebody mistyped is not a reason to fail
+		// a read that would otherwise have worked.
+		{"above the ceiling", MaxBodyCap + 1, MaxBodyCap},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capFor(tc.asked); got != tc.want {
+				t.Errorf("capFor(%d) = %d, want %d", tc.asked, got, tc.want)
+			}
+		})
+	}
+
+	// And it is the asked-for cap that actually governs the read, not just the arithmetic. A body
+	// between the default and the request's own cap is the case that was failing in the field: under
+	// the old single constant it came back cut and reported as not-JSON.
+	size := BodyCap * 3
+	c := New(Options{RoundTripper: roundTrip(func(*http.Request) (*http.Response, error) {
+		return respond(200, nil, strings.Repeat("x", size)), nil
+	})})
+
+	res := c.Do(context.Background(), Request{URL: "http://example.invalid/containers/json", Cap: 1 << 20})
+	if res.Truncated {
+		t.Errorf("a %d-byte body was cut under a 1 MiB cap", size)
+	}
+	if len(res.Body) != size {
+		t.Errorf("read %d bytes of %d", len(res.Body), size)
+	}
+	if res.Cap != 1<<20 {
+		t.Errorf("cap = %d, want the 1 MiB this request asked for: a diagnostic that named the "+
+			"constant instead would name the wrong number", res.Cap)
+	}
+
+	// Every other reader is unaffected — which is the whole point of putting the number on the request
+	// rather than on the constant. The probe reads HTML from services LabView does not control, and
+	// that is the read 64 KiB was chosen for.
+	res = c.Do(context.Background(), Request{URL: "http://example.invalid/page"})
+	if !res.Truncated || len(res.Body) != BodyCap {
+		t.Errorf("a request that asked for nothing read %d bytes (truncated = %v), want the default %d",
+			len(res.Body), res.Truncated, BodyCap)
 	}
 }
 
@@ -86,7 +154,7 @@ func TestTheBodyCapIsSharedAndIsSixtyFourKiB(t *testing.T) {
 // is invisible: a cap implemented with a bare LimitReader cannot tell a body of exactly 64 KiB from
 // a body of a megabyte, and would either invent a truncation on the first or miss it on the second.
 func TestExactlyTheCapIsNotReportedAsTruncated(t *testing.T) {
-	body, truncated, err := readCapped(strings.NewReader(strings.Repeat("y", BodyCap)))
+	body, truncated, err := readCapped(strings.NewReader(strings.Repeat("y", BodyCap)), BodyCap)
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -97,7 +165,7 @@ func TestExactlyTheCapIsNotReportedAsTruncated(t *testing.T) {
 		t.Errorf("read %d bytes, want %d", len(body), BodyCap)
 	}
 
-	body, truncated, err = readCapped(strings.NewReader(strings.Repeat("y", BodyCap+1)))
+	body, truncated, err = readCapped(strings.NewReader(strings.Repeat("y", BodyCap+1)), BodyCap)
 	if err != nil || !truncated || len(body) != BodyCap {
 		t.Errorf("one byte over: %d bytes, truncated = %v, err = %v", len(body), truncated, err)
 	}
