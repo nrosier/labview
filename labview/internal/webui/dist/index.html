@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <title>LabView</title>
+    <!-- Relative, never rooted: §2.2 requires a path-prefixed mount to work, and `/assets/…` would
+         resolve against the origin rather than against the mount point. -->
+    <link rel="stylesheet" href="assets/labview.css" />
+  </head>
+  <body>
+    <noscript>
+      LabView needs JavaScript to read the payload. The payload itself is at
+      <a href="api/overview">api/overview</a> and is the whole of what this page shows.
+    </noscript>
+
+    <div id="app" hidden>
+      <header class="chrome">
+        <div class="chrome-left">
+          <span class="brand">LabView</span>
+          <span id="scanned" class="muted"></span>
+          <span id="build" class="muted"></span>
+        </div>
+        <div class="chrome-right">
+          <label class="switch">
+            <input type="checkbox" id="probe-switch" />
+            <span>Probe</span>
+          </label>
+          <button type="button" id="rescan">Rescan</button>
+        </div>
+      </header>
+
+      <div id="banners" class="banners" role="status" aria-live="polite"></div>
+      <div id="change" class="change" hidden></div>
+
+      <div class="body">
+        <nav id="nav" aria-label="Views"></nav>
+
+        <main>
+          <div class="head">
+            <h1 id="title"></h1>
+            <p id="question" class="muted"></p>
+          </div>
+
+          <form id="filters" class="filters" role="search" onsubmit="return false">
+            <input type="search" id="q" placeholder="Search names, images, hostnames, label keys…"
+                   aria-label="Free text search" autocomplete="off" spellcheck="false" />
+            <div id="controls" class="controls"></div>
+          </form>
+
+          <div id="chips" class="chips"></div>
+          <p id="count" class="count" aria-live="polite"></p>
+          <div id="content"></div>
+        </main>
+      </div>
+
+      <aside id="drawer" class="drawer" hidden tabindex="-1" role="dialog" aria-modal="false"
+             aria-labelledby="drawer-title">
+        <div class="drawer-head">
+          <h2 id="drawer-title"></h2>
+          <button type="button" id="drawer-close" aria-label="Close">Close</button>
+        </div>
+        <div id="drawer-body"></div>
+      </aside>
+    </div>
+
+    <p id="boot" class="boot">Reading the payload…</p>
+
+    <!-- contract.js is generated from internal/webui and holds every table §22 states. app.js is an
+         evaluator of those tables: no view slug, no member spelling, no threshold of its own. -->
+    <script src="assets/contract.js"></script>
+    <script src="assets/app.js"></script>
+  </body>
+</html>

@@ -31,6 +31,25 @@ type Match struct {
 	// vocabulary of §7 so that §4.2's stronger-wins rule runs in one place and not two.
 	Accounts map[string][]labels.Account
 
+	// Notes is what the match found and deliberately did not conclude, keyed the same way.
+	//
+	// Two things go in here, and both are things a reader would otherwise conclude wrongly from the
+	// same payload:
+	//
+	//   - A provider whose kind needs an outpost and has none. §11 requires that be *reported as
+	//     protecting nothing, with that as the stated reason*, and a note is the only place a reason
+	//     can go — the account list is what the service is protected by, and this provider protects
+	//     it by nothing. Without the note the payload would say a service published to the internet
+	//     has no gate, while Authentik's own admin interface shows an application with a provider
+	//     attached, and nothing would explain the disagreement.
+	//   - An enforced proxy provider whose outpost a second ingress path does not pass. Here the
+	//     account is real and reported; what the note adds is that it does not cover every way in.
+	//
+	// Neither is anybody's count. They are notes because §7 is where a fact that changes no figure
+	// goes, and because both are statements about one service that a fleet-wide counter could only
+	// blur.
+	Notes map[string][]string
+
 	// Unmatched is every application no service could be tied to, in the order the applications
 	// were read (I7).
 	Unmatched []payload.UnmatchedApplication
@@ -46,6 +65,7 @@ func Apply(read Read, ix *fleet.Index) Match {
 	m := Match{
 		ByService: map[string]*payload.AuthentikMatch{},
 		Accounts:  map[string][]labels.Account{},
+		Notes:     map[string][]string{},
 	}
 	names := newNameIndex(ix)
 
@@ -64,7 +84,10 @@ func Apply(read Read, ix *fleet.Index) Match {
 		got.Evidence = append(got.Evidence, evidence)
 		got.Strength = append(got.Strength, strength)
 
-		m.Accounts[key] = append(m.Accounts[key], accountsFor(app, strength, evidence)...)
+		accounts, unenforced := accountsFor(app, strength, evidence)
+		m.Accounts[key] = append(m.Accounts[key], accounts...)
+		m.Notes[key] = append(m.Notes[key], unenforced...)
+		m.Notes[key] = append(m.Notes[key], unpassedOutposts(app, key, ix)...)
 	}
 	return m
 }
@@ -82,10 +105,10 @@ func (m Match) MatchedServices() int { return len(m.ByService) }
 type outcome uint8
 
 const (
-	outcomeNoEvidence outcome = iota // the rule could not run at all
-	outcomeNoCandidate               // it ran and found nobody
-	outcomeContested                 // it found more than one, so it must discard
-	outcomeBlocked                   // it found usable evidence and deliberately declined
+	outcomeNoEvidence  outcome = iota // the rule could not run at all
+	outcomeNoCandidate                // it ran and found nobody
+	outcomeContested                  // it found more than one, so it must discard
+	outcomeBlocked                    // it found usable evidence and deliberately declined
 	outcomeMatched
 )
 
@@ -170,11 +193,13 @@ func ruleInternalHost(app payload.AuthentikApplication, ix *fleet.Index, _ nameI
 // application to whatever answers on 443. That refusal is `blocked` rather than `no-candidate`,
 // because the evidence was there and the rule declined it (§11).
 func ruleURLHost(app payload.AuthentikApplication, ix *fleet.Index, _ nameIndex) (string, payload.AuthentikMatchStrength, string, step) {
-	urls, templated := handedOutURLs(app)
-	if len(urls) == 0 {
-		if templated {
-			return "", "", "", step{outcomeBlocked,
-				"The launch URL is a per-user template, which addresses no one service."}
+	handed := handedOutURLs(app)
+	if len(handed.URLs) == 0 {
+		// A refusal outranks an absence. An application that carries a template *and* nothing else
+		// is not an application with no URL, and reporting it as one would send an operator to
+		// configure a field they already filled in (§11).
+		if len(handed.Declined) > 0 {
+			return "", "", "", step{outcomeBlocked, handed.Declined[0]}
 		}
 		return "", "", "", step{outcomeNoEvidence,
 			"This application hands out no URL, so there is no host in one to resolve."}
@@ -182,7 +207,7 @@ func ruleURLHost(app payload.AuthentikApplication, ix *fleet.Index, _ nameIndex)
 
 	var found, blocked []string
 	var matchedURL string
-	for _, raw := range urls {
+	for _, raw := range handed.URLs {
 		a := fleet.ParseAddress(raw)
 		if a.Host == "" {
 			continue
@@ -223,10 +248,10 @@ func ruleURLHost(app payload.AuthentikApplication, ix *fleet.Index, _ nameIndex)
 // The hostname index deduplicates by service key, so one service naming one hostname in both a
 // tunnel route *and* a Traefik rule is one candidate rather than a contested pair (§11).
 func ruleHostname(app payload.AuthentikApplication, ix *fleet.Index, _ nameIndex) (string, payload.AuthentikMatchStrength, string, step) {
-	urls, _ := handedOutURLs(app)
+	handed := handedOutURLs(app)
 
 	var hostnames []string
-	for _, raw := range urls {
+	for _, raw := range handed.URLs {
 		if a := fleet.ParseAddress(raw); a.Host != "" && !a.IsIP() {
 			hostnames = appendOnce(hostnames, a.Host)
 		}
@@ -312,34 +337,64 @@ func ruleName(app payload.AuthentikApplication, _ *fleet.Index, names nameIndex)
 		"None of its names matches a stack, compose or container name: tried " + list(tried) + "."}
 }
 
-// handedOutURLs is every URL an application hands a browser, and whether a per-user template was
-// refused.
+// handedOut is every URL an application hands a browser, and the evidence that was deliberately
+// not treated as one.
+type handedOut struct {
+	// URLs are the addresses the rules may resolve.
+	URLs []string
+
+	// Declined is one sentence per piece of usable evidence this refused to read as an address.
+	//
+	// §11 requires such a refusal reported as *blocked* rather than as an absence, and the reason
+	// is what a reader does with it. "This application hands out no URL" tells an operator to go
+	// and configure one. "Its launch URL addresses a different address for every user" tells them
+	// the URL they already configured is not the kind of URL that can identify a service — which is
+	// not something they would work out from a blank trace line, and not something they should have
+	// to.
+	Declined []string
+}
+
+// handedOutURLs is what an application hands a browser, and what was declined.
+//
+// Two refusals, and both are §11's.
 //
 // A launch URL may contain `%(username)s`-style placeholders. That URL addresses a different
-// address for every user, so it identifies no one service and MUST NOT be matched on (§11) —
-// which is a refusal worth stating rather than a URL worth skipping quietly.
+// address for every user, so it identifies no one service and MUST NOT be matched on.
 //
-// An external host is included *except* in forward-domain mode, where it is the shared
-// authentication domain that every forward-domain application answers on.
-func handedOutURLs(app payload.AuthentikApplication) (urls []string, templated bool) {
+// An external host is matched *except* in forward-domain mode, where it is the shared
+// authentication domain every forward-domain application answers on — the one service that serves
+// that domain is the identity provider itself, so resolving it would attach every such application
+// to the gate rather than to the thing behind it.
+func handedOutURLs(app payload.AuthentikApplication) handedOut {
+	var out handedOut
+
 	if raw := strings.TrimSpace(app.LaunchURL); raw != "" {
 		if isTemplate(raw) {
-			templated = true
+			out.Declined = append(out.Declined, "Its launch URL "+quote(raw)+
+				" is a per-user template, which addresses a different address for every user "+
+				"and so names no one service.")
 		} else {
-			urls = appendOnce(urls, raw)
+			out.URLs = appendOnce(out.URLs, raw)
 		}
 	}
 	for _, p := range app.Providers {
-		if host := strings.TrimSpace(p.ExternalHost); host != "" && !strings.EqualFold(p.Mode, forwardDomainMode) {
-			urls = appendOnce(urls, host)
+		if host := strings.TrimSpace(p.ExternalHost); host != "" {
+			if strings.EqualFold(p.Mode, forwardDomainMode) {
+				out.Declined = append(out.Declined, "Its proxy provider is in "+
+					quote(forwardDomainMode)+" mode, so the external host "+quote(host)+
+					" is the authentication domain shared by every application in that mode "+
+					"rather than this application's own address.")
+			} else {
+				out.URLs = appendOnce(out.URLs, host)
+			}
 		}
 		for _, uri := range p.RedirectURIs {
 			if raw := strings.TrimSpace(uri); raw != "" {
-				urls = appendOnce(urls, raw)
+				out.URLs = appendOnce(out.URLs, raw)
 			}
 		}
 	}
-	return urls, templated
+	return out
 }
 
 // isTemplate reports whether a URL is a per-user one. Authentik writes these as Python
@@ -424,10 +479,14 @@ func tighten(s string) string {
 //
 // Stripping applies to the Authentik side only. A *service* called `sso` is called that, and
 // erasing the word on the fleet side would make the index unable to find it at all.
+//
+// `for` is here because Authentik's own provider wizard offers `Provider for <application>` as the
+// default name, so it is the commonest provider name in any fleet — and leaving it in reduces that
+// name to `for<something>`, which matches nothing and cannot be made to.
 var mechanismWords = []string{
 	"sso", "auth", "oauth", "oauth2", "oidc", "openid", "saml", "ldap", "proxy",
 	"forward", "forwardauth", "gate", "login", "signin", "sign", "in", "app",
-	"application", "provider", "outpost", "the", "and",
+	"application", "provider", "outpost", "the", "and", "for",
 }
 
 // stripMechanism removes mechanism words from a name and tightens what is left.
@@ -509,8 +568,13 @@ func unmatched(app payload.AuthentikApplication, trace []step) payload.Unmatched
 // A provider kind that maps to no AuthMethod produces no account. That is what keeps a
 // SAML-protected service out of the exposure finding without claiming a mechanism §4.2 has no
 // member for.
-func accountsFor(app payload.AuthentikApplication, strength payload.AuthentikMatchStrength, evidence string) []labels.Account {
+//
+// The second return is the reasons — one line per provider that was configured and enforces
+// nothing. They are notes rather than accounts because an account is something the service is
+// protected *by*, and these protect it by nothing.
+func accountsFor(app payload.AuthentikApplication, strength payload.AuthentikMatchStrength, evidence string) ([]labels.Account, []string) {
 	var out []labels.Account
+	var unenforced []string
 	for _, p := range app.Providers {
 		method, ok := Method(p.Kind)
 		if !ok {
@@ -519,6 +583,14 @@ func accountsFor(app payload.AuthentikApplication, strength payload.AuthentikMat
 		if NeedsOutpost(p.Kind) && len(p.Outposts) == 0 {
 			// Assigned to no outpost, so nothing carries it. Reported as protecting nothing, with
 			// that as the stated reason rather than as a silent omission (§11).
+			//
+			// This is the one finding in the whole program that removes protection a reader would
+			// otherwise have believed in, so the sentence has to name the application and the
+			// provider: without them the note is unactionable, and the operator's next step is to
+			// open that provider in Authentik and assign it an outpost.
+			unenforced = append(unenforced, "Authentik application "+quote(app.Slug)+" has a "+
+				string(p.Kind)+" provider "+quote(p.Name)+" that is assigned to no outpost, so "+
+				"nothing stands in the request path: it protects nothing")
 			continue
 		}
 
@@ -534,6 +606,7 @@ func accountsFor(app payload.AuthentikApplication, strength payload.AuthentikMat
 			Detail:     detail,
 			Confidence: confidence,
 			Evidence:   []string{evidence},
+			Live:       true,
 		}
 		if len(p.Outposts) > 0 {
 			noun := "outpost "
@@ -546,6 +619,60 @@ func accountsFor(app payload.AuthentikApplication, strength payload.AuthentikMat
 			acct.Address = p.InternalHost
 		}
 		out = append(out, acct)
+	}
+	return out, unenforced
+}
+
+// unpassedOutposts is the finding that needs both halves of this program's inputs at once: an
+// enforced proxy provider, and an ingress path that does not go through the outpost enforcing it.
+//
+// **What it rests on.** A proxy provider's `internal_host` is the address its outpost forwards
+// authenticated traffic *to*. A tunnel route resolved to `self-network` is a declared origin that
+// addresses this container over a docker network. When the outpost forwards to this service and a
+// tunnel also delivers to it, the tunnel is a second door into the same room and the outpost is
+// standing at the first one. Neither record says this on its own: Authentik does not know a tunnel
+// exists, the compose file does not know a provider exists, and both statements are ordinary.
+//
+// **What it does not say.** Only that the outpost is not in that path. Not that the service is
+// unprotected — a tunnel route can carry a Cloudflare Access policy, which is a gate this program
+// reads separately and reports as its own account — and not that anything is misconfigured, because
+// an operator may have meant exactly this. Anything stronger would be a conclusion drawn from two
+// facts that are individually normal.
+//
+// It is deliberately narrow in three ways. The provider must be enforced, so `orphan`'s
+// outpost-less provider produces the *other* note and not this one — there is no enforcement to
+// route around, and claiming a bypass would be doubly wrong. The provider's internal host must
+// resolve to *this* service, so a provider forwarding somewhere else is not made this service's
+// problem. And the origin must be `self-network`, which is the one resolution that means *straight
+// to the container*: an origin that resolved to another scanned service is a hop, and that hop is
+// where the gate on that path is to be looked for.
+func unpassedOutposts(app payload.AuthentikApplication, key string, ix *fleet.Index) []string {
+	svc := ix.Service(key)
+	if svc == nil {
+		return nil
+	}
+
+	var out []string
+	for _, p := range app.Providers {
+		if p.Kind != payload.ProviderProxy || !p.Enforced() || p.InternalHost == "" {
+			continue
+		}
+		if forwarded, ok := fleet.GateService(ix, p.InternalHost); !ok || forwarded != key {
+			continue
+		}
+		for _, route := range svc.Cloudflare {
+			if route.Origin == nil || route.Origin.Kind != payload.OriginSelfNetwork {
+				continue
+			}
+			noun := "outpost "
+			if len(p.Outposts) > 1 {
+				noun = "outposts "
+			}
+			out = append(out, "the tunnel route for "+quote(route.Hostname)+" delivers to "+
+				quote(route.Origin.Address)+", which is the address the "+noun+list(p.Outposts)+
+				" enforcing Authentik application "+quote(app.Slug)+" forwards to — so a request "+
+				"arriving over the tunnel does not pass that outpost")
+		}
 	}
 	return out
 }

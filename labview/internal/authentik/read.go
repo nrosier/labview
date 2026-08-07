@@ -83,6 +83,34 @@ func (r Read) Invisible() int {
 	return 0
 }
 
+// readLine is §15's `read`: what actually came back, as prose.
+//
+// Five numbers, and each earns its place by being one a reader would otherwise have to go and ask
+// for. `14 of 16` is the shortfall the whole two-pass assembly exists for — the second number is
+// Authentik's own count and the first is what it was willing to hand *this* token — so a gap is
+// visible without opening the panel. The parenthesis says how much of that gap the provider lists
+// closed. And the provider and outpost counts are what make a fleet's gates countable: a proxy
+// provider assigned to no outpost enforces nothing (§11), so `0 outposts` says that about every
+// provider at once, which is worth a reader seeing on the line that says the read worked.
+//
+// Only numbers that carry something are printed. `16 applications` rather than `16 of 16` when
+// nothing was withheld, and no parenthesis when nothing was rebuilt — a line that always shows every
+// field is a line a reader learns to skip.
+func (r Read) readLine() string {
+	applications := conn.Plural(r.Listed, "application", "applications")
+	if r.Withheld() > 0 {
+		// Withheld is only ever positive when Total is set, so the dereference is safe here and
+		// nowhere else.
+		applications = strconv.Itoa(r.Listed) + " of " + strconv.Itoa(*r.Total) + " applications"
+	}
+	if r.Recovered > 0 {
+		applications += " (" + strconv.Itoa(r.Recovered) + " recovered from providers)"
+	}
+	return applications +
+		", " + conn.Plural(r.Providers, "provider", "providers") +
+		", " + conn.Plural(r.Outposts, "outpost", "outposts")
+}
+
 // Candidate is one address discovery may try, with what made it a candidate.
 type Candidate struct {
 	URL string
@@ -174,7 +202,7 @@ func Do(ctx context.Context, o Options) Read {
 	r.Providers = countProviders(r.Applications)
 	r.Outposts = len(outposts)
 
-	read := conn.Plural(len(r.Applications), "application", "applications")
+	read := r.readLine()
 	if r.Invisible() > 0 {
 		// `partial` exactly when something stayed invisible. Not when anything was withheld:
 		// a withheld application a provider let us rebuild is not missing from the answer, and
@@ -472,7 +500,7 @@ func assemble(apps []wireApplication, details []wireProvider, byOutpost map[stri
 			Name:          app.Name,
 			Slug:          app.Slug,
 			Group:         app.Group,
-			LaunchURL:     app.LaunchURL,
+			LaunchURL:     app.launchURL(),
 			Providers:     providersOf(app, byPK, byOutpost),
 			DiscoveredVia: payload.DiscoveredViaList,
 		})

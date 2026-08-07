@@ -35,6 +35,13 @@ type Account struct {
 	// the fleet index's job, and re-walking the middleware chain to recover it here would be a
 	// second implementation of §7's recursion.
 	Address string
+
+	// Live says an integration read this account off a running system — the proxy's own chain, the
+	// identity provider's own records — rather than from a scanned configuration value.
+	//
+	// It decides nothing on its own; it is only the tie-break in the ordering, for the case §4.2's
+	// two keys leave undecided. See ordered.
+	Live bool
 }
 
 // Input is everything the label reading of a posture needs. The service arrives with its
@@ -374,6 +381,15 @@ func Resolve(groups ...[]Account) payload.AuthPosture {
 //
 // Both Resolve and GateAddress read it, so the address a gate is reached at can never come from a
 // different account than the method reported beside it.
+//
+// **The third key.** Two accounts can agree on confidence and on method and still be different
+// accounts — an LDAP gate the identity provider records and the same gate hinted at by an
+// environment key resolve to `authentik-ldap` at `observed` from both directions. Left to the two
+// keys above, the winner would be whichever group the caller happened to pass first, and the caller
+// passes labels first. A live account wins that tie: at equal confidence it names the provider and
+// what enforces it, where the scanned account names the key that hinted at it, and the detail a
+// reader is shown should be the one that says something. The loser is kept as evidence either way,
+// so nothing is lost by choosing — only the order of two sentences changes.
 func ordered(groups ...[]Account) []Account {
 	var all []Account
 	for _, g := range groups {
@@ -387,7 +403,10 @@ func ordered(groups ...[]Account) []Account {
 		if a, b := all[i].Confidence.Rank(), all[j].Confidence.Rank(); a != b {
 			return a < b
 		}
-		return all[i].Method.Rank() < all[j].Method.Rank()
+		if a, b := all[i].Method.Rank(), all[j].Method.Rank(); a != b {
+			return a < b
+		}
+		return all[i].Live && !all[j].Live
 	})
 	return all
 }

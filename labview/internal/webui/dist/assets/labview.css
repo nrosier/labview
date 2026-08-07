@@ -1,0 +1,423 @@
+/* §22.1: modern and dense, without motion. One type scale, sticky headers, light and dark following
+   the system preference, no transition longer than 200 ms, and no layout shift when a rescan lands.
+
+   Colour is categorical and centralised: every colour below is keyed off a `tone` class, and the
+   tones come from one table in Go (tone.go). Nothing here keys off a member name, so a member this
+   build has no term for renders as the neutral fallback rather than as an invisible chip.
+
+   The two emphasis tones are the only ones that carry severity:
+     --alert  reachable from outside with no gate — the one reserved colour
+     --warn   an ambiguous match, a proxy API answering unauthenticated, a failed connection phase
+   Both are always accompanied by the term's `mark`, because colour is never the only carrier of a
+   distinction. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --line: #dfe3e8;
+  --ink: #14181f;
+  --ink-soft: #5b6472;
+  --accent: #2b5fd9;
+
+  --neutral: #6b7280;
+  --info: #2b5fd9;
+  --good: #1c7c4a;
+  --warn: #a8620a;
+  --alert: #b3261e;
+
+  --neutral-bg: #eceef1;
+  --info-bg: #e4ebfb;
+  --good-bg: #e2f2e8;
+  --warn-bg: #fbeedd;
+  --alert-bg: #fbe4e2;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  --step-0: 0.8125rem;
+  --step-1: 0.9375rem;
+  --step-2: 1.125rem;
+  --step-3: 1.375rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #11141a;
+    --panel: #171b22;
+    --line: #2a303a;
+    --ink: #e6e9ee;
+    --ink-soft: #9aa4b2;
+    --accent: #7aa2f7;
+
+    --neutral: #9aa4b2;
+    --info: #7aa2f7;
+    --good: #6cc48d;
+    --warn: #e0a35c;
+    --alert: #f2807a;
+
+    --neutral-bg: #21262f;
+    --info-bg: #1b2740;
+    --good-bg: #172a20;
+    --warn-bg: #2e2415;
+    --alert-bg: #331d1c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: var(--step-1) / 1.45 var(--sans);
+}
+
+a { color: var(--accent); }
+
+button, input, select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); }
+
+/* Focus is visible on everything operable: §22.1 requires every clickable statistic, chip, row and
+   diagram node to be focusable and operable, which is worth nothing if the focus ring is hidden. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.boot { padding: 2rem; color: var(--ink-soft); }
+
+/* ---------------------------------------------------------------- chrome */
+
+.chrome {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0.9rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.chrome-left, .chrome-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.brand { font-weight: 650; letter-spacing: 0.01em; }
+
+.switch { display: inline-flex; align-items: center; gap: 0.3rem; }
+
+.muted { color: var(--ink-soft); font-size: var(--step-0); }
+
+.banners { display: grid; gap: 0.35rem; padding: 0.5rem 0.9rem 0; }
+
+.banner {
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  font-size: var(--step-0);
+  background: var(--panel);
+}
+
+.banner.tone-warn { border-left-color: var(--warn); background: var(--warn-bg); }
+.banner.tone-alert { border-left-color: var(--alert); background: var(--alert-bg); }
+.banner.tone-info { border-left-color: var(--info); background: var(--info-bg); }
+
+.change {
+  margin: 0.5rem 0.9rem 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  font-size: var(--step-0);
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------------------ body */
+
+.body {
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 1fr);
+  gap: 0;
+  align-items: start;
+}
+
+/* Responsive down to tablet width (§22.1): the navigation becomes a scrolling strip rather than a
+   column, and nothing else moves. */
+@media (max-width: 860px) {
+  .body { grid-template-columns: minmax(0, 1fr); }
+  nav { position: static !important; border-right: 0 !important; border-bottom: 1px solid var(--line); }
+  nav ol { display: flex; flex-wrap: wrap; }
+}
+
+nav {
+  position: sticky;
+  top: 2.6rem;
+  padding: 0.75rem 0.5rem;
+  border-right: 1px solid var(--line);
+  max-height: calc(100vh - 2.6rem);
+  overflow: auto;
+}
+
+nav h2 {
+  margin: 0.8rem 0 0.2rem 0.4rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+nav ol { list-style: none; margin: 0; padding: 0; }
+
+nav a {
+  display: block;
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+  text-decoration: none;
+  color: var(--ink);
+  font-size: var(--step-0);
+}
+
+nav a:hover { background: var(--neutral-bg); }
+nav a[aria-current="page"] { background: var(--info-bg); color: var(--accent); font-weight: 600; }
+
+main { padding: 0.9rem 1rem 4rem; min-width: 0; }
+
+.head h1 { margin: 0; font-size: var(--step-3); font-weight: 650; }
+.head p { margin: 0.15rem 0 0.6rem; }
+
+/* --------------------------------------------------------------- filters */
+
+.filters { display: grid; gap: 0.5rem; margin-bottom: 0.5rem; }
+
+#q {
+  width: 100%;
+  max-width: 34rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+}
+
+.controls { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+
+.dim { border: 1px solid var(--line); border-radius: 5px; padding: 0.3rem 0.45rem; background: var(--panel); }
+.dim > .dim-head { display: flex; align-items: baseline; gap: 0.4rem; margin-bottom: 0.25rem; }
+.dim-label { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-soft); }
+.dim-values { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+
+/* The tri-state control: off → include → exclude → off (§22.6). The state is on the button, and the
+   mark in the label carries it without colour. */
+.tri { font-size: var(--step-0); padding: 0.1rem 0.4rem; border-radius: 999px; }
+.tri[data-state="include"] { border-color: var(--info); background: var(--info-bg); color: var(--info); }
+.tri[data-state="exclude"] { border-color: var(--alert); background: var(--alert-bg); color: var(--alert); text-decoration: line-through; }
+
+.mode { font-size: var(--step-0); }
+
+.chips { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.25rem 0; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: var(--step-0);
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--neutral-bg);
+}
+
+.chip button { border: 0; background: none; padding: 0 0.1rem; line-height: 1; cursor: pointer; }
+
+.count { margin: 0.35rem 0 0.5rem; font-size: var(--step-0); color: var(--ink-soft); }
+
+/* ----------------------------------------------------------------- cards */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.5rem;
+}
+
+.card {
+  display: block;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel);
+  text-decoration: none;
+  color: inherit;
+}
+
+.card:hover { border-color: var(--accent); }
+
+.card .n { display: block; font: 650 var(--step-3) / 1.1 var(--sans); font-variant-numeric: tabular-nums; }
+.card .l { display: block; font-size: var(--step-0); color: var(--ink-soft); }
+.card .absent { font-size: var(--step-1); color: var(--ink-soft); font-style: italic; }
+
+.card.lead { grid-column: span 2; }
+.card.tone-alert { border-color: var(--alert); background: var(--alert-bg); }
+.card.tone-alert .n { color: var(--alert); }
+.card.tone-warn { border-color: var(--warn); background: var(--warn-bg); }
+.card.tone-warn .n { color: var(--warn); }
+
+.section-label {
+  margin: 1rem 0 0.35rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+/* ---------------------------------------------------------------- tables */
+
+.scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+
+table { border-collapse: collapse; width: 100%; font-size: var(--step-0); }
+
+thead th {
+  position: sticky;
+  top: 2.6rem;
+  z-index: 10;
+  background: var(--panel);
+  text-align: left;
+  font-weight: 600;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+thead th .hint { display: block; font-weight: 400; color: var(--ink-soft); font-size: 0.6875rem; white-space: normal; max-width: 22rem; }
+
+tbody td { padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--neutral-bg); }
+tbody tr[data-open]:hover { cursor: pointer; }
+
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.mono { font-family: var(--mono); font-size: 0.75rem; }
+
+.empty { padding: 1rem; color: var(--ink-soft); }
+
+.tag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.2rem;
+  font-size: 0.6875rem;
+  padding: 0.05rem 0.35rem;
+  margin: 0 0.15rem 0.15rem 0;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: var(--neutral-bg);
+  color: var(--neutral);
+  cursor: pointer;
+}
+
+.tag.tone-info { background: var(--info-bg); color: var(--info); }
+.tag.tone-good { background: var(--good-bg); color: var(--good); }
+.tag.tone-warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
+.tag.tone-alert { background: var(--alert-bg); color: var(--alert); border-color: var(--alert); }
+.tag .mark { font-weight: 700; }
+
+.absent { color: var(--ink-soft); font-style: italic; }
+
+/* --------------------------------------------------------------- drawers */
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(46rem, 100%);
+  z-index: 40;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  overflow: auto;
+  padding: 0.75rem 1rem 3rem;
+  box-shadow: -8px 0 24px rgb(0 0 0 / 12%);
+}
+
+.drawer-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  background: var(--panel);
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.drawer-head h2 { margin: 0; font-size: var(--step-2); }
+
+.drawer section { margin-top: 0.9rem; }
+.drawer h3 { margin: 0 0 0.2rem; font-size: var(--step-1); }
+.drawer .note { margin: 0 0 0.35rem; font-size: var(--step-0); color: var(--ink-soft); }
+
+dl.kv { display: grid; grid-template-columns: minmax(8rem, 14rem) minmax(0, 1fr); gap: 0.1rem 0.75rem; margin: 0; }
+dl.kv dt { color: var(--ink-soft); font-size: var(--step-0); }
+dl.kv dd { margin: 0; font-size: var(--step-0); overflow-wrap: anywhere; }
+
+pre.raw {
+  margin: 0;
+  padding: 0.5rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  max-height: 26rem;
+  overflow: auto;
+}
+
+/* -------------------------------------------------------------- diagrams */
+
+.diagram-bar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
+.diagram-note { font-size: var(--step-0); color: var(--ink-soft); margin: 0 0 0.5rem; max-width: 62rem; }
+.caps { font-size: var(--step-0); color: var(--warn); margin: 0 0 0.4rem; }
+
+.figure { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); overflow: auto; }
+.figure svg { display: block; }
+
+.node rect, .node ellipse { fill: var(--panel); stroke: var(--line); }
+.node text { font: 11px var(--sans); fill: var(--ink); }
+.node[data-kind="network"] rect { fill: var(--info-bg); stroke: var(--info); }
+.node[data-kind="external"] rect { fill: var(--neutral-bg); stroke-dasharray: 3 2; }
+.node:hover rect, .node:hover ellipse { stroke: var(--accent); }
+.node[data-tone="alert"] rect { stroke: var(--alert); fill: var(--alert-bg); }
+
+.edge path { fill: none; stroke: var(--neutral); stroke-width: 1.25; }
+.edge text { font: 10px var(--sans); fill: var(--ink-soft); }
+.edge[data-tone="warn"] path { stroke: var(--warn); }
+.edge[data-tone="alert"] path { stroke: var(--alert); stroke-width: 2; }
+.edge[data-dashed="1"] path { stroke-dasharray: 5 3; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0; }
+
+/* No transition longer than 200 ms anywhere, and none at all for anyone who asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

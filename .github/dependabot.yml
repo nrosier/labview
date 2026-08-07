@@ -1,11 +1,20 @@
-# Dependabot keeps LabView's npm deps, its Docker base image, and the GitHub
-# Actions used by these workflows up to date. Minor/patch bumps are grouped to
-# cut PR noise and are auto-merged by dependabot-auto-merge.yml once CI passes;
-# major bumps come as individual PRs for manual review.
+# Dependabot keeps LabView's Go modules, its Docker base images, and the GitHub
+# Actions used by these workflows up to date. Minor/patch bumps are grouped to cut
+# PR noise; major bumps come as individual PRs. Merging is manual in every case —
+# there is no auto-merge workflow in this repository.
 version: 2
 updates:
-  # --- LabView Node dependencies -----------------------------------------
-  - package-ecosystem: npm
+  # --- LabView Go modules --------------------------------------------------
+  # §2.1 caps the runtime dependency surface at a YAML 1.2 parser, a bcrypt
+  # implementation and JWT/JWKS verification, so this is a very short list and a PR
+  # here deserves reading rather than waving through.
+  #
+  # Read the go.mod comment before merging one. golang.org/x/crypto is held at
+  # v0.40.0 on purpose: it is the last release whose own `go` directive is still
+  # 1.23.0, and v0.42.0 and later would raise this module's floor above what §2.1
+  # sets. Dependabot cannot know that, so it will keep offering the bump — the
+  # answer is no until §2.1 changes.
+  - package-ecosystem: gomod
     directory: /labview
     schedule:
       interval: weekly
@@ -14,15 +23,24 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - dependencies
-      - javascript
+      - go
     groups:
       # One PR for all non-major updates.
-      npm-minor-patch:
+      gomod-minor-patch:
         update-types:
           - minor
           - patch
 
-  # --- Dockerfile base image (node:22-alpine) ------------------------------
+  # --- Dockerfile base images ----------------------------------------------
+  # Two: golang:1.23-alpine for the build stage and distroless/static-debian12 for
+  # the runtime stage.
+  #
+  # The build stage is pinned to the floor §2.1 declares, deliberately — building
+  # with the oldest supported toolchain is the check that the declaration in go.mod
+  # is true. So major and minor Go bumps are ignored here; a `golang:1.25-alpine` PR
+  # would be proposing a spec change dressed up as a dependency update. Patch
+  # updates to that tag, and every update to the distroless runtime base (where the
+  # CA bundle that §2.4 depends on lives), come through normally.
   - package-ecosystem: docker
     directory: /labview
     schedule:
@@ -32,6 +50,11 @@ updates:
     labels:
       - dependencies
       - docker
+    ignore:
+      - dependency-name: golang
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
 
   # --- The GitHub Actions used by these workflows --------------------------
   - package-ecosystem: github-actions

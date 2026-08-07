@@ -113,13 +113,38 @@ func (e envelope) hasNext() bool {
 // Reading them here is what makes an LDAP or SAML gate visible at all: neither has a detail list
 // among the four endpoints, so the application's own view of its provider is the only evidence.
 type wireApplication struct {
-	Name      string `json:"name"`
-	Slug      string `json:"slug"`
-	Group     string `json:"group"`
-	LaunchURL string `json:"launch_url"`
+	Name  string `json:"name"`
+	Slug  string `json:"slug"`
+	Group string `json:"group"`
+
+	// Both launch-URL fields, because either can be the only one that carries an address.
+	//
+	// `launch_url` is what Authentik computed for the user this token authenticated as, and
+	// `meta_launch_url` is what the operator configured. They differ in the case that matters: a
+	// per-user template is stored in the second and the first is either the substituted result or
+	// null, depending on release. Reading only the computed field would mean an application whose
+	// launch URL is a template hands out no URL at all as far as the matcher is concerned — and
+	// §11's refusal to match on a per-user template would then be a rule about a value nothing
+	// ever supplies.
+	LaunchURL     string `json:"launch_url"`
+	MetaLaunchURL string `json:"meta_launch_url"`
 
 	Provider             *wireProviderRef  `json:"provider_obj"`
 	BackchannelProviders []wireProviderRef `json:"backchannel_providers_obj"`
+}
+
+// launchURL is the one the payload carries: the computed one when there is one, and the configured
+// one when there is not.
+//
+// The template is carried rather than discarded. It is what the operator wrote, it is what the
+// Authentik admin interface shows, and a reader looking at an application that matched nothing is
+// owed the reason in the form the reason exists in — a placeholder they can recognise, rather than
+// a blank field that reads as *nothing configured*.
+func (a wireApplication) launchURL() string {
+	if url := strings.TrimSpace(a.LaunchURL); url != "" {
+		return url
+	}
+	return strings.TrimSpace(a.MetaLaunchURL)
 }
 
 // wireProviderRef is an application's view of one of its providers.
@@ -291,17 +316,12 @@ func kindOf(raw string) payload.AuthentikProviderKind {
 // the Authentik server itself and so always do. SCIM is outbound provisioning: it enforces
 // nothing, ever, and reporting it as a gate would be the single most misleading thing this
 // package could say.
+// The table itself is on the payload type, because the exposure verdict asks this question and the
+// verdict may not depend on an integration package. This is the same question asked from here, not
+// a second copy of the answer — SCIM and anything normalised to `other` come back false there for
+// the reason they would here: I1 does not license a conclusion from a name nobody recognises.
 func Enforced(kind payload.AuthentikProviderKind, outposts []string) bool {
-	switch kind {
-	case payload.ProviderProxy, payload.ProviderLDAP, payload.ProviderRADIUS:
-		return len(outposts) > 0
-	case payload.ProviderOAuth2, payload.ProviderSAML:
-		return true
-	default:
-		// SCIM, and anything normalised to `other`. An unknown kind is not assumed to protect
-		// anything: I1 does not license a conclusion from a name nobody recognises.
-		return false
-	}
+	return payload.AuthentikProvider{Kind: kind, Outposts: outposts}.Enforced()
 }
 
 // NeedsOutpost reports whether this kind is one an outpost has to carry. It is separate from

@@ -10,11 +10,6 @@
 # keeps a fixture hostname out of every build layer (I2).
 fixtures/
 
-# The frontend source and its dependency tree. What the binary serves is the bundle
-# committed under internal/webui/dist, embedded at compile time — the UI source is
-# never needed to build the image, and §2.3 says no source may be in it.
-web/
-
 # Documentation, the deployment example, and the sidecar example. The image ships the
 # config and passwd examples only.
 *.md
@@ -26,3 +21,15 @@ compose.yml
 # An operator's real config, if they mounted one here.
 config/
 config.local.yml
+
+# A binary from a local `go build ./cmd/labview`, which writes ./labview into this
+# directory — whose name collides with the directory itself, hence the leading slash.
+# It is host-native and would be shipped over the one the image builds if it reached
+# the context.
+/labview
+/labview.exe
+
+# There is no frontend build stage and nothing here to exclude for one. What the
+# binary serves is the bundle under internal/webui/dist, which is committed and
+# embedded by `go:embed` at compile time (§2.2) — so the Go build is the whole build,
+# and `go build` and `go test` work in a checkout with no Node installed.

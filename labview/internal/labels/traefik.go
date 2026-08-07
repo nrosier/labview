@@ -139,6 +139,17 @@ func routerTLS(fields map[string]string) bool {
 	return false
 }
 
+// RuleHosts is the hostnames a Traefik rule can match, in the order the rule names them.
+//
+// It exists so that §12's live routers and §7's labelled ones read a rule through the same
+// parser. A second implementation over there would be a second answer to "what hosts does this
+// rule match" — and rule 3 of the live matcher resolves its result through the same hostname
+// index the labels populated, so the two spellings have to agree exactly.
+func RuleHosts(rule string) []string { return matcherArgs(rule, "host") }
+
+// RulePathPrefixes is the same for path prefixes.
+func RulePathPrefixes(rule string) []string { return matcherArgs(rule, "pathprefix") }
+
 // matcherArgs pulls the quoted arguments of one Traefik rule matcher out of a rule.
 //
 // The rule is parsed no further than this. A rule is a small expression language with `&&`,

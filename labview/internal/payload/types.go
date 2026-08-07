@@ -192,7 +192,14 @@ type Service struct {
 // ConfiguredEdgeAuth is authentication that was *detected*: a method other than `none` from
 // labels, the live proxy chain, a tunnel access policy or an enforced identity provider. An
 // `inferred` posture counts; neither a probe result nor a declaration does (§13.1).
-func (s Service) ConfiguredEdgeAuth() bool { return s.Auth.Method.Detected() }
+//
+// The second term is not redundant with the first. Almost every enforced provider also produces a
+// method, so the two agree — except for the kinds §4.2 has no member for, where the method is
+// `none` and the gate is nonetheless real and confirmed. Written as `method.Detected()` alone, this
+// expression reports a SAML-protected service as reachable without authentication.
+func (s Service) ConfiguredEdgeAuth() bool {
+	return s.Auth.Method.Detected() || (s.Authentik != nil && s.Authentik.Enforced())
+}
 
 // ProbeGate is whether the probe read a gate. It is the second term of the exposure verdict and
 // stays written as its own expression even though the two terms are provably disjoint, because
@@ -351,6 +358,28 @@ type AuthentikProvider struct {
 	Outposts     []string `json:"outposts"`
 }
 
+// Enforced reports whether a gate of this kind can be standing in a request path at all, and it is
+// §11's table with nothing added (proxy, LDAP and RADIUS need an outpost; OAuth2 and SAML are
+// enforced by the Authentik server itself; SCIM is outbound provisioning and enforces nothing).
+//
+// It lives here, on the payload, rather than in the package that reads the API, because the
+// exposure verdict needs it and the verdict may not depend on an integration package. The reader
+// package's own Enforced delegates to this, so the table exists once.
+//
+// A kind normalised to ProviderOther returns false. I1 does not license concluding a gate from a
+// provider kind nobody recognises, and this is the direction to be wrong in: an unrecognised kind
+// leaves the service *in* the exposure finding, where a reader will look at it.
+func (p AuthentikProvider) Enforced() bool {
+	switch p.Kind {
+	case ProviderProxy, ProviderLDAP, ProviderRADIUS:
+		return len(p.Outposts) > 0
+	case ProviderOAuth2, ProviderSAML:
+		return true
+	default:
+		return false
+	}
+}
+
 // AuthentikApplication is one application record. DiscoveredVia says whether the list
 // returned it or it was rebuilt from a provider — a rebuilt record is thinner, and the
 // UI must say so (§11).
@@ -372,6 +401,26 @@ type AuthentikMatch struct {
 	Applications []AuthentikApplication   `json:"applications"`
 	Evidence     []string                 `json:"evidence"`
 	Strength     []AuthentikMatchStrength `json:"strength"`
+}
+
+// Enforced is whether any application matched onto this service carries a provider that is
+// actually standing in a request path.
+//
+// This is the *separate question* of §11: which mechanism protects a service and whether anything
+// protects it at all are not the same question, and three of Authentik's provider kinds are gates
+// §4.2 has no member for. A SAML provider is enforced by the Authentik server, so a service behind
+// one cannot be reached without completing the flow — but there is no `AuthMethod` to report, so
+// the method stays `none`. Without this the exposure finding would call that service unprotected,
+// which is not a hedge or an omission but a plain falsehood.
+func (m AuthentikMatch) Enforced() bool {
+	for _, app := range m.Applications {
+		for _, p := range app.Providers {
+			if p.Enforced() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // UnmatchedApplication is an application no service could be tied to. Considered lists

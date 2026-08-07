@@ -341,6 +341,12 @@ func readCapped(r io.Reader) ([]byte, bool, error) {
 }
 
 func (c *Client) acquire(ctx context.Context) error {
+	// A caller who is already gone never takes a slot, and so never reaches the dial. Checked before
+	// the select rather than inside it, because a select whose two cases are both ready picks at
+	// random: with a free slot, a cancelled scan would issue a request about half the time.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.limit == nil {
 		return nil
 	}

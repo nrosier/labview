@@ -11,12 +11,16 @@ config/
 /labview
 /labview.exe
 
-# The frontend's dependency tree. The lockfile is committed (§2.2: the build must be
-# reproducible offline from it); the resolved tree is not.
-web/node_modules/
-
-# Vite's scratch space, and the bundle in its build-output location. The bundle that
-# ships is the copy under internal/webui/dist, which IS committed: `go:embed` resolves
-# at compile time, so `go build` and `go test` have to work in a checkout with no Node.
-web/.vite/
-web/dist/
+# Nothing is ignored for the frontend, and that is the whole of §2.2's build story:
+# the bundle under internal/webui/dist is hand-authored and committed, with no
+# bundler, no dependency tree and no lockfile to reproduce — which is the strongest
+# form of "reproducible offline from a committed lockfile" available, since there is
+# nothing left to resolve. `go:embed` reads it at compile time, so `go build` and
+# `go test` work in a checkout with no Node installed, and `go build` is the whole
+# build (see the Dockerfile, which has no frontend stage for the same reason).
+#
+# assets/contract.js is generated from internal/webui/contract.go and committed
+# beside the hand-written modules; a test fails when the committed bytes are stale.
+# Regenerate with:
+#
+#     go test ./internal/webui -run TestContractAsset -update

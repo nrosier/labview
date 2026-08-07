@@ -199,7 +199,7 @@
         "backchannel_providers": [],
         "backchannel_providers_obj": [],
         "launch_url": null,
-        "meta_launch_url": "",
+        "meta_launch_url": "https://pair.example.com/u/%(username)s",
         "policy_engine_mode": "any"
       },
       {

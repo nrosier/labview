@@ -1,13 +1,16 @@
 name: Security Checks
 
-# Adapted from the ghostbudget template for this monorepo (all code lives in
-# labview/). Changes from the original:
-#   * npm steps run in ./labview and use --omit=dev (the modern --production);
-#   * the ESLint "lint-security" job is replaced by CodeQL static analysis —
-#     this project has no ESLint config, and CodeQL provides deeper JS/TS
-#     security scanning;
-#   * a Trivy filesystem scan is added (dependency vulns + Dockerfile misconfig
-#     + secrets), alongside the existing Trivy image scan;
+# All code lives in labview/ and is Go (§2.1): one statically linked binary, no
+# interpreter and no package manager at runtime. The scans are shaped around that:
+#
+#   * govulncheck replaces `npm audit` — it is the Go vulnerability database, and it
+#     reports at *symbol* level, which is the only reading that can gate here (see
+#     the job for why);
+#   * CodeQL analyses `go` rather than `javascript-typescript`. The browser bundle
+#     under internal/webui/dist is hand-authored and committed (§2.2), and `actions`
+#     is included as a second language so these workflows are scanned too;
+#   * Trivy scans the filesystem (Go module vulns, Dockerfile misconfig, secrets)
+#     and the built image;
 #   * the Docker image is built from ./labview.
 
 on:
@@ -21,7 +24,9 @@ on:
       - 'labview/**'
       - '.github/workflows/security.yml'
   schedule:
-    # Daily full scan (runs regardless of the path filters above).
+    # Daily full scan (runs regardless of the path filters above). This is the step
+    # that matters most for a Go binary: the dependency set barely changes, but the
+    # vulnerability database does, so yesterday's green is not today's.
     - cron: '17 3 * * *'
   workflow_dispatch:
 
@@ -39,25 +44,42 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: labview/package-lock.json
+          go-version-file: labview/go.mod
+          cache-dependency-path: labview/go.sum
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Dependencies are tidy and their hashes match
+        run: |
+          go mod tidy -diff
+          go mod verify
 
-      - name: npm audit (all deps, informational)
-        run: npm audit --audit-level=moderate
+      # Gating, and deliberately the default *symbol-level* scan: govulncheck reports
+      # only advisories whose vulnerable functions this binary can actually reach.
+      #
+      # That distinction is load-bearing here rather than a convenience. §2.1 pins
+      # golang.org/x/crypto to v0.40.0 because it is the last release whose own go
+      # directive is still 1.23.0, and every advisory currently open against v0.40.0
+      # is in golang.org/x/crypto/ssh — a subtree this program does not import, since
+      # the only thing it wants from that module is bcrypt (§19). A `-scan module`
+      # gate would therefore be red permanently, and the only way to clear it would be
+      # v0.52.0, which raises the Go floor to 1.25 and breaks §2.1. Symbol level asks
+      # the question that has an actionable answer: is any of it reachable from this
+      # code? When that answer changes, this step fails.
+      #
+      # @latest and not a pinned version, for the same reason trivy-action is tracked
+      # at master below: a scanner one release behind is a scanner missing the newest
+      # advisory, and reproducibility is not what is wanted from this particular tool.
+      - name: govulncheck (reachable vulnerabilities, gating)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      # Informational: the same scan with the unreachable advisories listed, so one
+      # that is being carried deliberately stays visible in the log and can be judged
+      # rather than forgotten. Not gating, for the reason above.
+      - name: govulncheck (including unreachable advisories, informational)
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -show verbose ./...
         continue-on-error: true
-
-      - name: npm audit (production deps, gating)
-        run: npm audit --omit=dev --audit-level=high
-
-      - name: Check for outdated packages
-        run: npm outdated || true
 
   dependency-review:
     name: Dependency Review
@@ -82,20 +104,44 @@ jobs:
       contents: read
       security-events: write
       actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+          - language: actions
+            build-mode: none
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: labview/go.mod
+          cache-dependency-path: labview/go.sum
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: javascript-typescript
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
           queries: security-extended
+
+      # Manual rather than autobuild: go.mod is in labview/, not at the repository
+      # root, and being explicit here means a CodeQL run cannot quietly analyse
+      # nothing because the autobuilder failed to find the module.
+      - name: Build (Go)
+        if: matrix.language == 'go'
+        working-directory: labview
+        run: go build ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
-          category: "/language:javascript-typescript"
+          category: "/language:${{ matrix.language }}"
 
   trivy-fs:
     name: Trivy Filesystem Scan

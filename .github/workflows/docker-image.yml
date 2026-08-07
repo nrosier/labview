@@ -14,11 +14,15 @@ permissions:
   contents: read
 
 jobs:
-  # Gate: a broken build or a reverted fix must not reach Docker Hub. The smoke
-  # suite runs the whole pipeline against fixtures/, including the edge cases that
-  # are written to fail if their fix is backed out (see IMPLEMENTATION.md).
+  # Gate: a broken build or a reverted fix must not reach Docker Hub. `go test ./...`
+  # is the whole gate, because the corpus (§23, internal/corpus) is an ordinary Go
+  # test — it runs the real pipeline over the seven fixture roots with the Docker,
+  # identity-provider, proxy and probe transports injected, and every fixture under
+  # fixtures/edge is written to fail if its fix is backed out (see IMPLEMENTATION.md).
+  # The same command also runs the three UI checks §23 requires to gate CI: payload
+  # coverage, card destinations, and the diagram text export.
   test:
-    name: Typecheck & smoke
+    name: Build, vet & corpus
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -27,35 +31,64 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      # go-version-file rather than a literal, so §2.1's floor is declared in exactly
+      # one place. Hardcoding '1.23' here would let go.mod and CI disagree silently,
+      # and the point of building on the floor is to check that the declaration is
+      # true — the same reason the Dockerfile pins golang:1.23-alpine.
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: labview/package-lock.json
+          go-version-file: labview/go.mod
+          cache-dependency-path: labview/go.sum
 
-      - name: Install dependencies
-        run: npm ci
+      # §2.1 caps the runtime dependency surface at a YAML parser, bcrypt and JWT
+      # verification. A stray `// indirect`, a dropped requirement or an unrecorded
+      # hash all show up here, and -diff reports them without writing to go.mod —
+      # which the Dockerfile's `go mod download` (never `tidy`) also depends on.
+      - name: Dependencies are tidy and recorded
+        run: |
+          go mod tidy -diff
+          go mod verify
 
-      - name: Typecheck (server + web)
-        run: npm run typecheck
+      - name: Vet
+        run: go vet ./...
 
-      - name: Smoke test (pipeline against fixtures)
-        run: npm run smoke
+      # Every package, including cmd/labview — so §2.5's one-shot subcommands are
+      # compiled by the gate and not only by the image build.
+      - name: Build
+        run: go build ./...
+
+      # No Docker daemon and no network: the corpus forces configuration to defaults
+      # and strips every LABVIEW_* credential from the environment itself (§23), so
+      # this is hermetic by construction rather than by convention here.
+      - name: Corpus and unit tests
+        run: go test ./...
+
+      # The race detector is a separate step so a data race is distinguishable from a
+      # failed assertion at a glance. The server's bounded concurrency (§5) is the
+      # reason it is worth the second run.
+      - name: Tests under the race detector
+        run: go test -race ./...
 
   build-and-push:
+    name: Image
     needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      # Only when something actually ships. Pull requests build the image below but
+      # never log in: fork PRs receive no secrets, so a login on that path fails for
+      # a reason that has nothing to do with the change, and a same-repo PR would
+      # otherwise publish :latest from an unmerged branch.
       - name: Log in to Docker Hub
+        if: github.event_name == 'push'
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -63,11 +96,15 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           # All application code lives in labview/, so the build context is scoped
-          # there. The Dockerfile COPYs package.json, src/ and web/ as
+          # there. The Dockerfile COPYs go.mod, go.sum, cmd/ and internal/ as
           # context-relative paths, so a repo-root context finds neither the
-          # Dockerfile nor those directories.
+          # Dockerfile nor those directories. There is no frontend stage: §2.2's
+          # bundle is committed under internal/webui/dist and embedded by `go:embed`,
+          # so `go build` is the whole build.
           context: ./labview
-          push: true
+          # A pull request builds the image — proving the Dockerfile still works is
+          # part of reviewing the change — and pushes nothing.
+          push: ${{ github.event_name == 'push' }}
           no-cache: true
           # The commit the image is built from, so the running UI can name it. The full
           # sha goes in and LabView shortens it, which makes the stamp in the topbar the

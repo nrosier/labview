@@ -9,7 +9,9 @@
 # only be found by rule 1:
 #
 #   * the slug is `wiki-internal`, which matches no stack, service or container name
-#   * `meta_launch_url` is a per-user template (`%(username)s`), so it names no host
+#   * its only launch URL is `meta_launch_url`, a per-user template (`%(username)s`),
+#     which the matcher refuses — so it reaches the payload as this application's
+#     launch URL and reaches no rule as an address
 #   * the provider's `external_host` is a stale hostname nothing here serves
 #
 # Two further things are pinned here. The tunnel origin resolves to this service
