@@ -24,8 +24,13 @@ jobs:
   # fixtures/edge is written to fail if its fix is backed out (see IMPLEMENTATION.md).
   # The same command also runs the three UI checks §23 requires to gate CI: payload
   # coverage, card destinations, and the diagram text export.
+  #
+  # `go test` cannot cover the last two steps, though: it sees §2.2's committed browser
+  # bundle only as bytes to embed. Those steps parse it and run it against a real
+  # payload, and they are in this job rather than a separate one so build-and-push
+  # needs no new edge.
   test:
-    name: Build, vet & corpus
+    name: Build, vet, corpus & bundle
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -74,6 +79,61 @@ jobs:
       # reason it is worth the second run.
       - name: Tests under the race detector
         run: go test -race ./...
+
+      # §2.2's bundle is hand-authored and committed, and `go:embed` embeds whatever
+      # bytes are on disk — so nothing above this line has ever read it. The Go tests
+      # that mention internal/webui/dist/assets/app.js assert the *path* is behind the
+      # auth gate, which a file of pure gibberish also satisfies. That is how a commit
+      # whose app.js contained a syntax error and no DOM code at all went green through
+      # every check in this workflow and shipped a page stuck on "Reading the payload…".
+      #
+      # Pinned rather than the runner's preinstalled Node, for the same reason Go is
+      # pinned above: the version doing the checking should be a decision, not a
+      # property of the image. Nothing is installed — the checker uses only node:
+      # builtins, so §2.1's dependency cap is untouched and there is no lockfile.
+      - name: Set up Node (for the browser-bundle checks only)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # Parse first, and separately: a bundle that does not parse fails here with the
+      # offending line and column, which is a better report than the render checks'
+      # several hundred simultaneous failures. Both files, because contract.js is the
+      # tables app.js evaluates — an unparseable contract breaks the page just as
+      # completely, and it is generated (`go test ./internal/webui -run TestContractAsset
+      # -update`), so nobody reads it by eye.
+      - name: Browser bundle parses
+        run: |
+          node --check internal/webui/dist/assets/contract.js
+          node --check internal/webui/dist/assets/app.js
+
+      # And then that it actually renders. The payload is the edge fixture's, scanned
+      # here rather than committed: a stored payload would drift from the scanner
+      # silently, and this way the checks read whatever the pipeline currently emits.
+      #
+      # Every transport that would leave the process is switched off, which is what makes
+      # the scan hermetic — and this runner is the reason it has to be explicit. Unset
+      # LABVIEW_DOCKER_HOST means the conventional local socket (see labview/Dockerfile),
+      # and ubuntu-latest has a live Engine on it, so a plain `scan` here would enumerate
+      # the *runner's* containers: the payload would then depend on what else the job had
+      # started, and foreign container names would end up in the checks. The identity and
+      # proxy reads are off for the same reason inverted — nothing in this fixture resolves,
+      # so they can only add a connection failure whose text varies with the runner's DNS.
+      # The probe is already off by default (§14); naming it means a change to that default
+      # cannot quietly turn this step into outbound HTTP to fixture hostnames.
+      #
+      # `LABVIEW_APPS_ROOT` is scoped to the one command. No fixture path reaches an image
+      # layer (I2) — this job builds no image.
+      - name: Browser bundle renders
+        env:
+          LABVIEW_APPS_ROOT: fixtures/edge
+          LABVIEW_DOCKER_ENABLED: 'false'
+          LABVIEW_AUTHENTIK_ENABLED: 'false'
+          LABVIEW_TRAEFIK_ENABLED: 'false'
+          LABVIEW_PROBE_ENABLED: 'false'
+        run: |
+          go run ./cmd/labview scan > "$RUNNER_TEMP/payload.json"
+          node ../.github/scripts/render-smoke.mjs "$RUNNER_TEMP/payload.json"
 
   # §2.1 says "Go 1.23 or later", and go.mod's `go 1.23.0` is that claim written down.
   # This job is the check that it is still true, and it is the *only* place the floor is
