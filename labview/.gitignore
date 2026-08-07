@@ -1,13 +1,26 @@
-node_modules/
-dist/
-web/dist/
 *.log
 .DS_Store
 config.local.yml
-# What probe-lab writes: reports about somebody's real services, at their real addresses.
-# Diagnostic output, not source — and the one place in this repository where a fleet's own
-# hostnames would otherwise end up committed (invariant I2).
-tools/probe-lab/reports/
+
 # What compose.yml mounts into /config: a real config, a real passwd file, and the
 # secret files beside them. None of it belongs in a repository.
 config/
+
+# Compiled binaries. `go build ./cmd/labview` writes ./labview into this directory,
+# whose name collides with the directory itself — hence the leading slash.
+/labview
+/labview.exe
+
+# Nothing is ignored for the frontend, and that is the whole of §2.2's build story:
+# the bundle under internal/webui/dist is hand-authored and committed, with no
+# bundler, no dependency tree and no lockfile to reproduce — which is the strongest
+# form of "reproducible offline from a committed lockfile" available, since there is
+# nothing left to resolve. `go:embed` reads it at compile time, so `go build` and
+# `go test` work in a checkout with no Node installed, and `go build` is the whole
+# build (see the Dockerfile, which has no frontend stage for the same reason).
+#
+# assets/contract.js is generated from internal/webui/contract.go and committed
+# beside the hand-written modules; a test fails when the committed bytes are stale.
+# Regenerate with:
+#
+#     go test ./internal/webui -run TestContractAsset -update

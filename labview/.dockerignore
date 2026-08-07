@@ -1,8 +1,35 @@
-node_modules
-dist
-web/dist
+# The build context is this directory, and the image must contain only the binary plus
+# an example config and an example passwd file (§2.3). Everything the Go build does not
+# read is excluded, so nothing can reach the image by accident.
+
 .git
-fixtures
-*.md
-!README.md
 .DS_Store
+*.log
+
+# The test corpus. §2.3 bars it from the image; excluding it from the context as well
+# keeps a fixture hostname out of every build layer (I2).
+fixtures/
+
+# Documentation, the deployment example, and the sidecar example. The image ships the
+# config and passwd examples only.
+*.md
+compose.yml
+.labview.example
+.gitignore
+.dockerignore
+
+# An operator's real config, if they mounted one here.
+config/
+config.local.yml
+
+# A binary from a local `go build ./cmd/labview`, which writes ./labview into this
+# directory — whose name collides with the directory itself, hence the leading slash.
+# It is host-native and would be shipped over the one the image builds if it reached
+# the context.
+/labview
+/labview.exe
+
+# There is no frontend build stage and nothing here to exclude for one. What the
+# binary serves is the bundle under internal/webui/dist, which is committed and
+# embedded by `go:embed` at compile time (§2.2) — so the Go build is the whole build,
+# and `go build` and `go test` work in a checkout with no Node installed.

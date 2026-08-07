@@ -1,0 +1,527 @@
+// Package dockerapi is §10: the container snapshot, and the two classifiers the Docker endpoint adds
+// to the shared taxonomy (§15).
+//
+// The permitted surface is exactly three requests — `GET /_ping`, `GET /containers/json?all=1`, and
+// one `GET /containers/{id}/json` per listed container — and that is the whole of it (I5). There is
+// no exec, no logs, no attach, no events and no write, so a read-only token or a `:ro` socket mount
+// is sufficient. The three request paths are the only URLs this package builds, which is what makes
+// the claim checkable rather than a promise.
+//
+// Nothing here throws out of its own boundary. A failure at any point becomes a connection report and
+// an absent snapshot; the scan continues and says what it could not do (I4).
+package dockerapi
+
+import (
+	"bytes"
+	"context"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nrosier/labview/internal/config"
+	"github.com/nrosier/labview/internal/conn"
+	"github.com/nrosier/labview/internal/payload"
+	"github.com/nrosier/labview/internal/transport"
+)
+
+// The three requests, written once. A path assembled anywhere else in this package would be a fourth
+// request nobody counted.
+const (
+	pathPing    = "/_ping"
+	pathList    = "/containers/json?all=1"
+	pathInspect = "/containers/" // + id + "/json"
+)
+
+// composeSep joins a compose project to a service name in the index.
+//
+// It is a NUL rather than the `/` the fleet index uses, because the two halves come from different
+// places. The fleet's key is built from a directory name and a compose service name, where `/`
+// cannot occur. This key is built from two *label values*, which an operator can set to anything —
+// so a separator that merely does not usually occur would let `a/b` + `c` and `a` + `b/c` collide,
+// and the winner between two unrelated containers would be whichever the Engine listed later.
+const composeSep = "\x00"
+
+// ComposeKey is how a container is found from a scanned service. The caller joins the stack's
+// *compose project name* — not its directory id — to the service name, because that is what the
+// Engine's labels carry.
+func ComposeKey(project, service string) string { return project + composeSep + service }
+
+// Snapshot is one read of the Engine. An unsuccessful read produces a Snapshot with a report and no
+// states, never a nil one: every caller then has a report to attach and nothing to check for.
+type Snapshot struct {
+	Report payload.ConnectionReport
+
+	// States is indexed by all three keys §10 requires — the compose key, the container name and the
+	// 12-character short id — so a service found by any of them finds the same record.
+	States map[string]payload.DockerState
+
+	// Order is the short ids in the Engine's list order, which is the order the index was written in
+	// and the order any list derived from this snapshot comes out in (I7).
+	Order []string
+}
+
+// Get finds a container by any of its three keys.
+func (s Snapshot) Get(key string) (payload.DockerState, bool) {
+	st, ok := s.States[key]
+	return st, ok
+}
+
+// Client reads the Engine. It holds no state between reads.
+type Client struct {
+	cfg  config.DockerConfig
+	http *transport.Client
+	fs   Filesystem
+
+	base     string // the URL prefix the three paths hang off
+	endpoint string // the credential-free endpoint the report names
+	source   payload.EndpointSource
+	socket   string // the path to pre-check, or empty for a tcp endpoint
+}
+
+// New builds a client for this configuration.
+//
+// The endpoint and its source are decided here and once: `unix://<socketPath>` when no host is
+// configured, else `tcp://<host>:<port>`, with `source` reporting `default` while the socket path is
+// still the built-in one. That distinction is what tells an operator whether the address in a failing
+// report is one they chose (§10).
+func New(cfg config.DockerConfig, fsys Filesystem, client *transport.Client) *Client {
+	c := &Client{cfg: cfg, fs: fsys}
+	if c.fs == nil {
+		c.fs = OSFilesystem{}
+	}
+
+	if cfg.Host != "" {
+		host := cfg.Host + ":" + strconv.Itoa(cfg.Port)
+		c.base = "http://" + host
+		c.endpoint = "tcp://" + host
+		c.source = payload.SourceConfig
+	} else {
+		c.socket = cfg.SocketPath
+		// The host in the URL names nothing: every request is dialled over the socket. It is there
+		// because HTTP requires a Host header, and it is a constant so no fleet identifier reaches
+		// the wire (I2).
+		c.base = "http://docker"
+		c.endpoint = "unix://" + cfg.SocketPath
+		c.source = payload.SourceConfig
+		if cfg.SocketPath == config.Defaults().Docker.SocketPath {
+			c.source = payload.SourceDefault
+		}
+	}
+
+	c.http = client
+	if c.http == nil {
+		c.http = transport.New(transport.Options{
+			Timeout:        time.Duration(cfg.TimeoutMs) * time.Millisecond,
+			MaxConcurrency: cfg.MaxConcurrency,
+			Endpoint:       c.endpoint,
+			UnixSocket:     c.socket,
+		})
+	}
+	return c
+}
+
+// Read takes the snapshot.
+func (c *Client) Read(ctx context.Context) Snapshot {
+	empty := func(phase payload.ConnectionPhase, detail string) Snapshot {
+		return Snapshot{Report: c.report(phase, detail, "")}
+	}
+
+	if !c.cfg.Enabled {
+		return empty(payload.PhaseDisabled, "")
+	}
+	if c.socket == "" && c.cfg.Host == "" {
+		// Neither a socket path nor a host. Nothing to talk to, and no request to make.
+		return empty(payload.PhaseNotConfigured, "")
+	}
+
+	// The pre-check, before the HTTP client sees the path (§10).
+	if c.socket != "" {
+		if state := CheckSocket(c.socket, c.fs); state != SocketPresent {
+			return empty(state.Phase(), state.Detail(c.socket))
+		}
+	}
+
+	// 1 of 3: liveness.
+	if phase, detail := c.ping(ctx); phase != payload.PhaseConnected {
+		return empty(phase, detail)
+	}
+
+	// 2 of 3: the list.
+	list, phase, detail := c.list(ctx)
+	if phase != payload.PhaseConnected {
+		return empty(phase, detail)
+	}
+
+	// 3 of 3: one inspect per listed container, under the configured fan-out.
+	states, refused := c.inspectAll(ctx, list)
+
+	snap := Snapshot{States: map[string]payload.DockerState{}}
+	// The index is written in list order, so which of two containers sharing a key wins is decided
+	// by the Engine's list and not by which inspect happened to finish first (§10).
+	for _, st := range states {
+		if st == nil {
+			continue
+		}
+		snap.Order = append(snap.Order, st.ID)
+		for _, key := range keysFor(*st, list) {
+			snap.States[key] = *st
+		}
+	}
+
+	read := conn.Plural(len(list), "container", "containers")
+	if refused > 0 {
+		snap.Report = c.report(payload.PhasePartial,
+			strconv.Itoa(refused)+" of "+strconv.Itoa(len(list))+" inspects were refused",
+			read+", "+strconv.Itoa(refused)+" could not be inspected")
+		return snap
+	}
+	snap.Report = c.report(payload.PhaseConnected, "", read)
+	return snap
+}
+
+func (c *Client) report(phase payload.ConnectionPhase, detail, read string) payload.ConnectionReport {
+	r := conn.Report(conn.TargetDocker, phase, c.endpoint, c.source, detail)
+	r.Read = read
+	if phase.BeforeTheNetwork() {
+		// Nothing was attempted, so naming an endpoint would suggest one was tried.
+		r.Endpoint, r.Source = "", ""
+	}
+	return r
+}
+
+// ---------------------------------------------------------------------------
+// The three requests
+// ---------------------------------------------------------------------------
+
+func (c *Client) ping(ctx context.Context) (payload.ConnectionPhase, string) {
+	res := c.http.Do(ctx, transport.Request{URL: c.base + pathPing})
+	if phase, detail, bad := engineFailure(res); bad {
+		return phase, detail
+	}
+	// The Engine answers `OK` in plain text. Anything else with a 200 is something *else* listening
+	// on that path, which is `protocol` and not a successful ping — a reverse proxy or a socket proxy
+	// pointed at the wrong upstream produces exactly this.
+	if body := strings.TrimSpace(string(res.Body)); !strings.EqualFold(body, "OK") {
+		return payload.PhaseProtocol, "the endpoint answered 200 and did not answer `OK`"
+	}
+	return payload.PhaseConnected, ""
+}
+
+func (c *Client) list(ctx context.Context) ([]listEntry, payload.ConnectionPhase, string) {
+	res := c.http.Do(ctx, transport.Request{URL: c.base + pathList})
+	if phase, detail, bad := engineFailure(res); bad {
+		return nil, phase, detail
+	}
+	var list []listEntry
+	phase, code, err := conn.ReadJSON(bytes.NewReader(res.Body), &list)
+	if err != nil {
+		detail := "the container list did not parse"
+		if code != "" {
+			detail += " (" + code + ")"
+		}
+		return nil, phase, detail
+	}
+	return list, payload.PhaseConnected, ""
+}
+
+// inspectAll issues one inspect per listed container under the configured fan-out, and returns the
+// results in list order alongside the number refused.
+//
+// A refused inspect is skipped and counted, never guessed at. That container's ports, networks and
+// health are simply absent, and §10 requires them left out of every conclusion rather than filled in
+// from the list entry — a container whose networks are unknown must not be reported as being on none.
+func (c *Client) inspectAll(ctx context.Context, list []listEntry) ([]*payload.DockerState, int) {
+	states := make([]*payload.DockerState, len(list))
+
+	workers := c.cfg.MaxConcurrency
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(list) {
+		workers = len(list)
+	}
+
+	var (
+		mu      sync.Mutex
+		refused int
+		next    = make(chan int)
+		wg      sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				st, ok := c.inspect(ctx, list[i])
+				if !ok {
+					mu.Lock()
+					refused++
+					mu.Unlock()
+					continue
+				}
+				// Written to its own slot, so nothing here depends on completion order (I7).
+				states[i] = st
+			}
+		}()
+	}
+	for i := range list {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+
+	return states, refused
+}
+
+func (c *Client) inspect(ctx context.Context, entry listEntry) (*payload.DockerState, bool) {
+	res := c.http.Do(ctx, transport.Request{URL: c.base + pathInspect + entry.ID + "/json"})
+	if _, _, bad := engineFailure(res); bad {
+		return nil, false
+	}
+	var got inspectResponse
+	if _, _, err := conn.ReadJSON(bytes.NewReader(res.Body), &got); err != nil {
+		return nil, false
+	}
+	st := got.state(entry)
+	return &st, true
+}
+
+// ---------------------------------------------------------------------------
+// The Engine's own classifier
+// ---------------------------------------------------------------------------
+
+// engineFailure is the second classifier §15 says the Docker endpoint adds: an Engine response read
+// as a phase and a detail.
+//
+// The phase itself always comes from the shared classification — the transport produced it from the
+// status or from the transport error. What this adds is the Engine's own error message, which is the
+// only place the *reason* lives: a 404 from the Engine says which container is gone, and a 500 says
+// what it could not do.
+func engineFailure(res transport.Result) (payload.ConnectionPhase, string, bool) {
+	if res.OK() {
+		return res.Phase, "", false
+	}
+	if res.Err != nil {
+		return res.Phase, conn.Prose(res.Phase), true
+	}
+
+	detail := "the Engine answered " + strconv.Itoa(res.Status)
+	var e engineError
+	if _, _, err := conn.ReadJSON(bytes.NewReader(res.Body), &e); err == nil && e.Message != "" {
+		detail += ": " + e.Message
+	}
+	return res.Phase, detail, true
+}
+
+// engineError is the shape every Engine error shares.
+type engineError struct {
+	Message string `json:"message"`
+}
+
+// ---------------------------------------------------------------------------
+// The Engine's wire shapes, and the fields §10 takes from them
+// ---------------------------------------------------------------------------
+
+// listEntry is what `GET /containers/json?all=1` returns per container. Only three fields are read:
+// the id to inspect, the names to index by, and the summary status — which §10 takes from *here*
+// rather than from the inspect, because the inspect has no equivalent of `Up 3 days (healthy)`.
+type listEntry struct {
+	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
+	Status string            `json:"Status"`
+	Labels map[string]string `json:"Labels"`
+}
+
+// inspectResponse is what `GET /containers/{id}/json` returns. Every field §10 tabulates is here and
+// nothing else is: an unread field is one fewer thing that can change meaning under us.
+type inspectResponse struct {
+	ID           string `json:"Id"`
+	Name         string `json:"Name"`
+	Created      string `json:"Created"`
+	Image        string `json:"Image"`
+	RestartCount int    `json:"RestartCount"`
+
+	Config struct {
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+
+	State struct {
+		Status    string `json:"Status"`
+		Running   bool   `json:"Running"`
+		StartedAt string `json:"StartedAt"`
+		Health    *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
+	} `json:"State"`
+
+	NetworkSettings struct {
+		Networks map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		} `json:"Networks"`
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+	} `json:"NetworkSettings"`
+}
+
+// state is the §10 field table, applied once.
+func (r inspectResponse) state(entry listEntry) payload.DockerState {
+	st := payload.DockerState{
+		ID:      shortID(r.ID),
+		Name:    strings.TrimPrefix(r.Name, "/"),
+		Image:   r.Config.Image,
+		State:   r.State.Status,
+		Status:  entry.Status, // from the list response, per §10
+		Running: r.State.Running,
+
+		Health:      healthOf(r.healthStatus()),
+		Networks:    []string{},
+		IPAddresses: map[string]string{},
+	}
+
+	// The digest is only reported when the Engine gave one in the form that is a digest. `Image` on
+	// an inspect is normally `sha256:…`, but on an old or unusual Engine it can be a bare name, and
+	// slicing that would publish 19 characters of an image name as a digest.
+	if strings.HasPrefix(r.Image, "sha256:") && len(r.Image) >= 19 {
+		st.ImageDigest = r.Image[:19]
+	}
+	// Zero restarts and no report are different facts, so this is a pointer (§16). The Engine always
+	// sends the field, so a zero here means zero.
+	restarts := r.RestartCount
+	st.RestartCount = &restarts
+
+	st.CreatedAt = r.Created
+	st.StartedAt = r.State.StartedAt
+
+	// Sorted, because these end up in a payload and I7 does not exempt a map's iteration order.
+	for name := range r.NetworkSettings.Networks {
+		st.Networks = append(st.Networks, name)
+	}
+	sort.Strings(st.Networks)
+	for _, name := range st.Networks {
+		// Only where non-empty: this map is what container-IP lookup is built from (§9), and an
+		// empty string in it would be an address that resolves to nothing.
+		if ip := r.NetworkSettings.Networks[name].IPAddress; ip != "" {
+			st.IPAddresses[name] = ip
+		}
+	}
+
+	st.PublishedPorts = ports(r.NetworkSettings.Ports)
+	return st
+}
+
+// healthStatus is the Engine's health string, or empty when the container declares no health check.
+func (r inspectResponse) healthStatus() string {
+	if r.State.Health == nil {
+		return ""
+	}
+	return r.State.Health.Status
+}
+
+// healthOf is `State.Health.Status`, else `none` (§10). A container with no health check declared is
+// `none` rather than absent, because §4 keeps the member and the UI colours off it.
+func healthOf(status string) payload.HealthState {
+	switch payload.HealthState(status) {
+	case payload.HealthHealthy:
+		return payload.HealthHealthy
+	case payload.HealthUnhealthy:
+		return payload.HealthUnhealthy
+	case payload.HealthStarting:
+		return payload.HealthStarting
+	default:
+		// An Engine reporting a status outside the closed set is reported as having none rather than
+		// as having invented a member: §16 makes adding a union member a breaking change, so a
+		// string from the wire must never become one (§4).
+		return payload.HealthNone
+	}
+}
+
+// ports turns `NetworkSettings.Ports` into the payload's port mappings.
+//
+// The raw string is the evidence and the presence of a published port is the signal; no rule anywhere
+// parses the number back out (§6). An exposed port with no binding gets one entry with no
+// `published`, because *exposed and unbound* is a different fact from *not exposed*.
+func ports(from map[string][]struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}) []payload.PortMapping {
+	out := []payload.PortMapping{}
+
+	keys := make([]string, 0, len(from))
+	for key := range from {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		target, protocol := splitPortKey(key)
+		bindings := from[key]
+		if len(bindings) == 0 {
+			out = append(out, payload.PortMapping{
+				Target: target, Protocol: protocol, Raw: key,
+			})
+			continue
+		}
+		for _, b := range bindings {
+			host := b.HostPort
+			if b.HostIP != "" {
+				host = b.HostIP + ":" + b.HostPort
+			}
+			out = append(out, payload.PortMapping{
+				Published: b.HostPort,
+				Target:    target,
+				Protocol:  protocol,
+				Raw:       host + "->" + key,
+			})
+		}
+	}
+	return out
+}
+
+func splitPortKey(key string) (target, protocol string) {
+	target, protocol, found := strings.Cut(key, "/")
+	if !found {
+		return target, "tcp"
+	}
+	return target, protocol
+}
+
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// keysFor is the three keys §10 requires per container.
+//
+// The compose key comes from the labels, so a container started by hand has only the other two — and
+// that is the correct answer rather than a gap: nothing scanned will look for it by a compose key it
+// does not have.
+func keysFor(st payload.DockerState, list []listEntry) []string {
+	keys := []string{st.Name, st.ID}
+
+	for _, entry := range list {
+		if shortID(entry.ID) != st.ID {
+			continue
+		}
+		project := entry.Labels["com.docker.compose.project"]
+		service := entry.Labels["com.docker.compose.service"]
+		if project != "" && service != "" {
+			keys = append(keys, ComposeKey(project, service))
+		}
+		break
+	}
+
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key != "" {
+			out = append(out, key)
+		}
+	}
+	return out
+}

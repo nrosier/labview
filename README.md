@@ -72,23 +72,28 @@ It targets a specific, common TrueNAS Scale pattern:
 ## Repository layout
 
 ```text
-labview/              the application (see labview/README.md for full docs)
-  src/                scanner, label parsers, analyzer, docker + authentik +
-                      traefik enrichment, server
-  web/                preact UI
-  fixtures/           apps/ (happy path), edge/ (regression cases),
+labview/              the Go module (see labview/README.md for full docs)
+  cmd/labview/        the binary: serve, scan, hashpw
+  internal/           one package per specification section — scan, labels, fleet,
+                      declare, dockerapi, authentik, traefikapi, probe, pipeline,
+                      payload, changes, cache, conn, transport, httpapi, access,
+                      secrets, config
+  internal/webui/     the UI contract as Go tables, plus dist/ — the committed,
+                      hand-authored bundle embedded by go:embed (no bundler, no Node)
+  internal/corpus/    the CI gate: the whole pipeline over every fixture root
+  fixtures/           apps/ (happy path), edge/ (18 regression cases),
+                      nets/ (what connects vs what merely reaches),
                       authentik/ + authentik-api.json (identity provider integration),
                       traefik/ + traefik-api.json (reverse proxy integration),
                       probe/ (the login pages a scan asks for, the near-misses,
-                      and the services it must never ask at all)
-  tools/probe-lab/    a diagnostic, not part of the scan: what the login rule reads
-                      at a URL, and what a ninth signal would have to be
-  scripts/smoke.ts    end-to-end pipeline assertions
+                      and the services it must never ask at all),
+                      auth/ (passwd files for LabView's own login)
   compose.yml         deployment example
-  Dockerfile          two-stage node:26-alpine build, runs as non-root
+  Dockerfile          two-stage build on golang:1.23-alpine, distroless runtime,
+                      runs as UID 65532
 .github/
   workflows/          CI: security scanning, test-gated image build/push
-  dependabot.yml      weekly dependency updates (npm, base image, Actions)
+  dependabot.yml      weekly dependency updates (Go modules, base images, Actions)
 truenas-apps/         local sample lab configuration (gitignored, not part of the app)
 IMPLEMENTATION.md     architecture, requirements and invariants — read before changing code
 LICENSE               MIT
@@ -102,14 +107,13 @@ published, and not part of the application.
 
 ## Quick start
 
-Requires Node.js 20 or newer.
+Requires Go 1.23 or newer — and nothing else. The UI is committed and embedded at compile
+time, so there is no Node, no bundler and no install step.
 
 ```bash
 git clone https://github.com/nrosier/labview.git
 cd labview/labview
-npm install
-npm run build                                   # bundles the UI + compiles the server
-LABVIEW_APPS_ROOT=/path/to/your/apps npm start   # -> http://localhost:8080
+LABVIEW_APPS_ROOT=/path/to/your/apps go run ./cmd/labview   # -> http://localhost:8080
 ```
 
 `LABVIEW_APPS_ROOT` is the directory containing one subdirectory per stack, each
@@ -129,13 +133,13 @@ cleanly to config-only. To read the Engine over TCP instead (a
 name the endpoint:
 
 ```bash
-LABVIEW_APPS_ROOT=/path/to/apps LABVIEW_DOCKER_HOST=tcp://your-proxy:2375 npm start
+LABVIEW_APPS_ROOT=/path/to/apps LABVIEW_DOCKER_HOST=tcp://your-proxy:2375 go run ./cmd/labview
 ```
 
-One-shot terminal report, no server:
+One-shot report, no server — the `Overview` payload on stdout, diagnostics on stderr:
 
 ```bash
-LABVIEW_APPS_ROOT=/path/to/apps npm run scan -- --summary
+LABVIEW_APPS_ROOT=/path/to/apps go run ./cmd/labview scan | jq .stats
 ```
 
 ### Docker
@@ -216,7 +220,7 @@ LabView read 56 stacks, 86 services from /data/apps
 ```
 
 The same phase and reason appear in a banner under the topbar, under
-`npm run scan -- --summary`, and in `meta.connections` on `/api/overview`. The
+`labview scan` on stderr, and in `meta.connections` on `/api/overview`. The
 phases — `resolve`, `connect`, `tls`, `timeout`, `authenticate`, `authorize`,
 `path`, `protocol`, `partial` and the rest — are tabulated with what to check for
 each in [labview/README.md](labview/README.md#when-a-connection-fails). The two
@@ -374,8 +378,13 @@ a session gets `401 {"error":"unauthorized"}`.
 
 The UI is a static SPA served from the same origin, readable without a session because
 it is what renders the login card. The JSON contract is
-[labview/src/model/types.ts](labview/src/model/types.ts), imported directly by
-both backend and frontend.
+[labview/internal/payload/types.go](labview/internal/payload/types.go) — the payload the
+backend builds and the browser reads, declared once. The browser cannot import a Go type,
+so the tables it needs alongside the payload (the vocabulary, the readings, the card
+destinations) are declared once in
+[labview/internal/webui/contract.go](labview/internal/webui/contract.go) and serialised
+into a committed `dist/assets/contract.js`; a test regenerates it and fails the build if
+the committed bytes are stale, so the two sides cannot drift into holding different rules.
 
 One shape is worth calling out if you consume that JSON yourself:
 `meta.authentik.unmatchedApplications` and `meta.traefik.unmatchedRouters` are
@@ -536,19 +545,31 @@ output is sensitive.
   startup line saying the surface is open. Full walkthrough, including the Authentik
   provider setup:
   [labview/README.md](labview/README.md#access-control).
-- **Non-root container.** The image runs as the `node` user.
+- **Non-root container, and almost nothing in it.** A distroless static final stage with
+  no shell and no package manager, running as numeric UID `65532`, holding one static
+  binary and two example files. It writes nothing at runtime, needs no Linux
+  capabilities, and works with a read-only root filesystem.
 
 CI runs on every push and PR touching `labview/**`, plus a daily scheduled sweep:
-`npm audit` (informational for all deps, **gating** at `high` for production
-deps), GitHub dependency review (fails at `moderate`), CodeQL with
-`security-extended`, Trivy filesystem and image scans (vulns, Dockerfile
-misconfig, secrets) uploading SARIF to GitHub Security, and TruffleHog verified
-secret scanning. Separately, every push to `main` builds and pushes the image —
-gated behind typecheck + smoke tests, so a broken build or a reverted regression
-fix cannot reach Docker Hub. Dependabot keeps dependencies current — npm, the
-Dockerfile base image, and the Actions themselves — with minor/patch bumps
-grouped into one PR per ecosystem and majors raised individually; merging is
-manual.
+`govulncheck` (**gating** on advisories this binary can actually reach, and
+informational on the rest), `go mod tidy -diff` and `go mod verify` on the dependency
+surface, GitHub dependency review (fails at `moderate`), CodeQL with
+`security-extended` over `go` and over the workflows themselves, Trivy filesystem and
+image scans (vulns, Dockerfile misconfig, secrets) uploading SARIF to GitHub Security,
+and TruffleHog verified secret scanning. The daily run is the one that matters most for
+a static binary: the dependency set barely changes, but the vulnerability database does.
+
+Separately, every push to `main` builds and pushes the image — gated behind
+`go build`, `go vet`, `go test ./...` and `go test -race ./...`, so a broken build or a
+reverted regression fix cannot reach Docker Hub. That gate is the whole point of the
+fixture corpus: every case under `fixtures/edge` is written to fail if its fix is backed
+out. A pull request builds the image too but pushes nothing.
+
+Dependabot keeps dependencies current — Go modules, the Dockerfile base images, and the
+Actions themselves — with minor/patch bumps grouped into one PR per ecosystem and majors
+raised individually; merging is manual. Two deliberate exceptions, both documented where
+they are configured: `golang.org/x/crypto` stays at `v0.40.0` and the `golang` build
+image stays on `1.23`, because both are pinned to the Go floor the specification sets.
 
 Found something? Please open an issue rather than a PR for anything
 security-sensitive.
@@ -559,39 +580,55 @@ security-sensitive.
 
 ```bash
 cd labview
-npm install
-npm run dev          # build the UI once, then tsx server with reload
-npm run dev:web      # in a second terminal: Vite dev server with HMR for the UI
+go run ./cmd/labview          # the server, on :8080
+go run ./cmd/labview scan     # one scan, payload to stdout
 
-npm run typecheck    # tsc for both server and web
-npm run smoke        # runs the full pipeline against fixtures/ and asserts results
-npm run build        # web bundle + server compile
+go build ./...
+go vet ./...
+go test ./...                 # unit tables + the fixture corpus: this is the CI gate
+go test -race ./...
+go mod tidy -diff             # the dependency surface
 ```
 
-`npm run smoke` runs the whole pipeline over four fixture fleets: `fixtures/apps`
-for the expected classifications, `fixtures/edge` for regression cases (URL
-credential redaction, `env_file` containment, `dockflare.enable=false`, LDAP
-attribution, nested interpolation, LAN-port exposure, provider attribution),
-`fixtures/authentik` for the identity-provider integration, and
-`fixtures/traefik` for the reverse-proxy integration. The two API integrations are
-driven through an injected `fetchImpl` serving `fixtures/authentik-api.json` and
-`fixtures/traefik-api.json`, so no network or live service is involved — including
-a stub that demands Basic auth on the gated hostname and answers unauthenticated
-only on the internal one, which is how the credential rule is asserted on the
-recorded calls. Each edge fixture is written so that it fails if the corresponding
-fix is reverted.
+There is no install step, no bundler and no separate typecheck: the compiler is the
+typecheck, and the UI is committed under `internal/webui/dist` and embedded by `go:embed`,
+so a checkout with only Go installed builds and tests the whole thing. After changing a
+table in `internal/webui`, regenerate the browser contract — a test fails while it is
+stale:
 
-The connection taxonomy is asserted the same way: every transport code, HTTP status
+```bash
+go test ./internal/webui -run TestContractAsset -update
+```
+
+`internal/corpus` is the smoke suite, and it is an ordinary Go test: it runs the whole
+pipeline over seven fixture roots — `fixtures/apps` for the expected classifications,
+`fixtures/edge` for 18 previously-fixed defects, `fixtures/nets` for what connects two
+services versus what merely lets them reach each other, `fixtures/authentik` and
+`fixtures/traefik` for the two API integrations, `fixtures/probe` for the active probe,
+and `fixtures/auth` for passwd parsing. The API integrations are driven through an
+injected `http.RoundTripper` serving `fixtures/authentik-api.json` and
+`fixtures/traefik-api.json`, so no network or live service is involved — including a stub
+that demands Basic auth on the gated hostname and answers unauthenticated only on the
+internal one, which is how the credential rule is asserted on the recorded calls. Each
+edge fixture is written so that it fails if the corresponding fix is reverted.
+
+The corpus is hermetic by construction rather than by convention: it forces configuration
+to defaults, disables Docker and the proxy read, and strips every `LABVIEW_AUTHENTIK_*`,
+`LABVIEW_TRAEFIK_*`, `LABVIEW_PROBE_*`, `LABVIEW_AUTH_*` and `LABVIEW_OIDC_*` variable
+from the environment before anything reads configuration — so an operator's exported
+credentials cannot make it reach the network or change what it asserts.
+
+The connection taxonomy is asserted the same way: every transport error, HTTP status
 and socket-file state mapped to its phase, the two that most invite conflation
 (`401` vs `403`, an unreadable socket vs a refused connection) each with an
-assertion that fails if they are merged, and the socket states driven against real
-paths made under `os.tmpdir()`.
+assertion that fails if they are merged, and the four socket states driven through an
+injected filesystem — an *unreadable* socket is not portably creatable as a real file,
+and a state this program must report is not one to leave untested for that reason.
 
-No Docker daemon is needed for any of them — set `LABVIEW_DOCKER_ENABLED=false`
+No Docker daemon is needed for any of it — set `LABVIEW_DOCKER_ENABLED=false`
 and the pipeline runs config-only.
 
-TypeScript is `strict` with `noUncheckedIndexedAccess`; there is no lint config,
-CodeQL covers static analysis in CI.
+There is no lint config beyond `go vet`; CodeQL covers static analysis in CI.
 
 Before changing the scanner or analyzer, read
 **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — it documents the requirements, the
@@ -623,18 +660,20 @@ conclusions, no fleet-specific identifiers, mechanism vs. provider, degrade-neve
   visitor to read: a shell, or a page that is only the login. That direction is deliberate: a login page LabView cannot
   recognise costs you a second look, while a rule loose enough to catch the rest would
   clear exposures that are real. When one of your own services lands on the wrong side of
-  it, [`labview/tools/probe-lab`](labview/tools/probe-lab/README.md) is the diagnostic:
-  point it at the address and it reports what the rule read, why each of the eight signals
-  did not fire, and what a ninth would have to be. It also looks where the scan does not —
-  down the redirect chain, and at a wider list of current-user addresses than the scan asks —
-  because that is where the misses turn out to be. Three of its findings have since become
-  rules: the flow-executor paths a redirect lands on, the eighth signal itself, and the
-  positive reading above, which came out of the tool describing a page by everything it
-  happened not to have. For everything else it reports what a visitor was shown — every link,
-  every form-less control, the visible text — and marks which of those facts point at *open*
-  and which only warrant a second look. For what is left, a `.labview` sidecar declaring the
-  service's login is the answer rather than a heavier probe: it clears the exposure, says
-  *declared* rather than detected while doing it, and leaves the detection alone.
+  it, a `.labview` sidecar declaring the service's login is the answer rather than a heavier
+  probe: it clears the exposure, says *declared* rather than detected while doing it, and
+  leaves the detection alone. The rules themselves, signal by signal, are written up under
+  [probing a service directly](labview/README.md#probing-a-service-directly).
+  An earlier revision also carried a `probe-lab` diagnostic — point it at an address and it
+  reported what the rule read, why each of the eight signals did not fire, and what a ninth
+  would have to be — and it looked where the scan does not, down the redirect chain and at a
+  wider list of current-user addresses. §2.3 permits no diagnostic tool in the image, so it is
+  not part of this implementation, but three of its findings are rules now: the flow-executor
+  paths a redirect lands on, the eighth signal itself, and the positive reading above, which
+  came out of the tool describing a page by everything it happened not to have. Its general
+  finding is the one worth keeping — when the probe was wrong about a service, the login was
+  not misread, it was somewhere the scan does not look — which is why the address list is
+  as much of the rule as the signals are.
 - Authentik's applications endpoint filters itself by what the token's user may
   launch, so a least-privilege token is not shown every application. LabView reports
   the total and rebuilds the withheld ones from their providers, but an application

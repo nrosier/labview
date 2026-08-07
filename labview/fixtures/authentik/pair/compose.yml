@@ -1,10 +1,16 @@
 # An application whose names identify a stack, not a service.
 #
-# The stub's application `pair` has no launch URL and no redirect URI, so names are
-# all that is left to match on — and both the slug and its provider ("Provider for
-# pair", which reduces to `pair` once the mechanism words are dropped) name this
-# directory, which holds two services. Either one could be the application's target
-# and nothing observable says which.
+# The stub's application `pair` has no redirect URI and its only launch URL is a
+# per-user template — `https://pair.example.com/u/%(username)s`, which is a different
+# address for every user and so identifies no service at all. It must be refused
+# rather than resolved, and refused *out loud*: the match trace has to say the URL was
+# declined, because an operator who configured one would otherwise read the blank line
+# as "configure a launch URL" and have nothing to do.
+#
+# So names are all that is left to match on — and both the slug and its provider
+# ("Provider for pair", which reduces to `pair` once the mechanism words are dropped)
+# name this directory, which holds two services. Either one could be the application's
+# target and nothing observable says which.
 #
 # The outcome must be no match at all, reported as an unmatched application. The
 # alternative — picking the first candidate — would move a service between

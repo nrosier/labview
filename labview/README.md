@@ -167,12 +167,21 @@ ship with an icon and label, never color alone.
 
 ## Quick start (local)
 
+Go 1.23 or newer, and nothing else — no Node, no bundler, no package manager. The web
+UI is committed under `internal/webui/dist` and embedded by `go:embed` at compile time,
+so `go build` is the whole build:
+
 ```bash
 cd labview
-npm install
-npm run build            # bundles the web UI + compiles the server
-LABVIEW_APPS_ROOT=/path/to/your/apps npm start
+LABVIEW_APPS_ROOT=/path/to/your/apps go run ./cmd/labview
 # open http://localhost:8080
+```
+
+Or build the binary once and run that:
+
+```bash
+go build -o labview ./cmd/labview
+LABVIEW_APPS_ROOT=/path/to/your/apps ./labview
 ```
 
 Live state comes from `/var/run/docker.sock` by default, so a local run needs no
@@ -181,34 +190,47 @@ config-only. To read the Engine over TCP instead (a socket proxy, typically), na
 the endpoint:
 
 ```bash
-LABVIEW_APPS_ROOT=/path/to/your/apps LABVIEW_DOCKER_HOST=tcp://your-proxy:2375 npm start
+LABVIEW_APPS_ROOT=/path/to/your/apps LABVIEW_DOCKER_HOST=tcp://your-proxy:2375 ./labview
 ```
 
 Just want a one-shot report on the terminal (no server)?
 
 ```bash
-LABVIEW_APPS_ROOT=/path/to/your/apps npm run scan -- --summary
+LABVIEW_APPS_ROOT=/path/to/your/apps ./labview scan
 ```
 
-That digest counts the stacks and services it found, what is reachable and from where,
-and the outcome of each optional API read. Its `networks:` line counts every real docker
-network, then how many of them carry two or more services and how many span two or more
-stacks — the difference between a fleet full of networks and a fleet where networks
-connect things. Without `--summary` the same scan prints the whole `Overview` as JSON.
+That writes the whole `Overview` payload to **stdout** as indented JSON and every
+diagnostic to **stderr**, so the two never mix and stdout stays parseable — pipe it
+straight into `jq`. `-compact` writes one line instead, and `-probe true|false`
+overrides `probe.enabled` for that scan alone.
 
-Live-reloading development:
+The stderr side is the digest: one `[conn]` line per outbound read naming the stage it
+stopped at and why (with the candidate addresses it tried, indented beneath), then one
+`[scan]` line counting what it found.
+
+```text
+warn  [conn] docker: connect unix:///var/run/docker.sock (default) — refused, unreachable, or no route …
+warn  [conn] probe: disabled — set LABVIEW_PROBE_ENABLED=true, or tick the box beside Rescan …
+info  [scan] 6 stacks, 9 services in 329ms
+```
+
+The digest the old `--summary` flag used to print is `jq .stats` — it is in the payload
+rather than in a second reporting path in the binary, so the numbers on the terminal and
+the numbers in the UI cannot disagree:
 
 ```bash
-npm run dev              # build the UI once, then tsx server with reload
+./labview scan | jq .stats
 ```
 
-For UI work, add the Vite dev server in a second terminal. It serves the app with
-hot module replacement and proxies `/api` and `/auth` to the server above, so point
-the browser at Vite's port rather than LabView's:
+That object counts the stacks and services found, how many are public, LAN-only, internal
+or without ingress, the auth breakdown by mechanism, the declaration counters, and the
+probe outcomes. Its four network counters are the ones worth reading together —
+`networks`, then `connectingNetworks`, `crossStackNetworks` and `soloLocalNetworks`: the
+difference between a fleet full of networks and a fleet where networks connect things.
 
-```bash
-npm run dev:web          # Vite dev server with HMR
-```
+The other two subcommands are `labview hashpw <user>` (§19's `user:hash` line, password
+on stdin — see [Access control](#access-control)) and `labview version` (the build
+stamp). No arguments at all means `serve`.
 
 ---
 
@@ -797,7 +819,7 @@ docker build --build-arg LABVIEW_BUILD_SHA=$(git rev-parse HEAD) -t labview:mine
 ```
 
 Leaving the argument off is supported, not an error — the build simply says it does not
-know, and `npm start` from a checkout finds the commit without any argument at all. The
+know, and `go run ./cmd/labview` from a checkout finds the commit without any argument at all. The
 stamp is **behind the login**: it is drawn from `/api/overview`, so the login card shows no
 build, and a visitor who cannot sign in cannot use it to match a known issue to your
 instance.
@@ -878,20 +900,27 @@ line you can copy the shape from.
 Three ways to make a line:
 
 ```bash
-# in the container — prompts with echo off, prints one line to stdout
-docker exec -it labview node dist/hashpw.js alice >> ./config/passwd
+# in the image — no shell in there, so the binary is the entrypoint and stdin is the password
+printf 'the password' | docker run --rm -i labview hashpw alice >> ./config/passwd
 
 # from a checkout
-npm run hashpw -- alice
+printf 'the password' | go run ./cmd/labview hashpw alice
 
 # with apache2-utils, if you have it
 htpasswd -nbB alice '<password>'
 ```
 
-The first two never take the password as an argument, because `ps`, `/proc` and your
-shell history can all read a command line; `htpasswd` does, which is worth knowing before
-you use it. `--cost N` (default 12) sets how slow verification is — every sign-in pays
-it, and 12 is roughly 250 ms on a homelab CPU.
+The first two **read the password from stdin and never from an argument**, because `ps`,
+`/proc` and your shell history can all read a command line; `htpasswd` takes it as an
+argument, which is worth knowing before you use it. `printf` rather than `echo` because
+`printf` sends no trailing newline — though `hashpw` strips one if it arrives, so both
+produce the same hash, and a password that legitimately ends in a space is left alone.
+
+There is no cost flag: the cost is fixed at **12**, because the hash has to be made by
+the same implementation that verifies it, and a per-line cost would be a credential
+format this program's verifier had an opinion about. Every sign-in pays it, and 12 is
+roughly 250 ms on a homelab CPU. The username must match `^[A-Za-z0-9._@-]{1,64}$` —
+`hashpw` refuses anything else rather than minting a line that can never be signed in to.
 
 **Failed sign-ins are throttled per username**: `auth.maxFailedAttempts` (5) within
 `auth.lockoutSeconds` (60) and the next attempt gets a `429` with `Retry-After`, even if
@@ -1057,7 +1086,7 @@ LabView rescanned /data/apps — +1 stack, 1 stack changed, +1 service; authenti
   · authentik appeared: monitoring, grafana
 ```
 
-The same lines print under `npm run scan -- --summary`, the same phase and reason
+The same lines print on stderr under `labview scan`, the same phase and reason
 appear in a banner under the topbar, and the whole set is in `meta.connections` on
 `/api/overview`. A target nobody switched on is logged at `debug` and shows no
 banner — an optional integration being off is not a fault.
@@ -1868,15 +1897,15 @@ kept a headline number that under-reports, which is the defect these fields exis
 
 ```jsonc
 {
-  "version": "0.1.0",       // the package version, as before
+  "version": "0.1.0",       // internal/config.Version — the one place it is written
   "commit": "d0e2030",      // short commit; absent when source is "unknown"
   "source": "image"         // "image" | "checkout" | "unknown"
 }
 ```
 
-`meta.version` was a hardcoded copy of `package.json` that nothing read and nothing
-rendered, so it was replaced rather than kept beside the new field — two spellings of one
-fact would have been a fresh duplicate, not a kept promise. `source` is never absent and
+`meta.version` is the constant `internal/config.Version` and nothing else — there is no
+manifest for it to drift against, which is the point: a build file carrying a second copy
+of the same number would be a fresh duplicate, not a kept promise. `source` is never absent and
 `commit` may be, because they answer different questions: a build genuinely may not know
 its revision, while *how* it knows is what says whether the sha describes the running bytes
 or only the tree they were started in. See [Which build am I looking
@@ -1918,29 +1947,34 @@ invariants that keep the output trustworthy — evidence-only conclusions, no
 fleet-specific identifiers, mechanism vs. provider, degrade-never-fail — plus a
 decision log explaining why the non-obvious choices are what they are.
 
+Every package names the section it implements in its doc comment, so `go doc` and the
+spec are the same table of contents:
+
 ```text
-src/
-  scan/       discover + compose/.env parsing
-  labels/     dockflare, traefik, auth derivation
-  analyze/    two-pass pipeline, middleware registry, network index,
-              declared-dependency resolution, graph, stats
-  enrich/     docker snapshot (dockerode) + authentik and traefik API clients
-              over a shared http.ts (fetch, timeouts, injectable fetchImpl)
-  model/      types.ts — the shared backend⇄frontend contract
-              changes.ts — what moved between two scans, and its wording
-              networks.ts — which network connections are drawn, and their wording
-  server/     fastify server + static hosting, scan cache and force semantics
-web/          preact UI (grid, detail drawer, cytoscape graph, mermaid)
-tools/
-  probe-lab/  a diagnostic, not part of the scan: point it at a URL and it reports
-              what the login rule read there, why each of the eight signals did or
-              did not fire, and what a ninth would have to be. It also looks where
-              the scan does not — down a redirect chain, and at a *wider* list of
-              current-user addresses than the scan asks — since that is where the
-              login pages it misses turn out to be. It imports the real rules rather
-              than reimplementing them, so its verdict is the pipeline's verdict, and
-              nothing it finds past what the scan would have seen is allowed to change
-              that verdict. Not in the image — see its own README
+cmd/labview/  main + the three subcommands (§2.5): serve, scan, hashpw
+internal/
+  config/     §3   defaults, the configuration file, the environment, retired keys
+  scan/       §6   the compose tree, interpolation, env files, sidecars, containment
+  labels/     §7   the two label vocabularies, the middleware registry, provider hints
+  fleet/      §8+9 what needs the whole fleet: ingress sets, the network index,
+                   tunnel origins, the graph, declared dependencies, stats
+  declare/    §14  what a sidecar file may do, comparison and drift
+  dockerapi/  §10  the container snapshot over a socket or TCP, and its classifiers
+  authentik/  §11  the identity-provider read and the match that ties it to services
+  traefikapi/ §12  the proxy read and the match that ties its live routers to services
+  probe/      §13  the active probe: eligibility, addresses, the eight signals
+  pipeline/   §5   one scan, from a compose tree to one Overview
+  payload/    Appendix A — every type on the wire, plus normalisation and vocabulary
+  changes/    §17  what moved between two scans, and what to say about it
+  cache/      §17  one scan shared by every reader, and what makes a rebuild
+  conn/       §15  one shape for every outbound target, and every phase in it
+  transport/  the one HTTP chokepoint — injectable, which is what makes tests hermetic
+  httpapi/    §18  the whole HTTP surface, the asset handler, the auth routes
+  access/     §19  LabView's own login: passwd, bcrypt, sessions, OIDC, throttling
+  secrets/    §20  the mask, and credentials embedded in URIs
+  webui/      §22  the view/vocabulary/diagram tables, the generated contract, the
+                   embedded bundle under dist/ (hand-authored: no bundler, no Node)
+  corpus/     §23  the full pipeline over the fixture roots — the CI gate
 fixtures/
   apps/       a representative happy-path fleet
   edge/       regression cases for previously-fixed defects
@@ -1953,50 +1987,49 @@ fixtures/
   traefik-api.json     canned proxy + identity responses for the above
   probe/      a fleet the scan asks: every login-page signal, every near-miss,
               and the services that must never be asked at all
+  auth/       not a fleet: a good, a messy and an empty passwd file for §19's login
+  outside-root.env, outside-root.labview
+              two files outside every scan root, which exist to be refused (I8)
 ```
 
 ```bash
-npm run typecheck    # tsc for server, web, and scripts/ + tools/
-npm run smoke        # runs the pipeline against fixtures/ and asserts results
-npm run build        # web bundle + server compile
-npm run probe-lab -- <url>   # diagnostic: what the login rule reads at a URL
+go build ./...                 # every package, including the three subcommands
+go vet ./...
+go test ./...                  # unit tables + the corpus: this is the CI gate
+go test -race ./...
+go mod tidy -diff              # the dependency surface §2.1 caps at three
 ```
 
-`probe-lab` is not part of the product and is documented on its own, in
-[tools/probe-lab/README.md](tools/probe-lab/README.md). It exists for the case the probe
-cannot settle: a service reported as answering with **no** login page is either genuinely
-unprotected or running a login screen this rule cannot see, and those look identical on the
-dashboard. Point it at the address and it prints the verdict, then all eight signals with
-the fact that decided each, then every piece of evidence no signal reads yet, then what a
-ninth signal would have to be. It writes a `.json` per target that drops into
-`scripts/smoke.ts` as a fixture, so a proposed rule is replayed offline with nobody's
-service involved. `--from-scan overview.json` picks its targets out of a saved payload:
-exactly the services LabView found neither authentication nor a login page for.
+There is no separate typecheck, no bundler step and no smoke script: the compiler is the
+typecheck, and the smoke suite is `internal/corpus`, which is an ordinary Go test. After
+changing any table in `internal/webui`, regenerate the committed browser contract — a test
+fails while it is stale:
 
-Run against a real fleet, it answered the question the same way most times: **the login was
-not misread, it was somewhere the scan does not look.** So it also follows a redirect chain to
-its end — stopping the moment a signal fires, so a hand-off to an identity provider is
-recognised rather than walked into — and, where a page came back with no gate and no form at
-all, asks a list of eight current-user addresses. A `401` there, from a request carrying no
-credential, is an application refusing an anonymous caller: the service is gated, and the
-served markup of its page could never have said so.
+```bash
+go test ./internal/webui -run TestContractAsset -update
+```
 
-**Two of those findings have since become rules**, which is the tool having done its job. The
-first was a redirect to an Authentik flow executor, and it needed no new signal at all — the
-first `Location` was already the evidence and the path was simply missing from the list, so the
-change was two entries and a fixture. The second was the form-less shell, and it became
-`state-challenge`: the scan now asks four current-user addresses itself when that is the shape
-it got back, so what the lab reports at those four is what the pipeline already decides. The
-other four the lab sweeps are still its own, and a refusal at one of them now reads as *one
-entry missing from a list* rather than as a new kind of request — which is the size of change
-its report has to state, and does.
+**Where the probe's harder rules came from.** An earlier revision carried a `probe-lab`
+diagnostic — point it at a URL and it reported which of the signals fired, what evidence no
+signal read yet, and what a ninth would have to be. It is not part of this implementation
+(§2.3 permits no diagnostic tool in the image, and the questions it answered have been
+answered), but two of its findings are rules now, and both are worth knowing when reading
+`internal/probe`:
 
-Nothing the lab finds past what the scan would have seen is allowed to change what the report
-says LabView concluded — that is the whole point of the tool. But it says plainly what would
-have to change for it to conclude otherwise, and which kind of change that is (a clause needs a
-fixture; a request nobody sends yet needs a decision).
+- **A redirect to an Authentik flow executor** needed no new signal at all. The first
+  `Location` was already the evidence; the path was simply missing from the list, so the fix
+  was two entries and a fixture.
+- **The form-less shell** became `state-challenge` (§13.4). The scan asks four current-user
+  addresses itself when that is the shape it got back, because a `401` from a request
+  carrying no credential is an application refusing an anonymous caller — and the served
+  markup of such a page could never have said so.
 
-`npm run smoke` runs the whole pipeline against six fixture roots — `apps` for
+The general finding is the one to keep: when the probe was wrong about a service, **the login
+was not misread, it was somewhere the scan does not look.** That is why a widened address
+list is a cheaper fix than a new signal, and why §13.3 is a list of paths as much as a list
+of rules.
+
+`internal/corpus` runs the whole pipeline against seven fixture roots — `apps` for
 the expected classifications, `edge` for the regression cases (URL credential
 redaction, `env_file` containment, `dockflare.enable=false`, LDAP attribution,
 nested interpolation, LAN-port exposure — `ports:` vs `expose:`, the
@@ -2004,8 +2037,9 @@ tunnel-straight-at-the-container pattern and the bypass note on a proxied servic
 — and provider attribution in a fleet whose SSO is *not* Authentik, where every
 mechanism is observable but nothing may be attributed to a vendor), `nets` for what
 is and is not a connection between two services, `authentik` for the
-identity-provider integration, `traefik` for the reverse-proxy integration, and
-`probe` for the [direct probe](#probing-a-service-directly).
+identity-provider integration, `traefik` for the reverse-proxy integration,
+`probe` for the [direct probe](#probing-a-service-directly), and `auth` — not a fleet at
+all — for the passwd parsing behind [LabView's own login](#access-control).
 
 Both API roots drive canned responses (`fixtures/authentik-api.json`,
 `fixtures/traefik-api.json`) through an injected HTTP layer, so the tests need no
@@ -2028,7 +2062,7 @@ its errors; all three sources agreeing, and the `mode` that makes them disagree;
 `serverStatus: DOWN`; the note that the API answered with no credential; that no
 credential is sent anywhere when the internal endpoint answers, even with one
 configured; that Basic goes only to the gated host and the session cookie is echoed;
-that a partial read changes no posture; that a `fetchImpl` which throws leaves the
+that a partial read changes no posture; that a `RoundTripper` which fails leaves the
 scan complete and the posture untouched; and the container-IP trap, asserted
 directly on the index because a container IP only exists in live Docker state.
 Each API root also runs its fleet **without** the API and asserts the difference in
@@ -2081,13 +2115,10 @@ published database port (I8). The request total is pinned exactly, and against t
 payload itself carries — which is what makes the walk's short-circuit falsifiable: removing
 it changes no verdict in the root, only how many requests went out.
 
-A separate group runs the `tools/probe-lab` report over the same canned bodies and asserts
-its verdict equals `readGate`'s on every one of them. That is the only thing standing
-between the diagnostic and a report describing a decision LabView would not make, which
-would be worse than no report at all — it would send somebody to change a rule that was
-never the problem. The same equality is asserted a second time as a *non*-effect: the
-tool's own page-evidence findings and its opt-in login-path guesses must leave that verdict
-byte-for-byte unchanged, so a diagnostic can never become a rule by accident.
+A separate group asserts the eight gate signals, the login-form field detection, the
+reason wording and the state-challenge rule as **tables of literals** rather than through
+fixtures — §23 requires that of every rule that can be stated without a fleet, because a
+rule asserted only through a fixture is a rule you cannot read.
 
 Every fixture is written so it fails if the corresponding logic is reverted — for both
 API integrations and for the probe that was checked by actually backing each rule out
@@ -2126,15 +2157,13 @@ The web bundle is intentionally self-contained (mermaid + cytoscape are inlined,
   newsletter box. And the *shape* of a 401/403 page is never read, since bodies are only
   parsed on a 200 — no exposure is missed there, because a challenge is already a gate,
   but the drawer cannot say what such a form was made of. When one of your own services
-  lands in the wrong half of this, [`tools/probe-lab`](tools/probe-lab/README.md) is how
-  you find out which miss it is: point it at the address and it reports what the rule read
-  and what an eighth signal would have to be. For the JavaScript-rendered case it will
-  usually settle it outright — a client-rendered login screen is invisible in the markup,
-  but the application behind it still answers `401` to an anonymous request at its
-  current-user address, and the tool asks. For everything else it reports what a visitor
-  was shown — every link, every form-less control, the visible text — and says which of
-  those facts point at *open*, which point at a login the scan cannot see, and which are
-  only worth another look. For the body that genuinely drew nothing and whose API answers a
+  lands in the wrong half of this, the drawer is where you find out which miss it is: it
+  records the status, the headers and the reason for every signal that did and did not fire
+  (§13.6), which is the same evidence a diagnostic would have printed. The
+  JavaScript-rendered case is largely settled already — a client-rendered login screen is
+  invisible in the markup, but the application behind it still answers `401` to an
+  anonymous request at its current-user address, and `state-challenge` (§13.4) asks. For the
+  body that genuinely drew nothing and whose API answers a
   *bare* `401`, the remedy is a line in the sidecar rather than a bigger probe: an `auth:`
   declaration (see [`.labview.example`](.labview.example)) takes the service out of the
   exposed count, is counted as *declared* rather than detected while doing it, and leaves
