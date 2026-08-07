@@ -355,7 +355,7 @@ server:
 #    # `user:hash` per line, `#` comments and blank lines ignored, first entry wins
 #    # on a duplicate username. The algorithm is the hash's own `$2a$`/`$2b$`/`$2y$`
 #    # prefix — bcrypt, as `htpasswd -nbB` writes it. Make a line with:
-#    #   docker exec -it labview node dist/hashpw.js alice
+#    #   printf 'the password' | docker exec -i labview /labview hashpw alice
 #    #   htpasswd -nbB alice '<password>'
 #    # Re-read on change, so adding a user needs no restart.
 #    file: /config/passwd

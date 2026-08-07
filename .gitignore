@@ -1,5 +1,22 @@
-labview-bob
-labview-bob/*
-truenas-apps
-truenas-apps/*
-.env
+# Every pattern here is anchored to the repository root with a leading slash, and that
+# is a correctness requirement rather than a style. A gitignore pattern containing no
+# slash of its own matches at *every* level of the tree, which is how `config/` in
+# labview/.gitignore came to swallow labview/internal/config — an ignored file is not an
+# untracked one, so `git status` stayed clean while CI checked out a module missing a
+# package it imports.
+#
+# `.env` was the same trap, one new file away from firing: §6.4's `env_file` behaviour is
+# tested by fixtures that are literally named `.env`, and the ten under labview/fixtures
+# survive only because they were committed before this rule existed. An eleventh would
+# have been ignored without a word.
+
+# Sample lab configuration used as scan input, and a scratch checkout beside it. Neither
+# is part of this repository. No trailing slash, so a stray file by either name is caught
+# as well as a directory.
+/labview-bob
+/truenas-apps
+
+# Compose reads .env from the directory holding the compose file, so there are exactly two
+# places one can legitimately appear: beside this file, and beside labview/compose.yml.
+/.env
+/labview/.env

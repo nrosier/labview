@@ -4,7 +4,15 @@ config.local.yml
 
 # What compose.yml mounts into /config: a real config, a real passwd file, and the
 # secret files beside them. None of it belongs in a repository.
-config/
+#
+# The leading slash is load-bearing, not tidiness. A gitignore pattern containing no
+# slash of its own matches at *every* level, so `config/` also matched
+# internal/config/ — §3's configuration package — and it was never committed. The
+# working tree looked clean the whole time, because an ignored file is not an
+# untracked one, and CI failed on `go mod tidy` trying to resolve
+# github.com/nrosier/labview/internal/config as an external module. Anchor anything
+# whose name a Go package could plausibly share.
+/config/
 
 # Compiled binaries. `go build ./cmd/labview` writes ./labview into this directory,
 # whose name collides with the directory itself — hence the leading slash.

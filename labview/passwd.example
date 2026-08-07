@@ -13,21 +13,26 @@
 #
 # Three ways to make a line:
 #
-#   docker exec -it labview node dist/hashpw.js alice
-#   npm run hashpw -- alice                        # from a checkout
-#   htpasswd -nbB alice '<password>'               # apache2-utils
+#   printf 'the password' | docker exec -i labview /labview hashpw alice
+#   printf 'the password' | go run ./cmd/labview hashpw alice   # from a checkout
+#   htpasswd -nbB alice '<password>'                            # apache2-utils
 #
-# The first two prompt with echo off and print only the finished line to stdout,
-# so `docker exec ... >> ./config/passwd` appends exactly one line. Note that
-# `htpasswd` takes the password on the command line, where `ps` and your shell
-# history can see it.
+# The first two read the password from stdin and print only the finished line to
+# stdout, so `... >> ./config/passwd` appends exactly one line. They do not prompt:
+# suppressing terminal echo needs golang.org/x/term, which the dependency budget does
+# not allow, and a pipe keeps the password out of the process table regardless — which
+# is the property that matters. `htpasswd` takes the password on the command line,
+# where `ps` and your shell history can both see it.
 #
 # A username may contain letters, digits and `. _ @ -`, up to 64 characters. On a
 # duplicate username the first line wins, and the duplicate is warned about.
 #
-# The cost (the `$12$` below) is how slow verification is, deliberately. 12 is the
-# default and takes ~250ms on a homelab CPU; raise it with `--cost` if you like,
-# but every sign-in pays it.
+# The cost (the `$12$` below) is how slow verification is, deliberately: ~250ms on a
+# homelab CPU, and every sign-in pays it. `hashpw` always mints at 12 and takes no
+# flag to change it, because the cost is the verifier's property rather than the
+# minting tool's. A line made elsewhere at another cost is still accepted — the cost
+# is read back out of the hash, so htpasswd's cheaper default works and simply
+# verifies faster.
 
 # A structurally valid line, to show the shape. The hash is of a random string that
 # was never recorded, so nobody can sign in as `demo` — an example file with a

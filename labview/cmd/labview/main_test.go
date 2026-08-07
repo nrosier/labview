@@ -274,7 +274,17 @@ func TestVersionReportsTheBuildStamp(t *testing.T) {
 	}
 	// The source is part of the line, because *0.1.0 from a checkout* and *0.1.0 from a release build*
 	// are different answers to the question an operator is asking when they run this.
-	if !strings.Contains(line, string(stamp.Source)) {
+	//
+	// Only when there is a source to name, though. §3.4's rule is that an unstamped build carries no
+	// source rather than the string "unknown", and versionLine implements exactly that. Asserting it
+	// unconditionally made this test's result depend on whether some ancestor of the working directory
+	// happens to be a git checkout — it passed from a clone and failed from an extracted tarball, which
+	// is a property of the machine rather than of the code. Both branches are asserted instead.
+	if stamp.Source == payload.BuildUnknown {
+		if strings.Contains(line, string(payload.BuildUnknown)) {
+			t.Fatalf("version printed %q, want an unstamped build to name no source at all", line)
+		}
+	} else if !strings.Contains(line, string(stamp.Source)) {
 		t.Fatalf("version printed %q, want it to name the source %q", line, stamp.Source)
 	}
 	if stamp.Commit != "" && !strings.Contains(line, stamp.Commit) {

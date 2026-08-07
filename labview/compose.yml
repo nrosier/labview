@@ -86,8 +86,14 @@ services:
       # OIDC issuer plus client id. Until then the HTTP surface is open exactly as
       # it was before, and the startup log says so in one line.
       #
-      # Make a line with `docker exec labview node dist/hashpw.js alice` (or
-      # `htpasswd -nbB alice <password>`) and append it to ./config/passwd.
+      # Make a line with the binary's own subcommand and append it on the host — the
+      # bind below is read-only, and the password is read from stdin so it never lands
+      # in the process table or your shell history:
+      #
+      #   printf 'the password' | docker exec -i labview /labview hashpw alice >> ./config/passwd
+      #
+      # `htpasswd -nbB alice <password>` also produces a line LabView accepts, at
+      # htpasswd's default cost rather than the cost 12 this subcommand mints at.
       #
       # Set a session key, or every restart signs everyone out:
       # LABVIEW_SESSION_SECRET: ${LABVIEW_SESSION_SECRET:-}
