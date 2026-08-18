@@ -1338,6 +1338,245 @@ for (const view of REPORT_VIEWS) await checkCollect(view, PAYLOAD, 'scanned');
     /overflow-wrap:\s*anywhere/.test(block('tbody td')), block('tbody td'));
 }
 
+// --- 14. A table compares, and the row is the way to the rest of it --------
+//
+// §22.2: a view's reading may be split between the table and the row's drawer, which is only honest if the
+// row actually opens. Section 5 above opens every panel by URL — the way a shared link arrives — and that
+// path cannot see a table whose rows stopped being clickable, because syncDrawer falls back to the payload
+// when no row matches. This is the reader's entry point: the click.
+//
+// The trap this exists for is subtle and was live in three views: onActivate resolves an `<a href>` before it
+// resolves `TR[data-open]`, so whatever the cell that *names* the row links to is what a reader gets when
+// they click the most obvious thing in it. A name whose link lands somewhere that does not show that subject
+// is therefore a row that cannot be opened by clicking it — and nothing throws, the drawer simply never
+// appears and the page goes somewhere plausible instead. So the name may be a link, but only to a reading of
+// the same subject; the second loop below is what checks where it landed.
+//
+// The drawer title is how the subject is identified, rather than a row's first cell: the naming cell is not
+// always the first one (a service row leads with its stack) and this way the check reads the same fact the
+// reader does.
+
+const namedLinks = [];   // { rowNoun, subject, href } — verified after this loop, see below
+
+for (const view of C.views) {
+  const drawer = C.drawers.find((d) => d.kind === view.kind);
+  if (!drawer) continue;                       // stat and diagram views: rows that navigate, not rows that open
+  const out = await run('?view=' + view.slug);
+  if (!noThrow('view ' + view.slug + ' renders for the row-click check', out)) continue;
+  const rows = bodyRows(out);
+  if (!rows.length) continue;                  // an empty fixture view says nothing either way
+
+  const openable = rows.filter((tr) => tr.getAttribute('data-open') !== null);
+  check('every row of ' + view.slug + ' opens its ' + drawer.kind + ' drawer',
+    openable.length === rows.length,
+    openable.length + ' of ' + rows.length + ' rows carry data-open');
+  const row = openable[0];
+  if (!row) continue;
+  check('a row of ' + view.slug + ' offers itself to the keyboard', row.getAttribute('tabindex') === '0',
+    JSON.stringify(row.getAttribute('tabindex')));
+
+  out.doc.dispatch('click', { target: row, preventDefault() {} });
+  await flush();
+  check('clicking a ' + view.rowNoun + ' opens a drawer', out.id('drawer').hidden === false);
+  const title = out.text('drawer-title') || '';
+  check('the drawer names the ' + view.rowNoun + ' it opened on', title.length > 0);
+  const panels = out.id('drawer').querySelectorAll('[data-panel]')
+    .map((n) => n.getAttribute('data-panel'));
+  check('clicking a ' + view.rowNoun + ' opens the ' + drawer.kind + ' drawer, not another one',
+    panels.length > 0 && panels.every((p) => p.startsWith(drawer.kind + ':')),
+    'panels: ' + JSON.stringify(panels));
+  check('the ' + drawer.kind + ' drawer opened with all ' + drawer.sections.length + ' of its sections',
+    panels.length === drawer.sections.length, panels.length + ' sections drawn');
+
+  // Which cell names the row: the one reading exactly what the drawer title says the subject is.
+  const subject = title.split(' — ')[0].trim();
+  if (!subject) continue;
+  cellsOf(row).filter((td) => td.textContent.trim() === subject).forEach((td) => {
+    td.all().filter((n) => n.tagName === 'A').forEach((a) => {
+      namedLinks.push({ rowNoun: view.rowNoun, subject, href: a.getAttribute('href') || '' });
+    });
+  });
+}
+
+// Where a naming cell's link landed. Run after the loop above rather than inside it, because a run replaces
+// the document those rows belong to.
+for (const l of namedLinks) {
+  const what = 'the name of a ' + l.rowNoun + ' links to a reading of that same ' + l.rowNoun;
+  const dest = await run(l.href === '.' ? '' : l.href);
+  if (!noThrow(what + ' — its destination renders', dest)) continue;
+  const title = dest.text('drawer-title') || '';
+  check(what, dest.id('drawer').hidden === false && title.split(' — ')[0].trim() === l.subject,
+    JSON.stringify(l.subject) + ' → ' + l.href + (dest.id('drawer').hidden
+      ? ' opened no drawer at all' : ' opened ' + JSON.stringify(title)));
+}
+
+// A count worth attention is marked (§22.2). The marking is a glyph rather than one of the two reserved
+// emphasis colours, so what is checked is that the glyph is there — on every nonzero count and on no zero,
+// since a mark on every row marks none. Driven by the column's `icon`, so a column that gains or loses the
+// marking is covered without a list here.
+{
+  let markedCells = 0;
+  const markedColumns = [];
+  for (const view of C.views) {
+    const cols = view.columns.filter((c) => c.icon);
+    if (!cols.length) continue;
+    const out = await run('?view=' + view.slug);
+    if (!noThrow('view ' + view.slug + ' renders for the marked-count check', out)) continue;
+    const rows = bodyRows(out);
+    if (!rows.length) continue;
+    cols.forEach((col) => {
+      markedColumns.push(view.slug + '.' + col.key);
+      const j = view.columns.indexOf(col);
+      const cells = rows.map((tr) => cellsOf(tr)[j]).filter(Boolean);
+      const glyphs = (td) => td.all().filter((n) => n.classList.contains('numicon')).length;
+
+      // The glyph must contribute no text of its own: section 2 reads these cells as integers to check the
+      // numeric alignment, and a marker that wrote a character would take the whole column out of that
+      // check rather than fail it.
+      check('view ' + view.slug + ' column ' + col.key + ' still reads as a number beside its mark',
+        cells.every((td) => isInteger(td.textContent) || td.textContent.includes('not reported')),
+        'cells read: ' + JSON.stringify(cells.map((td) => td.textContent.trim()).slice(0, 6)));
+
+      const numbers = cells.filter((td) => isInteger(td.textContent));
+      const wrong = numbers.filter((td) => (Number(td.textContent) !== 0) !== (glyphs(td) > 0));
+      check('view ' + view.slug + ' column ' + col.key + ' marks every count that is not zero, and no zero',
+        wrong.length === 0,
+        wrong.length + ' of ' + numbers.length + ' wrong, at values ' +
+        JSON.stringify(wrong.map((td) => td.textContent.trim()).slice(0, 6)));
+      markedCells += numbers.filter((td) => Number(td.textContent) !== 0).length;
+    });
+  }
+  check('a marked column is declared somewhere', markedColumns.length > 0);
+  // Every assertion above passes vacuously on a fleet with nothing to report, which is exactly the fleet the
+  // marking does not matter on. The edge fixture has both a stack the scan could not fully read and a
+  // service whose declaration this scan contradicts, so at least one mark must have been drawn.
+  check('the mark was actually drawn for something', markedCells > 0,
+    'no nonzero count in ' + JSON.stringify(markedColumns));
+}
+
+// A count can be the link to the rows it counts — the service count on a stack, the member count on a
+// network. §22.3 asks that of a card and the reason is the same here: a number whose destination shows
+// nothing is a number a reader cannot check.
+// A link out of a row must name the view it lands on. This is the shape of the bug the two checks above only
+// catch where a fixture happens to have rows: a state parameter scopes a view to one record, so a link that
+// carries `svc=…`, `stack=…`, `net=…` or `diagram=…` and no `view=…` resolves to the *default* view — whose
+// rows are statistics, which no scope matches. The reader clicks a service and gets the overview with every
+// card filtered out. Nothing throws; §22.7 is satisfied, because the URL is honest about a state nobody
+// wants. Checked on the URL rather than by opening it, so it holds for a view a fixture leaves empty.
+for (const view of C.views) {
+  if (view.slug === C.grammar.defaultView) continue;   // a scoped link that stays here needs no `view`
+  const out = await run('?view=' + view.slug);
+  if (out.thrown.length) continue;
+  const hrefs = [...new Set(out.id('content').all()
+    .filter((n) => n.tagName === 'A')
+    .map((n) => n.getAttribute('href') || '')
+    .filter((h) => h.charAt(0) === '?'))];
+  const dead = hrefs.filter((h) => {
+    const params = new URLSearchParams(h.slice(1));
+    return [...params.keys()].length > 0 && !params.get('view');
+  });
+  check('every link out of a ' + view.rowNoun + ' names the view it lands on', dead.length === 0,
+    'these fall back to the default view: ' + JSON.stringify(dead));
+}
+
+// Every linked count is read off the tables first and the destinations are opened afterwards, because a run
+// replaces the document these nodes belong to: reading a row after opening its own link would read the
+// destination's table instead, and agree with itself.
+{
+  const linked = [];
+  for (const view of C.views) {
+    const out = await run('?view=' + view.slug);
+    if (out.thrown.length) continue;
+    const rows = bodyRows(out);
+    view.columns.forEach((col, j) => {
+      if (!col.numeric) return;
+      rows.forEach((tr) => {
+        const td = cellsOf(tr)[j];
+        if (!td || !isInteger(td.textContent)) return;
+        const a = td.all().find((n) => n.tagName === 'A');
+        if (!a) return;
+        linked.push({ slug: view.slug, key: col.key, count: Number(td.textContent),
+          href: a.getAttribute('href') || '' });
+      });
+    });
+  }
+  const seen = new Set();
+  for (const l of linked) {
+    if (seen.has(l.href)) continue;
+    seen.add(l.href);
+    const what = 'the ' + l.key + ' count in ' + l.slug + ' leads to the rows it counts';
+    const dest = await run(l.href === '.' ? '' : l.href);
+    if (!noThrow(what + ' — its destination renders', dest)) continue;
+    const rows = bodyRows(dest).length;
+    check(what, rows >= l.count,
+      'count ' + l.count + ' → ' + l.href + ' drew ' + rows + ' rows');
+  }
+}
+
+// --- 15. The reserved colour marks the reserved reading, and nothing else --
+//
+// §22.1 reserves one emphasis colour for reachable-from-outside-with-no-gate. There are two ways to lose it
+// and both were live: spend it somewhere else, or fail to spend it on the reading. `tbody tr.lead td` washed
+// every first-ranked row in `--alert-bg`, and eleven views rank by eleven different questions — unhealthy,
+// read-write, more than one stack — so the colour meant "sorted first" rather than what it is reserved for.
+// Meanwhile the count that *is* that finding, a stack's exposed services, rendered as an unremarkable digit.
+//
+// The stylesheet half is checked as text because that is where the bug lives; the reading half is checked in
+// the DOM. Neither one names the tone: both read it out of the finding set, so renaming it in tone.go moves
+// the check rather than breaking it.
+{
+  const css = readFileSync(join(ROOT, 'assets', 'labview.css'), 'utf8');
+  const leadAt = css.indexOf('tbody tr.lead td {');
+  const leadCSS = leadAt < 0 ? '' : css.slice(leadAt, css.indexOf('}', leadAt));
+  check('the stylesheet still emphasises the first-ranked rows', leadCSS !== '');
+  check('a first-ranked row is not painted in the reserved colour', !/--alert/.test(leadCSS), leadCSS);
+
+  const finding = C.sets.find((s) => s.name === 'finding');
+  const reserved = finding && finding.terms.find((t) => t.member === NAME('findingExposed'));
+  check('the finding set reserves a tone for the exposure', !!(reserved && reserved.tone));
+  // `tone-<name>` is the bundle's one convention for putting a term's tone on a node, shared by the
+  // stylesheet and every renderer in app.js. The name itself comes from the contract above.
+  const cls = 'tone-' + (reserved ? reserved.tone : '');
+
+  let toldInColour = 0;
+  for (const view of C.views) {
+    // A count of the finding, which is a different cell from the finding itself: the set says which
+    // vocabulary the number counts, `numeric` says it is a count and not the terms.
+    const cols = view.columns.filter((c) => c.numeric && finding && c.set === finding.name);
+    if (!cols.length) continue;
+    const out = await run('?view=' + view.slug);
+    if (!noThrow('view ' + view.slug + ' renders for the reserved-tone check', out)) continue;
+    const rows = bodyRows(out);
+    cols.forEach((col) => {
+      const j = view.columns.indexOf(col);
+      const found = rows.map((tr) => ({ tr: tr, td: cellsOf(tr)[j] }))
+        .filter((p) => p.td && isInteger(p.td.textContent))
+        .map((p) => ({ tr: p.tr, td: p.td, n: Number(p.td.textContent) }));
+
+      const toned = (td) => td.all().some((n) => n.classList.contains(cls));
+      const wrong = found.filter((p) => (p.n !== 0) !== toned(p.td));
+      check('the ' + col.key + ' count in ' + view.slug +
+        ' wears the reserved tone when it is not zero, and never when it is',
+        wrong.length === 0,
+        wrong.length + ' of ' + found.length + ' wrong, at values ' +
+        JSON.stringify(wrong.map((p) => p.td.textContent.trim()).slice(0, 6)));
+
+      // And the rows this view ranks first are those rows. A view that counts the finding and then sorts
+      // by something else is the other half of the same bug: the emphasis lands on rows the reader was not
+      // pointed at, and the ones they were pointed at are somewhere further down the table.
+      const misranked = found.filter((p) => (p.n !== 0) !== p.tr.classList.contains('lead'));
+      check('the rows ' + view.slug + ' ranks first are the ones with an exposure', misranked.length === 0,
+        misranked.length + ' of ' + found.length + ' misranked, at values ' +
+        JSON.stringify(misranked.map((p) => p.td.textContent.trim()).slice(0, 6)));
+
+      toldInColour += found.filter((p) => p.n !== 0).length;
+    });
+  }
+  // As with the marks above: every assertion passes vacuously on a fleet with nothing exposed. The edge
+  // fixture has services reachable with no gate, so the reserved colour must have been spent on one.
+  check('the reserved colour was actually spent on an exposure', toldInColour > 0);
+}
+
 // ---------------------------------------------------------------------------
 
 console.log((checks - failures) + '/' + checks + ' checks passed');

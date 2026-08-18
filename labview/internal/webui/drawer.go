@@ -1,8 +1,8 @@
 package webui
 
 // §22.4: one service, everything known about it, **findings first and raw last** — then equivalent
-// drawers for networks, routes, applications, routers and probed services. One panel or drawer is
-// open at a time (§22.1: Escape closes the topmost layer only).
+// drawers for stacks, networks, routes, applications, routers and probed services. One panel or
+// drawer is open at a time (§22.1: Escape closes the topmost layer only).
 //
 // The order is the argument. A drawer that opened on the image name and the restart policy would put
 // the reader's attention on the least consequential thing known about the service; a drawer that
@@ -54,7 +54,9 @@ type Drawer struct {
 	Sections []Section `json:"sections"`
 }
 
-// Drawers is §22.4's set: the service drawer in §22.4's order, then the equivalents.
+// Drawers is §22.4's set: the service drawer in §22.4's order, then the equivalents. Every one of them
+// is also where a table gave a column back: a view that stopped showing a field is only allowed to if
+// a section here shows it, which is the coverage check rather than a convention (coverage.go).
 var Drawers = []Drawer{
 	{
 		Kind:  "service",
@@ -212,6 +214,71 @@ var Drawers = []Drawer{
 				Title: "Raw",
 				Raw:   true,
 				Note:  "the service's payload subtree, copyable. An escape hatch — and explicitly not how a field satisfies the coverage rule (§22.4)",
+			},
+		},
+	},
+	{
+		// The stack drawer. §22.2's Stacks view is a roll-up — a stack is where its services are, not a
+		// thing with a posture of its own — so what the table shows is the roll-up and the attention it
+		// needs, and everything that describes the stack itself is here. Same split as the service
+		// drawer and for the same reason: the reader scanning thirty stacks and the reader asking about
+		// one want different things on screen, and a table wide enough to serve the second serves
+		// neither.
+		Kind:  "stack",
+		Title: "Stack",
+		Opens: "a row in Stacks",
+		Sections: []Section{
+			{
+				// Findings first (§22.4), and for a stack the finding is what the scan could not do with
+				// it: a compose file that would not parse, a service it had to skip. The count is in the
+				// table; the words are here, because a warning summarised is a warning nobody acts on.
+				ID:     "warnings",
+				Title:  "Scan warnings",
+				Fields: []string{"stacks.warnings"},
+				Note:   "what the scan could not read in this stack, in its own words — an empty list is the good case",
+			},
+			{
+				ID:    "identity",
+				Title: "Identity",
+				Fields: []string{
+					"stacks.id", "stacks.name", "stacks.dir", "stacks.composeFile",
+					"stacks.projectName", "stacks.hasEnvFile",
+				},
+				Note: "where the stack is and what the Engine labels its containers with, which is how a container is matched back — and whether an env file was found, never what is in it (I6)",
+			},
+			{
+				ID:    "networks",
+				Title: "Declared networks",
+				Fields: []string{
+					"stacks.declaredNetworks.name", "stacks.declaredNetworks.external",
+					"stacks.declaredNetworks.driver",
+				},
+				Note: "what the compose file declares — an external network may carry containers this scan never saw (§8)",
+			},
+			{
+				ID:    "volumes",
+				Title: "Declared volumes",
+				Fields: []string{
+					"stacks.declaredVolumes.name", "stacks.declaredVolumes.external",
+					"stacks.declaredVolumes.driver",
+				},
+			},
+			{
+				ID:    "declaration",
+				Title: "Declaration",
+				Fields: []string{
+					"stacks.declared.file", "stacks.declared.owner", "stacks.declared.criticality",
+					"stacks.declared.description", "stacks.declared.notes", "stacks.declared.data",
+					"stacks.declared.links.label", "stacks.declared.links.url",
+					"stacks.declared.dependencies.name", "stacks.declared.dependencies.detail",
+				},
+				Note: "the stack-level sidecar: who owns it, how critical it is, and the links and dependencies an operator wrote down (§14)",
+			},
+			{
+				ID:    "raw",
+				Title: "Raw",
+				Raw:   true,
+				Note:  "the stack's payload subtree, copyable — the services in it are their own rows, each with their own drawer",
 			},
 		},
 	},

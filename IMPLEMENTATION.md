@@ -1723,8 +1723,8 @@ Operator · System. Each is one row per object, filterable (§22.6) and addressa
 | View | The question it answers | One row is | MUST show at least |
 |---|---|---|---|
 | Overview | what is here, and what needs attention | a statistic | every counter in `stats`, as a card (§22.3) |
-| Stacks | how the tree is laid out | a stack | directory, compose file, project name, whether an env file was found, service count, declared networks and volumes, stack-level declaration, warnings |
-| Services | everything about one service, comparably | a service | stack, name, image, state, ingress set, auth method with confidence, exposure, declaration state, probe verdict |
+| Stacks | how the tree is laid out | a stack | *in the table:* name, service count, ingress and auth roll-ups, an exposure count in the **reserved colour**, and a **marked** warning count. *In the row's drawer:* directory, compose file, project name, whether an env file was found, declared networks and volumes, stack-level declaration, and the warnings themselves |
+| Services | everything about one service, comparably | a service | *in the table:* stack, name, state, ingress set, auth method with confidence, exposure, and a **marked** drift count. *In the row's drawer:* image, declaration state, probe verdict — and everything else of §22.4 |
 | Ingress | how each hostname reaches a container | a route | hostname, path, kind (tunnel or proxy router), TLS and resolver, entrypoints, middleware chain, resolved origin and its `OriginKind`, target service, the gate on that path |
 | Networks | what connects services and what merely co-locates them | a network | name, scope, driver, member count, stack count, whether it connects anything, and the dependencies that cross it |
 | Diagrams | the shape of the fleet | a diagram | the four diagrams of §22.5 |
@@ -1742,11 +1742,32 @@ Rules that apply across views:
 - **Stacks roll up; filters do not.** A stack may collapse to one row showing every distinct ingress
   kind and auth mechanism its services have plus an exposure count (`none` rolls up to nothing), but
   filtering is always **service-level**.
+- **A table compares; a drawer describes.** A view's required reading MAY be split between the two:
+  what a reader compares *across* rows belongs in the table, and what only describes the one row
+  belongs in that row's drawer (§22.4). Splitting MUST NOT lose anything — a field the table stops
+  showing MUST appear in a non-**Raw** drawer section, which is the coverage check of §23 enforcing it
+  rather than a convention. A row whose reading is split MUST itself open, and MUST be focusable and
+  operable with Enter and Space like any other clickable element (§22.1). A link inside such a row wins
+  the activation, so the row MUST NOT put one on the cell a reader is most likely to click to open it.
+- **A count worth attention MUST be marked, and not with a reserved colour.** A stack's scan warnings
+  and a service's drift entries are what a reader scans a table for, so a nonzero count MUST carry a
+  visible mark beside it — an exclamation glyph, since the two reserved emphasis colours (§22.1) mean
+  exactly what they mean and MUST NOT be borrowed. A zero MUST still read as `0`, and MUST NOT be
+  marked: a mark on every row marks none.
+- **Rank is not severity.** Every view sorts what it is about to the top, and each view is about a
+  different question — unhealthy in Containers, read-write in Storage, more than one stack in
+  Networks. So the emphasis a table gives its first rows MUST say *first*, not *worst*: a raised
+  surface and an edge marker in the neutral accent, never one of §22.1's two reserved colours, which
+  would otherwise mean eleven different things at once. Where a view counts the reserved finding
+  itself, the reserved colour goes on that **cell** — a nonzero count wears the finding's own tone, a
+  zero wears none — and the view's rank MUST follow the same count, so the rows a reader is pointed at
+  and the reading that points at them are the same rows.
 - **Overlapping counters MUST NOT be drawn as a partition.** The three external ingress counters
   overlap, so they are per-tag gauges; auth methods partition, so they may be one distribution bar.
 - **Findings lead.** In the Probe view: *answered with no login page*, then *answered with a login
   page*, then *did not answer*. In Declarations: drift before not-confirmed. In Diagnostics: failures
-  and `partial` before working targets.
+  and `partial` before working targets. In Stacks: the exposure first, then a stack the scan could
+  only partly read, then the rest — two conditions in the order §22.1 ranks them, not one.
 - Every view MUST state its row count, and every list that is capped MUST say what it dropped.
 - A rescan control MUST be present, MUST show the change note (§17) and the scanned-at time, and
   MUST carry the probe switch, re-synced from `meta.probe.enabled` on every payload received
@@ -1811,8 +1832,11 @@ One service, everything known about it, in this order — findings first, raw la
 10. **Raw** — the service's payload subtree, copyable. This exists as an escape hatch and **MUST NOT
     be how a field satisfies the §22.1 coverage rule.**
 
-Networks, routes, applications, routers and probed services get equivalent drawers. One panel or
-drawer is open at a time.
+Stacks, networks, routes, applications, routers and probed services get equivalent drawers. One panel
+or drawer is open at a time. The stack drawer is where the Stacks table's roll-up stops being a
+summary: the scan warnings in their own words first, then where the stack is and what the Engine
+labels its containers with, its declared networks and volumes, its stack-level declaration (§14), and
+raw last — its services are not repeated there, since each is a row with a drawer of its own.
 
 ### 22.5 Diagrams
 

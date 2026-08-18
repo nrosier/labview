@@ -797,11 +797,43 @@ tbody td { padding: 0.3rem 0.6rem; border-bottom: 1px solid var(--line); vertica
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--soft); }
 tbody tr[data-open]:hover { cursor: pointer; }
-tbody tr.lead td { background: color-mix(in oklch, var(--alert-bg) 60%, transparent); }
+/* The first-ranked rows (`row.lead === 0`). What they have in common is only that this view sorts them
+   above everything else, and each view ranks by its own question — reachable with no gate in Services,
+   unhealthy in Containers, more than one stack in Networks. So the emphasis here says *first*, not
+   *worst*: a slightly raised surface and an edge marker in the neutral accent, which is legible in both
+   themes and costs nothing reserved. This used to wash the row in `--alert-bg`, which spent §22.1's one
+   reserved colour on eleven different conditions and left the reading it is reserved for — a `1` in the
+   Stacks view's Exposed column — looking like every other digit. The reserved colour now lives where the
+   reading is: on the cell, from the finding's own term (tone.go).
+
+   Weaker than `--soft` on purpose: the hover rule above is `--soft` flat, so a lead row still lights up
+   under the pointer instead of already looking hovered. */
+tbody tr.lead td { background: color-mix(in oklch, var(--soft) 55%, transparent); }
+tbody tr.lead td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
 
 td.num, th.num { text-align: right; }
 td .hint { display: block; }
 td .muted { display: block; }
+
+/* A count's glyph (Column.Icon): the exclamation mark beside a stack's warnings or a service's drift
+   entries. Inline-baseline rather than a block, so the row keeps its height whether the glyph is there or
+   not — §22.1 asks for no layout shift when a rescan lands, and a rescan is exactly when a count crosses
+   zero in either direction.
+
+   Deliberately not a tone. §22.1 reserves `alert` for reachable-with-no-gate and `warn` for three named
+   conditions (tone.go), and neither a scan warning nor a drift entry is one of them; borrowing the colour
+   would make the exposure finding one emphasis among several. The shape is the carrier, which is also
+   what the rule that colour is never the only carrier is asking for. `--ink-soft` keeps it quieter than
+   the digits it marks — the number is the reading, the glyph is only what makes the row findable. */
+.numicon { display: inline-grid; place-items: center; width: 0.85em; height: 0.85em; margin-right: 0.3rem;
+  vertical-align: -0.05em; color: var(--ink-soft); }
+.numicon svg { width: 100%; height: 100%; }
+tbody tr:hover .numicon { color: var(--ink); }
+
+/* A linked count — the Stacks view's service count. Underlined only on hover, like the other in-cell
+   links, and it must not lose the tabular alignment the `.num` cell gives the digits. */
+td.num a { color: inherit; text-decoration: none; }
+td.num a:hover { text-decoration: underline; }
 
 .empty { padding: 1.5rem 1rem; color: var(--ink-soft); text-align: center; border: 1px dashed var(--line); border-radius: var(--r-lg); }
 

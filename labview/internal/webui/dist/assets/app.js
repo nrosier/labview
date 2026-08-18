@@ -487,6 +487,29 @@
     return VIEWS[s.view || G.defaultView] || VIEWS[G.defaultView];
   }
 
+  // slugOfKind is the view that shows a given row kind — the one way this file is allowed to write a
+  // `view` parameter from a row.
+  //
+  // A link needs the slug, and the slug belongs to views.go (contract.go): `'services'` written here
+  // would be this file holding a view spelling, and the two would agree until someone renamed the view.
+  // The kind is already the key everything else dispatches on, so asking *which view shows services*
+  // reads the table rather than a second copy of it. Empty when no view has that kind, which linkOf
+  // turns into the default view rather than a broken URL (I4).
+  function slugOfKind(kind) {
+    var found = '';
+    VIEW_ORDER.forEach(function (slug) { if (!found && VIEWS[slug].kind === kind) found = slug; });
+    return found;
+  }
+
+  // rowLink is a cross-reference from one row to another: the view whose rows are that kind, scoped to the
+  // one record. Always both halves together, because either alone is a dead end — `svc=…` with no view lands
+  // on the default view, whose rows are statistics, so the scope matches nothing and the reader who clicked
+  // a service name is handed the overview with every card filtered out. It is the same URL the reader could
+  // have typed (§22.7), which is why the destination has to be a view that can show the thing.
+  function rowLink(kind, field, value) {
+    return withField(withField(newState(), 'view', slugOfKind(kind)), field, value);
+  }
+
   // ---------------------------------------------------------------------------
   // Rows
   //
@@ -594,7 +617,7 @@
     r.open = { kind: M.rowService, svc: key, title: svc.name, subject: svc, bases: r.bases };
     applyRules(M.shapeService, r, svc);
     sayService(r, svc);
-    r.cells.stack = { text: [stack.name || stack.id], link: withField(newState(), 'stack', stack.id) };
+    r.cells.stack = { text: [stack.name || stack.id], link: rowLink(M.rowStack, 'stack', stack.id) };
     r.cells.service = { text: [svc.name] };
     return r;
   }
@@ -645,7 +668,6 @@
       r.stack = stack.id;
       r.bases = [[PRE.stack, stack]];
       r.raw = stack;
-      r.lead = leadIf((stack.warnings || []).length > 0);
       r.sort = [(stack.name || '').toLowerCase(), stack.id];
       say(r, stack.name, stack.id, stack.dir, stack.composeFile, stack.projectName);
       var exposed = 0;
@@ -659,10 +681,39 @@
         tag(r, M.dimAuth, methodOf(svc));
         if (svc.auth && svc.auth.exposedWithoutAuth) exposed++;
       });
-      r.numbers.services = (stack.services || []).length;
       r.numbers.exposed = exposed;
       r.numbers.warnings = (stack.warnings || []).length;
-      r.cells.name = { text: [stack.name || stack.id], link: withField(newState(), 'stack', stack.id) };
+      // Three ranks, not two, because the row's leading rank is also the row's emphasis: `lead === 0`
+      // is what paints the reserved wash (renderTable). A stack reachable from outside with no gate
+      // ranks first and wears it; a stack the scan warned about sorts above the quiet ones but is
+      // marked by the glyph beside its count instead (views.go gives that column the icon). Ranking
+      // the warning first — which this did while the table was thirteen columns wide — spends §22.1's
+      // one reserved colour on the weaker of the two conditions and leaves the stronger reading as an
+      // unremarkable `1`.
+      r.lead = exposed ? 0 : (r.numbers.warnings ? 1 : 2);
+      // The count of services reachable with no gate is the reserved finding, said as a number. The
+      // tone comes from the finding's own term rather than from a colour spelled here — tone.go owns
+      // which term is reserved, and a zero is toneless because a stack with nothing exposed has
+      // nothing to report.
+      r.cells.exposed = {
+        number: exposed,
+        tone: exposed ? termOf('finding', M.findingExposed).tone : ''
+      };
+      // The row opens the stack's drawer, which is where the tree, the declared networks and volumes and
+      // the stack's own declaration went when this table stopped being thirteen columns wide (views.go).
+      r.open = { kind: M.rowStack, title: stack.name || stack.id, subject: stack, bases: r.bases };
+      // One name, and deliberately *not* a link. Written rather than resolved from the column's two paths,
+      // which would print the id under the name whenever they differ — a stack is one row and reads as one
+      // thing, and both paths are in the drawer's identity section anyway. Not a link because onActivate
+      // resolves a link before it resolves a row, so a linked name would mean the one thing a reader is
+      // most likely to click is the one thing that does not open the stack they clicked it on.
+      r.cells.name = { text: [stack.name || stack.id] };
+      // The service count carries the link instead, where it reads as what it does: `3` → the three
+      // services, in the view that shows services.
+      r.cells.services = {
+        number: (stack.services || []).length,
+        link: rowLink(M.rowService, 'stack', stack.id)
+      };
       out.push(r);
     });
     return out;
@@ -675,6 +726,10 @@
       r.lead = leadIf(r.exposed);
       r.sort = [(stack.name || '').toLowerCase(), (svc.name || '').toLowerCase()];
       r.cells.exposure = { members: findingOf(svc), set: 'finding' };
+      // The count, not the sentences: the entries themselves are in the drawer's declaration section,
+      // which is also where not-confirmed lives — and §22.2 never merges the two, so this counts drift
+      // alone. A service with no declaration has nothing to contradict and reads as zero, not absent.
+      r.numbers.drift = svc.declared ? (svc.declared.drift || []).length : 0;
       out.push(r);
     });
     return out;
@@ -779,7 +834,15 @@
       applyRules(M.shapeNetwork, r, facts);
       say(r, net.name, net.driver, node.scope);
       net.members.forEach(function (m) { say(r, m); });
-      r.cells.name = { text: [net.name], link: withField(newState(), 'net', net.name) };
+      // The name names the row, and the row opens the network (below) — so it is not a link, for the same
+      // reason the Stacks table's name is not: onActivate resolves a link first, and a reader clicking the
+      // name of a network means the network. The member count carries the link instead, where the number
+      // and its destination are the same thing said twice (§22.3's rule, applied to a cell).
+      r.cells.name = { text: [net.name] };
+      r.cells.members = {
+        number: net.members.length,
+        link: rowLink(M.rowService, 'net', net.name)
+      };
       r.cells.driver = { text: [net.driver || node.scope] };
       r.cells.connects = net.members.length > 1
         ? { text: [net.members.length + ' services across ' + net.stacks.length +
@@ -802,7 +865,9 @@
       r.numbers.nodes = dr.total;
       r.numbers.edges = dr.edges.length;
       say(r, d.title, d.shows, d.note);
-      r.cells.diagram = { text: [d.title], note: d.note, link: diagramState(newState(), d.id) };
+      // Through rowLink, not diagramState(newState(), …): a `diagram` parameter with no view lands on the
+      // default view, which has no drawing in it, so the row that names a diagram would draw none.
+      r.cells.diagram = { text: [d.title], note: d.note, link: rowLink(M.rowDiagram, 'diagram', d.id) };
       r.cells.shows = { text: [d.shows] };
       r.cells.export = { text: ['Mermaid'], export: mermaid(dr) };
       r.open = null;
@@ -851,7 +916,7 @@
         say(r, m.source, m.target, m.raw, svc.name);
         var shared = (mounted[stack.id + '\x00' + (m.source || '')] || 1) - 1;
         r.numbers.shared = shared;
-        r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+        r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
         r.cells.external = { text: [externalSource(stack, m) ? 'yes' : 'no'] };
         r.open = { kind: M.rowService, svc: key, title: svc.name, subject: svc, bases: serviceBases(stack, svc) };
         out.push(r);
@@ -904,7 +969,7 @@
         r.sort = [(svc.name || '').toLowerCase(), (e.key || '').toLowerCase(), pad(i)];
         // The key and the source, never the value (I6). A masked value is absent, not starred.
         say(r, e.key, svc.name);
-        r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+        r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
         r.cells.prefix = { text: [prefixOf(e.key)] };
         r.cells.value = e.masked
           ? { absent: true, note: 'masked: a mask that carried the length would carry the secret (I6)' }
@@ -926,7 +991,7 @@
         r.lead = leadIf(cited.length > 0);
         r.sort = [(svc.name || '').toLowerCase(), label.toLowerCase(), ''];
         say(r, label, svc.name, asString(labels[label]));
-        r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+        r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
         r.cells.prefix = { text: [prefixOf(label)] };
         r.cells.key = { text: [label] };
         r.cells.value = { text: [asString(labels[label])] };
@@ -1585,7 +1650,7 @@
         tag(r, M.dimIngress, M.ingressTraefik);
         r.lead = leadIf(rowHas(r, M.dimState, M.routerErrored));
         r.sort = [asString(live.router).toLowerCase(), id];
-        r.cells.match = { text: [svc.name], link: withField(newState(), 'svc', key) };
+        r.cells.match = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
         r.open = { kind: M.rowRouter, title: r.label || id, subject: live, bases: r.bases };
         out.push(r);
       });
@@ -1625,7 +1690,7 @@
       // without a gate.
       r.lead = rowHas(r, M.dimProbe, M.outcomeOpen) ? 0 : (rowHas(r, M.dimProbe, M.outcomeGated) ? 1 : 2);
       r.sort = [asString(svc.name).toLowerCase(), key];
-      r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+      r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
       r.open = { kind: M.rowProbe, title: svc.name, subject: p, bases: r.bases };
       out.push(r);
     });
@@ -1648,7 +1713,7 @@
       r.numbers.unconfirmed = unconfirmed;
       r.lead = drift ? 0 : (unconfirmed ? 1 : (d.unauthenticatedAccepted ? 2 : 3));
       r.sort = [asString(svc.name).toLowerCase(), key];
-      r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+      r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
       out.push(r);
     });
     return out;
@@ -1677,7 +1742,7 @@
         say(r, svc.name, text, d.file);
         tag(r, M.dimDecl, member);
         r.sort = [asString(svc.name).toLowerCase(), pad(i)];
-        r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+        r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
         // The entry itself is the row, so it goes in the column the narrowing was on.
         r.cells[column] = { text: [text] };
         r.open = { kind: M.rowDeclaration, title: svc.name, subject: d, bases: r.bases };
@@ -1702,7 +1767,7 @@
       r.lead = leadIf(r.exposed);
       say(r, asString(d.unauthenticatedAccepted.reason));
       r.sort = [asString(svc.name).toLowerCase(), key];
-      r.cells.service = { text: [svc.name], link: withField(newState(), 'svc', key) };
+      r.cells.service = { text: [svc.name], link: rowLink(M.rowService, 'svc', key) };
       out.push(r);
     });
     return out;
@@ -1849,9 +1914,10 @@
   }
 
   // ---------------------------------------------------------------------------
-  // The navigation glyphs
+  // The glyphs
   //
-  // Drawings, keyed by the icon *token* each view carries in the contract — never by slug. That is the
+  // Drawings, keyed by the icon *token* the contract carries — on a view for the navigation, and on a
+  // column for a count worth marking (views.go) — never by slug or by column key. That is the
   // same rule as everywhere else in this file: a table of `services: [...]` here would be this file
   // holding a view spelling, and the spelling belongs to views.go. The token names a shape; this table
   // turns the shape into paths, which is presentation and therefore genuinely this file's business.
@@ -1887,7 +1953,11 @@
       'M12 12h.01'],
     'file-check': ['M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z', 'M14 2v5h6',
       'm9 15 2 2 4-4'],
-    'activity': ['M22 12h-4l-3 9L9 3l-3 9H2']
+    'activity': ['M22 12h-4l-3 9L9 3l-3 9H2'],
+    // Not a navigation glyph: this one marks a count (Column.Icon). The exclamation mark is the whole
+    // point of it — the triangle is what makes it read as one at 14px.
+    'alert-triangle': ['M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z',
+      'M12 9v4', 'M12 17h.01']
   };
 
   function iconNode(token, cls) {
@@ -2013,8 +2083,24 @@
 
     if (cell.number !== undefined && cell.number !== null) {
       td.classList.add('num');
+      // The column's glyph, on a count that is not zero (views.go). Before the number rather than after,
+      // so a scanning eye finds the marked rows down one edge instead of at whatever x the digits end at —
+      // and drawn rather than coloured, because §22.1 reserves the two emphasis colours for conditions
+      // this is not one of, and a distinction carried by colour alone is forbidden anyway.
+      if (col && col.icon && cell.number !== 0) add(td, iconNode(col.icon, 'numicon'));
       var num = mk('span', cell.tone ? 'tone-' + cell.tone : '', String(cell.number));
-      add(td, num);
+      // A count can be a link: the Stacks view's service count is how a reader gets from a stack to its
+      // services, and putting the link on the number keeps the cell reading as one thing. Handled here
+      // rather than by the text branch below, which would lose the alignment and the glyph.
+      var to = cell.href || (cell.link ? linkOf(cell.link) : '');
+      if (to) {
+        var wrap = mk('a', '');
+        wrap.setAttribute('href', to);
+        add(wrap, num);
+        add(td, wrap);
+      } else {
+        add(td, num);
+      }
       return;
     }
 

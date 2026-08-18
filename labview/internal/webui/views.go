@@ -94,6 +94,17 @@ type Column struct {
 	// Numeric right-aligns and sorts as a number.
 	Numeric bool `json:"numeric,omitempty"`
 
+	// Icon is a glyph drawn beside a numeric cell whose count is not zero, as a token rather than as
+	// drawing instructions — the same arrangement as View.Icon, and for the same reason: the bundle's
+	// icon table turns a token into a path, and the choice of which count is worth marking is this
+	// file's.
+	//
+	// Only on a count, and only when the count is nonzero: the icon is there to make a row with
+	// something to report findable at a glance, and one drawn beside every zero would mark every row
+	// and therefore none. It is not a colour — §22.1 reserves those — so it carries its own
+	// distinction and takes nothing from the two emphasis tones (tone.go).
+	Icon string `json:"icon,omitempty"`
+
 	// Evidence marks a column whose cell carries the evidence, detail or notes that produced it —
 	// §22.1: *evidence is never more than one interaction away*.
 	Evidence bool `json:"evidence,omitempty"`
@@ -175,22 +186,25 @@ var Views = []View{
 		Question: "how the tree is laid out",
 		RowNoun:  "stack",
 		Kind:     RowStack,
+		// Six columns: what a stack *is* and what about it needs attention. The tree — directory,
+		// compose file, project name, env file, declared networks and volumes, the stack's own
+		// declaration — is in the drawer this view's rows open (drawer.go), which is where a reader who
+		// is asking about one stack goes rather than a reader who is scanning thirty of them. §22.1 is
+		// satisfied either way: a drawer section is a place to appear, and the coverage check counts it
+		// (coverage.go). What the split changes is the width of the table, which was thirteen columns of
+		// mostly paths.
 		Columns: []Column{
 			{Key: "name", Header: "Stack", Fields: []string{"stacks.id", "stacks.name"}},
-			{Key: "dir", Header: "Directory", Fields: []string{"stacks.dir"}},
-			{Key: "compose", Header: "Compose file", Fields: []string{"stacks.composeFile"}},
-			{Key: "project", Header: "Project name", Fields: []string{"stacks.projectName"}, Note: "what the Engine labels containers with, which is how a container is matched back"},
-			{Key: "env", Header: "Env file", Fields: []string{"stacks.hasEnvFile"}, Note: "whether one was found — never what is in it (I6)"},
-			{Key: "services", Header: "Services", Numeric: true},
+			{Key: "services", Header: "Services", Numeric: true, Note: "the count links to them"},
 			{Key: "ingressRollup", Header: "Ingress", Set: SetIngressKind, Dim: DimIngress, Note: "every distinct kind in the stack; none rolls up to nothing"},
 			{Key: "authRollup", Header: "Auth", Set: SetAuthMethod, Dim: DimAuth, Note: "every distinct mechanism in the stack — a roll-up, and filtering is still service-level"},
 			{Key: "exposed", Header: "Exposed", Numeric: true, Set: SetFinding, Note: "services reachable from outside with no gate"},
-			{Key: "networks", Header: "Declared networks", Fields: []string{"stacks.declaredNetworks.name", "stacks.declaredNetworks.external", "stacks.declaredNetworks.driver"}},
-			{Key: "volumes", Header: "Declared volumes", Fields: []string{"stacks.declaredVolumes.name", "stacks.declaredVolumes.external", "stacks.declaredVolumes.driver"}},
-			{Key: "declared", Header: "Declaration", Fields: []string{"stacks.declared.file", "stacks.declared.owner", "stacks.declared.criticality", "stacks.declared.description", "stacks.declared.notes", "stacks.declared.data", "stacks.declared.links.label", "stacks.declared.links.url", "stacks.declared.dependencies.name", "stacks.declared.dependencies.detail"}, Evidence: true},
-			{Key: "warnings", Header: "Warnings", Fields: []string{"stacks.warnings"}, Numeric: true, Evidence: true},
+			{Key: "warnings", Header: "Warnings", Fields: []string{"stacks.warnings"}, Numeric: true, Icon: "alert-triangle", Evidence: true, Note: "the drawer has the scan's own words"},
 		},
-		Order: "stacks with warnings first, then by name",
+		// Two conditions, in the order §22.1 ranks them: the reserved finding outranks a scan warning,
+		// and a warning outranks nothing at all. The emphasis follows the same ranking — the row wash
+		// belongs to the exposure, and the warning count carries a glyph instead (Icon above).
+		Order: "exposed stacks first, then stacks with warnings, then by name",
 		Empty: "No stacks under the apps root. The Diagnostics view states the root that was read.",
 		Dims:  []Dim{DimIngress, DimAuth},
 	},
@@ -202,17 +216,23 @@ var Views = []View{
 		Question: "everything about one service, comparably",
 		RowNoun:  "service",
 		Kind:     RowService,
+		// Where the service is, what state it is in, how it is reached, what stands in front of it, what
+		// that adds up to, and whether the operator's description of it still holds. The image, the
+		// declaration agreement, the probe verdict and the cross-check notes moved into the service
+		// drawer's identity, declaration, probe and authentication-detail sections (drawer.go) — every
+		// one of them was already there, so this view is narrower and covers the same payload.
+		//
+		// Filtering is unchanged: `decl` and `probe` still narrow this view (Dims below), and a
+		// dimension can be filtered without having a column of its own — that is what the chips and the
+		// controls are for (§22.6).
 		Columns: []Column{
 			{Key: "stack", Header: "Stack"},
 			{Key: "name", Header: "Service", Fields: []string{"stacks.services.name", "stacks.services.containerName"}},
-			{Key: "image", Header: "Image", Fields: []string{"stacks.services.image"}},
 			{Key: "state", Header: "State", Fields: []string{"stacks.services.docker.state", "stacks.services.docker.running"}, Dim: DimState, Note: "not read when the Engine was not read — never stopped (§22.8)"},
 			{Key: "ingress", Header: "Ingress", Fields: []string{"stacks.services.ingress"}, Set: SetIngressKind, Dim: DimIngress, Note: "a set, not a category: the three external kinds overlap"},
 			{Key: "auth", Header: "Auth", Fields: []string{"stacks.services.auth.method", "stacks.services.auth.confidence", "stacks.services.auth.detail", "stacks.services.auth.evidence"}, Set: SetAuthMethod, Dim: DimAuth, Evidence: true, Note: "confidence is how the gate was established, never how strong it is"},
 			{Key: "exposure", Header: "Exposure", Fields: []string{"stacks.services.auth.exposedWithoutAuth"}, Set: SetFinding, Evidence: true},
-			{Key: "declaration", Header: "Declared", Fields: []string{"stacks.services.declared.authAgreement"}, Set: SetDeclState, Dim: DimDecl},
-			{Key: "probe", Header: "Probe", Fields: []string{"stacks.services.probe.gate"}, Set: SetProbeGate, Dim: DimProbe, Evidence: true},
-			{Key: "notes", Header: "Notes", Fields: []string{"stacks.services.notes"}, Evidence: true},
+			{Key: "drift", Header: "Drift", Fields: []string{"stacks.services.declared.drift"}, Numeric: true, Icon: "alert-triangle", Evidence: true, Note: "declarations this scan contradicts, never merely unconfirmed (§22.2)"},
 		},
 		Order: "exposed without auth first, then by stack and service name",
 		Empty: "No service matches. Remove a filter chip to widen it.",

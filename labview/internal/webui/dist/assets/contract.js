@@ -122,6 +122,12 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "service:config",
           "service:declaration",
           "service:raw",
+          "stack:warnings",
+          "stack:identity",
+          "stack:networks",
+          "stack:volumes",
+          "stack:declaration",
+          "stack:raw",
           "network:identity",
           "network:members",
           "network:crossing",
@@ -225,39 +231,10 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ]
         },
         {
-          "key": "dir",
-          "header": "Directory",
-          "fields": [
-            "stacks.dir"
-          ]
-        },
-        {
-          "key": "compose",
-          "header": "Compose file",
-          "fields": [
-            "stacks.composeFile"
-          ]
-        },
-        {
-          "key": "project",
-          "header": "Project name",
-          "fields": [
-            "stacks.projectName"
-          ],
-          "note": "what the Engine labels containers with, which is how a container is matched back"
-        },
-        {
-          "key": "env",
-          "header": "Env file",
-          "fields": [
-            "stacks.hasEnvFile"
-          ],
-          "note": "whether one was found — never what is in it (I6)"
-        },
-        {
           "key": "services",
           "header": "Services",
-          "numeric": true
+          "numeric": true,
+          "note": "the count links to them"
         },
         {
           "key": "ingressRollup",
@@ -281,51 +258,18 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "note": "services reachable from outside with no gate"
         },
         {
-          "key": "networks",
-          "header": "Declared networks",
-          "fields": [
-            "stacks.declaredNetworks.name",
-            "stacks.declaredNetworks.external",
-            "stacks.declaredNetworks.driver"
-          ]
-        },
-        {
-          "key": "volumes",
-          "header": "Declared volumes",
-          "fields": [
-            "stacks.declaredVolumes.name",
-            "stacks.declaredVolumes.external",
-            "stacks.declaredVolumes.driver"
-          ]
-        },
-        {
-          "key": "declared",
-          "header": "Declaration",
-          "fields": [
-            "stacks.declared.file",
-            "stacks.declared.owner",
-            "stacks.declared.criticality",
-            "stacks.declared.description",
-            "stacks.declared.notes",
-            "stacks.declared.data",
-            "stacks.declared.links.label",
-            "stacks.declared.links.url",
-            "stacks.declared.dependencies.name",
-            "stacks.declared.dependencies.detail"
-          ],
-          "evidence": true
-        },
-        {
           "key": "warnings",
           "header": "Warnings",
           "fields": [
             "stacks.warnings"
           ],
           "numeric": true,
-          "evidence": true
+          "icon": "alert-triangle",
+          "evidence": true,
+          "note": "the drawer has the scan's own words"
         }
       ],
-      "order": "stacks with warnings first, then by name",
+      "order": "exposed stacks first, then stacks with warnings, then by name",
       "empty": "No stacks under the apps root. The Diagnostics view states the root that was read.",
       "dims": [
         "ingress",
@@ -351,13 +295,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "fields": [
             "stacks.services.name",
             "stacks.services.containerName"
-          ]
-        },
-        {
-          "key": "image",
-          "header": "Image",
-          "fields": [
-            "stacks.services.image"
           ]
         },
         {
@@ -404,31 +341,15 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "evidence": true
         },
         {
-          "key": "declaration",
-          "header": "Declared",
+          "key": "drift",
+          "header": "Drift",
           "fields": [
-            "stacks.services.declared.authAgreement"
+            "stacks.services.declared.drift"
           ],
-          "set": "declarationState",
-          "dim": "decl"
-        },
-        {
-          "key": "probe",
-          "header": "Probe",
-          "fields": [
-            "stacks.services.probe.gate"
-          ],
-          "set": "probeGate",
-          "dim": "probe",
-          "evidence": true
-        },
-        {
-          "key": "notes",
-          "header": "Notes",
-          "fields": [
-            "stacks.services.notes"
-          ],
-          "evidence": true
+          "numeric": true,
+          "icon": "alert-triangle",
+          "evidence": true,
+          "note": "declarations this scan contradicts, never merely unconfirmed (§22.2)"
         }
       ],
       "order": "exposed without auth first, then by stack and service name",
@@ -3619,6 +3540,76 @@ window.LABVIEW_CONTRACT = Object.freeze({
       ]
     },
     {
+      "kind": "stack",
+      "title": "Stack",
+      "opens": "a row in Stacks",
+      "sections": [
+        {
+          "id": "warnings",
+          "title": "Scan warnings",
+          "fields": [
+            "stacks.warnings"
+          ],
+          "note": "what the scan could not read in this stack, in its own words — an empty list is the good case"
+        },
+        {
+          "id": "identity",
+          "title": "Identity",
+          "fields": [
+            "stacks.id",
+            "stacks.name",
+            "stacks.dir",
+            "stacks.composeFile",
+            "stacks.projectName",
+            "stacks.hasEnvFile"
+          ],
+          "note": "where the stack is and what the Engine labels its containers with, which is how a container is matched back — and whether an env file was found, never what is in it (I6)"
+        },
+        {
+          "id": "networks",
+          "title": "Declared networks",
+          "fields": [
+            "stacks.declaredNetworks.name",
+            "stacks.declaredNetworks.external",
+            "stacks.declaredNetworks.driver"
+          ],
+          "note": "what the compose file declares — an external network may carry containers this scan never saw (§8)"
+        },
+        {
+          "id": "volumes",
+          "title": "Declared volumes",
+          "fields": [
+            "stacks.declaredVolumes.name",
+            "stacks.declaredVolumes.external",
+            "stacks.declaredVolumes.driver"
+          ]
+        },
+        {
+          "id": "declaration",
+          "title": "Declaration",
+          "fields": [
+            "stacks.declared.file",
+            "stacks.declared.owner",
+            "stacks.declared.criticality",
+            "stacks.declared.description",
+            "stacks.declared.notes",
+            "stacks.declared.data",
+            "stacks.declared.links.label",
+            "stacks.declared.links.url",
+            "stacks.declared.dependencies.name",
+            "stacks.declared.dependencies.detail"
+          ],
+          "note": "the stack-level sidecar: who owns it, how critical it is, and the links and dependencies an operator wrote down (§14)"
+        },
+        {
+          "id": "raw",
+          "title": "Raw",
+          "raw": true,
+          "note": "the stack's payload subtree, copyable — the services in it are their own rows, each with their own drawer"
+        }
+      ]
+    },
+    {
       "kind": "network",
       "title": "Network",
       "opens": "a row in Networks, a network node in the networks diagram, or the net parameter",
@@ -3824,6 +3815,12 @@ window.LABVIEW_CONTRACT = Object.freeze({
     "service:config",
     "service:declaration",
     "service:raw",
+    "stack:warnings",
+    "stack:identity",
+    "stack:networks",
+    "stack:volumes",
+    "stack:declaration",
+    "stack:raw",
     "network:identity",
     "network:members",
     "network:crossing",
