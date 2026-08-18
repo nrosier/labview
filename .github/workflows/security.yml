@@ -45,7 +45,7 @@ jobs:
         working-directory: labview
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # The toolchain the Dockerfile ships, NOT go.mod's floor — keep this in step with
       # labview/Dockerfile's build stage. govulncheck reports standard-library advisories
@@ -55,10 +55,20 @@ jobs:
       # stdlib advisories — accurately: Go 1.23 is end of life, so there was no patched
       # 1.23 to move to and no version of this step could pass. Auditing a toolchain the
       # image does not ship would be the mirror of that mistake, so this tracks the image.
+      #
+      # check-latest is what makes '1.26' mean the same thing here as `golang:1.26-alpine`
+      # means in the Dockerfile: the newest 1.26.x, resolved now. Without it setup-go takes
+      # any 1.26.x already in the runner's tool cache and never looks further, so the pin
+      # silently froze on the runner image's Go while the security releases moved past it —
+      # the audit reported five reachable stdlib advisories (net/url, crypto/tls, net/http,
+      # encoding/asn1) that were all fixed in the patch it declined to fetch. A stdlib
+      # advisory is normally one patch release wide, so a stale patch is the one way this
+      # job can be red for a reason that has nothing to say about this code.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          check-latest: true
           cache-dependency-path: labview/go.sum
 
       - name: Dependencies are tidy and their hashes match
@@ -103,7 +113,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
@@ -127,16 +137,18 @@ jobs:
             build-mode: none
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # The shipped toolchain again, for the same reason as the audit job above: CodeQL
       # analyses what the compiler gives it, so a stdlib two years behind the image's
-      # would be analysed instead of the one that ships.
+      # would be analysed instead of the one that ships — and check-latest for the same
+      # reason too, so the two jobs cannot end up reading different 1.26.x stdlibs.
       - name: Set up Go
         if: matrix.language == 'go'
         uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          check-latest: true
           cache-dependency-path: labview/go.sum
 
       - name: Initialize CodeQL
@@ -167,7 +179,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run Trivy (vuln, misconfig, secrets)
         uses: aquasecurity/trivy-action@master
@@ -194,7 +206,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build Docker image
         run: docker build -t labview:test ./labview
@@ -220,7 +232,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

@@ -45,10 +45,18 @@ jobs:
       # at compile time, not by the choice of toolchain. The floor-compat job below is
       # what checks the declaration is still true; testing on the floor as well would only
       # mean the tests never touch the stdlib the image contains.
+      #
+      # check-latest for that last clause to stay true: without it setup-go stops at any
+      # 1.26.x sitting in the runner's tool cache, which is the runner image's Go and not
+      # the one `golang:1.26-alpine` resolves to — so the corpus would run against a stdlib
+      # the image stopped containing, and against a different one than the security
+      # workflow's govulncheck gate reads. The floor job below is the exception and keeps
+      # go-version-file: the whole point there is to pin, not to track.
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          check-latest: true
           cache-dependency-path: labview/go.sum
 
       # §2.1 caps the runtime dependency surface at a YAML parser, bcrypt and JWT
