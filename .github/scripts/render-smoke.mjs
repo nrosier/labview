@@ -240,16 +240,24 @@ const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((r) =
 //
 // A fresh document each time and a fresh evaluation of app.js: the module is an IIFE with no exports, so
 // the entry point is the only way in — which is the entry point that was broken.
-async function run(search, { status = 200, body = PAYLOAD, session = null } = {}) {
+async function run(search, { status = 200, body = PAYLOAD, session = null, remembered = null } = {}) {
   const parsed = parseHTML(HTML);
   DOC.root = parsed.root;
   DOC.byID = parsed.byID;
   DOC.activeElement = null;
   DOC.listeners = new Map();
 
+  // `documentElement`, because the theme is written on the root element as well as on #app: the colour
+  // tokens are bound there, so the boot card and the strip an over-scroll uncovers are the same palette
+  // as the shell. Absent here, the guard in app.js would skip that write and nothing would say so.
+  DOC.documentElement = parsed.root.childNodes.find((n) => n.localName === 'html') || parsed.root;
+
   const thrown = [];
   const requests = [];
   const history = [];
+  // Seeded, so a run can start from a reader who already chose — which is the only way to check that a
+  // remembered preference is applied before the payload arrives rather than after it.
+  const store = new Map(Object.keys(remembered || {}).map((k) => [k, String(remembered[k])]));
 
   const win = {
     location: { search, pathname: '/', href: 'http://labview.test/' + search },
@@ -260,6 +268,14 @@ async function run(search, { status = 200, body = PAYLOAD, session = null } = {}
     addEventListener(kind, fn) { win.listeners.set(kind, (win.listeners.get(kind) || []).concat(fn)); },
     listeners: new Map(),
     setTimeout, clearTimeout,
+    // A store that works, so what runs is the remembering path rather than the catch block beside it.
+    // The bundle guards every access because storage can be absent or throwing; a shim with no storage
+    // at all would exercise only the guard and would let a broken write ship.
+    localStorage: {
+      getItem(key) { return store.has(key) ? store.get(key) : null; },
+      setItem(key, value) { store.set(key, String(value)); },
+      removeItem(key) { store.delete(key); },
+    },
     fetch(url, opts) {
       requests.push([url, opts && opts.method ? opts.method : 'GET']);
       if (url === 'api/session') {
@@ -297,7 +313,8 @@ async function run(search, { status = 200, body = PAYLOAD, session = null } = {}
   await flush();
 
   const id = (name) => DOC.getElementById(name);
-  return { thrown, requests, history, id, win, text: (name) => (id(name) ? id(name).textContent : null) };
+  return { thrown, requests, history, id, win, store, doc: DOC,
+    text: (name) => (id(name) ? id(name).textContent : null) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,7 +1173,125 @@ for (const view of REPORT_VIEWS) await checkCollect(view, PAYLOAD, 'scanned');
   }
 }
 
-// --- 12. The structure the stylesheet needs ------------------------------
+// --- 12. The shell: the rail, the scope card and the two preferences ------
+//
+// The shell is markup this file's other sections do not look at, and all of it is load-bearing in a way
+// the eye catches late: a navigation entry that lost its label reads as a mystery glyph, a rail that
+// remembers nothing reads as a switch that does not work, and a theme written on `#app` alone leaves the
+// boot card in the other palette. None of that throws, so none of it would fail anything without this.
+
+{
+  const out = await run('');
+  noThrow('the shell renders', out);
+
+  const links = out.id('nav').all().filter((n) => n.tagName === 'A');
+  check('every navigation entry draws a glyph',
+    links.length > 0 && links.every((a) => a.all().some((n) => n.localName === 'svg' && n.childNodes.length > 0)),
+    links.filter((a) => !a.all().some((n) => n.localName === 'svg')).length + ' entries drew none');
+  // The glyph table is keyed by the icon token the *contract* carries, and a token the table does not
+  // know draws a dot instead of nothing — so a misspelt token still yields fourteen entries with
+  // fourteen glyphs and the check above stays green. The fallback is the only visible symptom, which
+  // makes looking for the fallback the check.
+  const DOT_D = 'M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6z';
+  const fellBack = links.filter((a) =>
+    a.all().some((n) => n.localName === 'path' && n.getAttribute('d') === DOT_D));
+  check('every icon token the contract carries has a glyph of its own', fellBack.length === 0,
+    fellBack.length + ' of ' + links.length + ' entries fell back to the dot');
+
+  // The glyph is a picture and the title is the name. A rail that collapses to icons is only usable
+  // because the name is still in the document, so the label is checked as text rather than as a class.
+  const labels = links.map((a) => {
+    const span = a.all().find((n) => n.classList.contains('navlabel'));
+    return span ? span.textContent : '';
+  });
+  check('every navigation entry keeps the view title as text',
+    labels.length === C.views.length && labels.every((t) => C.views.some((v) => v.title === t)),
+    JSON.stringify(labels.filter((t) => !C.views.some((v) => v.title === t))));
+
+  const defaultView = C.views.find((v) => v.slug === C.grammar.defaultView);
+  check('the hero names the group the view belongs to', out.text('eyebrow') === defaultView.group,
+    JSON.stringify(out.text('eyebrow')) + ' vs ' + JSON.stringify(defaultView.group));
+
+  // §22.1's coverage map claims `meta.appsRoot`, and before the rail had a scope card nothing drew it.
+  const root = (PAYLOAD.meta || {}).appsRoot;
+  check('the rail names the tree that was scanned',
+    out.text('scope-detail') === (root || 'not reported'),
+    JSON.stringify(out.text('scope-detail')) + ' vs ' + JSON.stringify(root));
+
+  // A statistic is read out in the order it is written, which is why the label is the first child: a
+  // reader who hears the number first has to hold a bare integer until the next word arrives.
+  const card = out.id('content').all().find((n) => n.classList.contains('card'));
+  const order = (card ? card.children : []).map((n) => (n.className || '').split(/\s+/)[0]);
+  check('a statistic reads its label before its number', order[0] === 'l' && order[1] === 'n',
+    order.join(' → '));
+
+  const app = out.id('app');
+  check('the theme follows the system preference until the reader says otherwise',
+    app.getAttribute('data-theme') === 'system');
+
+  out.id('theme-toggle').dispatch('click', {});
+  check('the theme switch moves off the system preference', app.getAttribute('data-theme') === 'light',
+    JSON.stringify(app.getAttribute('data-theme')));
+  check('the theme is written on the root element too, where the colour tokens are bound',
+    out.doc.documentElement.getAttribute('data-theme') === 'light',
+    JSON.stringify(out.doc.documentElement.getAttribute('data-theme')));
+  check('the theme switch says which of the three states it is in',
+    (out.text('theme-label') || '').toLowerCase().includes('light'),
+    JSON.stringify(out.text('theme-label')));
+  check('the chosen theme is remembered', out.store.get('labview.theme') === 'light',
+    JSON.stringify(out.store.get('labview.theme')));
+
+  out.id('theme-toggle').dispatch('click', {});
+  check('the switch cycles through the pinned dark state', app.getAttribute('data-theme') === 'dark');
+  out.id('theme-toggle').dispatch('click', {});
+  check('the switch cycles back to following the system', app.getAttribute('data-theme') === 'system');
+
+  out.id('side-toggle').dispatch('click', {});
+  check('the rail collapses', app.getAttribute('data-side') === 'collapsed');
+  check('the rail toggle reports whether it is expanded',
+    out.id('side-toggle').getAttribute('aria-expanded') === 'false');
+  check('a collapsed rail keeps every label in the document, for anyone not reading the glyphs',
+    links.every((a) => (a.textContent || '').length > 0));
+  check('the collapsed rail is remembered', out.store.get('labview.side') === 'collapsed');
+}
+
+// The drawer takes focus when it opens, which is only operable if closing gives it back. Nothing about a
+// lost focus throws or draws differently — the reader is simply returned to the top of the document and
+// has to walk the rail and the topbar again to get back to the row they were reading.
+{
+  const out = await run('view=services');
+  noThrow('a table view renders', out);
+
+  const row = out.id('content').all().find((n) => n.tagName === 'TR' && n.getAttribute('data-open') !== null);
+  check('a row offers itself to the keyboard', row && row.getAttribute('tabindex') === '0',
+    row ? JSON.stringify(row.getAttribute('tabindex')) : 'no row carried data-open');
+  row.focus();
+  out.doc.dispatch('click', { target: row });
+  check('a row opens the drawer', out.id('drawer').hidden === false);
+  check('the drawer takes focus so the keyboard lands in it', out.doc.activeElement === out.id('drawer'));
+
+  out.doc.dispatch('keydown', { key: 'Escape' });
+  check('Escape closes the drawer', out.id('drawer').hidden === true);
+  check('closing gives focus back to the row it was opened from', out.doc.activeElement === row,
+    out.doc.activeElement === null ? 'focus was dropped on the document'
+      : out.doc.activeElement.tagName + ' ' + (out.doc.activeElement.id || ''));
+}
+
+// A reader who already chose, arriving fresh: the preference has to be applied before the payload does,
+// or the page is drawn once in the wrong palette and corrected afterwards.
+{
+  const out = await run('', { remembered: { 'labview.theme': 'dark', 'labview.side': 'collapsed' } });
+  noThrow('a remembered preference is applied at boot', out);
+  check('a remembered theme is in force before the payload arrives',
+    out.id('app').getAttribute('data-theme') === 'dark',
+    JSON.stringify(out.id('app').getAttribute('data-theme')));
+  check('a remembered rail state is in force before the payload arrives',
+    out.id('app').getAttribute('data-side') === 'collapsed');
+  check('the remembered theme reaches the root element, so the boot card matches the shell',
+    out.doc.documentElement.getAttribute('data-theme') === 'dark');
+}
+
+// --- 13. The structure the stylesheet needs ------------------------------
 //
 // There is no layout engine here, so none of these checks can see a column that is too narrow. What they
 // can see is the structure the stylesheet's readings depend on, and the readings themselves — both of the

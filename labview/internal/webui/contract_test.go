@@ -136,6 +136,15 @@ func TestContractCarriesEveryTable(t *testing.T) {
 			"the member in from the payload", c.Unknown)
 	}
 
+	// Every view names its navigation glyph. The bundle draws a fallback for a token it has no shape
+	// for, so a missing one is not a broken page — it is a navigation entry that reads differently from
+	// the other thirteen, which is the kind of thing nobody notices until the screenshot.
+	for _, v := range c.Views {
+		if v.Icon == "" {
+			t.Errorf("view %q declares no icon: its navigation entry would draw the fallback", v.Slug)
+		}
+	}
+
 	// Every view's declared dimension must exist, or the browser would render a filter control with no
 	// vocabulary and no parameter to write.
 	for _, v := range c.Views {

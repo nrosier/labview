@@ -1699,10 +1699,15 @@ to the rows behind it, and the rules that keep it honest.
   external diagram renderer.
 - **Keyboard and screen reader.** Every clickable statistic, chip, row and diagram node MUST be
   focusable and operable with Enter and Space, and MUST expose an accessible name. Escape closes the
-  topmost layer only — panel before drawer.
+  topmost layer only — panel before drawer. A layer that takes focus MUST give it back to whatever had
+  it when the layer opened: focus dropped on the document returns the reader to the top of the page,
+  which for a table of thirty-five rows means walking the whole shell again to get back.
 - **Modern and dense, without motion.** Responsive down to tablet width; sticky table headers; one
-  type scale; light and dark following the system preference; no transition longer than 200 ms; and
-  **no layout shift when a rescan lands** — the same rows in the same places, values updated.
+  type scale; light and dark **defaulting** to the system preference, with an explicit override the
+  browser remembers — a preference is not part of what a link describes (§22.7), so it MUST live
+  beside the URL rather than in it; no transition longer than 200 ms; and **no layout shift when a
+  rescan lands** — the same rows in the same places, values updated. The same rule holds for a
+  preference: switching the theme or collapsing the navigation MUST NOT move a row.
 - **Colour is categorical and centralised.** One mapping from every union member to a colour and a
   label, with a defined fallback for an unknown member — which is why adding a member is a breaking
   change (§16). Exactly **one** reserved emphasis colour, for exactly one condition: reachable from

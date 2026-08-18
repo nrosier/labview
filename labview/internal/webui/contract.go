@@ -154,6 +154,7 @@ type ContractView struct {
 	Slug     string   `json:"slug"`
 	Title    string   `json:"title"`
 	Group    string   `json:"group"`
+	Icon     string   `json:"icon,omitempty"`
 	Question string   `json:"question"`
 	RowNoun  string   `json:"rowNoun"`
 	Kind     string   `json:"kind"`
@@ -269,7 +270,7 @@ func TheContract() Contract {
 	}
 	for _, v := range Views {
 		c.Views = append(c.Views, ContractView{
-			Slug: v.Slug, Title: v.Title, Group: string(v.Group), Question: v.Question,
+			Slug: v.Slug, Title: v.Title, Group: string(v.Group), Icon: v.Icon, Question: v.Question,
 			RowNoun: v.RowNoun, Kind: string(v.Kind), Columns: v.Columns, Fields: v.Fields,
 			Order: v.Order, Empty: v.Empty, Dims: v.Dims,
 		})

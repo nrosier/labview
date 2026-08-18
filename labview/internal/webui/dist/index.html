@@ -16,40 +16,125 @@
       <a href="api/overview">api/overview</a> and is the whole of what this page shows.
     </noscript>
 
-    <div id="app" hidden>
-      <header class="chrome">
-        <div class="chrome-left">
-          <span class="brand">LabView</span>
-          <span id="scanned" class="muted"></span>
-          <span id="build" class="muted"></span>
+    <!-- The shell is a sidebar and an inset, and the two data attributes on it are the whole of the
+         UI's own state: `data-side` is whether the rail is collapsed, `data-theme` is the reader's
+         colour choice. Both are written by app.js and read only by CSS, so a preference costs no
+         re-render and cannot move a row — §22.1's *no layout shift when a rescan lands* is about the
+         payload, but the same rule is why a theme switch is an attribute rather than a rebuild. -->
+    <div id="app" hidden data-side="expanded" data-theme="system">
+      <aside class="side">
+        <div class="side-brand">
+          <a class="brand" href="?">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2 2 7l10 5 10-5-10-5Z" />
+                <path d="m2 12 10 5 10-5" />
+                <path d="m2 17 10 5 10-5" />
+              </svg>
+            </span>
+            <span class="brand-name">LabView</span>
+          </a>
         </div>
-        <div class="chrome-right">
-          <label class="switch">
-            <input type="checkbox" id="probe-switch" />
-            <span>Probe</span>
-          </label>
-          <button type="button" id="rescan">Rescan</button>
+
+        <!-- The scope card: what was scanned. `meta.appsRoot` is in the coverage map (§22.1) and until
+             now nothing in the bundle drew it, so the map claimed a place that did not exist. It is the
+             one fact that says *which fleet this page is about*, which is what belongs at the top of a
+             navigation column. -->
+        <div class="side-scope">
+          <span class="scope-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+            </svg>
+          </span>
+          <span class="scope-text">
+            <span id="scope-name" class="scope-name">Apps root</span>
+            <span id="scope-detail" class="scope-detail mono"></span>
+          </span>
         </div>
-      </header>
 
-      <div id="banners" class="banners" role="status" aria-live="polite"></div>
-      <div id="change" class="change" hidden></div>
-
-      <div class="body">
         <nav id="nav" aria-label="Views"></nav>
 
-        <main>
-          <div class="head">
-            <h1 id="title"></h1>
-            <p id="question" class="muted"></p>
-          </div>
+        <div class="side-foot">
+          <!-- Three glyphs, one shown by CSS per `data-theme`, because the alternative is app.js
+               choosing a drawing — and the switch has to say which of the three states it is in, since
+               *following the system* and *pinned to dark* look identical on a dark desktop. -->
+          <button type="button" id="theme-toggle" class="side-action">
+            <span class="theme-icons" aria-hidden="true">
+              <svg class="i-system" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="3" width="20" height="14" rx="2" />
+                <path d="M8 21h8M12 17v4" />
+              </svg>
+              <svg class="i-light" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+              </svg>
+              <svg class="i-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+              </svg>
+            </span>
+            <span id="theme-label" class="side-action-text">System theme</span>
+          </button>
+          <span id="build" class="build mono"></span>
+        </div>
+      </aside>
 
-          <form id="filters" class="filters" role="search" onsubmit="return false">
+      <div class="inset">
+        <header class="topbar">
+          <button type="button" id="side-toggle" class="icon-btn" aria-label="Collapse the sidebar"
+                  aria-expanded="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="2.5" />
+              <path d="M9 3v18" />
+            </svg>
+          </button>
+
+          <form id="filters" class="search" role="search" onsubmit="return false">
+            <span class="search-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m16.6 16.6 4.4 4.4" />
+              </svg>
+            </span>
             <input type="search" id="q" placeholder="Search names, images, hostnames, label keys…"
                    aria-label="Free text search" autocomplete="off" spellcheck="false" />
-            <div id="controls" class="controls"></div>
           </form>
 
+          <div class="topbar-right">
+            <label class="switch">
+              <input type="checkbox" id="probe-switch" />
+              <span class="switch-track" aria-hidden="true"></span>
+              <span class="switch-text">Probe</span>
+            </label>
+            <button type="button" id="rescan" class="btn primary">Rescan</button>
+          </div>
+        </header>
+
+        <div id="banners" class="banners" role="status" aria-live="polite"></div>
+
+        <main>
+          <div class="hero">
+            <div class="hero-head">
+              <span id="eyebrow" class="eyebrow"></span>
+              <h1 id="title"></h1>
+              <p id="question" class="muted"></p>
+            </div>
+            <!-- The scan stamp and the change note sit together, because the change note is only
+                 readable against the time it is a change *since* — and a rescan that moved nothing has
+                 to say so beside the stamp rather than by staying silent (§22.8). -->
+            <div class="hero-meta">
+              <span id="scanned" class="muted"></span>
+              <div id="change" class="change" hidden></div>
+            </div>
+          </div>
+
+          <div id="controls" class="controls"></div>
           <div id="chips" class="chips"></div>
           <p id="count" class="count" aria-live="polite"></p>
           <div id="content"></div>
@@ -60,7 +145,12 @@
              aria-labelledby="drawer-title">
         <div class="drawer-head">
           <h2 id="drawer-title"></h2>
-          <button type="button" id="drawer-close" aria-label="Close">Close</button>
+          <button type="button" id="drawer-close" class="icon-btn" aria-label="Close">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
         </div>
         <div id="drawer-body"></div>
       </aside>

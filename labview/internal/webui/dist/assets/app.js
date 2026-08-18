@@ -1849,6 +1849,58 @@
   }
 
   // ---------------------------------------------------------------------------
+  // The navigation glyphs
+  //
+  // Drawings, keyed by the icon *token* each view carries in the contract — never by slug. That is the
+  // same rule as everywhere else in this file: a table of `services: [...]` here would be this file
+  // holding a view spelling, and the spelling belongs to views.go. The token names a shape; this table
+  // turns the shape into paths, which is presentation and therefore genuinely this file's business.
+  //
+  // A token with no entry draws DOT rather than nothing, so a view added in Go without a drawing here
+  // is a plain navigation entry instead of an invisible one (I4).
+  // ---------------------------------------------------------------------------
+
+  var DOT = ['M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6z'];
+
+  var ICONS = {
+    'layout-dashboard': ['M3 3h7v9H3z', 'M14 3h7v5h-7z', 'M14 12h7v9h-7z', 'M3 16h7v5H3z'],
+    'layers': ['m12 2 9 5-9 5-9-5z', 'm3 12 9 5 9-5', 'm3 17 9 5 9-5'],
+    'boxes': ['M12 2l4.5 2v4L12 10 7.5 8V4z', 'M12 6 7.5 4M12 6l4.5-2M12 6v4',
+      'M6.5 13.5 11 15.5v4l-4.5 2L2 19.5v-4z', 'M6.5 17.5 2 15.5m4.5 2 4.5-2m-4.5 2v4',
+      'M17.5 13.5 22 15.5v4l-4.5 2L13 19.5v-4z', 'M17.5 17.5 13 15.5m4.5 2 4.5-2m-4.5 2v4'],
+    'globe': ['M12 3a9 9 0 1 0 0 18 9 9 0 1 0 0-18z', 'M3.6 9h16.8', 'M3.6 15h16.8',
+      'M12 3a15 15 0 0 1 0 18', 'M12 3a15 15 0 0 0 0 18'],
+    'network': ['M9 2h6v6H9z', 'M2 16h6v6H2z', 'M16 16h6v6h-6z',
+      'M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3', 'M12 12V8'],
+    'share': ['M18 2.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 1 0 0-5z', 'M6 9.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 1 0 0-5z',
+      'M18 16.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 1 0 0-5z', 'm8.6 10.7 6.8-3.4', 'm8.6 13.3 6.8 3.4'],
+    'box': ['m12 2 9 5v10l-9 5-9-5V7z', 'm12 12 9-5', 'm12 12-9-5', 'M12 12v10'],
+    'hard-drive': ['M22 12H2', 'M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z',
+      'M6 16h.01', 'M10 16h.01'],
+    'sliders': ['M4 21v-7', 'M4 10V3', 'M12 21v-9', 'M12 8V3', 'M20 21v-5', 'M20 12V3',
+      'M1 14h6', 'M9 8h6', 'M17 16h6'],
+    'key': ['M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z',
+      'M16.5 7.5h.01'],
+    'route': ['M6 16a3 3 0 1 0 0 6 3 3 0 1 0 0-6z', 'M18 2a3 3 0 1 0 0 6 3 3 0 1 0 0-6z',
+      'M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15'],
+    'radar': ['M19.07 4.93A10 10 0 1 1 4.93 19.07', 'M15.54 8.46a5 5 0 1 1-7.08 7.08', 'm12 12 7-7',
+      'M12 12h.01'],
+    'file-check': ['M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z', 'M14 2v5h6',
+      'm9 15 2 2 4-4'],
+    'activity': ['M22 12h-4l-3 9L9 3l-3 9H2']
+  };
+
+  function iconNode(token, cls) {
+    var host = mk('span', cls);
+    var svg = add(host, mkSVG('svg', {
+      viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8',
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true'
+    }));
+    (ICONS[token] || DOT).forEach(function (d) { add(svg, mkSVG('path', { d: d })); });
+    return host;
+  }
+
+  // ---------------------------------------------------------------------------
   // What is on screen
   // ---------------------------------------------------------------------------
 
@@ -1859,6 +1911,7 @@
   var BUSY = false;       // a request is in flight
   var CONTROLS_FOR = null; // which view the filter controls were built for
   var OPEN = null;        // the drawer's subject
+  var RETURN = null;      // where focus was when the drawer took it, to give back on close
 
   // ---------------------------------------------------------------------------
   // Cells (§22.2, §22.4)
@@ -2172,6 +2225,14 @@
     var when = scanned ? 'scanned ' + asString(scanned) : 'scan time ' + NOT_REPORTED;
     el('scanned').textContent = ms === null ? when : when + ' in ' + ms + 'ms';
 
+    // Which tree this reading is of. It is in the payload and in §22.1's coverage map, and until this
+    // line nothing drew it — so every screenshot of this page was of an unnamed fleet, and two labs'
+    // screenshots were indistinguishable.
+    var root = asString(pathOf(OV, 'meta.appsRoot'));
+    el('scope-detail').textContent = root || NOT_REPORTED;
+    el('scope-detail').title = root ? 'the directory this scan read: ' + root
+      : 'the scan did not report which directory it read';
+
     // §3.4: an unknown revision is a supported state and says so, rather than showing a blank.
     var version = asString(pathOf(OV, 'meta.build.version'));
     var commit = asString(pathOf(OV, 'meta.build.commit'));
@@ -2303,7 +2364,11 @@
       var list = add(host, mk('ol', ''));
       views.forEach(function (v) {
         var li = add(list, mk('li', ''));
-        var a = mk('a', '', v.title);
+        var a = mk('a', 'navlink');
+        // The glyph is decorative and the label is the name: the icon carries `aria-hidden`, so the link
+        // is read as its title and a collapsed rail loses the picture rather than the accessible name.
+        add(a, iconNode(v.icon, 'navicon'));
+        add(a, mk('span', 'navlabel', v.title));
         // A view link keeps nothing of the old view: the filters of one view are not the filters of
         // another, and a stale `net=` would silently narrow a table that never mentions networks.
         a.setAttribute('href', linkOf(withField(newState(), 'view', v.slug === G.defaultView ? '' : v.slug)));
@@ -2584,21 +2649,30 @@
       // The lead card is above every heading: §22.3 puts the exposure finding first and above the fold,
       // and a section label in front of it would push it down.
       var label = row.lead === 0 ? '' : (dest ? dest.group : 'Other');
+      // A band is one run of cards that point into the same section. The runs are the contract's order,
+      // not a sort, so the same section can open a band more than once — which is why the label and its
+      // cards are wrapped together: a band that owns its heading can put it in a gutter beside the cards,
+      // and a run of two cards then reads as a labelled row rather than as a grid with a hole in it.
       if (label !== group || !grid) {
         group = label;
-        if (label) add(host, mk('h2', 'section-label', label));
-        grid = add(host, mk('div', 'cards'));
+        var band = add(host, mk('div', 'band'));
+        if (label) add(band, mk('h2', 'section-label', label));
+        grid = add(band, mk('div', 'cards'));
       }
       var a = add(grid, mk('a', toneClass('card', card.tone)));
       a.setAttribute('href', '?' + card.dest);
       if (row.lead === 0) a.classList.add('lead');
       if (card.note) a.title = card.note;
 
+      // Label first, then the number: the label is what the number means, and a reader who hears
+      // "thirty-five" before "services" has to hold a bare integer until the next word arrives. The
+      // order is the DOM's, not a CSS `order`, so what is read and what is seen cannot disagree.
+      add(a, mk('span', 'l', card.label));
+
       var count = cellOf(row, { key: 'count', numeric: true });
       if (count.absent) add(a, mk('span', 'n absent', NOT_REPORTED));
       else add(a, mk('span', 'n', String(count.number)));
 
-      add(a, mk('span', 'l', card.label));
       // What the destination shows, and whether it is *exactly* these rows or the records the view can
       // show — §22.3 requires the difference to be visible, because a card that overstated it would be a
       // number pointing at a different set.
@@ -2911,6 +2985,12 @@
     });
 
     host.hidden = false;
+    // The drawer takes focus, so it owes it back (§22.1 is keyboard-operable, not merely keyboard-
+    // reachable): a reader who pressed Escape and landed on the document would have to walk the rail and
+    // the topbar again to get back to the row they were reading. Remembered here rather than in the
+    // handler because a drawer can also be opened from a link, a node in a diagram or the URL.
+    var was = document.activeElement;
+    RETURN = was && was.focus && !closest(was, function (n) { return n === host; }) ? was : null;
     host.focus();
 
     // A link into one panel opens the drawer *at* that panel rather than at the top of it — otherwise the
@@ -2929,6 +3009,9 @@
     el('drawer').hidden = true;
     clear(el('drawer-body'));
     el('drawer-title').textContent = '';
+    var back = RETURN;
+    RETURN = null;
+    if (back && back.focus) back.focus();
   }
 
   // ---------------------------------------------------------------------------
@@ -2941,6 +3024,9 @@
     var view = viewOf(S);
 
     document.title = 'LabView — ' + view.title;
+    // The group above the title, because a view's name answers *what* and its group answers *which part
+    // of the fleet* — and the rail's own heading is off screen the moment the reader scrolls.
+    el('eyebrow').textContent = view.group;
     el('title').textContent = view.title;
     el('question').textContent = view.question;
 
@@ -3153,7 +3239,80 @@
     return out;
   }
 
+  // ---------------------------------------------------------------------------
+  // The reader's two preferences
+  //
+  // The theme and the rail are deliberately *not* state in §22.7's sense: a link is a reading of the
+  // fleet, and pinning the reader's colour scheme onto it would mean a pasted URL redecorated somebody
+  // else's screen. So they are remembered here instead of being carried in the query, and both are a
+  // single attribute on `#app` — CSS does the rest, so switching either one re-renders nothing and can
+  // move no row (§22.1).
+  // ---------------------------------------------------------------------------
+
+  var THEMES = ['system', 'light', 'dark'];
+  var THEME_TEXT = { system: 'System theme', light: 'Light theme', dark: 'Dark theme' };
+
+  // A store that may not be there. Storage can be absent, or present and throwing — a browser with
+  // site data disabled throws on `getItem` rather than on the property — so the whole access is
+  // guarded, and the cost of failure is a preference that does not survive a reload (I4).
+  function recall(key, fallback) {
+    try {
+      var got = window.localStorage.getItem('labview.' + key);
+      return got === null || got === undefined ? fallback : String(got);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function remember(key, value) {
+    try {
+      window.localStorage.setItem('labview.' + key, value);
+    } catch (e) {
+      // Not remembered. The switch still worked for this page, which is the part that was asked for.
+    }
+  }
+
+  function applyTheme(theme) {
+    if (THEMES.indexOf(theme) < 0) theme = THEMES[0];
+    el('app').setAttribute('data-theme', theme);
+    // Also on the root element, because the tokens are bound there: the boot card and the strip an
+    // over-scroll uncovers are outside `#app` and would otherwise stay the other palette. Guarded,
+    // since a host with no root element to write is still a host that has to render.
+    if (document.documentElement && document.documentElement.setAttribute) {
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+    // The label names the state rather than the action, and is the button's accessible name: *system*
+    // and *dark* are indistinguishable on a dark desktop, so a switch that only showed a sun or a moon
+    // could not say which of the three it was in. The next state is in the title.
+    el('theme-label').textContent = THEME_TEXT[theme];
+    el('theme-toggle').title = THEME_TEXT[theme] + ' — switch to ' +
+      THEME_TEXT[THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]].toLowerCase();
+    return theme;
+  }
+
+  function applySide(side) {
+    var collapsed = side === 'collapsed';
+    el('app').setAttribute('data-side', collapsed ? 'collapsed' : 'expanded');
+    el('side-toggle').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    el('side-toggle').setAttribute('aria-label', collapsed ? 'Expand the sidebar' : 'Collapse the sidebar');
+    return collapsed ? 'collapsed' : 'expanded';
+  }
+
   function wire() {
+    // Before the first payload, so the boot card is already in the reader's colours and the switch is
+    // not a control that changes what the page was drawn as after the fact.
+    applyTheme(recall('theme', THEMES[0]));
+    applySide(recall('side', 'expanded'));
+
+    el('theme-toggle').addEventListener('click', function () {
+      var now = THEMES.indexOf(el('app').getAttribute('data-theme'));
+      remember('theme', applyTheme(THEMES[(now + 1) % THEMES.length]));
+    });
+
+    el('side-toggle').addEventListener('click', function () {
+      remember('side', applySide(el('app').getAttribute('data-side') === 'collapsed' ? 'expanded' : 'collapsed'));
+    });
+
     document.addEventListener('click', onActivate);
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape' && !el('drawer').hidden) { closeDrawer(); return; }
@@ -3303,7 +3462,7 @@
       return;
     }
 
-    var form = add(boot, mk('form', 'filters'));
+    var form = add(boot, mk('form', 'signin'));
     var user = mk('input', '');
     user.type = 'text';
     user.name = 'username';

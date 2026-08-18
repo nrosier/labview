@@ -109,6 +109,15 @@ type View struct {
 	Title string
 	Group Group
 
+	// Icon is the navigation glyph, as a token rather than as drawing instructions.
+	//
+	// It is here, in the view table, for the same reason the title is: the bundle holds no view slug of
+	// its own (contract.go), so a browser that picked its own icon per view would be keying off a
+	// spelling this file owns. The token names the shape; the bundle's icon table turns it into a path.
+	// A token the bundle has no shape for draws the fallback dot rather than nothing, so adding a view
+	// here without drawing it is a plain navigation entry, not an invisible one.
+	Icon string
+
 	// Question is §22.2's *question it answers*, shown as the view's subtitle.
 	Question string
 
@@ -146,6 +155,7 @@ var Views = []View{
 		Slug:     SlugOverview,
 		Title:    "Overview",
 		Group:    GroupFleet,
+		Icon:     "layout-dashboard",
 		Question: "what is here, and what needs attention",
 		RowNoun:  "statistic",
 		Kind:     RowStat,
@@ -161,6 +171,7 @@ var Views = []View{
 		Slug:     SlugStacks,
 		Title:    "Stacks",
 		Group:    GroupFleet,
+		Icon:     "layers",
 		Question: "how the tree is laid out",
 		RowNoun:  "stack",
 		Kind:     RowStack,
@@ -187,6 +198,7 @@ var Views = []View{
 		Slug:     SlugServices,
 		Title:    "Services",
 		Group:    GroupFleet,
+		Icon:     "boxes",
 		Question: "everything about one service, comparably",
 		RowNoun:  "service",
 		Kind:     RowService,
@@ -210,6 +222,7 @@ var Views = []View{
 		Slug:     SlugIngress,
 		Title:    "Ingress",
 		Group:    GroupReachability,
+		Icon:     "globe",
 		Question: "how each hostname reaches a container",
 		RowNoun:  "route",
 		Kind:     RowRoute,
@@ -237,6 +250,7 @@ var Views = []View{
 		Slug:     SlugNetworks,
 		Title:    "Networks",
 		Group:    GroupReachability,
+		Icon:     "network",
 		Question: "what connects services and what merely co-locates them",
 		RowNoun:  "network",
 		Kind:     RowNetwork,
@@ -257,6 +271,7 @@ var Views = []View{
 		Slug:     SlugDiagrams,
 		Title:    "Diagrams",
 		Group:    GroupReachability,
+		Icon:     "share",
 		Question: "the shape of the fleet",
 		RowNoun:  "diagram",
 		Kind:     RowDiagram,
@@ -274,6 +289,7 @@ var Views = []View{
 		Slug:     SlugContainers,
 		Title:    "Containers",
 		Group:    GroupRuntime,
+		Icon:     "box",
 		Question: "what is actually running",
 		RowNoun:  "container",
 		Kind:     RowContainer,
@@ -298,6 +314,7 @@ var Views = []View{
 		Slug:     SlugStorage,
 		Title:    "Storage",
 		Group:    GroupRuntime,
+		Icon:     "hard-drive",
 		Question: "where data lives",
 		RowNoun:  "mount or volume",
 		Kind:     RowStorage,
@@ -317,6 +334,7 @@ var Views = []View{
 		Slug:     SlugConfig,
 		Title:    "Config",
 		Group:    GroupRuntime,
+		Icon:     "sliders",
 		Question: "what each service is configured with",
 		RowNoun:  "environment variable or label",
 		Kind:     RowConfig,
@@ -335,6 +353,7 @@ var Views = []View{
 		Slug:     SlugIdentity,
 		Title:    "Identity",
 		Group:    GroupEnrichment,
+		Icon:     "key",
 		Question: "what the identity provider reported",
 		RowNoun:  "application",
 		Kind:     RowApplication,
@@ -379,6 +398,7 @@ var Views = []View{
 		Slug:     SlugProxy,
 		Title:    "Proxy",
 		Group:    GroupEnrichment,
+		Icon:     "route",
 		Question: "what the reverse proxy is actually serving",
 		RowNoun:  "live router",
 		Kind:     RowRouter,
@@ -423,6 +443,7 @@ var Views = []View{
 		Slug:     SlugProbe,
 		Title:    "Probe",
 		Group:    GroupEnrichment,
+		Icon:     "radar",
 		Question: "what answered when asked",
 		RowNoun:  "probed service",
 		Kind:     RowProbe,
@@ -449,6 +470,7 @@ var Views = []View{
 		Slug:     SlugDeclarations,
 		Title:    "Declarations",
 		Group:    GroupOperator,
+		Icon:     "file-check",
 		Question: "where the operator and the scan disagree",
 		RowNoun:  "declaration",
 		Kind:     RowDeclaration,
@@ -475,6 +497,7 @@ var Views = []View{
 		Slug:     SlugDiagnostics,
 		Title:    "Diagnostics",
 		Group:    GroupSystem,
+		Icon:     "activity",
 		Question: "what LabView could not do",
 		RowNoun:  "connection report",
 		Kind:     RowReport,
