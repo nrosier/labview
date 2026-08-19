@@ -75,6 +75,12 @@
   var DIMS = {};
   C.dimensions.forEach(function (d) { DIMS[d.param] = d; });
 
+  // The overview's headline bands: the cards §22.3 shows before the reader expands anything, in the
+  // contract's own order of first appearance. Read off the cards rather than listed, so the bands and
+  // their order are the card table's and this file names neither.
+  var HEADLINES = [];
+  C.cards.forEach(function (c) { if (c.headline) once(HEADLINES, c.headline); });
+
   var RULES = {};
   C.rules.forEach(function (r) { RULES[r.shape] = r.rules; });
 
@@ -641,7 +647,11 @@
     cardsOf(ov).forEach(function (card, i) {
       var r = newRow(M.rowStat, card.id, card.label);
       var count = countOf(card, ov);
-      r.lead = card.lead ? 0 : 1;
+      // The lead card, then each headline band in the contract's order, then everything else. Ranking it
+      // here means sortRows lays the overview out — the bands fall out of the ordering every other view
+      // already uses, and renderCards needs no sort of its own.
+      r.lead = card.lead ? 0
+        : (card.headline ? 1 + HEADLINES.indexOf(card.headline) : 1 + HEADLINES.length);
       r.sort = [pad(i)];
       say(r, card.label, card.note, card.unit);
       r.cells.card = { text: [card.label], note: card.note, tone: card.tone, member: card.member, set: card.set };
@@ -654,10 +664,20 @@
     return out;
   }
 
+  // plural inflects the card's unit noun. English, not fleet vocabulary — the same line §22.1's *no
+  // vocabulary of its own* draws, and the same one `words` below stands on: a rule about `-y` is not a
+  // decision about what a term means, whereas `entrys` is a decision to look careless on the one card the
+  // overview opens with.
+  function plural(noun) {
+    if (/[^aeiou]y$/.test(noun)) return noun.slice(0, -1) + 'ies';
+    if (/(s|x|z|ch|sh)$/.test(noun)) return noun + 'es';
+    return noun + 's';
+  }
+
   function destinationOf(card) {
     var view = VIEWS[card.view];
     var title = view ? view.title : card.view;
-    if (card.exact) return title + ' — exactly these ' + (card.unit ? card.unit + 's' : 'rows');
+    if (card.exact) return title + ' — exactly these ' + (card.unit ? plural(card.unit) : 'rows');
     return title + ' — the records it can show';
   }
 
@@ -887,6 +907,17 @@
       r.lead = health === M.healthUnhealthy ? 0 : (running ? 2 : 1);
       r.sort = [(stack.name || '').toLowerCase(), (svc.name || '').toLowerCase()];
       if (d) say(r, d.name, d.image, d.status, d.id);
+      // No base of its own for the container record, unlike the mount in storageRows below: a mount is an
+      // element of a list and `resolve` cannot address one, whereas `docker` is a single object at a fixed
+      // path — so the service base already reaches every field the drawer declares, and
+      // `stacks.services.docker.state` resolves as `docker.state` against the service.
+      //
+      // What does change is which drawer opens: the container one, not the service one. The runtime facts
+      // this table no longer shows have to be one interaction away and they are only in `container`
+      // (§22.4). `subject` stays the *service* subtree, because a service the Engine never returned has no
+      // container object at all: Raw must show the record that does exist rather than the absence of one,
+      // and the fields then read as *not reported*, which is the honest account of a scan that never asked.
+      r.open = { kind: M.rowContainer, svc: key, title: svc.name, subject: svc, bases: r.bases };
       out.push(r);
     });
     return out;
@@ -1980,6 +2011,7 @@
   var COUNTS = null;      // the previous payload's card counts, for the change note
   var BUSY = false;       // a request is in flight
   var CONTROLS_FOR = null; // which view the filter controls were built for
+  var FILTERS_ON = 0;     // how many members were in force last render, so an arriving filter can disclose
   var OPEN = null;        // the drawer's subject
   var RETURN = null;      // where focus was when the drawer took it, to give back on close
 
@@ -2413,15 +2445,20 @@
       add(node, document.createTextNode('This scan reports the same counts as the last one.'));
       return;
     }
+    // Three, in the cards' own order — which is the contract's order of importance, so these are the three
+    // that matter most of the ones that moved. Eight of them ran to three lines beside the scan stamp and
+    // read as a paragraph rather than a change note; the count of the rest is still stated, and the
+    // Overview is one click away with all of them on it.
+    var SHOW = 3;
     add(node, mk('strong', '', 'Since the last scan: '));
-    moved.slice(0, 8).forEach(function (m, i) {
+    moved.slice(0, SHOW).forEach(function (m, i) {
       if (i) add(node, document.createTextNode('; '));
       var from = m.from.ok ? String(m.from.n) : NOT_REPORTED;
       var to = m.to.ok ? String(m.to.n) : NOT_REPORTED;
       add(node, document.createTextNode(m.label + ' ' + from + ' → ' + to));
     });
-    if (moved.length > 8) {
-      add(node, document.createTextNode('; and ' + (moved.length - 8) + ' more counts moved'));
+    if (moved.length > SHOW) {
+      add(node, document.createTextNode('; and ' + (moved.length - SHOW) + ' more counts moved'));
     }
   }
 
@@ -2501,10 +2538,18 @@
     CONTROLS_FOR = view.slug + '\x00' + key;
 
     var host = clear(el('controls'));
+    if (!(view.dims || []).length) { syncControls(); return; }
+
+    // One control for all of them. Eight bordered panels between the heading and the first row is a
+    // question the reader did not ask yet, and it pushed the answer off the screen — so the panels are
+    // behind a fold, and the *chips* carry §22.6's obligation to say what is in force. The label counts
+    // it, and syncControls keeps that count honest.
+    var panels = add(fold(host, 'filters', 'Filters', false, true), mk('div', 'dim-panels'));
+
     (view.dims || []).forEach(function (param) {
       var dim = DIMS[param];
       if (!dim) return;
-      var box = add(host, mk('div', 'dim'));
+      var box = add(panels, mk('div', 'dim'));
       var head = add(box, mk('div', 'dim-head'));
       add(head, mk('span', 'dim-label', dim.label));
       // §22.6: a multi-valued dimension can ask for *all of these* or *any of these*, and which one is
@@ -2559,6 +2604,26 @@
       b.setAttribute('aria-pressed', all ? 'true' : 'false');
       b.disabled = !f || f.include.length < 2;
     });
+
+    if (!host.querySelector('[data-foldable="filters"]')) return;
+
+    // How many members are in force, on the control that hides the buttons carrying them. A control
+    // reading only *Filters* cannot be told apart from one with nothing selected behind it.
+    var on = 0;
+    (viewOf(S).dims || []).forEach(function (param) {
+      var f = S.tags[param];
+      if (f) on += f.include.length + f.exclude.length;
+    });
+    foldLabel('filters', on ? 'Filters (' + on + ')' : 'Filters');
+
+    // A filter *arriving* opens the fold, whatever the reader last left it set to: someone who followed a
+    // link into a narrowed table must be able to see and undo what is narrowing it, and a shut control
+    // over a short table is how a filter becomes invisible (§22.6). On the transition rather than on every
+    // render, so a reader who then closes it keeps it closed — forcing it open again on the next click
+    // would be a control arguing with the person operating it. Not remembered either: this is the link's
+    // doing, not a preference.
+    if (on && !FILTERS_ON) applyFold('filters', true);
+    FILTERS_ON = on;
   }
 
   // cycle is §22.6's tri-state: off → include → exclude → off.
@@ -2728,42 +2793,66 @@
       add(host, mk('p', 'empty', view.empty));
       return;
     }
-    var group = null, grid = null;
+    // Bands first, then their cards. Two things are unknowable while still walking the rows: how many
+    // cards a fold is about to hide, and whether a label opens more than one of them — and a fold that
+    // could not say what it holds is the control §22.6 already forbids for a dimension with no members.
+    //
+    // One band per label rather than one per run: a card that starts folded is being kept for the reader
+    // who goes looking for it, and *Reachability* holding one count here and four further down would send
+    // them hunting twice. The order within a band is still the contract's, and so is the order the bands
+    // themselves first appear in.
+    var bands = [], byLabel = {};
     rows.forEach(function (row) {
       var card = row.card;
       var dest = VIEWS[card.view];
-      // The lead card is above every heading: §22.3 puts the exposure finding first and above the fold,
-      // and a section label in front of it would push it down.
-      var label = row.lead === 0 ? '' : (dest ? dest.group : 'Other');
-      // A band is one run of cards that point into the same section. The runs are the contract's order,
-      // not a sort, so the same section can open a band more than once — which is why the label and its
-      // cards are wrapped together: a band that owns its heading can put it in a gutter beside the cards,
-      // and a run of two cards then reads as a labelled row rather than as a grid with a hole in it.
-      if (label !== group || !grid) {
-        group = label;
-        var band = add(host, mk('div', 'band'));
-        if (label) add(band, mk('h2', 'section-label', label));
-        grid = add(band, mk('div', 'cards'));
+      var label = card.headline || (dest ? dest.group : 'Other');
+      if (!Object.prototype.hasOwnProperty.call(byLabel, label)) {
+        byLabel[label] = { label: label, headline: !!card.headline, rows: [] };
+        bands.push(byLabel[label]);
       }
-      var a = add(grid, mk('a', toneClass('card', card.tone)));
-      a.setAttribute('href', '?' + card.dest);
-      if (row.lead === 0) a.classList.add('lead');
-      if (card.note) a.title = card.note;
-
-      // Label first, then the number: the label is what the number means, and a reader who hears
-      // "thirty-five" before "services" has to hold a bare integer until the next word arrives. The
-      // order is the DOM's, not a CSS `order`, so what is read and what is seen cannot disagree.
-      add(a, mk('span', 'l', card.label));
-
-      var count = cellOf(row, { key: 'count', numeric: true });
-      if (count.absent) add(a, mk('span', 'n absent', NOT_REPORTED));
-      else add(a, mk('span', 'n', String(count.number)));
-
-      // What the destination shows, and whether it is *exactly* these rows or the records the view can
-      // show — §22.3 requires the difference to be visible, because a card that overstated it would be a
-      // number pointing at a different set.
-      add(a, mk('span', 'hint', destinationOf(card)));
+      byLabel[label].rows.push(row);
     });
+
+    bands.forEach(function (b) {
+      var band = add(host, mk('div', 'band'));
+      var grid;
+      if (b.headline) {
+        add(band, mk('h2', 'section-label', b.label));
+        grid = add(band, mk('div', 'cards'));
+      } else {
+        // The heading *is* the control, and it carries the count: a reader deciding whether to open it is
+        // asking how much is in there, and a label with a button beside it repeating the same word would
+        // answer a question nobody asked.
+        grid = add(fold(band, 'cards.' + b.label, b.label + ' (' + b.rows.length + ')', false, true),
+          mk('div', 'cards'));
+      }
+      b.rows.forEach(function (row) { cardNode(grid, row); });
+    });
+  }
+
+  function cardNode(grid, row) {
+    var card = row.card;
+    var a = add(grid, mk('a', toneClass('card', card.tone)));
+    a.setAttribute('href', '?' + card.dest);
+    // Which card this is, not merely that a card is here — so a check can say the overview leads with the
+    // headline set rather than counting anonymous boxes.
+    a.setAttribute('data-card', card.id);
+    if (row.lead === 0) a.classList.add('lead');
+    if (card.note) a.title = card.note;
+
+    // Label first, then the number: the label is what the number means, and a reader who hears
+    // "thirty-five" before "services" has to hold a bare integer until the next word arrives. The
+    // order is the DOM's, not a CSS `order`, so what is read and what is seen cannot disagree.
+    add(a, mk('span', 'l', card.label));
+
+    var count = cellOf(row, { key: 'count', numeric: true });
+    if (count.absent) add(a, mk('span', 'n absent', NOT_REPORTED));
+    else add(a, mk('span', 'n', String(count.number)));
+
+    // What the destination shows, and whether it is *exactly* these rows or the records the view can
+    // show — §22.3 requires the difference to be visible, because a card that overstated it would be a
+    // number pointing at a different set.
+    add(a, mk('span', 'hint', destinationOf(card)));
   }
 
   // ---------------------------------------------------------------------------
@@ -3014,6 +3103,75 @@
     return found;
   }
 
+  // The words a field label upper-cases whole. This is English spelling, not fleet vocabulary: §22.1
+  // forbids this file inventing a member, a slug, a tone or an icon, and an initialism is none of those —
+  // it is how `tls` is written when it is read aloud. A word missing from the list reads as `Tls`, which
+  // is plain rather than wrong, and the exact spelling is never lost: the full dotted path is on the term.
+  var CAPS = {
+    id: 1, ids: 1, ip: 1, ips: 1, url: 1, urls: 1, uri: 1, uris: 1, tls: 1, ttl: 1, api: 1, cpu: 1,
+    dns: 1, http: 1, https: 1, json: 1, yaml: 1, otp: 1, sso: 1, oidc: 1, saml: 1, ldap: 1, ui: 1
+  };
+
+  // words turns one path segment into a label: `imageDigest` → Image digest, `noTlsVerify` → No TLS
+  // verify, `ipAddresses` → IP addresses, `publishedPorts` → Published ports. Mechanical, because a table
+  // of hand-written labels is a second place to keep the field list in step with (§22.4) — and because a
+  // reader who needs the spelling has it in the term's title and verbatim in the Raw section.
+  function words(segment) {
+    var parts = segment.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[._-]+/g, ' ').split(' ');
+    var out = [];
+    parts.forEach(function (p) {
+      if (p) out.push(CAPS[p.toLowerCase()] ? p.toUpperCase() : p.toLowerCase());
+    });
+    if (!out.length) return segment;
+    if (!CAPS[out[0].toLowerCase()]) out[0] = out[0].charAt(0).toUpperCase() + out[0].slice(1);
+    return out.join(' ');
+  }
+
+  // A field's group is the path above its last segment: `origin.address` and `origin.port` are one group,
+  // `hostname` belongs to the section itself. Grouping is what turns a flat run of twenty-four terms into
+  // four short lists a reader can find something in, and the grouping is the payload's own shape rather
+  // than a judgement this file makes about which facts belong together.
+  function groupOf(rest) {
+    var cut = rest.lastIndexOf('.');
+    return cut < 0 ? '' : rest.slice(0, cut);
+  }
+
+  function groupCount(fields) {
+    var seen = [];
+    fields.forEach(function (f) { once(seen, groupOf(f.rest)); });
+    return seen.length;
+  }
+
+  // kvGroups writes one definition list per group, in the order the section declared them, except that the
+  // section's own ungrouped terms always come first: a heading-less list *after* a headed one reads as
+  // part of it. Headings are the caller's decision because a section with one group needs none — its
+  // heading is the section title, already on screen.
+  function kvGroups(host, fields, headings) {
+    var order = [], byGroup = {};
+    fields.forEach(function (f) {
+      var g = groupOf(f.rest);
+      if (!Object.prototype.hasOwnProperty.call(byGroup, g)) { byGroup[g] = []; order.push(g); }
+      byGroup[g].push(f);
+    });
+    order.sort(function (a, b) { return (a === '' ? 0 : 1) - (b === '' ? 0 : 1); });
+    order.forEach(function (g) {
+      if (headings && g) add(host, mk('h4', 'kv-group', words(g.split('.').pop())));
+      var kv = add(host, mk('dl', 'kv'));
+      byGroup[g].forEach(function (f) {
+        var dt = add(kv, mk('dt', '', words(f.rest.split('.').pop())));
+        // The path stays reachable on the term it labels, so a reader comparing the page against
+        // `api/overview` never has to guess which leaf `No TLS verify` was.
+        dt.setAttribute('title', f.path);
+        var dd = add(kv, mk('dd', ''));
+        if (!f.vals.length) add(dd, absentNode());
+        else f.vals.forEach(function (v, i) {
+          if (i) add(dd, document.createElement('br'));
+          add(dd, document.createTextNode(v));
+        });
+      });
+    });
+  }
+
   function openDrawer(open, at) {
     OPEN = open;
     var spec = open ? drawerOf(open.kind) : null;
@@ -3044,29 +3202,44 @@
         return;
       }
 
-      var kv = add(box, mk('dl', 'kv'));
-      var wrote = 0;
-      (section.fields || []).forEach(function (path) {
+      // Resolve every declared field before drawing any of it, because what is reported and what is not
+      // are two different readings and they are laid out differently. A section can declare thirty fields
+      // of which four are filled in; a reader who has to walk past twenty-six *not reported* lines to
+      // reach them is being made to do the work this surface exists to do. So the reported terms come
+      // first, and the rest go in a fold that says how many it holds.
+      //
+      // The fold hides, it does not drop: every declared field is in the document either way, which is
+      // both what §22.4's coverage rule means on screen and what the per-panel check counts.
+      var fields = (section.fields || []).map(function (path) {
         var base = baseFor(open, path);
         var rest = base ? path.slice(base[0].length) : path;
-        var vals = base && base[1] ? valuesAt(base[1], rest) : [];
-        add(kv, mk('dt', 'mono', rest || path));
-        var dd = add(kv, mk('dd', ''));
-        var shown = vals.map(asString).filter(function (v) { return v !== ''; });
-        if (!shown.length) add(dd, absentNode());
-        else shown.forEach(function (v, i) {
-          if (i) add(dd, document.createElement('br'));
-          add(dd, document.createTextNode(v));
-        });
-        wrote++;
+        var vals = (base && base[1] ? valuesAt(base[1], rest) : [])
+          .map(asString).filter(function (v) { return v !== ''; });
+        return { path: path, rest: rest || path, vals: vals };
       });
-      if (!wrote) {
+
+      if (!fields.length) {
         // A section with no field table of its own reads the subject it was opened on. Better than an
         // empty panel, and it is the same subject the raw section shows.
-        add(kv, mk('dt', 'mono', 'subject'));
+        var kv = add(box, mk('dl', 'kv'));
+        add(kv, mk('dt', '', 'Subject'));
         var dd2 = add(kv, mk('dd', ''));
         dd2.appendChild(mk('pre', 'raw', open.subject === null || open.subject === undefined
           ? NOT_REPORTED : JSON.stringify(open.subject, null, 2)));
+        return;
+      }
+
+      // Headings are decided over the whole section, not over each half: the same field reads under the
+      // same heading whether or not it happens to be reported in this payload.
+      var headings = groupCount(fields) > 1;
+      var gone = fields.filter(function (f) { return !f.vals.length; });
+      kvGroups(box, fields.filter(function (f) { return f.vals.length; }), headings);
+      if (gone.length) {
+        // Keyed on the panel, so the fold a reader opened is still open the next time they open that same
+        // panel — and so two sections of one drawer cannot collide on an id.
+        kvGroups(fold(box, 'absent.' + (panel || open.kind + '.' + section.id),
+          gone.length + (gone.length === 1 ? ' field' : ' fields') + ' not reported', false, false),
+        gone, headings);
       }
     });
 
@@ -3235,6 +3408,17 @@
       return;
     }
 
+    // A fold is chrome, not a reading: it changes what is visible and nothing about which rows the URL
+    // names, so it does not go through go() and writes no parameter (§22.7).
+    var folder = closest(target, function (n) { return attr(n, 'data-fold') !== null; });
+    if (folder) {
+      ev.preventDefault();
+      var fid = attr(folder, 'data-fold');
+      var now = applyFold(fid, attr(folder, 'aria-expanded') !== 'true');
+      if (attr(folder, 'data-remember') !== null) remember('fold.' + fid, now ? 'open' : 'shut');
+      return;
+    }
+
     var chip = closest(target, function (n) { return attr(n, 'data-chip') !== null; });
     if (chip) {
       ev.preventDefault();
@@ -3382,6 +3566,65 @@
     el('side-toggle').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     el('side-toggle').setAttribute('aria-label', collapsed ? 'Expand the sidebar' : 'Collapse the sidebar');
     return collapsed ? 'collapsed' : 'expanded';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Folds
+  //
+  // One mechanism for every *there is more here, but not up front* on the page: the dimension panels, the
+  // overview's lower bands, and the run of not-reported fields at the foot of a drawer section. Three
+  // rules hold it together.
+  //
+  // The content is always in the document. A fold that built its contents on click would mean the search
+  // box, the browser's own find-in-page and §22.1's payload-complete rule all disagreed with what the page
+  // contains — so hiding is one CSS rule keyed on `data-open`, and nothing here appends or removes.
+  //
+  // What is open survives a re-render. §22.1 forbids a rescan moving a row, and a band the reader opened
+  // snapping shut under them is the same broken promise — so the answer is kept in FOLD_OPEN for this page
+  // and, for the controls a reader sets deliberately, in storage for the next one (§22.7).
+  //
+  // The button says how much it is hiding. A control reading only *Filters* cannot be told apart from one
+  // with nothing behind it, which is the mistake §22.6 already names for a dimension with no members.
+  // ---------------------------------------------------------------------------
+
+  var FOLDS = {};      // id -> the button and the box currently drawn for it
+  var FOLD_OPEN = {};  // id -> this page's answer, so a re-render draws the fold as the reader left it
+
+  function fold(host, id, label, dflt, keep) {
+    var open = Object.prototype.hasOwnProperty.call(FOLD_OPEN, id) ? FOLD_OPEN[id]
+      : (keep ? recall('fold.' + id, dflt ? 'open' : 'shut') === 'open' : !!dflt);
+
+    var button = add(host, mk('button', 'fold'));
+    button.type = 'button';
+    button.setAttribute('data-fold', id);
+    if (keep) button.setAttribute('data-remember', '');
+    button.setAttribute('aria-controls', 'fold-' + id);
+    // The caret is the element CSS turns, and the label is a span beside it — so the button's accessible
+    // name is the label rather than the label plus a glyph no reader can pronounce. A span rather than a
+    // text node because the label changes: the filter control counts what is in force.
+    add(button, mk('span', 'caret', ''));
+    var text = add(button, mk('span', 'fold-label', label));
+
+    var box = add(host, mk('div', 'folded'));
+    box.setAttribute('id', 'fold-' + id);
+    box.setAttribute('data-foldable', id);
+
+    FOLDS[id] = { button: button, box: box, label: text };
+    applyFold(id, open);
+    return box;
+  }
+
+  function foldLabel(id, label) {
+    if (FOLDS[id]) FOLDS[id].label.textContent = label;
+  }
+
+  function applyFold(id, open) {
+    FOLD_OPEN[id] = !!open;
+    var f = FOLDS[id];
+    if (!f) return !!open;
+    f.box.setAttribute('data-open', open ? 'true' : 'false');
+    f.button.setAttribute('aria-expanded', open ? 'true' : 'false');
+    return !!open;
   }
 
   function wire() {

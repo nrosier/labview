@@ -522,12 +522,12 @@ nav ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.1rem; }
 
 /* ---------------------------------------------------------------- banners */
 
-.banners { display: grid; gap: 0.4rem; padding: 0.75rem 1rem 0; }
+.banners { display: grid; gap: 0.35rem; padding: 0.6rem 1rem 0; }
 
 .banner {
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  padding: 0.5rem 0.7rem;
+  padding: 0.35rem 0.65rem;
   font-size: var(--step-0);
   background: var(--panel);
   box-shadow: var(--shadow-1);
@@ -535,7 +535,12 @@ nav ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.1rem; }
 
 .banner strong { font-weight: 600; }
 .banner a { margin-left: 0.4rem; }
-.banner .hint { display: block; margin-top: 0.15rem; }
+
+/* One line per banner, wrapping only when the words run out of room. A degraded state is never folded and
+   never truncated — it is the page saying what it could not read — but three of them stacked two lines
+   each pushed the fleet off the first screen, and a hint that follows its statement on the same line is
+   the same sentence either way. */
+.banner .hint { display: inline; margin-left: 0.4rem; }
 
 .banner.tone-warn { background: var(--warn-bg); border-color: color-mix(in oklch, var(--warn) 40%, transparent); }
 .banner.tone-alert { background: var(--alert-bg); border-color: color-mix(in oklch, var(--alert) 45%, transparent); }
@@ -550,9 +555,9 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
-  gap: 0.75rem 1.5rem;
-  padding: 0.9rem 1.1rem;
-  margin-bottom: 0.9rem;
+  gap: 0.6rem 1.5rem;
+  padding: 0.7rem 1rem;
+  margin-bottom: 0.7rem;
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--bubble), var(--panel);
@@ -586,9 +591,79 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
 
 .change strong { color: var(--ink); font-weight: 600; }
 
+/* ------------------------------------------------------------------ folds */
+
+/* One mechanism, three places: the overview's non-headline bands, the filter panels, and the tail of
+   not-reported fields in every drawer section. The control is neutral chrome — §22.1 reserves alert and
+   warn for readings about the fleet, and *there is more of this behind here* is not one of those — and it
+   always says how much it is holding, because a disclosure that does not is a reason to open everything.
+
+   The single declaration below is the whole of the hiding. The content is in the document either way,
+   which is what keeps §22.3's every-counter-has-a-card rule and §22.4's field-coverage rule properties of
+   the tables rather than of what happens to be on screen — and it is why render-smoke, which runs the
+   bundle with no CSS at all, asserts this declaration as stylesheet *text* rather than by looking. */
+[data-foldable][data-open="false"] { display: none; }
+
+.fold {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem 0.25rem 0.3rem;
+  font-size: var(--step-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+  color: var(--ink-soft);
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.fold:hover { color: var(--ink); background: var(--soft); border-color: var(--line); }
+
+/* One glyph rotated rather than two glyphs swapped, so open and shut are visibly the same control in two
+   states. `aria-expanded` on the button is what a screen reader is told; this is the sighted half of the
+   same statement, and the label's count is the half that survives both. */
+.fold .caret {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex: none;
+  background: currentColor;
+  transition: transform 140ms ease;
+  mask: var(--icon-caret) center / contain no-repeat;
+  -webkit-mask: var(--icon-caret) center / contain no-repeat;
+}
+
+.fold[aria-expanded="true"] .caret { transform: rotate(90deg); }
+
+:root {
+  --icon-caret: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 5 7 7-7 7'/%3E%3C/svg%3E");
+}
+
 /* --------------------------------------------------------------- filters */
 
-.controls { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+/* The one row above the table: the disclosure on the left, how many rows are shown on the right. `.folded`
+   takes a whole line of its own inside the controls, so opening the panels pushes the table down and
+   moves nothing sideways. The panels stop where the count begins rather than at the table's right edge —
+   a row's worth of ragged edge under the sentence that explains it, which is cheaper than either
+   restructuring the row or drawing the count somewhere it does not belong. */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.2rem 1rem;
+  margin: 0.6rem 0 0;
+}
+
+.toolbar > .controls { flex: 1 1 20rem; min-width: 0; }
+.toolbar > .count { margin: 0; }
+
+.controls { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; }
+.controls > .fold { flex: 0 0 auto; }
+.controls > .folded { flex: 1 0 100%; }
+
+.dim-panels { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 
 /* Each dimension grows to take its share of the row it landed on. Left at their intrinsic widths they
    step in and out by however many values the payload happens to carry — a staircase down the page whose
@@ -625,7 +700,9 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
 
 .mode { font-size: var(--step-xs); padding: 0.1rem 0.45rem; border-radius: var(--r-pill); }
 
-.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.6rem 0 0; }
+/* Outside the fold, always (§22.6): the panels can be shut, but a narrowed table has to say so, and a chip
+   is the only thing on the page that both states the filter and undoes it. */
+.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.5rem 0 0; }
 
 .chip {
   display: inline-flex;
@@ -652,7 +729,7 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
 .chip.tone-alert { background: var(--alert-bg); border-color: color-mix(in oklch, var(--alert) 45%, transparent); color: var(--alert); }
 .chip.tone-warn { background: var(--warn-bg); border-color: color-mix(in oklch, var(--warn) 45%, transparent); color: var(--warn); }
 
-.count { margin: 0.6rem 0 0.6rem; font-size: var(--step-0); color: var(--ink-soft); }
+.count { margin: 0.6rem 0; font-size: var(--step-0); color: var(--ink-soft); }
 
 /* ----------------------------------------------------------------- cards */
 
@@ -708,17 +785,27 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
 .card.tone-warn .n { color: var(--warn); }
 .card.tone-good .n { color: var(--good); }
 
-/* One band per run of cards pointing into the same section. Stacked, a run of one or two cards leaves the
-   rest of the row empty and the page reads as a broken grid; with the label in a gutter beside the cards
-   the same run reads as a labelled row, and the labels line up down the page. The gutter only appears
-   when there is room for it — below that the label goes back above its cards. */
+/* One band per group of cards pointing into the same section. Stacked, a group of one or two cards leaves
+   the rest of the row empty and the page reads as a broken grid; with the label in a gutter beside the
+   cards the same group reads as a labelled row, and the labels line up down the page. The gutter only
+   appears when there is room for it — below that the label goes back above its cards.
+
+   Two shapes: a headline band states its label and shows its cards, and every other band is a fold. The
+   distinction is the contract's (`card.headline`), so which bands are open on arrival is decided in Go
+   beside the cards themselves rather than here. */
 .band { display: grid; gap: 0.35rem; margin: 0.9rem 0 0; }
 .band:first-child { margin-top: 0; }
+.band > .fold { justify-self: start; }
 
 @media (min-width: 1000px) {
   .band { grid-template-columns: 8.5rem minmax(0, 1fr); align-items: start; gap: 0 1rem; }
   .band > .cards { grid-column: 2; }
   .band > .section-label { grid-row: 1; padding-top: 0.55rem; }
+  /* The control spans the gutter so it starts where the headline labels start — one column of labels down
+     the page, whether the band beside it is open or a disclosure — while its cards stay in column 2 and so
+     line up with every other band's. */
+  .band > .fold { grid-column: 1 / -1; }
+  .band > .folded { grid-column: 2; }
 }
 
 .section-label {
@@ -749,6 +836,12 @@ main { padding: 0.75rem 1rem 4rem; min-width: 0; }
    controls, the chips and the count — and it grew with the hero, so the bound grew with it. Too small
    and the table wastes the window; too large and the box outruns the viewport, the page takes over the
    vertical scroll, and the sticky header is lost again exactly as described above.
+
+   It still accounts for the filter panels at full height even though they now arrive folded, because a
+   fold is an attribute flip with no re-render behind it: a reader can disclose eight panels between two
+   frames, and a bound tuned to the shut state would lose the sticky header the moment they did. Over-
+   reserving costs a row of the table in the common case, which is the direction of this trade that fails
+   safely.
 
    `vh` first and `dvh` second so a browser without dynamic viewport units keeps a bound rather than
    dropping the declaration and silently losing the sticky header again. The lower bound is there so a
@@ -785,7 +878,19 @@ thead th {
   font-size: var(--step-xs);
 }
 
-thead th .hint { display: block; font-weight: 400; text-transform: none; letter-spacing: 0; white-space: normal; max-width: 22rem; }
+/* A column note belongs in the header rather than in a tooltip (§22.8), and the header is the one place on
+   the page where prose costs every row below it: three lines of note on one column set the height of the
+   whole row. So it is drawn as the aside it is — narrower and lighter than the header it explains — and
+   the notes themselves were shortened in views.go, which is the half of this that no CSS can do. */
+thead th .hint {
+  display: block;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: normal;
+  max-width: 17rem;
+  color: color-mix(in oklch, var(--ink-soft) 80%, transparent);
+}
 
 /* The width floor and ceiling, per cell rather than per table, so the table's intrinsic width follows the
    column count instead of a number this file would have to guess: seven columns overflow and scroll, three
@@ -895,21 +1000,60 @@ td.num a:hover { text-decoration: underline; }
 
 .drawer section { margin-top: 1.1rem; }
 .drawer h3 { margin: 0 0 0.3rem; font-size: var(--step-xs); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-soft); }
+
+/* The permalink §22.7 puts on every panel, which had no rule of its own and so read as `DECLARED#` — a
+   heading with a typo in it. Set off and receded rather than hidden: `display: none` would take it out of
+   the tab order and out of the accessible name, which would trade a cosmetic problem for the loss of the
+   thing §22.7 asked for. It comes forward on hover and on focus, so it is still findable by either hand. */
+.drawer h3 a { margin-left: 0.4rem; color: var(--line); text-decoration: none; }
+.drawer h3 a:hover, .drawer h3 a:focus-visible { color: var(--accent); }
 .drawer .note { margin: 0 0 0.45rem; font-size: var(--step-0); color: var(--ink-soft); }
 
+/* A section's fields, in one list per group of the payload's own shape. A term reads as words — *Image
+   digest*, *No TLS verify* — with the dotted path on its `title`, because a column of dotted paths is the
+   payload's spelling rather than a reading of it, and this is the surface a reader comes to *to read*.
+
+   The hairline per row is what makes twelve terms scannable: the two columns are far enough apart that
+   without one the eye loses which value belongs to which term, and a rule between rows costs less than
+   closing the gap would. */
 dl.kv {
   display: grid;
-  grid-template-columns: minmax(8rem, 14rem) minmax(0, 1fr);
-  gap: 0.1rem 0.75rem;
+  grid-template-columns: minmax(8rem, 13rem) minmax(0, 1fr);
+  gap: 0 0.9rem;
   margin: 0;
-  padding: 0.6rem 0.75rem;
+  padding: 0.35rem 0.75rem 0.5rem;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--bg);
 }
 
-dl.kv dt { color: var(--ink-soft); font-size: var(--step-0); }
-dl.kv dd { margin: 0; font-size: var(--step-0); overflow-wrap: anywhere; }
+dl.kv + dl.kv, .kv-group + dl.kv { margin-top: 0.35rem; }
+
+dl.kv dt, dl.kv dd {
+  padding: 0.3rem 0;
+  font-size: var(--step-0);
+  border-top: 1px solid color-mix(in oklch, var(--line) 60%, transparent);
+}
+
+dl.kv > dt:first-of-type, dl.kv > dd:first-of-type { border-top: 0; }
+dl.kv dt { color: var(--ink-soft); font-weight: 500; }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+
+/* The group's own name, from the path above the term — `cloudflare.origin.address` and its siblings under
+   *Origin*. A section with one group gets none: its heading is the section title, already on screen.
+   Sentence case, deliberately: the section heading above it is the uppercase one, and two uppercase
+   headings a line apart read as two sections rather than as a section and a group inside it. */
+.kv-group {
+  margin: 0.7rem 0 0;
+  font-size: var(--step-0);
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+/* The tail of a section: the fields this payload did not report. Set apart rather than hidden — the count
+   on the control is a reading in itself, since *twenty-six of thirty not reported* says the integration
+   was never read, which is exactly what §22.8 asks a blank not to say silently. */
+.drawer .fold { margin-top: 0.35rem; }
 
 pre.raw {
   margin: 0;

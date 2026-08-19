@@ -69,6 +69,20 @@ type Card struct {
 	// Lead marks the one card §22.3 requires to be visible without scrolling.
 	Lead bool
 
+	// Headline is the band this card shows in before the reader expands anything, and empty for a card
+	// that starts folded away.
+	//
+	// Thirty-nine cards drawn at once is a wall, and a wall is not a summary: the reader who opens the
+	// overview to find out whether anything is wrong should not have to read the identity provider's
+	// middleware count first. So the headline set is the two questions worth answering unasked — *is
+	// anything wrong* and *how big is this fleet* — and every other card is still drawn, still counted,
+	// still a link, one control away (§22.3).
+	//
+	// A band label rather than a boolean, because a card that shows up front has to say which of those
+	// two questions it is answering; the distinct values, in this table's order, are also the order the
+	// bands appear in.
+	Headline string
+
 	// Tone is the card's colour. §22.5 reserves the alert colour for one meaning — reachable without
 	// authentication — and this is the other place it may appear.
 	Tone Tone
@@ -176,49 +190,60 @@ func CardOf(ov payload.Overview, id string) (Card, bool) {
 // services is the destination every service-shaped card starts from.
 func services() State { return State{View: SlugServices} }
 
+// The overview's two headline bands, in the order they appear. Findings before inventory, which is the
+// order §22.2 gives the views and §22.3 gives the cards.
+const (
+	BandAttention = "Needs attention"
+	BandFleet     = "The fleet"
+)
+
 // CardTable is §22.3's table, in the order the overview lays it out: the exposure finding first and
 // above the fold, then the fleet, reachability, declarations, probe, networks, and the integrations
 // last — findings before inventory, which is the same order §22.2 gives the views.
 var CardTable = []Card{
 	{
-		ID:    "exposedWithoutAuth",
-		Label: "Exposed without authentication",
-		Unit:  "service",
-		Note:  "reachable from outside with no gate this scan could find, read off the stored finding rather than recomputed (§4.2)",
-		Path:  "stats.exposedWithoutAuth",
-		Dest:  State{View: SlugServices, Exposed: true},
-		Exact: true,
-		Lead:  true,
-		Tone:  ToneAlert,
+		ID:       "exposedWithoutAuth",
+		Label:    "Exposed without authentication",
+		Unit:     "service",
+		Note:     "reachable from outside with no gate this scan could find, read off the stored finding rather than recomputed (§4.2)",
+		Path:     "stats.exposedWithoutAuth",
+		Dest:     State{View: SlugServices, Exposed: true},
+		Exact:    true,
+		Lead:     true,
+		Headline: BandAttention,
+		Tone:     ToneAlert,
 	},
 
 	// Fleet.
 	{
-		ID:    "stacks",
-		Label: "Stacks",
-		Unit:  "stack",
-		Note:  "one directory holding a compose file; a directory whose children hold them is not itself a stack (§6)",
-		Path:  "stats.stacks",
-		Dest:  State{View: SlugStacks},
-		Exact: true,
+		ID:       "stacks",
+		Label:    "Stacks",
+		Unit:     "stack",
+		Note:     "one directory holding a compose file; a directory whose children hold them is not itself a stack (§6)",
+		Path:     "stats.stacks",
+		Dest:     State{View: SlugStacks},
+		Exact:    true,
+		Headline: BandFleet,
 	},
 	{
-		ID:    "services",
-		Label: "Services",
-		Unit:  "service",
-		Note:  "every service in every compose file, whether or not a container for it was ever read",
-		Path:  "stats.services",
-		Dest:  services(),
-		Exact: true,
+		ID:       "services",
+		Label:    "Services",
+		Unit:     "service",
+		Note:     "every service in every compose file, whether or not a container for it was ever read",
+		Path:     "stats.services",
+		Dest:     services(),
+		Exact:    true,
+		Headline: BandFleet,
 	},
 	{
-		ID:    "running",
-		Label: "Running",
-		Unit:  "container",
-		Note:  "counted off the Engine's boolean; a service whose container was never read is not running and is not stopped either (§22.8)",
-		Path:  "stats.running",
-		Dest:  State{View: SlugContainers}.Including(DimState, StateRunning),
-		Exact: true,
+		ID:       "running",
+		Label:    "Running",
+		Unit:     "container",
+		Note:     "counted off the Engine's boolean; a service whose container was never read is not running and is not stopped either (§22.8)",
+		Path:     "stats.running",
+		Dest:     State{View: SlugContainers}.Including(DimState, StateRunning),
+		Exact:    true,
+		Headline: BandFleet,
 	},
 
 	// Reachability. One card per ingress kind, each including that member rather than equalling it:
@@ -310,13 +335,14 @@ var CardTable = []Card{
 		Exact: true,
 	},
 	{
-		ID:    "declaredAuthUnconfirmed",
-		Label: "Declared, not confirmed",
-		Unit:  "service",
-		Note:  "declared and not observed — kept apart from drift, which is a declaration the evidence contradicts (§22.2)",
-		Path:  "stats.declaredAuthUnconfirmed",
-		Dest:  State{View: SlugDeclarations}.Including(DimDecl, DeclNotConfirmed),
-		Exact: true,
+		ID:       "declaredAuthUnconfirmed",
+		Label:    "Declared, not confirmed",
+		Unit:     "service",
+		Note:     "declared and not observed — kept apart from drift, which is a declaration the evidence contradicts (§22.2)",
+		Path:     "stats.declaredAuthUnconfirmed",
+		Dest:     State{View: SlugDeclarations}.Including(DimDecl, DeclNotConfirmed),
+		Exact:    true,
+		Headline: BandAttention,
 	},
 	{
 		ID:    "exposureAccepted",
@@ -329,14 +355,15 @@ var CardTable = []Card{
 		Tone:  ToneWarn,
 	},
 	{
-		ID:    "declarationDrift",
-		Label: "Declaration drift",
-		Unit:  "entry",
-		Note:  "entries, not services: a service with two drift entries contributes two, and the destination lists entries",
-		Path:  "stats.declarationDrift",
-		Dest:  State{View: SlugDeclarations, Drift: true},
-		Exact: true,
-		Tone:  ToneWarn,
+		ID:       "declarationDrift",
+		Label:    "Declaration drift",
+		Unit:     "entry",
+		Note:     "entries, not services: a service with two drift entries contributes two, and the destination lists entries",
+		Path:     "stats.declarationDrift",
+		Dest:     State{View: SlugDeclarations, Drift: true},
+		Exact:    true,
+		Headline: BandAttention,
+		Tone:     ToneWarn,
 	},
 	{
 		ID:    "declaredDependencies",
@@ -361,14 +388,15 @@ var CardTable = []Card{
 		Tone:  ToneGood,
 	},
 	{
-		ID:    "probeOpen",
-		Label: "Probe answered, no gate",
-		Unit:  "service",
-		Note:  "answered an anonymous request with no gate signal — a finding about the path, not a verdict about the application (§13.3)",
-		Path:  "stats.probeOpen",
-		Dest:  State{View: SlugProbe}.Including(DimProbe, OutcomeOpen),
-		Exact: true,
-		Tone:  ToneWarn,
+		ID:       "probeOpen",
+		Label:    "Probe answered, no gate",
+		Unit:     "service",
+		Note:     "answered an anonymous request with no gate signal — a finding about the path, not a verdict about the application (§13.3)",
+		Path:     "stats.probeOpen",
+		Dest:     State{View: SlugProbe}.Including(DimProbe, OutcomeOpen),
+		Exact:    true,
+		Headline: BandAttention,
+		Tone:     ToneWarn,
 	},
 
 	// Networks (§8).
@@ -524,24 +552,26 @@ var CardTable = []Card{
 
 	// System (§15, §22.8).
 	{
-		ID:    "failingConnections",
-		Label: "Failing connections",
-		Unit:  "connection",
-		Note:  "partial reads and every failure that is not a setting; disabled and not-configured are settings, not faults (§22.8)",
-		Path:  "",
-		Dest:  State{View: SlugDiagnostics}.Including(DimState, ReportFailing),
-		Exact: true,
-		Tone:  ToneWarn,
+		ID:       "failingConnections",
+		Label:    "Failing connections",
+		Unit:     "connection",
+		Note:     "partial reads and every failure that is not a setting; disabled and not-configured are settings, not faults (§22.8)",
+		Path:     "",
+		Dest:     State{View: SlugDiagnostics}.Including(DimState, ReportFailing),
+		Exact:    true,
+		Headline: BandAttention,
+		Tone:     ToneWarn,
 	},
 	{
-		ID:    "warnings",
-		Label: "Scan warnings",
-		Unit:  "warning",
-		Note:  "what the scan could not do, in its own words — the list is bounded, and this is all of it",
-		Path:  "",
-		Dest:  State{View: SlugDiagnostics, Panel: PanelWarnings},
-		Exact: true,
-		Tone:  ToneWarn,
+		ID:       "warnings",
+		Label:    "Scan warnings",
+		Unit:     "warning",
+		Note:     "what the scan could not do, in its own words — the list is bounded, and this is all of it",
+		Path:     "",
+		Dest:     State{View: SlugDiagnostics, Panel: PanelWarnings},
+		Exact:    true,
+		Headline: BandAttention,
+		Tone:     ToneWarn,
 	},
 	{
 		ID:    "build",

@@ -128,6 +128,12 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "stack:volumes",
           "stack:declaration",
           "stack:raw",
+          "container:runtime",
+          "container:identity",
+          "container:addresses",
+          "container:ports",
+          "container:declared",
+          "container:raw",
           "network:identity",
           "network:members",
           "network:crossing",
@@ -398,38 +404,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "note": "tunnel ingress or proxy router — the mechanism, never the provider (I3)"
         },
         {
-          "key": "tls",
-          "header": "TLS",
-          "fields": [
-            "stacks.services.traefik.tls",
-            "stacks.services.traefik.certResolver",
-            "stacks.services.cloudflare.noTlsVerify"
-          ]
-        },
-        {
-          "key": "entrypoints",
-          "header": "Entrypoints",
-          "fields": [
-            "stacks.services.traefik.entrypoints"
-          ]
-        },
-        {
-          "key": "middleware",
-          "header": "Middleware",
-          "fields": [
-            "stacks.services.traefik.middlewares"
-          ],
-          "evidence": true
-        },
-        {
-          "key": "router",
-          "header": "Router",
-          "fields": [
-            "stacks.services.traefik.router",
-            "stacks.services.traefik.rule"
-          ]
-        },
-        {
           "key": "origin",
           "header": "Origin",
           "fields": [
@@ -465,7 +439,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "set": "authMethod",
           "dim": "auth",
           "evidence": true,
-          "note": "the gate on this route, which is not always the service's overall posture"
+          "note": "the gate on this route, not the service's overall posture"
         }
       ],
       "order": "ungated external paths first, then by hostname and path",
@@ -609,27 +583,24 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "kind": "container",
       "columns": [
         {
-          "key": "id",
-          "header": "ID",
-          "fields": [
-            "stacks.services.docker.id"
-          ]
+          "key": "service",
+          "header": "Service"
         },
         {
           "key": "name",
-          "header": "Name",
+          "header": "Container",
           "fields": [
             "stacks.services.docker.name"
-          ]
+          ],
+          "note": "the name the Engine reports, which is not always the service's"
         },
         {
           "key": "image",
           "header": "Image",
           "fields": [
-            "stacks.services.docker.image",
-            "stacks.services.docker.imageDigest"
+            "stacks.services.docker.image"
           ],
-          "note": "the digest is what is running, where the tag is only what was asked for"
+          "note": "the tag, which is what was asked for; the digest actually running is in the drawer"
         },
         {
           "key": "state",
@@ -656,39 +627,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ],
           "numeric": true,
           "note": "not reported when the Engine did not say — never 0"
-        },
-        {
-          "key": "created",
-          "header": "Created",
-          "fields": [
-            "stacks.services.docker.createdAt"
-          ]
-        },
-        {
-          "key": "started",
-          "header": "Started",
-          "fields": [
-            "stacks.services.docker.startedAt"
-          ]
-        },
-        {
-          "key": "ips",
-          "header": "Addresses",
-          "fields": [
-            "stacks.services.docker.networks",
-            "stacks.services.docker.ipAddresses"
-          ]
-        },
-        {
-          "key": "ports",
-          "header": "Published ports",
-          "fields": [
-            "stacks.services.docker.publishedPorts.published",
-            "stacks.services.docker.publishedPorts.target",
-            "stacks.services.docker.publishedPorts.protocol",
-            "stacks.services.docker.publishedPorts.raw"
-          ],
-          "note": "what the Engine reports as published, which is the reading that decides LAN reachability"
         }
       ],
       "fields": [
@@ -844,36 +782,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ]
         },
         {
-          "key": "launch",
-          "header": "Launch URL",
-          "fields": [
-            "stacks.services.authentik.applications.launchUrl"
-          ]
-        },
-        {
-          "key": "providers",
-          "header": "Providers",
-          "fields": [
-            "stacks.services.authentik.applications.providers.name",
-            "stacks.services.authentik.applications.providers.kind",
-            "stacks.services.authentik.applications.providers.rawKind",
-            "stacks.services.authentik.applications.providers.mode",
-            "stacks.services.authentik.applications.providers.internalHost",
-            "stacks.services.authentik.applications.providers.externalHost",
-            "stacks.services.authentik.applications.providers.redirectUris",
-            "stacks.services.authentik.applications.providers.backchannel"
-          ],
-          "set": "authentikProviderKind",
-          "note": "kind and mode, with the raw kind kept so an unknown one is readable rather than dropped"
-        },
-        {
-          "key": "outposts",
-          "header": "Outposts",
-          "fields": [
-            "stacks.services.authentik.applications.providers.outposts"
-          ]
-        },
-        {
           "key": "match",
           "header": "Matched service",
           "fields": [
@@ -893,7 +801,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ],
           "set": "discoveredVia",
           "dim": "match",
-          "note": "a record rebuilt from a provider is tagged rebuilt, because it is not what the applications endpoint returned"
+          "note": "a record rebuilt from a provider is tagged rebuilt: it is not what the applications endpoint returned"
         }
       ],
       "fields": [
@@ -967,20 +875,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ]
         },
         {
-          "key": "entrypoints",
-          "header": "Entrypoints",
-          "fields": [
-            "stacks.services.traefikLive.entryPoints"
-          ]
-        },
-        {
-          "key": "tls",
-          "header": "TLS",
-          "fields": [
-            "stacks.services.traefikLive.tls"
-          ]
-        },
-        {
           "key": "status",
           "header": "Status",
           "fields": [
@@ -989,28 +883,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ],
           "evidence": true,
           "note": "the proxy's own words, verbatim"
-        },
-        {
-          "key": "middleware",
-          "header": "Middleware chain",
-          "fields": [
-            "stacks.services.traefikLive.middlewares.name",
-            "stacks.services.traefikLive.middlewares.type",
-            "stacks.services.traefikLive.middlewares.address",
-            "stacks.services.traefikLive.middlewares.errors",
-            "stacks.services.traefikLive.middlewares.viaChain",
-            "stacks.services.traefikLive.middlewares.viaEntrypoint"
-          ],
-          "evidence": true,
-          "note": "where each entry came from: named on the router, reached through a chain, or applied by the entrypoint"
-        },
-        {
-          "key": "servers",
-          "header": "Backend servers",
-          "fields": [
-            "stacks.services.traefikLive.servers.url",
-            "stacks.services.traefikLive.servers.status"
-          ]
         },
         {
           "key": "match",
@@ -1081,15 +953,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "header": "Service"
         },
         {
-          "key": "vantage",
-          "header": "Vantage",
-          "fields": [
-            "stacks.services.probe.vantage"
-          ],
-          "set": "probeVantage",
-          "note": "where it was asked from, which is what the answer is about"
-        },
-        {
           "key": "address",
           "header": "Address",
           "fields": [
@@ -1120,71 +983,8 @@ window.LABVIEW_CONTRACT = Object.freeze({
             "stacks.services.probe.gate"
           ],
           "set": "probeGate",
-          "dim": "probe"
-        },
-        {
-          "key": "fact",
-          "header": "Rested on",
-          "fields": [
-            "stacks.services.probe.detail"
-          ],
-          "evidence": true,
-          "note": "the one fact the verdict rested on"
-        },
-        {
-          "key": "form",
-          "header": "Form shape",
-          "fields": [
-            "stacks.services.probe.form.password",
-            "stacks.services.probe.form.username",
-            "stacks.services.probe.form.submit",
-            "stacks.services.probe.form.otp",
-            "stacks.services.probe.form.action"
-          ]
-        },
-        {
-          "key": "state",
-          "header": "State challenge",
-          "fields": [
-            "stacks.services.probe.state.asked",
-            "stacks.services.probe.state.refusedAt",
-            "stacks.services.probe.state.status",
-            "stacks.services.probe.state.challenge"
-          ],
-          "evidence": true
-        },
-        {
-          "key": "anon",
-          "header": "Anonymous reading",
-          "fields": [
-            "stacks.services.probe.anon.textChars",
-            "stacks.services.probe.anon.links",
-            "stacks.services.probe.anon.loginHref",
-            "stacks.services.probe.anon.loginLabel"
-          ]
-        },
-        {
-          "key": "redirect",
-          "header": "Redirect",
-          "fields": [
-            "stacks.services.probe.redirect.to",
-            "stacks.services.probe.redirect.crossOrigin",
-            "stacks.services.probe.refresh.to",
-            "stacks.services.probe.refresh.crossOrigin",
-            "stacks.services.probe.truncated"
-          ]
-        },
-        {
-          "key": "attempts",
-          "header": "Attempts",
-          "fields": [
-            "stacks.services.probe.attempts.endpoint",
-            "stacks.services.probe.attempts.why",
-            "stacks.services.probe.attempts.phase",
-            "stacks.services.probe.attempts.code",
-            "stacks.services.probe.attempts.detail"
-          ],
-          "evidence": true
+          "dim": "probe",
+          "note": "and the fact it rested on is in the drawer, never merged into the verdict"
         }
       ],
       "fields": [
@@ -1228,31 +1028,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           ]
         },
         {
-          "key": "description",
-          "header": "Description",
-          "fields": [
-            "stacks.services.declared.description",
-            "stacks.services.declared.notes"
-          ]
-        },
-        {
-          "key": "data",
-          "header": "Data",
-          "fields": [
-            "stacks.services.declared.data",
-            "stacks.services.declared.file"
-          ],
-          "note": "the operator's own fields, kept as written"
-        },
-        {
-          "key": "links",
-          "header": "Links",
-          "fields": [
-            "stacks.services.declared.links.label",
-            "stacks.services.declared.links.url"
-          ]
-        },
-        {
           "key": "declaredAuth",
           "header": "Declared auth",
           "fields": [
@@ -1264,33 +1039,6 @@ window.LABVIEW_CONTRACT = Object.freeze({
           "dim": "decl",
           "evidence": true,
           "note": "the mechanism the operator declared, and whether the scan agrees"
-        },
-        {
-          "key": "dependencies",
-          "header": "Declared dependencies",
-          "fields": [
-            "stacks.services.declared.dependsOn.ref",
-            "stacks.services.declared.dependsOn.detail",
-            "stacks.services.declared.dependencies.name",
-            "stacks.services.declared.dependencies.detail"
-          ]
-        },
-        {
-          "key": "accepted",
-          "header": "Accepted exposure",
-          "fields": [
-            "stacks.services.declared.unauthenticatedAccepted.reason"
-          ],
-          "set": "finding",
-          "note": "still exposed: an acceptance records a decision and changes nothing about reachability"
-        },
-        {
-          "key": "expected",
-          "header": "Expected ingress",
-          "fields": [
-            "stacks.services.declared.expectedIngress"
-          ],
-          "set": "ingressKind"
         },
         {
           "key": "drift",
@@ -2898,6 +2646,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "view": "services",
       "exact": true,
       "lead": true,
+      "headline": "Needs attention",
       "tone": "alert"
     },
     {
@@ -2909,6 +2658,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=stacks",
       "view": "stacks",
       "exact": true,
+      "headline": "The fleet",
       "tone": ""
     },
     {
@@ -2920,6 +2670,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=services",
       "view": "services",
       "exact": true,
+      "headline": "The fleet",
       "tone": ""
     },
     {
@@ -2931,6 +2682,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=containers&state=running",
       "view": "containers",
       "exact": true,
+      "headline": "The fleet",
       "tone": ""
     },
     {
@@ -3043,6 +2795,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=declarations&decl=not-confirmed",
       "view": "declarations",
       "exact": true,
+      "headline": "Needs attention",
       "tone": ""
     },
     {
@@ -3065,6 +2818,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=declarations&drift=1",
       "view": "declarations",
       "exact": true,
+      "headline": "Needs attention",
       "tone": "warn"
     },
     {
@@ -3098,6 +2852,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=probe&probe=open",
       "view": "probe",
       "exact": true,
+      "headline": "Needs attention",
       "tone": "warn"
     },
     {
@@ -3294,6 +3049,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=diagnostics&state=failing",
       "view": "diagnostics",
       "exact": true,
+      "headline": "Needs attention",
       "tone": "warn"
     },
     {
@@ -3304,6 +3060,7 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "dest": "view=diagnostics&panel=list%3Awarnings",
       "view": "diagnostics",
       "exact": true,
+      "headline": "Needs attention",
       "tone": "warn"
     },
     {
@@ -3610,6 +3367,80 @@ window.LABVIEW_CONTRACT = Object.freeze({
       ]
     },
     {
+      "kind": "container",
+      "title": "Container",
+      "opens": "a row in Containers",
+      "sections": [
+        {
+          "id": "runtime",
+          "title": "Runtime",
+          "fields": [
+            "stacks.services.docker.state",
+            "stacks.services.docker.status",
+            "stacks.services.docker.running",
+            "stacks.services.docker.health",
+            "stacks.services.docker.restartCount",
+            "stacks.services.docker.createdAt",
+            "stacks.services.docker.startedAt"
+          ],
+          "note": "the Engine's own words for what it is doing, when it was created and when this run started — a service whose container was never read is not stopped, and reads as not reported (§22.8)"
+        },
+        {
+          "id": "identity",
+          "title": "Identity",
+          "fields": [
+            "stacks.services.docker.id",
+            "stacks.services.docker.name",
+            "stacks.services.docker.image",
+            "stacks.services.docker.imageDigest"
+          ],
+          "note": "the container's own id and name — which is the name the Engine gave it, not the compose service name — and the image with the digest actually running"
+        },
+        {
+          "id": "addresses",
+          "title": "Addresses",
+          "fields": [
+            "stacks.services.docker.networks",
+            "stacks.services.docker.ipAddresses"
+          ],
+          "note": "the networks this container is attached to and its address on each; an address is reachability from that network and nothing more (§16)"
+        },
+        {
+          "id": "ports",
+          "title": "Published ports",
+          "fields": [
+            "stacks.services.docker.publishedPorts.published",
+            "stacks.services.docker.publishedPorts.target",
+            "stacks.services.docker.publishedPorts.protocol",
+            "stacks.services.docker.publishedPorts.raw"
+          ],
+          "note": "what the Engine reports bound on the host, which is a gate nothing enforces"
+        },
+        {
+          "id": "declared",
+          "title": "Declared",
+          "fields": [
+            "stacks.services.image",
+            "stacks.services.containerName",
+            "stacks.services.restart",
+            "stacks.services.command",
+            "stacks.services.ports.published",
+            "stacks.services.ports.target",
+            "stacks.services.ports.protocol",
+            "stacks.services.ports.raw",
+            "stacks.services.expose"
+          ],
+          "note": "the compose file's own words, which are evidence of what was asked for and none at all that it is running; `expose` is container-to-container and never a LAN reading (§16)"
+        },
+        {
+          "id": "raw",
+          "title": "Raw",
+          "raw": true,
+          "note": "the service's payload subtree, copyable; the container record is the `docker` object inside it, and its absence there is the whole statement that the Engine was never read"
+        }
+      ]
+    },
+    {
       "kind": "network",
       "title": "Network",
       "opens": "a row in Networks, a network node in the networks diagram, or the net parameter",
@@ -3821,6 +3652,12 @@ window.LABVIEW_CONTRACT = Object.freeze({
     "stack:volumes",
     "stack:declaration",
     "stack:raw",
+    "container:runtime",
+    "container:identity",
+    "container:addresses",
+    "container:ports",
+    "container:declared",
+    "container:raw",
     "network:identity",
     "network:members",
     "network:crossing",

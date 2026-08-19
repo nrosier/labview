@@ -283,6 +283,82 @@ var Drawers = []Drawer{
 		},
 	},
 	{
+		// The container drawer. Until it existed, a container row opened the *service* drawer — which has
+		// no section for a container id, an address on a network or a published port, so ten columns of
+		// runtime facts had nowhere to go but the table, and the table was ten columns wide.
+		//
+		// Findings first, as §22.4 requires, and for a running container the finding is its state: what it
+		// is doing now, and how many times it has been restarted to keep doing it. Identity comes second
+		// because *which image is this* is the question asked after *is it up*.
+		Kind:  "container",
+		Title: "Container",
+		Opens: "a row in Containers",
+		Sections: []Section{
+			{
+				ID:    "runtime",
+				Title: "Runtime",
+				Fields: []string{
+					"stacks.services.docker.state", "stacks.services.docker.status",
+					"stacks.services.docker.running", "stacks.services.docker.health",
+					"stacks.services.docker.restartCount",
+					"stacks.services.docker.createdAt", "stacks.services.docker.startedAt",
+				},
+				Note: "the Engine's own words for what it is doing, when it was created and when this run started — a service whose container was never read is not stopped, and reads as not reported (§22.8)",
+			},
+			{
+				ID:    "identity",
+				Title: "Identity",
+				Fields: []string{
+					"stacks.services.docker.id", "stacks.services.docker.name",
+					"stacks.services.docker.image", "stacks.services.docker.imageDigest",
+				},
+				Note: "the container's own id and name — which is the name the Engine gave it, not the compose service name — and the image with the digest actually running",
+			},
+			{
+				ID:    "addresses",
+				Title: "Addresses",
+				Fields: []string{
+					"stacks.services.docker.networks", "stacks.services.docker.ipAddresses",
+				},
+				Note: "the networks this container is attached to and its address on each; an address is reachability from that network and nothing more (§16)",
+			},
+			{
+				ID:    "ports",
+				Title: "Published ports",
+				Fields: []string{
+					"stacks.services.docker.publishedPorts.published",
+					"stacks.services.docker.publishedPorts.target",
+					"stacks.services.docker.publishedPorts.protocol",
+					"stacks.services.docker.publishedPorts.raw",
+				},
+				Note: "what the Engine reports bound on the host, which is a gate nothing enforces",
+			},
+			{
+				// The compose file's answers to the questions the sections above ask the Engine, so the two
+				// can be read against each other — a tag asked for and a digest running, a port declared
+				// and a port bound. It closes the drawer rather than opening it because a declaration is
+				// not a finding: it is what was asked for, and it is present whether or not the Engine was
+				// ever read. This is also the half of the drawer that still says something when it was not.
+				ID:    "declared",
+				Title: "Declared",
+				Fields: []string{
+					"stacks.services.image", "stacks.services.containerName",
+					"stacks.services.restart", "stacks.services.command",
+					"stacks.services.ports.published", "stacks.services.ports.target",
+					"stacks.services.ports.protocol", "stacks.services.ports.raw",
+					"stacks.services.expose",
+				},
+				Note: "the compose file's own words, which are evidence of what was asked for and none at all that it is running; `expose` is container-to-container and never a LAN reading (§16)",
+			},
+			{
+				ID:    "raw",
+				Title: "Raw",
+				Raw:   true,
+				Note:  "the service's payload subtree, copyable; the container record is the `docker` object inside it, and its absence there is the whole statement that the Engine was never read",
+			},
+		},
+	},
+	{
 		Kind:  "network",
 		Title: "Network",
 		Opens: "a row in Networks, a network node in the networks diagram, or the net parameter",

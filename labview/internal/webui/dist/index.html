@@ -134,9 +134,17 @@
             </div>
           </div>
 
-          <div id="controls" class="controls"></div>
+          <!-- One row above the table: the control that discloses the dimension panels on the left, and
+               how many rows are shown on the right. They belong on the same line because they answer the
+               same question — *what am I looking at, and is it all of it* — and stacking eight bordered
+               panels between the heading and the first row was most of what made this column a wall. -->
+          <div class="toolbar">
+            <div id="controls" class="controls"></div>
+            <p id="count" class="count" aria-live="polite"></p>
+          </div>
+          <!-- Outside the fold, always: §22.6 says a filtered table must say it is filtered, and a chip
+               is the only thing on the page that both states the filter and can undo it. -->
           <div id="chips" class="chips"></div>
-          <p id="count" class="count" aria-live="polite"></p>
           <div id="content"></div>
         </main>
       </div>

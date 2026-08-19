@@ -674,11 +674,49 @@ for (const panel of C.panels) {
   const section = kind.sections.find((s) => panel.endsWith(':' + s.id));
   const box = out.id('drawer').querySelectorAll('[data-panel="' + panel + '"]')[0];
   if (box && section && section.fields) {
-    const terms = box.all().filter((n) => n.tagName === 'DT').length;
+    const terms = box.all().filter((n) => n.tagName === 'DT');
     check('panel ' + panel + ' accounts for each of its ' + section.fields.length + ' fields',
-      terms === section.fields.length, terms + ' rows for ' + section.fields.length + ' fields');
+      terms.length === section.fields.length, terms.length + ' rows for ' + section.fields.length + ' fields');
     const values = box.all().filter((n) => n.tagName === 'DD');
     if (values.some((dd) => !dd.textContent.includes('not reported'))) resolvedBy.set(kind.kind, true);
+
+    // §22.4's readability rule, checked here rather than in section 16 because a panel is already open:
+    // it holds for every panel this build declares rather than for a sampled one.
+    //
+    // A term reads as words, and the path is still on it. `docker.publishedPorts.raw` as a label is the
+    // drawer describing the payload to itself, and a label with no path behind it is a rename that loses
+    // the one spelling the API answers to — so both halves are one check, since either alone is a
+    // regression that reads as a fix. Sentence case is the assertion for the first half: the transform
+    // capitalises the leading word or upper-cases it whole, and nothing else in it can produce a dot.
+    const raw = terms.filter((dt) => dt.textContent.includes('.') || !/^[A-Z]/.test(dt.textContent));
+    check('panel ' + panel + ' names its fields in words rather than in payload paths',
+      raw.length === 0, JSON.stringify(raw.map((dt) => dt.textContent).slice(0, 4)));
+    const paths = terms.map((dt) => dt.getAttribute('title'));
+    check('panel ' + panel + ' keeps the exact path of every field it renames',
+      paths.every((p) => section.fields.indexOf(p) >= 0) &&
+      new Set(paths).size === section.fields.length,
+      JSON.stringify(paths.filter((p) => section.fields.indexOf(p) < 0).slice(0, 4)) +
+      ' of ' + JSON.stringify(paths));
+
+    // The other half of the same rule: a run of *not reported* fields MAY be folded away, and the check
+    // above is what keeps it in the document. This says the fold holds the absent ones *and only* those —
+    // a fold that swallowed a reported value would hide a finding behind a control announcing it hides
+    // nothing worth reading. Only asserted where the section has some of each, which is the only case
+    // where the two can be told apart.
+    const buried = (n) => {
+      for (let p = n; p && p !== box; p = p.parentNode) {
+        if (p.getAttribute && p.getAttribute('data-foldable') !== null) return true;
+      }
+      return false;
+    };
+    const said = values.filter((dd) => !dd.textContent.includes('not reported'));
+    const silent = values.filter((dd) => dd.textContent.includes('not reported'));
+    if (said.length && silent.length) {
+      check('panel ' + panel + ' reads out what it has and folds away only what it does not',
+        said.every((dd) => !buried(dd)) && silent.every((dd) => buried(dd)),
+        said.filter(buried).length + ' of ' + said.length + ' reported values are behind the fold, ' +
+        silent.filter((dd) => !buried(dd)).length + ' of ' + silent.length + ' absent ones in front of it');
+    }
   }
   if (box && section && section.raw) {
     check('panel ' + panel + ' shows the raw record it opened on',
@@ -1575,6 +1613,155 @@ for (const view of C.views) {
   // As with the marks above: every assertion passes vacuously on a fleet with nothing exposed. The edge
   // fixture has services reachable with no gate, so the reserved colour must have been spent on one.
   check('the reserved colour was actually spent on an exposure', toldInColour > 0);
+}
+
+// --- 16. What the page opens on, and what it keeps behind a control --------
+//
+// The main column used to stack thirty-nine counters across eight bands, and eight bordered filter panels
+// between the heading and the first row. What replaced it is one CSS rule and a `data-open` attribute —
+// which makes it the one kind of change this file is structurally blind to: nothing throws, every node is
+// still in the document, and every existing count still matches. So the hiding is asserted against the
+// stylesheet's text, the way sections 13 and 15 do, and the shape is asserted in the DOM.
+//
+// §22.4's two rules about the drawer's own folded tail are in section 5 instead, where a panel is already
+// open.
+
+{
+  const css = readFileSync(join(ROOT, 'assets', 'labview.css'), 'utf8');
+  const at = css.indexOf('[data-foldable][data-open="false"] {');
+  const rule = at < 0 ? '' : css.slice(at, css.indexOf('}', at));
+  // Without this one declaration every fold below is decoration: the controls flip an attribute, all of
+  // the checks pass, and the page hides nothing at all.
+  check('a shut fold is hidden, which is the whole of what folding is here',
+    /display:\s*none/.test(rule), JSON.stringify(rule));
+}
+
+// The overview: §22.3 keeps a card for every counter in `stats`, and the ask was that a reader arriving at
+// it sees the interesting ones rather than all of them. Both at once means the cards a fold is hiding are
+// still cards on the page, so *how many are drawn* cannot tell the two apart — `data-card` says which.
+{
+  const out = await run('');
+  noThrow('the overview renders for the fold checks', out);
+  const content = out.id('content');
+  // Against the cards actually drawn rather than against the contract's count, because one declaration can
+  // expand into several: a distribution card becomes a card per member (`segmentOf`), and those are drawn
+  // without a headline, so they fold with their group. Section 3 above is what ties the drawn set back to
+  // the contract; this only asks that none of them is anonymous.
+  const drawn = content.all().filter((n) => n.classList.contains('card'));
+  const cards = content.querySelectorAll('[data-card]');
+  check('every card on the overview says which card it is',
+    cards.length === drawn.length, cards.length + ' named of ' + drawn.length + ' drawn');
+
+  // A fold nests: a card sits in `.cards` inside the box the control opens. Read as *is anything above
+  // this shut*, so a band inside a band would still count as hidden.
+  const hidden = (n) => {
+    for (let p = n; p; p = p.parentNode) {
+      if (p.getAttribute && p.getAttribute('data-open') === 'false') return true;
+    }
+    return false;
+  };
+  const shown = cards.filter((a) => !hidden(a)).map((a) => a.getAttribute('data-card'));
+  const headline = C.cards.filter((c) => c.headline).map((c) => c.id);
+  check('the overview opens on the cards the contract calls headline, and on no others',
+    JSON.stringify(shown.slice().sort()) === JSON.stringify(headline.slice().sort()),
+    'shown ' + JSON.stringify(shown) + ' vs headline ' + JSON.stringify(headline));
+
+  // Attention before size, which is a claim about order and not only about membership: the reserved
+  // finding of §22.1 is the first thing on the page or the ranking has quietly become alphabetical.
+  const lead = C.cards.find((c) => c.lead);
+  check('the overview leads with the finding the contract ranks first',
+    !!lead && shown[0] === lead.id, JSON.stringify(shown[0]) + ' vs ' + (lead ? lead.id : 'no lead card'));
+
+  // One control per folded band, and it says how much it is holding: a control reading only its group name
+  // cannot be told apart from one with nothing behind it, which is the mistake §22.6 already names for a
+  // dimension with no members.
+  const bandOf = (c) => { const v = C.views.find((x) => x.slug === c.view); return v ? v.group : 'Other'; };
+  const folded = new Set(C.cards.filter((c) => !c.headline).map(bandOf));
+  const controls = content.querySelectorAll('[data-fold]');
+  check('the overview folds one band per group and leaves the headline bands open',
+    controls.length === folded.size,
+    controls.length + ' controls for ' + folded.size + ' folded bands: ' + JSON.stringify([...folded]));
+  check('every band the reader has not opened yet is shut',
+    controls.every((b) => b.getAttribute('aria-expanded') === 'false'),
+    controls.filter((b) => b.getAttribute('aria-expanded') !== 'false').length + ' arrived open');
+  const mute = controls.filter((b) => {
+    const box = content.querySelectorAll('[data-foldable="' + b.getAttribute('data-fold') + '"]')[0];
+    const held = box ? box.querySelectorAll('[data-card]').length : 0;
+    return !held || !b.textContent.includes('(' + held + ')');
+  });
+  check('every fold control says how many cards it is holding', mute.length === 0,
+    JSON.stringify(mute.map((b) => b.textContent)));
+}
+
+// The filters: the panels behind one control, the chips in front of it. §22.6 obliges a narrowed table to
+// say it is narrowed, and a chip is the only thing on the page that both states a filter and undoes it —
+// so it is the one part of the control strip that cannot be what the fold hides.
+const filterable = C.views.find((v) => (v.dims || []).length);
+{
+  const out = await run('?view=' + filterable.slug);
+  noThrow('a filterable view renders for the fold checks', out);
+  const host = out.id('controls');
+  const box = host.querySelectorAll('[data-foldable="filters"]')[0];
+  check('the dimension panels are behind one control', !!box);
+  const inside = (n, ancestor) => {
+    if (!ancestor) return false;
+    for (let p = n; p; p = p.parentNode) if (p === ancestor) return true;
+    return false;
+  };
+  const dims = host.all().filter((n) => n.classList.contains('dim'));
+  check(filterable.slug + ' still draws a panel per dimension it declares',
+    dims.length === filterable.dims.length, dims.length + ' panels for ' + filterable.dims.length + ' dimensions');
+  check('every dimension panel is behind that control',
+    !!box && dims.every((n) => inside(n, box)),
+    dims.filter((n) => !inside(n, box)).length + ' of ' + dims.length + ' panels are outside it');
+  check('the control arrives shut, so the view opens on its first row',
+    !!box && box.getAttribute('data-open') === 'false',
+    box ? JSON.stringify(box.getAttribute('data-open')) : 'no fold at all');
+  check('the chips are in front of the control, never behind it', !inside(out.id('chips'), box));
+}
+
+// A reader who followed a filtered link has to be able to see and unset what is narrowing the table, so
+// the panels open themselves when the URL carries a filter — whatever the remembered preference says.
+{
+  const param = filterable.dims[0];
+  const dim = C.dimensions.find((d) => d.param === param);
+  const set = dim && dim.set ? C.sets.find((s) => s.name === dim.set) : null;
+  const member = set ? set.terms[0].member : 'running';
+  const out = await run('?view=' + filterable.slug + '&' + param + '=' + encodeURIComponent(member));
+  noThrow('a narrowed table renders', out);
+  const box = out.id('controls').querySelectorAll('[data-foldable="filters"]')[0];
+  check('a link that narrows the table opens the panels that narrowed it',
+    !!box && box.getAttribute('data-open') === 'true',
+    box ? JSON.stringify(box.getAttribute('data-open')) : 'no fold at all');
+  check('and the control counts what is in force, rather than reading as an empty one',
+    (out.id('controls').textContent || '').includes('(1)'),
+    JSON.stringify(out.id('controls').textContent));
+}
+
+// The section-12 pattern, applied to the one fold a reader sets deliberately: written when they set it, in
+// force before the payload arrives. A preference that is not remembered is a control that undoes itself on
+// every navigation (§22.7).
+{
+  const out = await run('?view=' + filterable.slug);
+  const button = out.id('controls').querySelectorAll('[data-fold="filters"]')[0];
+  check('the control is a button, so the keyboard reaches it and Enter works on it',
+    !!button && button.tagName === 'BUTTON', button ? button.tagName : 'no control');
+  if (button) {
+    out.doc.dispatch('click', { target: button, preventDefault() {} });
+    await flush();
+    check('opening the panels writes it down',
+      out.store.get('labview.fold.filters') === 'open',
+      JSON.stringify(out.store.get('labview.fold.filters')));
+    check('and the control reports that it is open',
+      button.getAttribute('aria-expanded') === 'true',
+      JSON.stringify(button.getAttribute('aria-expanded')));
+  }
+  const back = await run('?view=' + filterable.slug, { remembered: { 'labview.fold.filters': 'open' } });
+  noThrow('a remembered fold is applied at boot', back);
+  const box = back.id('controls').querySelectorAll('[data-foldable="filters"]')[0];
+  check('a reader who opened the panels finds them open on the next view they visit',
+    !!box && box.getAttribute('data-open') === 'true',
+    box ? JSON.stringify(box.getAttribute('data-open')) : 'no fold at all');
 }
 
 // ---------------------------------------------------------------------------

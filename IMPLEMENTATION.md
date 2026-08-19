@@ -1725,16 +1725,16 @@ Operator · System. Each is one row per object, filterable (§22.6) and addressa
 | Overview | what is here, and what needs attention | a statistic | every counter in `stats`, as a card (§22.3) |
 | Stacks | how the tree is laid out | a stack | *in the table:* name, service count, ingress and auth roll-ups, an exposure count in the **reserved colour**, and a **marked** warning count. *In the row's drawer:* directory, compose file, project name, whether an env file was found, declared networks and volumes, stack-level declaration, and the warnings themselves |
 | Services | everything about one service, comparably | a service | *in the table:* stack, name, state, ingress set, auth method with confidence, exposure, and a **marked** drift count. *In the row's drawer:* image, declaration state, probe verdict — and everything else of §22.4 |
-| Ingress | how each hostname reaches a container | a route | hostname, path, kind (tunnel or proxy router), TLS and resolver, entrypoints, middleware chain, resolved origin and its `OriginKind`, target service, the gate on that path |
+| Ingress | how each hostname reaches a container | a route | *in the table:* hostname, path, kind (tunnel or proxy router), resolved origin with its `OriginKind`, target service, and the gate on that path. *In the row's drawer:* TLS and resolver, entrypoints, and the middleware chain — how the mechanism is configured, rather than where the path goes |
 | Networks | what connects services and what merely co-locates them | a network | name, scope, driver, member count, stack count, whether it connects anything, and the dependencies that cross it |
 | Diagrams | the shape of the fleet | a diagram | the four diagrams of §22.5 |
-| Containers | what is actually running | a container | id, name, image and digest, state, status, health, restart count, created and started, IPs per network, published ports |
+| Containers | what is actually running | a container | *in the table:* the declaring service, the container name the Engine reports, image, state, health, restart count. *In the row's drawer:* id, image digest, the status in the Engine's own words, created and started, IPs per network, published ports — and the compose file's declared image, ports and restart policy, so what was asked for and what is running can be read against each other |
 | Storage | where data lives | a mount or volume | type, source, target, read-only, declaring service, whether the volume is external, and which services share it |
 | Config | what each service is configured with | an env var or a label | key, **masked** value, source, owning service — plus labels grouped by prefix, and which label produced which conclusion |
-| Identity | what the identity provider reported | an application | slug, name, group, launch URL, providers with kind and mode, outposts, matched service with strength, `discoveredVia` (a rebuilt record MUST be tagged *rebuilt*), and every unmatched application with reason → detail → trace |
-| Proxy | what the reverse proxy is actually serving | a live router | router and provider, rule, hosts, entrypoints, TLS, middleware chain with `viaChain` / `viaEntrypoint`, backend servers and their status, errors verbatim, matched service — and every unmatched router with reason → detail → trace |
-| Probe | what answered when asked | a probed service | vantage, address, phase, status, verdict, the one fact it rested on, the form shape, the state-challenge record, the anonymous reading |
-| Declarations | where the operator and the scan disagree | a declaration | owner, criticality, description, notes, data, links, declared auth with agreement, declared dependencies, accepted exposures with reason, expected ingress — with **drift** and **not confirmed** as two separate readings that are never merged |
+| Identity | what the identity provider reported | an application | *in the table:* slug, name, group, matched service with strength, and `discoveredVia` (a rebuilt record MUST be tagged *rebuilt*). *In the row's drawer:* launch URL, providers with kind and mode, and outposts. Every unmatched application MUST be shown with reason → detail → trace |
+| Proxy | what the reverse proxy is actually serving | a live router | *in the table:* router and provider, rule, hosts, status with the proxy's errors verbatim, and matched service. *In the row's drawer:* entrypoints, TLS, the middleware chain with `viaChain` / `viaEntrypoint`, and the backend servers with their status — a chain is read down one router, never across rows. Every unmatched router MUST be shown with reason → detail → trace |
+| Probe | what answered when asked | a probed service | *in the table:* service, address, phase, status, verdict. *In the row's drawer:* the vantage the answer is about, the one fact the verdict rested on, the form shape, the state-challenge record, the anonymous reading, and the redirect chain — the working behind one verdict, which is what a reader who doubts it came for |
+| Declarations | where the operator and the scan disagree | a declaration | *in the table:* service, owner, criticality, declared auth with its agreement, and **drift** and **not confirmed** as two separate readings that are never merged. *In the row's drawer:* description, notes, data, links, declared dependencies, accepted exposures with reason, and expected ingress |
 | Diagnostics | what LabView could not do | a connection report | target, phase, endpoint, source, detail, hint, what was read, and every rejected candidate with its `why`; plus scan warnings, scan duration, scanned-at, apps root, and the build stamp with its `source` |
 
 Rules that apply across views:
@@ -1809,6 +1809,24 @@ A card whose number and destination disagree is a defect, not a rounding differe
 An optional count that is absent MUST render as *not reported*, never as `0`, and its card MUST say
 what would make it available.
 
+**The overview opens on what needs attention, then on how big the fleet is.** Forty cards drawn at once
+is a wall rather than a reading, so the overview MAY **fold**: a band of cards MAY arrive collapsed
+behind one control, provided that
+
+- **every card is in the document**, open band or shut. The rule above is *every counter has a card*, and
+  a card the page never built is a counter with no card however the stylesheet is written — so a fold is
+  a visibility rule over cards that exist, and nothing a fold hides may be conditional on the fold.
+- **the control says how many cards it holds** — *Enrichment (12)* — so a shut band and an empty one are
+  distinguishable without opening either.
+- **what shows before anything is expanded is the attention band, then the size band**: the exposure
+  finding, declaration drift, scan warnings, failed connections, an open probe and a declared gate nothing
+  confirmed; then stacks, services and running containers. The exposure card keeps the place the table
+  above gives it — the very front of the first band — and MUST NOT be behind a fold: *visible without
+  scrolling* is not satisfied by *visible after one click*.
+
+A fold is chrome, not a reading: it changes what is visible and nothing about which records the page is
+about, so it MUST NOT be written into the URL and MUST be remembered beside it, like the theme (§22.7).
+
 ### 22.4 The service drawer
 
 One service, everything known about it, in this order — findings first, raw last:
@@ -1832,11 +1850,33 @@ One service, everything known about it, in this order — findings first, raw la
 10. **Raw** — the service's payload subtree, copyable. This exists as an escape hatch and **MUST NOT
     be how a field satisfies the §22.1 coverage rule.**
 
-Stacks, networks, routes, applications, routers and probed services get equivalent drawers. One panel
-or drawer is open at a time. The stack drawer is where the Stacks table's roll-up stops being a
-summary: the scan warnings in their own words first, then where the stack is and what the Engine
+Stacks, networks, routes, applications, routers, probed services and **containers** get equivalent
+drawers. One panel or drawer is open at a time. The stack drawer is where the Stacks table's roll-up stops
+being a summary: the scan warnings in their own words first, then where the stack is and what the Engine
 labels its containers with, its declared networks and volumes, its stack-level declaration (§14), and
-raw last — its services are not repeated there, since each is a row with a drawer of its own.
+raw last — its services are not repeated there, since each is a row with a drawer of its own. The
+container drawer is what lets the Containers table be six columns instead of ten: runtime first, because
+for a running container the finding is its state — what it is doing now and how many restarts it took to
+keep doing it — then identity with the id and the digest actually running, then its address on each
+network, then the ports bound on the host, then the compose file's declared image, ports and restart
+policy so the two halves can be read against each other. Raw is over the **service** subtree: a service
+the Engine never returned has no container record at all, and that absence is the statement (§22.8), not
+something to render as a field.
+
+**A drawer is read, not decoded.** However a drawer lays its fields out:
+
+- a field MUST read as **words** — *Image digest*, *Restart count*, *Published* — never as the payload
+  path it came from, and that exact path MUST stay available on the field, since the path is what a reader
+  takes to the JSON and to Appendix A. This transforms English only. It is not a second place to name a
+  fleet concept, which §22.1 keeps to one mapping.
+- fields MAY be **grouped** under the prefix they share, so a section of thirty fields reads as its four
+  subjects rather than as thirty lines.
+- a run of fields the payload did not report MAY be **folded**, provided the control carries the count —
+  *16 fields not reported* is itself a reading, and it is the one §22.8 asks a blank not to make silently
+  — and provided the fields stay **present**. Dropping them fails the coverage check of §23, and rightly:
+  *not reported* is a finding, and a row that is not there is silence.
+- what the payload **did** report MUST NOT be inside that fold. A reader who opens a drawer sees what is
+  known first, and goes looking for what is not.
 
 ### 22.5 Diagrams
 
@@ -1878,6 +1918,13 @@ match state (matched / unmatched / rebuilt / ambiguous), and free text.
   env var values, masked or not (I6).
 - Active filters MUST be shown as individually removable chips with a clear-all, the result count
   MUST always be visible, and an empty result MUST name the filter to remove.
+- **The dimension panels MAY be folded behind one control**, since a dozen dimensions drawn open push the
+  rows they narrow off the screen. If they are, the control MUST say how many filters are active whenever
+  any are (*Filters (2)*), and the chips and the result count MUST stay visible with the panels shut — the rule
+  above is *always visible*, and a filtered table that does not say it is filtered is a wrong reading, not
+  a tidy one. The fold MUST arrive **open** when the URL carries a filter, whatever preference the browser
+  remembers: a reader who followed a filtered link has to be able to see and unset what is narrowing the
+  table, and a filter with no way back is the same defect as a filter with no chip (§22.7).
 - Filtering never mutates the payload and never changes a count shown elsewhere as a total.
 
 ### 22.7 View state is a shareable URL

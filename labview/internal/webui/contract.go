@@ -209,6 +209,7 @@ type ContractCard struct {
 	Exact    bool   `json:"exact"`
 	Optional bool   `json:"optional,omitempty"`
 	Lead     bool   `json:"lead,omitempty"`
+	Headline string `json:"headline,omitempty"`
 	Tone     Tone   `json:"tone"`
 	Segments bool   `json:"segments,omitempty"`
 	Set      Set    `json:"set,omitempty"`
@@ -292,7 +293,7 @@ func TheContract() Contract {
 		c.Cards = append(c.Cards, ContractCard{
 			ID: card.ID, Label: card.Label, Unit: card.Unit, Note: card.Note, Path: card.Path,
 			Dest: card.Dest.String(), View: card.Dest.ViewSlug(), Exact: card.Exact,
-			Optional: card.Optional, Lead: card.Lead, Tone: card.Tone,
+			Optional: card.Optional, Lead: card.Lead, Headline: card.Headline, Tone: card.Tone,
 			Segments: card.Segments, Set: card.Set,
 		})
 	}

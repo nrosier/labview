@@ -246,6 +246,9 @@ var Views = []View{
 		Question: "how each hostname reaches a container",
 		RowNoun:  "route",
 		Kind:     RowRoute,
+		// Six columns: the path, the mechanism carrying it, where it lands, and whether anything gates it.
+		// TLS, entrypoints, the middleware list and the router's own rule are how the mechanism is
+		// configured rather than where the path goes, and they are in the `route` drawer (§22.4).
 		Columns: []Column{
 			{Key: "hostname", Header: "Hostname", Fields: []string{"stacks.services.cloudflare.hostname", "stacks.services.traefik.hosts"}},
 			{Key: "path", Header: "Path", Fields: []string{"stacks.services.cloudflare.path", "stacks.services.traefik.pathPrefixes"}},
@@ -254,13 +257,9 @@ var Views = []View{
 			// cell showing the mechanism and the filter narrowing to it are one reading (§22.6).
 			{Key: "kind", Header: "Kind", Set: SetIngressKind, Dim: DimIngress,
 				Note: "tunnel ingress or proxy router — the mechanism, never the provider (I3)"},
-			{Key: "tls", Header: "TLS", Fields: []string{"stacks.services.traefik.tls", "stacks.services.traefik.certResolver", "stacks.services.cloudflare.noTlsVerify"}},
-			{Key: "entrypoints", Header: "Entrypoints", Fields: []string{"stacks.services.traefik.entrypoints"}},
-			{Key: "middleware", Header: "Middleware", Fields: []string{"stacks.services.traefik.middlewares"}, Evidence: true},
-			{Key: "router", Header: "Router", Fields: []string{"stacks.services.traefik.router", "stacks.services.traefik.rule"}},
 			{Key: "origin", Header: "Origin", Fields: []string{"stacks.services.cloudflare.service", "stacks.services.cloudflare.origin.address", "stacks.services.cloudflare.origin.host", "stacks.services.cloudflare.origin.port", "stacks.services.cloudflare.origin.kind", "stacks.services.cloudflare.origin.hopKey", "stacks.services.cloudflare.origin.evidence", "stacks.services.cloudflare.raw"}, Set: SetOriginKind, Evidence: true, Note: "how the address resolved, and the hop it resolved through"},
 			{Key: "target", Header: "Target service", Fields: []string{"stacks.services.traefik.service", "stacks.services.traefik.servicePort"}},
-			{Key: "gate", Header: "Gate on this path", Fields: []string{"stacks.services.cloudflare.access.group", "stacks.services.cloudflare.access.policy", "stacks.services.cloudflare.access.emails"}, Set: SetAuthMethod, Dim: DimAuth, Evidence: true, Note: "the gate on this route, which is not always the service's overall posture"},
+			{Key: "gate", Header: "Gate on this path", Fields: []string{"stacks.services.cloudflare.access.group", "stacks.services.cloudflare.access.policy", "stacks.services.cloudflare.access.emails"}, Set: SetAuthMethod, Dim: DimAuth, Evidence: true, Note: "the gate on this route, not the service's overall posture"},
 		},
 		Order: "ungated external paths first, then by hostname and path",
 		Empty: "No route reaches a container in this fleet, or none matches the filter.",
@@ -313,17 +312,23 @@ var Views = []View{
 		Question: "what is actually running",
 		RowNoun:  "container",
 		Kind:     RowContainer,
+		// Six columns, because these are the ones a reader compares *across* containers: which service, on
+		// what image, up or not, healthy or not, and how hard it is having to try. The id, the timestamps,
+		// the addresses and the published ports are facts about *one* container — nobody scans a column of
+		// 64-hex ids — so they are in the `container` drawer the row opens, one interaction away (§22.4).
+		//
+		// The service leads, and it is the only column here the Engine does not supply. Every other one
+		// reads *not reported* on a scan that could not reach the socket (I4, and the banner says so), and
+		// a table of thirty-five rows with no identity left in any of them is not a degraded reading of the
+		// fleet — it is an unreadable one. The compose files are what this row is *about*; the Engine is
+		// what happened to it.
 		Columns: []Column{
-			{Key: "id", Header: "ID", Fields: []string{"stacks.services.docker.id"}},
-			{Key: "name", Header: "Name", Fields: []string{"stacks.services.docker.name"}},
-			{Key: "image", Header: "Image", Fields: []string{"stacks.services.docker.image", "stacks.services.docker.imageDigest"}, Note: "the digest is what is running, where the tag is only what was asked for"},
+			{Key: "service", Header: "Service"},
+			{Key: "name", Header: "Container", Fields: []string{"stacks.services.docker.name"}, Note: "the name the Engine reports, which is not always the service's"},
+			{Key: "image", Header: "Image", Fields: []string{"stacks.services.docker.image"}, Note: "the tag, which is what was asked for; the digest actually running is in the drawer"},
 			{Key: "state", Header: "State", Fields: []string{"stacks.services.docker.status"}, Dim: DimState},
 			{Key: "health", Header: "Health", Fields: []string{"stacks.services.docker.health"}, Set: SetHealth, Dim: DimHealth},
 			{Key: "restarts", Header: "Restarts", Fields: []string{"stacks.services.docker.restartCount"}, Numeric: true, Note: "not reported when the Engine did not say — never 0"},
-			{Key: "created", Header: "Created", Fields: []string{"stacks.services.docker.createdAt"}},
-			{Key: "started", Header: "Started", Fields: []string{"stacks.services.docker.startedAt"}},
-			{Key: "ips", Header: "Addresses", Fields: []string{"stacks.services.docker.networks", "stacks.services.docker.ipAddresses"}},
-			{Key: "ports", Header: "Published ports", Fields: []string{"stacks.services.docker.publishedPorts.published", "stacks.services.docker.publishedPorts.target", "stacks.services.docker.publishedPorts.protocol", "stacks.services.docker.publishedPorts.raw"}, Note: "what the Engine reports as published, which is the reading that decides LAN reachability"},
 		},
 		Fields: []string{"meta.dockerAvailable", "meta.dockerError"},
 		Order:  "unhealthy first, then not running, then by name",
@@ -377,15 +382,16 @@ var Views = []View{
 		Question: "what the identity provider reported",
 		RowNoun:  "application",
 		Kind:     RowApplication,
+		// Five columns: which application, and whether it was matched to a service and on what. The
+		// provider list — eight fields per provider — and the outposts and launch URL are what the
+		// application *is*, and reading them is reading one application; they are in the `application`
+		// drawer (§22.4). Eight of these columns was the widest table on the page.
 		Columns: []Column{
 			{Key: "slug", Header: "Slug", Fields: []string{"stacks.services.authentik.applications.slug"}},
 			{Key: "name", Header: "Name", Fields: []string{"stacks.services.authentik.applications.name"}},
 			{Key: "group", Header: "Group", Fields: []string{"stacks.services.authentik.applications.group"}},
-			{Key: "launch", Header: "Launch URL", Fields: []string{"stacks.services.authentik.applications.launchUrl"}},
-			{Key: "providers", Header: "Providers", Fields: []string{"stacks.services.authentik.applications.providers.name", "stacks.services.authentik.applications.providers.kind", "stacks.services.authentik.applications.providers.rawKind", "stacks.services.authentik.applications.providers.mode", "stacks.services.authentik.applications.providers.internalHost", "stacks.services.authentik.applications.providers.externalHost", "stacks.services.authentik.applications.providers.redirectUris", "stacks.services.authentik.applications.providers.backchannel"}, Set: SetProviderKind, Note: "kind and mode, with the raw kind kept so an unknown one is readable rather than dropped"},
-			{Key: "outposts", Header: "Outposts", Fields: []string{"stacks.services.authentik.applications.providers.outposts"}},
 			{Key: "match", Header: "Matched service", Fields: []string{"stacks.services.authentik.strength", "stacks.services.authentik.evidence"}, Set: SetMatchStrength, Dim: DimMatch, Evidence: true, Note: "per-match strength, and what matched"},
-			{Key: "via", Header: "Discovered via", Fields: []string{"stacks.services.authentik.applications.discoveredVia"}, Set: SetDiscoveredVia, Dim: DimMatch, Note: "a record rebuilt from a provider is tagged rebuilt, because it is not what the applications endpoint returned"},
+			{Key: "via", Header: "Discovered via", Fields: []string{"stacks.services.authentik.applications.discoveredVia"}, Set: SetDiscoveredVia, Dim: DimMatch, Note: "a record rebuilt from a provider is tagged rebuilt: it is not what the applications endpoint returned"},
 		},
 		Fields: []string{
 			"meta.authentik.enabled", "meta.authentik.configured", "meta.authentik.reachable",
@@ -422,15 +428,15 @@ var Views = []View{
 		Question: "what the reverse proxy is actually serving",
 		RowNoun:  "live router",
 		Kind:     RowRouter,
+		// Five columns: which router, what it matches, and whether the proxy is happy with it. The
+		// middleware chain is six fields per entry and the backends two per server — a chain read across
+		// rows is unreadable and a chain read down one router is the point, so both are in the `router`
+		// drawer with the entrypoints and TLS (§22.4).
 		Columns: []Column{
 			{Key: "router", Header: "Router", Fields: []string{"stacks.services.traefikLive.router", "stacks.services.traefikLive.provider"}},
 			{Key: "rule", Header: "Rule", Fields: []string{"stacks.services.traefikLive.rule"}},
 			{Key: "hosts", Header: "Hosts", Fields: []string{"stacks.services.traefikLive.hosts"}},
-			{Key: "entrypoints", Header: "Entrypoints", Fields: []string{"stacks.services.traefikLive.entryPoints"}},
-			{Key: "tls", Header: "TLS", Fields: []string{"stacks.services.traefikLive.tls"}},
 			{Key: "status", Header: "Status", Fields: []string{"stacks.services.traefikLive.status", "stacks.services.traefikLive.errors"}, Evidence: true, Note: "the proxy's own words, verbatim"},
-			{Key: "middleware", Header: "Middleware chain", Fields: []string{"stacks.services.traefikLive.middlewares.name", "stacks.services.traefikLive.middlewares.type", "stacks.services.traefikLive.middlewares.address", "stacks.services.traefikLive.middlewares.errors", "stacks.services.traefikLive.middlewares.viaChain", "stacks.services.traefikLive.middlewares.viaEntrypoint"}, Evidence: true, Note: "where each entry came from: named on the router, reached through a chain, or applied by the entrypoint"},
-			{Key: "servers", Header: "Backend servers", Fields: []string{"stacks.services.traefikLive.servers.url", "stacks.services.traefikLive.servers.status"}},
 			{Key: "match", Header: "Matched service", Fields: []string{"stacks.services.traefikLive.service", "stacks.services.traefikLive.evidence"}, Dim: DimMatch, Evidence: true},
 		},
 		Fields: []string{
@@ -467,19 +473,16 @@ var Views = []View{
 		Question: "what answered when asked",
 		RowNoun:  "probed service",
 		Kind:     RowProbe,
+		// Five columns: who was asked, where, how far it got and what came back. Twelve was the record —
+		// the form shape, the state challenge, the anonymous reading, the redirect chain and every rejected
+		// attempt are the *working* behind one verdict, and working is read one row at a time. All of it is
+		// in the `probe` drawer, which is where a reader who doubts a verdict goes (§22.4).
 		Columns: []Column{
 			{Key: "service", Header: "Service"},
-			{Key: "vantage", Header: "Vantage", Fields: []string{"stacks.services.probe.vantage"}, Set: SetProbeVantage, Note: "where it was asked from, which is what the answer is about"},
 			{Key: "address", Header: "Address", Fields: []string{"stacks.services.probe.endpoint"}},
 			{Key: "phase", Header: "Phase", Fields: []string{"stacks.services.probe.phase"}, Set: SetConnectionPhase},
 			{Key: "status", Header: "Status", Fields: []string{"stacks.services.probe.status", "stacks.services.probe.mediaType"}, Numeric: true},
-			{Key: "verdict", Header: "Verdict", Fields: []string{"stacks.services.probe.gate"}, Set: SetProbeGate, Dim: DimProbe},
-			{Key: "fact", Header: "Rested on", Fields: []string{"stacks.services.probe.detail"}, Evidence: true, Note: "the one fact the verdict rested on"},
-			{Key: "form", Header: "Form shape", Fields: []string{"stacks.services.probe.form.password", "stacks.services.probe.form.username", "stacks.services.probe.form.submit", "stacks.services.probe.form.otp", "stacks.services.probe.form.action"}},
-			{Key: "state", Header: "State challenge", Fields: []string{"stacks.services.probe.state.asked", "stacks.services.probe.state.refusedAt", "stacks.services.probe.state.status", "stacks.services.probe.state.challenge"}, Evidence: true},
-			{Key: "anon", Header: "Anonymous reading", Fields: []string{"stacks.services.probe.anon.textChars", "stacks.services.probe.anon.links", "stacks.services.probe.anon.loginHref", "stacks.services.probe.anon.loginLabel"}},
-			{Key: "redirect", Header: "Redirect", Fields: []string{"stacks.services.probe.redirect.to", "stacks.services.probe.redirect.crossOrigin", "stacks.services.probe.refresh.to", "stacks.services.probe.refresh.crossOrigin", "stacks.services.probe.truncated"}},
-			{Key: "attempts", Header: "Attempts", Fields: []string{"stacks.services.probe.attempts.endpoint", "stacks.services.probe.attempts.why", "stacks.services.probe.attempts.phase", "stacks.services.probe.attempts.code", "stacks.services.probe.attempts.detail"}, Evidence: true},
+			{Key: "verdict", Header: "Verdict", Fields: []string{"stacks.services.probe.gate"}, Set: SetProbeGate, Dim: DimProbe, Note: "and the fact it rested on is in the drawer, never merged into the verdict"},
 		},
 		Fields: []string{"meta.probe.enabled", "meta.probe.source", "meta.probe.skipped"},
 		Order:  "§22.2: answered with no login page, then answered with a login page, then did not answer",
@@ -494,17 +497,17 @@ var Views = []View{
 		Question: "where the operator and the scan disagree",
 		RowNoun:  "declaration",
 		Kind:     RowDeclaration,
+		// Six columns, and the view's own question decides which: *where the operator and the scan
+		// disagree*. So drift and not-confirmed stay, side by side and still never merged; the declared
+		// mechanism stays because it is the half of the disagreement the operator wrote; owner and
+		// criticality stay because they say whose disagreement it is and how much it matters. The
+		// description, the links, the data block, the declared dependencies and the accepted exposure are
+		// the declaration itself, and reading a declaration is reading one row — `declaration` drawer.
 		Columns: []Column{
 			{Key: "service", Header: "Service"},
 			{Key: "owner", Header: "Owner", Fields: []string{"stacks.services.declared.owner"}},
 			{Key: "criticality", Header: "Criticality", Fields: []string{"stacks.services.declared.criticality"}},
-			{Key: "description", Header: "Description", Fields: []string{"stacks.services.declared.description", "stacks.services.declared.notes"}},
-			{Key: "data", Header: "Data", Fields: []string{"stacks.services.declared.data", "stacks.services.declared.file"}, Note: "the operator's own fields, kept as written"},
-			{Key: "links", Header: "Links", Fields: []string{"stacks.services.declared.links.label", "stacks.services.declared.links.url"}},
 			{Key: "declaredAuth", Header: "Declared auth", Fields: []string{"stacks.services.declared.auth.mechanism", "stacks.services.declared.auth.detail", "stacks.services.declared.authAgreement"}, Set: SetMechanism, Dim: DimDecl, Evidence: true, Note: "the mechanism the operator declared, and whether the scan agrees"},
-			{Key: "dependencies", Header: "Declared dependencies", Fields: []string{"stacks.services.declared.dependsOn.ref", "stacks.services.declared.dependsOn.detail", "stacks.services.declared.dependencies.name", "stacks.services.declared.dependencies.detail"}},
-			{Key: "accepted", Header: "Accepted exposure", Fields: []string{"stacks.services.declared.unauthenticatedAccepted.reason"}, Set: SetFinding, Note: "still exposed: an acceptance records a decision and changes nothing about reachability"},
-			{Key: "expected", Header: "Expected ingress", Fields: []string{"stacks.services.declared.expectedIngress"}, Set: SetIngressKind},
 			{Key: "drift", Header: "Drift", Fields: []string{"stacks.services.declared.drift"}, Numeric: true, Set: SetDeclState, Evidence: true, Note: "the declaration and the scan disagree"},
 			{Key: "unconfirmed", Header: "Not confirmed", Fields: []string{"stacks.services.declared.unconfirmed"}, Numeric: true, Set: SetDeclState, Evidence: true, Note: "nothing contradicts the declaration and nothing corroborates it — never merged with drift"},
 		},
