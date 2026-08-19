@@ -452,6 +452,12 @@ var LoginFailureReasons = []LoginFailureReason{
 // ValidLoginFailureReason reports whether s is a member of the closed set.
 func ValidLoginFailureReason(s string) bool { return validMember(s, LoginFailureReasons) }
 
+// LoginErrorParam is the query parameter a failed login redirect carries the code in. It is the
+// only channel that report has — the handshake ends in a 302 to the UI, so there is no body to put
+// it in — which is why the spelling is a constant here rather than one in the redirect builder and
+// another in the browser.
+const LoginErrorParam = "login_error"
+
 // SessionRejection is why a session was refused. It is internal: logged, never served
 // (§4.7).
 type SessionRejection string

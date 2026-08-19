@@ -2008,6 +2008,7 @@
   var S = newState();     // the state the URL names (§22.7)
   var OV = null;          // the payload being read; null until the first one arrives
   var SESSION = null;     // GET api/session — the posture, for the sign-in form
+  var LOGIN_ERROR = '';   // the code a failed handshake redirected with, read once and cleared
   var COUNTS = null;      // the previous payload's card counts, for the change note
   var BUSY = false;       // a request is in flight
   var CONTROLS_FOR = null; // which view the filter controls were built for
@@ -3729,6 +3730,10 @@
     var before = COUNTS;
     OV = ov;
     COUNTS = countsOf(ov);
+    // The handshake code in the URL described how this page was reached, and a payload is the answer to
+    // it: whatever went wrong, the reader is past it. Dropped here so that a session expiring an hour
+    // later reports the expiry rather than reviving a failure the reader already recovered from.
+    LOGIN_ERROR = '';
     el('app').hidden = false;
     el('boot').hidden = true;
     render();
@@ -3755,43 +3760,116 @@
   // The posture comes from the public `api/session` route: a login form that was only visible to people
   // who were already past it would be no use to the one reader who needs it.
   function signIn() {
+    // A failed handshake has no body to report itself in — it ends in a 302 back to the UI — so the
+    // only account of it is the parameter that redirect carries (access/oidc.go). §4.7 says a code
+    // outside the closed set is rejected rather than displayed, so the set is asked before the term is,
+    // and the sentence is the contract's own label rather than prose written here.
+    var code = LOGIN_ERROR;
+    LOGIN_ERROR = '';
+    var said = code && isMember(M.setLoginFailure, code) ? termOf(M.setLoginFailure, code).label : '';
+
     return window.fetch('api/session', { headers: { Accept: 'application/json' } })
       .then(function (res) { return res.ok ? res.json() : null; })
       .catch(function () { return null; })
       .then(function (info) {
         SESSION = info;
-        drawSignIn(info, '');
+        drawSignIn(info, said);
       });
   }
 
-  function drawSignIn(info, error) {
+  // The brand mark, the same three paths the shell's carries (index.html). Drawn rather than borrowed
+  // because the sign-in card is the one screen the shell is not on.
+  var BRAND_PATHS = ['M12 2 2 7l10 5 10-5-10-5Z', 'm2 12 10 5 10-5', 'm2 17 10 5 10-5'];
+
+  function brandMark(cls) {
+    var host = mk('span', cls);
+    var svg = add(host, mkSVG('svg', {
+      viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.9',
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true'
+    }));
+    BRAND_PATHS.forEach(function (d) { add(svg, mkSVG('path', { d: d })); });
+    return host;
+  }
+
+  // drawSignIn is the whole page for a reader who has not signed in.
+  //
+  // *The whole page*, and that is the point: §19 gates the payload and not the bundle, so the shell
+  // reaches anyone who can reach the mount — but a brand, a search box and a Rescan button drawn behind
+  // a card that says *sign in* read as an interface that half-loaded, and offer controls that cannot
+  // work. So the shell is hidden, not merely covered. The attribute alone does not do it: an author
+  // `display` outranks the UA stylesheet's `[hidden]`, which is what `#app[hidden]` in labview.css is
+  // for, and why that rule is asserted as stylesheet text rather than trusted.
+  //
+  // Order is welcome, then the one primary action, then the fallbacks. The provider's name comes from
+  // the posture (`oidcLabel`) and never from this file: which SSO a lab runs is a deployment's fact.
+  // The posture's warnings, last. They are about the *installation* — a credential file that could not
+  // be read, an issuer that did not resolve — so they belong under the actions rather than above them:
+  // a reader whose provider works should not have to read past a note that does not concern them, and
+  // one whose sign-in fails needs the note to still be on the page (§19).
+  function signInNotes(card, info) {
+    var notes = (info && info.notes) || [];
+    if (!notes.length) return;
+    var box = add(card, mk('div', 'boot-notes'));
+    notes.forEach(function (note) { add(box, mk('p', 'muted', asString(note))); });
+  }
+
+  function drawSignIn(info, error, refused) {
     var methods = (info && info.methods) || [];
+    var oidc = methods.indexOf(M.methodOIDC) >= 0;
+    var passwd = methods.indexOf(M.methodPasswd) >= 0;
+
     el('app').hidden = true;
     var boot = clear(el('boot'));
     boot.hidden = false;
+    boot.setAttribute('data-signin', 'true');
+    var card = add(boot, mk('div', 'boot-card'));
 
-    add(boot, mk('h1', '', 'LabView'));
-    add(boot, mk('p', '', 'This LabView requires a sign-in before it will answer with a payload.'));
-    if (error) add(boot, mk('p', toneClass('banner', TONE_WARN), error));
-    ((info && info.notes) || []).forEach(function (note) {
-      add(boot, mk('p', 'muted', asString(note)));
-    });
+    var head = add(card, mk('div', 'boot-brand'));
+    add(head, brandMark('boot-mark'));
+    add(head, mk('span', 'boot-word', 'LabView'));
 
-    if (methods.indexOf(M.methodOIDC) >= 0) {
-      var a = add(boot, mk('a', '', 'Sign in with ' + ((info && info.oidcLabel) || 'your provider')));
-      // A full page navigation, not a fetch: the handshake is a redirect to the provider (§18).
-      a.setAttribute('href', 'auth/oidc/start');
+    add(card, mk('h1', '', 'Welcome'));
+    add(card, mk('p', 'boot-lede', oidc || passwd
+      ? 'Sign in to read what this lab is running.'
+      : 'This LabView requires a sign-in before it will answer with a payload.'));
+
+    if (error) {
+      var banner = add(card, mk('p', toneClass('boot-error', TONE_WARN), error));
+      banner.setAttribute('role', 'alert');
     }
 
-    if (methods.indexOf(M.methodPasswd) < 0) {
+    // What the reader's hands should land on: the primary action if there is one, the first field if the
+    // only way in is the form. Focus is set rather than autofocused so the choice is made once, here.
+    var focusOn = null;
+
+    if (oidc) {
+      var a = add(card, mk('a', 'btn primary boot-sso'));
+      add(a, mk('span', '', 'Continue with ' + ((info && info.oidcLabel) || 'your provider')));
+      var arrow = add(a, mkSVG('svg', {
+        viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+        'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true'
+      }));
+      add(arrow, mkSVG('path', { d: 'M5 12h14m-6-7 7 7-7 7' }));
+      // A full page navigation, not a fetch: the handshake is a redirect to the provider (§18).
+      a.setAttribute('href', 'auth/oidc/start');
+      focusOn = a;
+    }
+
+    if (!passwd) {
       if (!methods.length) {
-        add(boot, mk('p', 'absent', 'The posture reports no usable sign-in method. ' +
+        add(card, mk('p', 'absent', 'The posture reports no usable sign-in method. ' +
           'That is a configuration to fix rather than something this page can work around (§19).'));
       }
+      signInNotes(card, info);
+      if (focusOn) focusOn.focus();
       return;
     }
 
-    var form = add(boot, mk('form', 'signin'));
+    // Two ways in, so the second one has to look like the second one. The rule says *or* rather than
+    // repeating a heading, because both halves sign the same reader in.
+    if (oidc) add(card, mk('div', 'boot-or', 'or'));
+
+    var form = add(card, mk('form', 'signin'));
     var user = mk('input', '');
     user.type = 'text';
     user.name = 'username';
@@ -3804,11 +3882,16 @@
     pass.autocomplete = 'current-password';
     pass.placeholder = 'Password';
     pass.setAttribute('aria-label', 'Password');
-    var submit = mk('button', '', 'Sign in');
+    var submit = mk('button', oidc ? '' : 'primary', 'Sign in');
     submit.type = 'submit';
     add(form, user);
     add(form, pass);
     add(form, submit);
+    signInNotes(card, info);
+    // A refused attempt redraws this card, and the reader is mid-task in the form — so focus goes back
+    // to the password rather than out to the SSO button they had already declined.
+    focusOn = refused ? pass : (focusOn || user);
+    focusOn.focus();
 
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -3836,16 +3919,22 @@
           var retry = out.res.headers.get('Retry-After');
           var said = asString(out.body.error) ||
             'the attempt was refused and the reason was not reported';
-          drawSignIn(SESSION, retry ? said + ' Try again in ' + retry + 's.' : said);
+          drawSignIn(SESSION, retry ? said + ' Try again in ' + retry + 's.' : said, true);
         })
         .catch(function (err) {
-          drawSignIn(SESSION, 'the sign-in request did not complete: ' + ((err && err.message) || String(err)));
+          drawSignIn(SESSION, 'the sign-in request did not complete: ' +
+            ((err && err.message) || String(err)), true);
         });
     });
   }
 
   function boot() {
     S = parseState(window.location.search);
+    // Read here rather than in signIn, because this is the one moment the parameter is known to be the
+    // redirect's and not a leftover: `parseState` does not carry it — it is not a piece of *state*, and
+    // §22.7 keeps the URL to what names the records on screen — so it is taken off the location once,
+    // and the sign-in screen consumes it.
+    LOGIN_ERROR = new URLSearchParams(window.location.search || '').get(M.paramLoginError) || '';
     wire();
     load(false, null);
   }

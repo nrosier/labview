@@ -4150,6 +4150,14 @@ window.LABVIEW_CONTRACT = Object.freeze({
       "value": "failing"
     },
     {
+      "name": "paramLoginError",
+      "value": "login_error"
+    },
+    {
+      "name": "setLoginFailure",
+      "value": "loginFailureReason"
+    },
+    {
       "name": "edgeDependsOn",
       "value": "depends_on"
     },

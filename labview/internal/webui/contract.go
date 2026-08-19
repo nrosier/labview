@@ -442,6 +442,13 @@ func names() []ContractName {
 		// Diagnostics.
 		{"reportFailing", ReportFailing},
 
+		// The sign-in screen (§19). A failed handshake reports itself as a 302 to `/?login_error=<code>`
+		// and nothing else, so the browser has to read that parameter to say anything at all about it —
+		// and §4.7 says a code outside the closed set is rejected rather than displayed, which is a
+		// question about a *set*, so the set's name travels too.
+		{"paramLoginError", payload.LoginErrorParam},
+		{"setLoginFailure", string(SetLoginFailure)},
+
 		// The graph: edge kinds, the readings a diagram grants, and the node kinds the shapes key off.
 		{"edgeDependsOn", string(payload.EdgeDependsOn)},
 		{"edgeNetworkKind", string(payload.EdgeNetwork)},

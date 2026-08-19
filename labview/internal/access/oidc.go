@@ -136,7 +136,7 @@ func (f Failure) Error() string { return string(f.Code) + ": " + f.Reason }
 func (f Failure) Redirect() string {
 	// The code is one of a closed set, but it is escaped anyway: a value that reached here from
 	// somewhere unexpected must not be able to break out of the query string.
-	return "/?login_error=" + url.QueryEscape(string(f.Code))
+	return "/?" + payload.LoginErrorParam + "=" + url.QueryEscape(string(f.Code))
 }
 
 func fail(code payload.LoginFailureReason, reason string) Failure {

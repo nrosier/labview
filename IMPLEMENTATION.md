@@ -1573,6 +1573,27 @@ the summary is re-logged only when it changes, and reports **counts, never names
 data and gating them means the reader gets a JSON 401 instead of a login form. The OIDC routes sit
 outside `/api` so the allowlist stays about the API.
 
+**Which makes the sign-in page the browser's half of that decision.** The bundle loads for anyone
+who can reach the mount, so *what it draws* before there is a payload is the only thing standing
+between an unauthenticated reader and a dashboard-shaped page with nothing in it. A refused payload
+MUST leave the reader on a sign-in and nothing else: the shell hidden, one card centred in the
+viewport, a welcome, and the ways in — the provider button first and named (`Continue with
+<label>`), the password form after it under a divider, and the posture notes last, after the
+action rather than between the welcome and it. Focus starts on the way in, and on the password
+field instead when a password attempt was just refused.
+
+**Both stages MUST be able to hide, and saying so takes a rule.** `#app` and `#boot` swap, and each
+carries a `display` of its own — so `[hidden]` on either is inert without an author rule to honour
+it, because `[hidden] { display: none }` is a *user-agent* declaration and any author `display`
+outranks it whatever the selector's weight. Origin beats specificity; a missing
+`#app[hidden], #boot[hidden] { display: none }` is what paints the whole shell under a sign-in card
+in one direction and leaves the sign-in over the fleet in the other. render-smoke executes the
+bundle without CSS, so this one is asserted as stylesheet **text**.
+
+A session can also end while a page is open, and that is the same rule arriving second: a refused
+rescan MUST take the shell away rather than lay a card over the fleet the reader may no longer
+read.
+
 Responses carry `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` and
 `X-Frame-Options: DENY` unconditionally, plus `Cache-Control: no-store` on `/api/*` while
 enforcing. **No CSP** — the UI is self-contained behind a header that already forbids framing, and
@@ -1623,6 +1644,16 @@ with a client secret in the environment, an `HS256` token forged with that secre
 unknown key id triggers exactly **one** JWKS refetch. The username comes from the configured
 claim → `preferred_username` → `email` → `sub`, and MUST satisfy the username pattern. Every
 failure redirects to `/?login_error=<code>` with one of the eight codes in §4.7.
+
+That redirect is the **only** account a failed handshake gives of itself — it ends in a 302, so
+there is no body to put a reason in — which puts three obligations on the browser. It MUST read the
+parameter, or the reader is returned to a login page identical to the one they just left. It MUST
+resolve the code through §4.7's closed set and reject anything outside it, because the code arrives
+in a URL and is therefore reader-supplied: a build that printed it back would be putting a
+stranger's string in its own banner. And it MUST consume the code once — a session expiring an hour
+later reports the expiry, not a handshake failure the reader already recovered from. The parameter's
+spelling is `payload.LoginErrorParam`, travelling to the browser through the contract like every
+other shared name (§4), so the redirect builder and the reader of it cannot drift apart.
 
 Deliberate non-goals: no roles or per-service permissions, no trusted-header mode, no session
 persistence across restarts, no rate limiting beyond the login route.

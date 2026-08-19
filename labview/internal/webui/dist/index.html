@@ -164,7 +164,13 @@
       </aside>
     </div>
 
-    <p id="boot" class="boot">Reading the payload…</p>
+    <!-- Everything before a payload happens here, and for an unauthenticated reader it is the whole
+         page: §19 gates the data rather than the shell, so the bundle loads for anyone who can reach
+         the mount, and what they must get is a sign-in and nothing else. #boot is the stage — it
+         centres one card in the viewport — and app.js fills it. A div rather than the paragraph this
+         was, because the card holds a heading and a form and a <p> may contain neither; the old markup
+         only worked because DOM insertion has no parser to object to it. -->
+    <div id="boot" class="boot">Reading the payload…</div>
 
     <!-- contract.js is generated from internal/webui and holds every table §22 states. app.js is an
          evaluator of those tables: no view slug, no member spelling, no threshold of its own. -->

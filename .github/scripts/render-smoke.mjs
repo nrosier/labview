@@ -861,6 +861,253 @@ for (const view of C.views.filter((v) => v.dims && v.dims.length)) {
     none.id('boot').textContent.includes('no usable sign-in method'));
 }
 
+// --- 9b. An unauthenticated reader gets the sign-in and nothing else (§19) ----
+//
+// The bug this section exists for: §19 gates the data and not the bundle, so the shell reaches anyone who
+// can reach the mount, and `#app` carried `hidden` from the first line of index.html to say so. It did
+// nothing. `[hidden] { display: none }` is a *user-agent* rule and `#app { display: grid }` is an author
+// one, and origin beats specificity — so an unauthenticated reader got the brand, the search box and a
+// Rescan button painted under the sign-in card, offering controls that cannot work.
+//
+// Nothing in the DOM was wrong, which is why every check above passed over it for as long as it shipped.
+// So the rule is asserted as stylesheet *text* (this file executes the bundle with no CSS at all), and it
+// is asserted for **both** ids: `#boot` is a centred grid too, so the same trap in the other direction
+// would leave the sign-in stage over the payload once one arrived. The swap needs both halves able to hide.
+
+{
+  const css = readFileSync(join(ROOT, 'assets', 'labview.css'), 'utf8');
+  // Comments stripped first, because the two selectors are discussed in prose a few lines above the rule
+  // and a check that a *comment* mentions them would be no check at all.
+  const bare = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const hides = (id) => {
+    const at = bare.indexOf(id + '[hidden]');
+    if (at < 0) return '';
+    const open = bare.indexOf('{', at);
+    return open < 0 ? '' : bare.slice(open, bare.indexOf('}', open));
+  };
+  check('the shell can actually hide, so `hidden` on it means hidden',
+    /display:\s*none/.test(hides('#app')), JSON.stringify(hides('#app')));
+  check('and so can the sign-in stage, or it would sit over the payload once one arrived',
+    /display:\s*none/.test(hides('#boot')), JSON.stringify(hides('#boot')));
+}
+
+{
+  const out = await run('', {
+    status: 401,
+    session: { enforced: true, methods: ['oidc'], oidcLabel: 'Authentik', notes: [] },
+  });
+  noThrow('a provider-only 401 draws the login page', out);
+  const boot = out.id('boot');
+  const card = boot.all().find((n) => n.classList.contains('boot-card'));
+
+  check('the shell is hidden rather than drawn behind the card', out.id('app').hidden === true);
+  check('the sign-in stage is showing', boot.hidden === false);
+  check('and says it is a sign-in, so the stylesheet check above has a state to key off',
+    boot.getAttribute('data-signin') === 'true');
+  check('there is a card', !!card);
+
+  // *Welcome, then the button* — the order asked for. Both are asserted, because a heading with no action
+  // is a dead end and an action with no welcome is a naked button on an empty page.
+  const heading = (card ? card.all() : []).find((n) => n.tagName === 'H1');
+  check('the card opens with a welcome', !!heading && (heading.textContent || '').trim().length > 0,
+    JSON.stringify(heading && heading.textContent));
+  const sso = (card ? card.all() : []).find((n) => n.getAttribute('href') === 'auth/oidc/start');
+  check('the provider button is in the card', !!sso);
+  check('and it is the primary action, not one link among several',
+    !!sso && sso.classList.contains('primary'), sso ? sso.className : '');
+  check('the welcome comes before the button',
+    !!heading && !!sso && card.all().indexOf(heading) < card.all().indexOf(sso));
+
+  check('the button names the provider the posture named',
+    !!sso && (sso.textContent || '').includes('Authentik'), sso ? sso.textContent : '');
+
+  // Where the reader's hands land. With one way in there is no reason to make them find it. Read here
+  // rather than saved for later: the document and its id map are shared between runs and replaced by the
+  // next one, so anything asked about a page after another has rendered is asked of the wrong page.
+  check('the provider button has focus, since it is the only way in',
+    out.doc.activeElement === sso,
+    out.doc.activeElement ? out.doc.activeElement.tagName : 'none');
+}
+
+// The provider's *name* comes from the posture. A build that hardcoded "Authentik" would read correctly on
+// this lab and lie on the next one, and no DOM shape would catch it — so it is checked against a posture
+// that names something else, and against one that names nothing.
+{
+  const other = await run('', {
+    status: 401,
+    session: { enforced: true, methods: ['oidc'], oidcLabel: 'Keycloak at ops', notes: [] },
+  });
+  check('a different provider gets its own name rather than this one',
+    (other.id('boot').textContent || '').includes('Keycloak at ops'),
+    JSON.stringify(other.id('boot').textContent));
+}
+
+{
+  const unnamed = await run('', { status: 401, session: { enforced: true, methods: ['oidc'], notes: [] } });
+  check('a posture that names no provider still offers the button',
+    unnamed.id('boot').all().some((n) => n.getAttribute('href') === 'auth/oidc/start'));
+}
+
+{
+  const both = await run('', {
+    status: 401,
+    session: { enforced: true, methods: ['passwd', 'oidc'], oidcLabel: 'Authentik', notes: [] },
+  });
+  const bootBoth = both.id('boot');
+  check('with two ways in, focus is still on the primary one',
+    !!both.doc.activeElement && both.doc.activeElement.getAttribute('href') === 'auth/oidc/start');
+  check('and the second way in is separated from the first rather than stacked on it',
+    bootBoth.all().some((n) => n.classList.contains('boot-or')));
+
+  // The card holds a heading and a form. #boot was a <p>, which may contain neither — it only ever worked
+  // because DOM insertion has no parser to object, and it would have broken the moment anything rendered
+  // this markup rather than building it.
+  const inP = (n) => { for (let p = n.parentNode; p; p = p.parentNode) if (p.tagName === 'P') return true; return false; };
+  check('no part of the card is nested inside a paragraph',
+    !bootBoth.all().some((n) => (n.tagName === 'FORM' || n.tagName === 'H1') && inP(n)));
+}
+
+{
+  const pw = await run('', { status: 401, session: { enforced: true, methods: ['passwd'], notes: [] } });
+  check('focus is on the username field when the form is the only way in',
+    !!pw.doc.activeElement && pw.doc.activeElement.tagName === 'INPUT' && pw.doc.activeElement.type === 'text',
+    pw.doc.activeElement ? pw.doc.activeElement.tagName + '/' + pw.doc.activeElement.type : 'none');
+  check('a form-only posture draws no provider button',
+    !pw.id('boot').all().some((n) => n.getAttribute('href') === 'auth/oidc/start'));
+}
+
+// The posture's warnings are still on the page, and under the actions rather than between the welcome
+// and the button (§22.8: a reported fact is not dropped for being inconvenient).
+{
+  const noted = await run('', {
+    status: 401,
+    session: {
+      enforced: true, methods: ['oidc'], oidcLabel: 'Authentik',
+      notes: ['Password sign-in is enabled but its file could not be read, so it is not available.'],
+    },
+  });
+  const nBoot = noted.id('boot');
+  check('a posture warning is shown rather than swallowed',
+    (nBoot.textContent || '').includes('could not be read'));
+  const nAll = nBoot.all();
+  const nSSO = nAll.find((n) => n.getAttribute('href') === 'auth/oidc/start');
+  const nNote = nAll.find((n) => (n.textContent || '').includes('could not be read') && n.tagName === 'P');
+  check('and after the action, not between the welcome and it',
+    !!nSSO && !!nNote && nAll.indexOf(nSSO) < nAll.indexOf(nNote));
+}
+
+// A failed handshake reports itself as a 302 to `/?login_error=<code>` and in no other way (access/oidc.go),
+// so a browser that does not read that parameter says nothing at all about it — the reader is returned to a
+// login page that looks exactly like the one they just came from. The sentence is the contract's: §4.7 fixes
+// eight codes and the vocabulary carries a label for each, and §4.7 also says a code outside the set is
+// rejected rather than displayed.
+{
+  const set = C.sets.find((s) => s.name === 'loginFailureReason');
+  check('the contract carries a sentence per login failure code', !!set && set.terms.length > 0);
+  const param = (C.names.find((n) => n.name === 'paramLoginError') || {}).value;
+  check('and the parameter that carries the code', !!param, JSON.stringify(param));
+
+  for (const term of (set ? set.terms : [])) {
+    const out = await run('?' + param + '=' + encodeURIComponent(term.member), {
+      status: 401,
+      session: { enforced: true, methods: ['oidc'], oidcLabel: 'Authentik', notes: [] },
+    });
+    noThrow('a redirect carrying ' + term.member + ' draws the login page', out);
+    check('a failed handshake says why: ' + term.member,
+      (out.id('boot').textContent || '').includes(term.label),
+      JSON.stringify(out.id('boot').textContent));
+  }
+
+  // Rejected rather than displayed. The code lands in the URL, so it is reader-supplied text — a build that
+  // printed it back would be putting an attacker's string in its own banner.
+  const bogus = await run('?' + param + '=<script>alert(1)</script>', {
+    status: 401,
+    session: { enforced: true, methods: ['oidc'], oidcLabel: 'Authentik', notes: [] },
+  });
+  noThrow('a code outside the closed set does not break the page', bogus);
+  check('a code outside the closed set is rejected rather than displayed (§4.7)',
+    !(bogus.id('boot').textContent || '').includes('alert(1)'),
+    JSON.stringify(bogus.id('boot').textContent));
+  check('and the page still offers the way in',
+    bogus.id('boot').all().some((n) => n.getAttribute('href') === 'auth/oidc/start'));
+
+  const stale = await run('?' + param + '=oidc-state', {
+    status: 401,
+    session: { enforced: true, methods: ['passwd'], notes: [] },
+  });
+  const staleBoot = stale.id('boot');
+  const first = (set.terms.find((t) => t.member === 'oidc-state') || {}).label || '';
+  check('the handshake error is shown on arrival', (staleBoot.textContent || '').includes(first));
+  const form = staleBoot.all().find((n) => n.tagName === 'FORM');
+  check('a login page reached with a stale error still has a working form', !!form);
+  if (form) {
+    form.dispatch('submit', { target: form, preventDefault() {} });
+    await flush();
+    const said = staleBoot.textContent || '';
+    check('a refused attempt replaces the handshake error rather than stacking under it',
+      !said.includes(first), JSON.stringify(said));
+    check('and the refusal is what is shown instead', said.includes('refused'), JSON.stringify(said));
+  }
+}
+
+// --- 9c. A session that ends while the page is open (§19) ----------------
+//
+// The two rules below are only reachable on a page that already has a payload, which is why neither was
+// covered by anything above: `#app` carries `hidden` from index.html, so on a first-load 401 it is hidden
+// whether or not the sign-in path says so, and the handshake code in the URL is only read once, so no
+// first load can show it twice. Both are about the *second* refusal — a session that expired an hour into
+// a reading — and both fail silently, in the way the original bug did: the page keeps drawing.
+//
+// The transport is swapped rather than parameterised, because what is being modelled is a server whose
+// answer changed between two requests, and that is not a property of the run.
+const expire = (session) => (url) => {
+  if (url === 'api/session') {
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(session) });
+  }
+  return Promise.resolve({
+    ok: false, status: 401, statusText: '', headers: { get: () => null },
+    json: () => Promise.resolve({}),
+  });
+};
+
+{
+  const out = await run('');
+  noThrow('a payload arrives before the session ends', out);
+  check('the shell is showing to begin with', out.id('app').hidden === false);
+
+  out.win.fetch = expire({ enforced: true, methods: ['oidc'], oidcLabel: 'Authentik', notes: [] });
+  out.id('rescan').dispatch('click', {});
+  await flush();
+
+  const boot = out.id('boot');
+  check('a refused rescan draws the sign-in', boot.hidden === false &&
+    boot.all().some((n) => n.getAttribute('href') === 'auth/oidc/start'));
+  // The rule this traps: the sign-in *takes the shell away*. Without it the reader is left looking at the
+  // fleet they can no longer read, with a login card over the top of it.
+  check('and takes the shell away rather than sitting over it', out.id('app').hidden === true);
+}
+
+{
+  // A stale code in the URL, and a load that succeeded. Whatever the code described, the reader got past
+  // it — so when the session later ends, the page must report the expiry and not revive that.
+  const key = (C.names.find((n) => n.name === 'paramLoginError') || {}).value;
+  const codes = C.sets.find((s) => s.name === 'loginFailureReason');
+  const said = ((codes ? codes.terms : []).find((t) => t.member === 'oidc-state') || {}).label || '';
+  const out = await run('?' + key + '=oidc-state');
+  noThrow('a stale handshake code does not disturb a payload that arrived', out);
+  check('a stale code is not shown over a payload that arrived',
+    !(out.id('content').textContent || '').includes(said));
+
+  out.win.fetch = expire({ enforced: true, methods: ['oidc'], oidcLabel: 'Authentik', notes: [] });
+  out.id('rescan').dispatch('click', {});
+  await flush();
+
+  const boot = out.id('boot');
+  check('the expiry draws the sign-in', boot.hidden === false);
+  check('and reports the expiry rather than reviving a handshake the reader recovered from',
+    !(boot.textContent || '').includes(said), JSON.stringify(boot.textContent));
+}
+
 // --- 10. Rescan (§13.7) --------------------------------------------------
 
 {

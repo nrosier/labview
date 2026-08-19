@@ -250,6 +250,19 @@ button[disabled] { opacity: 0.6; cursor: default; transform: none; }
   transition: grid-template-columns 160ms ease;
 }
 
+/* The rule above is why `hidden` on the shell needs saying twice. `[hidden] { display: none }` lives in
+   the *user-agent* stylesheet, and an author `display` outranks it whatever the selector — origin beats
+   specificity — so `#app { display: grid }` silently made the attribute inert and an unauthenticated
+   reader got the whole shell painted under the sign-in card. §19 gates the data and not the shell on
+   purpose, so the bundle reaching the browser is correct; *drawing* it before there is a payload is not.
+   `#boot` is here for the same reason and in the other direction: it is a grid too (it centres the
+   sign-in card), so without this the sign-in stage would still be over the page after the payload
+   landed. The two ids swap, and the swap only works if both sides of it can actually hide.
+   render-smoke asserts this rule as stylesheet *text* — it executes the bundle without CSS, so a
+   deleted rule here is invisible to every check that reads the DOM. */
+#app[hidden],
+#boot[hidden] { display: none; }
+
 #app[data-side="collapsed"] { --side-w: 3.5rem; }
 
 .side {
@@ -1126,34 +1139,151 @@ pre.raw {
 
 /* ------------------------------------------------------------------ boot */
 
-/* The boot text and the sign-in form are the only screen a reader sees before there is a payload, and
-   §19 says it must be usable on its own. One centred card, so it does not read as a page that failed
-   to load the rest of itself. */
+/* Everything before a payload, and for an unauthenticated reader that is the entire page: §19 gates the
+   data and not the bundle, so this screen loads for anyone who can reach the mount and the shell stays
+   hidden behind `#app[hidden]` until a payload actually arrives.
+   `.boot` is the stage and `.boot-card` is the card. The split is what lets the two states differ: the
+   transient messages — *Reading the payload…*, a request that failed, a contract that did not load — are
+   bare text in the stage, centred and quiet, because a bordered card for a line that is about to be
+   replaced would flash a surface up and take it away again. */
 .boot {
-  max-width: 27rem;
-  margin: 14vh auto;
-  padding: 1.5rem;
+  display: grid;
+  place-items: center;
+  min-height: 100dvh;
+  padding: 2rem 1.25rem;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: var(--step-1);
+  /* One wash behind the card, so a page holding a single small object does not read as a void with
+     something dropped in it. The same accent every other surface is tinted with (§22.1), at the
+     lightness a background can carry without competing with the button it sits behind. */
+  background:
+    radial-gradient(58% 42% at 50% 8%, color-mix(in oklch, var(--accent) 11%, transparent) 0%,
+      transparent 72%),
+    radial-gradient(80% 60% at 50% 108%, color-mix(in oklch, var(--accent) 6%, transparent) 0%,
+      transparent 70%);
+}
+
+/* Centred in both axes off the viewport rather than pushed down by a margin: a `14vh` top puts a short
+   card high in a tall window and the bottom of a tall one off a laptop screen, and this card grows by
+   several rows when the posture has warnings or offers a password as well as a provider. */
+.boot-card {
+  width: 100%;
+  max-width: 23.5rem;
+  padding: 1.9rem 1.75rem 1.65rem;
   border: 1px solid var(--line);
   border-radius: var(--r-xl);
   background: var(--bubble), var(--panel);
   box-shadow: var(--shadow-3);
+  text-align: left;
+}
+
+/* The mark, so the page says whose sign-in this is before it asks for anything. */
+.boot-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  color: var(--accent);
+}
+
+.boot-mark { display: flex; }
+.boot-mark svg { width: 1.55rem; height: 1.55rem; }
+
+.boot-word {
+  font-size: var(--step-2);
+  font-weight: 640;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+
+.boot-card h1 {
+  margin: 0 0 0.35rem;
+  font-size: var(--step-3);
+  font-weight: 640;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.boot-lede { margin: 0 0 1.35rem; font-size: var(--step-1); color: var(--ink-soft); }
+
+.boot-error {
+  margin: 0 0 1.1rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  font-size: var(--step-0);
+}
+
+.boot-error.tone-warn {
+  background: var(--warn-bg);
+  border-color: color-mix(in oklch, var(--warn) 40%, transparent);
+  color: var(--warn);
+}
+
+/* The primary action, and shaped like one: the full width of the card, so which control signs the reader
+   in is not a question they have to answer by reading. */
+.boot-sso {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.72rem 1rem;
+  border-radius: var(--r-md);
+  font-size: var(--step-1);
+  font-weight: 560;
+  text-decoration: none;
+}
+
+.boot-sso svg { width: 1rem; height: 1rem; transition: transform 140ms ease; }
+.boot-sso:hover svg { transform: translateX(2px); }
+
+/* Two ways in, so the second reads as the second. A rule either side of the word rather than a heading:
+   both halves sign the same reader in and neither is a section of the other. */
+.boot-or {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin: 1.15rem 0 1rem;
+  font-size: var(--step-0);
   color: var(--ink-soft);
 }
 
-.boot h1 { margin: 0 0 0.3rem; font-size: var(--step-3); font-weight: 640; color: var(--ink); }
-.boot p { margin: 0 0 0.6rem; font-size: var(--step-0); }
-.boot a { display: inline-block; margin-bottom: 0.6rem; }
+.boot-or::before,
+.boot-or::after { content: ''; flex: 1; height: 1px; background: var(--line); }
 
-.signin { display: grid; gap: 0.5rem; margin-top: 0.9rem; }
+.signin { display: grid; gap: 0.5rem; }
 
 .signin input {
-  padding: 0.45rem 0.7rem;
+  padding: 0.55rem 0.7rem;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--field);
+  font-size: var(--step-1);
 }
 
-.signin button { justify-content: center; padding: 0.45rem 0.7rem; background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 550; }
+.signin input:focus-visible { border-color: color-mix(in oklch, var(--accent) 55%, var(--line)); }
+
+.signin button {
+  justify-content: center;
+  padding: 0.6rem 0.7rem;
+  border-radius: var(--r-md);
+  font-size: var(--step-1);
+  font-weight: 550;
+}
+
+/* The posture's own warnings, under the actions: they are about the installation rather than about the
+   reader, and §22.8 asks that a fact the payload reported not be dropped for being inconvenient. */
+.boot-notes {
+  display: grid;
+  gap: 0.3rem;
+  margin-top: 1.25rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line);
+}
+
+.boot-notes p { margin: 0; }
+.boot-card .absent { display: block; margin-top: 0.9rem; font-size: var(--step-0); }
 
 /* ------------------------------------------------------------ responsive */
 
