@@ -86,7 +86,7 @@ jobs:
       # failed assertion at a glance. The server's bounded concurrency (§5) is the
       # reason it is worth the second run.
       - name: Tests under the race detector
-        run: go test -race ./...
+        run: go test -race -v ./...
 
       # §2.2's bundle is hand-authored and committed, and `go:embed` embeds whatever
       # bytes are on disk — so nothing above this line has ever read it. The Go tests
