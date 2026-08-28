@@ -121,13 +121,16 @@ func Run(ctx context.Context, o Options) payload.Overview {
 
 	readIdentity := func(candidates []authentik.Candidate) {
 		wg.Add(1)
+		println("DIAG dispatch-identity", time.Now().UnixNano())
 		go func() {
 			defer wg.Done()
+			println("DIAG identity-goroutine-start", time.Now().UnixNano())
 			identity = authentik.Do(ctx, authentik.Options{
 				Cfg:        cfg.Authentik,
 				Client:     o.Clients.Authentik,
 				Candidates: candidates,
 			})
+			println("DIAG identity-goroutine-done", time.Now().UnixNano())
 		}()
 	}
 	readProxy := func(candidates []traefikapi.Candidate) {
@@ -154,7 +157,9 @@ func Run(ctx context.Context, o Options) payload.Overview {
 	// -----------------------------------------------------------------------
 	// Stage 3 — the Docker snapshot, overlapping whichever reads started above
 	// -----------------------------------------------------------------------
+	println("DIAG docker-read-start", time.Now().UnixNano())
 	snapshot := dockerapi.New(cfg.Docker, o.Filesystem, o.Clients.Docker).Read(ctx)
+	println("DIAG docker-read-done", time.Now().UnixNano())
 
 	// -----------------------------------------------------------------------
 	// Stage 4 — the middleware registry
