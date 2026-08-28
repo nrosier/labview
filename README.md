@@ -89,7 +89,7 @@ labview/              the Go module (see labview/README.md for full docs)
                       and the services it must never ask at all),
                       auth/ (passwd files for LabView's own login)
   compose.yml         deployment example
-  Dockerfile          two-stage build on golang:1.23-alpine, distroless runtime,
+  Dockerfile          two-stage build on golang:1.27-alpine, distroless runtime,
                       runs as UID 65532
 .github/
   workflows/          CI: security scanning, test-gated image build/push
@@ -107,7 +107,7 @@ published, and not part of the application.
 
 ## Quick start
 
-Requires Go 1.23 or newer — and nothing else. The UI is committed and embedded at compile
+Requires Go 1.27 or newer — and nothing else. The UI is committed and embedded at compile
 time, so there is no Node, no bundler and no install step.
 
 ```bash
@@ -575,9 +575,11 @@ out. A pull request builds the image too but pushes nothing.
 
 Dependabot keeps dependencies current — Go modules, the Dockerfile base images, and the
 Actions themselves — with minor/patch bumps grouped into one PR per ecosystem and majors
-raised individually; merging is manual. Two deliberate exceptions, both documented where
-they are configured: `golang.org/x/crypto` stays at `v0.40.0` and the `golang` build
-image stays on `1.23`, because both are pinned to the Go floor the specification sets.
+raised individually; merging is manual. One deliberate exception, documented where it's
+configured: Dependabot's minor/major bumps to the `golang` build image are ignored,
+because that toolchain tracks what ships (currently `1.27`) rather than the compatibility
+floor the specification sets — see `labview/Dockerfile`. `golang.org/x/crypto` has no such
+exception; it tracks upstream normally, and the floor in `go.mod` moves with it.
 
 Found something? Please open an issue rather than a PR for anything
 security-sensitive.

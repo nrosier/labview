@@ -43,7 +43,7 @@ themselves: the label prefixes `dockflare` and `traefik`, the string `authentik`
 
 ### 2.1 Implementation language
 
-The service MUST be implemented in **Go (1.23 or later)** and MUST build to a single
+The service MUST be implemented in **Go (1.27 or later)** and MUST build to a single
 statically linked binary with `CGO_ENABLED=0`.
 
 It is a requirement, not a preference: a process that mounts a Docker socket and a whole compose
