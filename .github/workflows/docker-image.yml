@@ -102,7 +102,7 @@ jobs:
       - name: Set up Node (for the browser-bundle checks only)
         uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
 
       # Parse first, and separately: a bundle that does not parse fails here with the
       # offending line and column, which is a better report than the render checks'
