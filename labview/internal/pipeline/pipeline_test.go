@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -141,7 +139,6 @@ func (socketInfo) Sys() any           { return nil }
 // and the redirect refusal all remain internal/transport's, and only the bytes are the test's.
 type engine struct {
 	mu    sync.Mutex
-	start time.Time // DIAG: set by newEngine, for elapsed-time logging
 	asked []string // target names, in the order the requests arrived
 
 	// gate is closed the first time a target is asked, so another target's handler can wait on it.
@@ -158,7 +155,6 @@ type engine struct {
 
 func newEngine() *engine {
 	return &engine{
-		start:  time.Now(),
 		gate:   map[string]chan struct{}{},
 		fired:  map[string]bool{},
 		holds:  map[string]func(){},
@@ -186,9 +182,13 @@ func (e *engine) record(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.asked = append(e.asked, name)
-	if ch, ok := e.gate[name]; ok && !e.fired[name] {
+	// fired is set regardless of whether a gate exists yet: a target can be asked before anyone
+	// has called waitFor for it, and that arrival must still count once waitFor shows up later.
+	if !e.fired[name] {
 		e.fired[name] = true
-		close(ch)
+		if ch, ok := e.gate[name]; ok {
+			close(ch)
+		}
 	}
 }
 
@@ -236,13 +236,9 @@ func (e *engine) order() []string {
 
 func (e *engine) RoundTrip(r *http.Request) (*http.Response, error) {
 	name := target(r)
-	println("DIAG roundtrip", name, r.URL.Path, strconv.FormatInt(time.Since(e.start).Microseconds(), 10)+"us",
-		"goroutines="+strconv.Itoa(runtime.NumGoroutine()), "gomaxprocs="+strconv.Itoa(runtime.GOMAXPROCS(0)))
 	e.record(name)
 	if hold := e.holdFor(name); hold != nil {
-		println("DIAG holding", name, strconv.FormatInt(time.Since(e.start).Microseconds(), 10)+"us")
 		hold()
-		println("DIAG hold-released", name, strconv.FormatInt(time.Since(e.start).Microseconds(), 10)+"us")
 	}
 
 	body, code, ctype := e.answer(r)
@@ -488,8 +484,6 @@ func TestAConfiguredEndpointIsAskedBeforeTheDockerSnapshotFinishes(t *testing.T)
 		c.Authentik.URL = "https://sso.example.com"
 		c.Traefik.Enabled = false
 	}, nil)
-
-	t.Logf("DIAG asked order: %v; numcpu=%d gomaxprocs=%d", e.order(), runtime.NumCPU(), runtime.GOMAXPROCS(0))
 
 	if !out.Meta.DockerAvailable {
 		t.Fatalf("the fake engine answered, so the snapshot succeeded; got %q", out.Meta.DockerError)
