@@ -100,7 +100,7 @@ jobs:
       # property of the image. Nothing is installed — the checker uses only node:
       # builtins, so §2.1's dependency cap is untouched and there is no lockfile.
       - name: Set up Node (for the browser-bundle checks only)
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
 
