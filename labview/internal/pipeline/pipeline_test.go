@@ -182,9 +182,13 @@ func (e *engine) record(name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.asked = append(e.asked, name)
-	if ch, ok := e.gate[name]; ok && !e.fired[name] {
+	// fired is set regardless of whether a gate exists yet: a target can be asked before anyone
+	// has called waitFor for it, and that arrival must still count once waitFor shows up later.
+	if !e.fired[name] {
 		e.fired[name] = true
-		close(ch)
+		if ch, ok := e.gate[name]; ok {
+			close(ch)
+		}
 	}
 }
 
