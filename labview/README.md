@@ -167,7 +167,7 @@ ship with an icon and label, never color alone.
 
 ## Quick start (local)
 
-Go 1.23 or newer, and nothing else — no Node, no bundler, no package manager. The web
+Go 1.27 or newer, and nothing else — no Node, no bundler, no package manager. The web
 UI is committed under `internal/webui/dist` and embedded by `go:embed` at compile time,
 so `go build` is the whole build:
 

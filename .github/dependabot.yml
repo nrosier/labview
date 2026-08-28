@@ -9,11 +9,11 @@ updates:
   # implementation and JWT/JWKS verification, so this is a very short list and a PR
   # here deserves reading rather than waving through.
   #
-  # Read the go.mod comment before merging one. golang.org/x/crypto is held at
-  # v0.40.0 on purpose: it is the last release whose own `go` directive is still
-  # 1.23.0, and v0.42.0 and later would raise this module's floor above what §2.1
-  # sets. Dependabot cannot know that, so it will keep offering the bump — the
-  # answer is no until §2.1 changes.
+  # Read the go.mod comment before merging one. §2.1's floor moves whenever a direct
+  # dependency's own `go` directive forces it — golang.org/x/crypto v0.52.0 raised it
+  # from 1.23.0 to 1.27.0 this way. Check that go.mod's header comment and
+  # IMPLEMENTATION.md §2.1 still agree after any bump; Dependabot only sees the
+  # module version, not the spec.
   - package-ecosystem: gomod
     directory: /labview
     schedule:
@@ -32,15 +32,17 @@ updates:
           - patch
 
   # --- Dockerfile base images ----------------------------------------------
-  # Two: golang:1.23-alpine for the build stage and distroless/static-debian12 for
+  # Two: golang:1.27-alpine for the build stage and distroless/static-debian12 for
   # the runtime stage.
   #
-  # The build stage is pinned to the floor §2.1 declares, deliberately — building
-  # with the oldest supported toolchain is the check that the declaration in go.mod
-  # is true. So major and minor Go bumps are ignored here; a `golang:1.25-alpine` PR
-  # would be proposing a spec change dressed up as a dependency update. Patch
-  # updates to that tag, and every update to the distroless runtime base (where the
-  # CA bundle that §2.4 depends on lives), come through normally.
+  # The build stage tracks a *supported* toolchain, deliberately not §2.1's floor —
+  # see labview/Dockerfile for why: building on the floor was tried and reverted,
+  # since Go 1.23 going end of life left 28 reachable stdlib advisories with no
+  # patched 1.23 to move to. So major and minor Go bumps are ignored here on
+  # purpose — the maintainer picks when to move the image rather than Dependabot
+  # proposing whatever tag is newest on its own schedule. Patch updates to that
+  # tag, and every update to the distroless runtime base (where the CA bundle
+  # that §2.4 depends on lives), come through normally.
   - package-ecosystem: docker
     directory: /labview
     schedule:

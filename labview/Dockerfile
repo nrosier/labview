@@ -13,9 +13,9 @@
 # A *supported* toolchain, deliberately not the floor §2.1 sets. These are two
 # independent things and conflating them is what broke the dependency audit:
 #
-#   * `go 1.23.0` in go.mod is a compatibility promise — §2.1 says "1.23 or later",
-#     so the module must stay buildable by a 1.23 toolchain. The directive is what
-#     enforces that: the compiler rejects any 1.24+ language feature or API here
+#   * `go 1.27.0` in go.mod is a compatibility promise — §2.1 says "1.27 or later",
+#     so the module must stay buildable by a 1.27 toolchain. The directive is what
+#     enforces that: the compiler rejects any 1.28+ language feature or API here
 #     regardless of which toolchain reads it, so the promise is checked by every
 #     build rather than by the choice of base image.
 #   * the toolchain that compiles the shipped binary decides which *standard library*
@@ -25,11 +25,14 @@
 # life at 1.23.12 — govulncheck found 21 reachable stdlib advisories in the result
 # (request smuggling in net/http, cross-domain header leakage in net/http, x509 name
 # constraint bypass) with no patched 1.23 to move to. A floor is a minimum to remain
-# compatible with, not a version to ship.
+# compatible with, not a version to ship. The floor has since moved to 1.27 anyway,
+# forced by golang.org/x/crypto v0.52.0 — the two knobs happen to read the same
+# number now, but they are still checked by separate mechanisms (see docker-image.yml).
 #
-# CI still compiles on 1.23.x in a separate job (docker-image.yml, floor-compat) so
-# the §2.1 claim keeps being tested — which is the part building on the floor was
-# actually for. Bump this image when Go 1.26 leaves support; the floor stays put.
+# CI still compiles on the declared floor in a separate job (docker-image.yml,
+# floor-compat) so the §2.1 claim keeps being tested — which is the part building on
+# the floor was actually for. Bump this image when Go 1.27 leaves support; the floor
+# moves independently, whenever a dependency forces it.
 FROM golang:1.27-alpine AS build
 WORKDIR /src
 

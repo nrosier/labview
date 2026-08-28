@@ -41,7 +41,7 @@ jobs:
 
       # The toolchain the Dockerfile's build stage uses, so the corpus runs against the
       # standard library that actually ships. Not go.mod's floor: that is a minimum to
-      # stay compatible with (§2.1, "1.23 or later") and is enforced by the `go` directive
+      # stay compatible with (§2.1, "1.27 or later") and is enforced by the `go` directive
       # at compile time, not by the choice of toolchain. The floor-compat job below is
       # what checks the declaration is still true; testing on the floor as well would only
       # mean the tests never touch the stdlib the image contains.
@@ -143,12 +143,13 @@ jobs:
           go run ./cmd/labview scan > "$RUNNER_TEMP/payload.json"
           node ../.github/scripts/render-smoke.mjs "$RUNNER_TEMP/payload.json"
 
-  # §2.1 says "Go 1.23 or later", and go.mod's `go 1.23.0` is that claim written down.
+  # §2.1 says "Go 1.27 or later", and go.mod's `go 1.27.0` is that claim written down.
   # This job is the check that it is still true, and it is the *only* place the floor is
   # built on — the image, the corpus and the vulnerability scan all use a supported
-  # toolchain instead (see labview/Dockerfile for why those two things must not be the
-  # same knob). A `go get` that quietly raises the directive, or a 1.24+ API landing in
-  # a source file, fails here and nowhere else.
+  # toolchain instead (see labview/Dockerfile for why floor and toolchain are checked by
+  # separate mechanisms, even now that both happen to read 1.27). A `go get` that quietly
+  # raises the directive further, or a 1.28+ API landing in a source file, fails here and
+  # nowhere else.
   #
   # Compile and vet only, not the corpus: what is under test is whether the declared
   # minimum can still build this module, and behaviour is covered by `test` above on the
