@@ -37,7 +37,7 @@ jobs:
         working-directory: labview
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The toolchain the Dockerfile's build stage uses, so the corpus runs against the
       # standard library that actually ships. Not go.mod's floor: that is a minimum to
@@ -162,7 +162,7 @@ jobs:
         working-directory: labview
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go (go.mod's declared minimum)
         uses: actions/setup-go@v7
@@ -182,7 +182,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Only when something actually ships. Pull requests build the image below but
       # never log in: fork PRs receive no secrets, so a login on that path fails for

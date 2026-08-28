@@ -45,7 +45,7 @@ jobs:
         working-directory: labview
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The toolchain the Dockerfile ships, NOT go.mod's floor — keep this in step with
       # labview/Dockerfile's build stage. govulncheck reports standard-library advisories
@@ -113,7 +113,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Dependency Review
         uses: actions/dependency-review-action@v5.0.0
@@ -137,7 +137,7 @@ jobs:
             build-mode: none
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # The shipped toolchain again, for the same reason as the audit job above: CodeQL
       # analyses what the compiler gives it, so a stdlib two years behind the image's
@@ -179,7 +179,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Run Trivy (vuln, misconfig, secrets)
         uses: aquasecurity/trivy-action@master
@@ -206,7 +206,7 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Build Docker image
         run: docker build -t labview:test ./labview
@@ -232,7 +232,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
