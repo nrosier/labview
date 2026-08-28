@@ -30,7 +30,7 @@
 # CI still compiles on 1.23.x in a separate job (docker-image.yml, floor-compat) so
 # the §2.1 claim keeps being tested — which is the part building on the floor was
 # actually for. Bump this image when Go 1.26 leaves support; the floor stays put.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 
 # Dependencies first, so a source-only change does not re-download the module cache.
