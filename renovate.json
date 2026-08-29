@@ -1,4 +1,19 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "ignorePaths": ["labview/fixtures/**"]
+  "extends": [
+    "config:recommended"
+  ],
+  "ignorePaths": [
+    "labview/fixtures/**"
+  ],
+  "env": {
+    "GOPROXY": "https://proxy.golang.org,direct",
+    "GOPRIVATE": ""
+  },
+  "packageRules": [
+    {
+      "matchDatasources": ["go"],
+      "registryUrls": ["https://proxy.golang.org"]
+    }
+  ]
 }
