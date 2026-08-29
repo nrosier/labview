@@ -10,10 +10,7 @@
     "GOPROXY": "https://proxy.golang.org,direct",
     "GOPRIVATE": ""
   },
-  "packageRules": [
-    {
-      "matchDatasources": ["go"],
-      "registryUrls": ["https://proxy.golang.org"]
-    }
+  "postUpdateOptions": [
+    "gomodTidy"
   ]
 }
