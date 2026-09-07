@@ -13,6 +13,6 @@ go 1.27.0
 // CI — an `// indirect` on a package this module imports itself is a false statement about the
 // dependency surface §2.1 caps at three.
 require (
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	gopkg.in/yaml.v3 v3.0.1
 )
